@@ -5,7 +5,7 @@
 //! placement/binding candidate edges lazily, avoiding a materialized
 //! `cells × BELs` cross product.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -473,6 +473,8 @@ pub struct Device {
     bel_pins: Vec<BelPin>,
     wires: Vec<Wire>,
     pips: Vec<Pip>,
+    bels_by_kind: BTreeMap<ResourceKind, Vec<BelId>>,
+    routing_neighbors: Vec<Vec<(WireId, PipId)>>,
 }
 
 impl Device {
@@ -493,6 +495,8 @@ impl Device {
             bel_pins: Vec::new(),
             wires: Vec::new(),
             pips: Vec::new(),
+            bels_by_kind: BTreeMap::new(),
+            routing_neighbors: Vec::new(),
         })
     }
 
@@ -555,6 +559,7 @@ impl Device {
             point,
             capacity,
         });
+        self.routing_neighbors.push(Vec::new());
         Ok(id)
     }
 
@@ -577,6 +582,7 @@ impl Device {
             point,
             pins: Vec::new(),
         });
+        self.bels_by_kind.entry(kind).or_default().push(id);
         Ok(id)
     }
 
@@ -637,6 +643,10 @@ impl Device {
             bidirectional,
             capacity,
         });
+        insert_routing_neighbor(&mut self.routing_neighbors[from.0], (to, id));
+        if bidirectional {
+            insert_routing_neighbor(&mut self.routing_neighbors[to.0], (from, id));
+        }
         Ok(id)
     }
 
@@ -682,6 +692,22 @@ impl Device {
         &self.pips
     }
 
+    /// BEL IDs of one resource class in stable ID order.
+    #[must_use]
+    pub fn bels_of_kind(&self, kind: ResourceKind) -> &[BelId] {
+        self.bels_by_kind.get(&kind).map_or(&[], Vec::as_slice)
+    }
+
+    /// Outgoing routing neighbors in the ordering used by graph traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown wire ID.
+    pub fn routing_neighbors(&self, wire: WireId) -> Result<&[(WireId, PipId)], ModelError> {
+        self.wire(wire)?;
+        Ok(&self.routing_neighbors[wire.0])
+    }
+
     fn validate_point(&self, point: Point) -> Result<(), ModelError> {
         if point.x < self.width && point.y < self.height {
             Ok(())
@@ -705,6 +731,13 @@ impl Device {
     fn pip(&self, id: PipId) -> Result<&Pip, ModelError> {
         self.pips.get(id.0).ok_or(ModelError::UnknownPip(id))
     }
+}
+
+fn insert_routing_neighbor(neighbors: &mut Vec<(WireId, PipId)>, neighbor: (WireId, PipId)) {
+    let index = neighbors
+        .binary_search(&neighbor)
+        .unwrap_or_else(|index| index);
+    neighbors.insert(index, neighbor);
 }
 
 /// A node in the unified logical/physical problem graph.
@@ -773,20 +806,19 @@ impl<'a> UnifiedGraph<'a> {
         let cell_data = self.design.cell(cell)?;
         Ok(self
             .device
-            .bels
+            .bels_of_kind(cell_data.kind)
             .iter()
-            .enumerate()
-            .filter(|(_, bel)| {
-                bel.kind == cell_data.kind
-                    && cell_data.pins.iter().all(|cell_pin| {
-                        let logical = &self.design.pins[cell_pin.0];
-                        bel.pins.iter().any(|bel_pin| {
-                            let physical = &self.device.bel_pins[bel_pin.0];
-                            physical.name == logical.name && physical.direction == logical.direction
-                        })
+            .copied()
+            .filter(|bel| {
+                let bel = &self.device.bels[bel.0];
+                cell_data.pins.iter().all(|cell_pin| {
+                    let logical = &self.design.pins[cell_pin.0];
+                    bel.pins.iter().any(|bel_pin| {
+                        let physical = &self.device.bel_pins[bel_pin.0];
+                        physical.name == logical.name && physical.direction == logical.direction
                     })
+                })
             })
-            .map(|(index, _)| BelId(index))
             .collect())
     }
 
@@ -830,19 +862,7 @@ impl<'a> UnifiedGraph<'a> {
     ///
     /// Returns an error for an unknown wire ID.
     pub fn routing_neighbors(&self, wire: WireId) -> Result<Vec<(WireId, PipId)>, ModelError> {
-        self.device.wire(wire)?;
-        let mut neighbors = Vec::new();
-        for (index, pip) in self.device.pips.iter().enumerate() {
-            let pip_id = PipId(index);
-            if pip.from == wire {
-                neighbors.push((pip.to, pip_id));
-            }
-            if pip.bidirectional && pip.to == wire {
-                neighbors.push((pip.from, pip_id));
-            }
-        }
-        neighbors.sort_unstable();
-        Ok(neighbors)
+        Ok(self.device.routing_neighbors(wire)?.to_vec())
     }
 
     /// Returns outgoing arcs for any logical or physical node.
@@ -1105,7 +1125,7 @@ impl Error for ModelError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        BufferSpec, Design, Device, GraphEdgeKind, GraphNode, PinDirection, ResourceKind,
+        BufferSpec, Design, Device, GraphEdgeKind, GraphNode, PinDirection, Point, ResourceKind,
         UnifiedGraph,
     };
 
@@ -1211,5 +1231,51 @@ mod tests {
 
         assert_eq!(graph.routing_neighbors(from).unwrap().len(), 1);
         assert!(graph.routing_neighbors(to).unwrap().is_empty());
+    }
+
+    #[test]
+    fn device_indexes_bels_by_resource_kind() {
+        let mut device = Device::new("indexed", 1, 1).unwrap();
+        let logic = device
+            .add_bel("logic", ResourceKind::Logic, Point::new(0, 0))
+            .unwrap();
+        let register = device
+            .add_bel("register", ResourceKind::Register, Point::new(0, 0))
+            .unwrap();
+        let second_logic = device
+            .add_bel("logic-2", ResourceKind::Logic, Point::new(0, 0))
+            .unwrap();
+
+        assert_eq!(
+            device.bels_of_kind(ResourceKind::Logic),
+            &[logic, second_logic]
+        );
+        assert_eq!(device.bels_of_kind(ResourceKind::Register), &[register]);
+        assert!(device.bels_of_kind(ResourceKind::Memory).is_empty());
+    }
+
+    #[test]
+    fn device_indexes_directed_and_bidirectional_routing_neighbors() {
+        let mut device = Device::new("indexed", 3, 1).unwrap();
+        let first = device.add_wire("first", Point::new(0, 0), 1).unwrap();
+        let second = device.add_wire("second", Point::new(1, 0), 1).unwrap();
+        let third = device.add_wire("third", Point::new(2, 0), 1).unwrap();
+        let to_third = device.add_pip(first, third, false, 1).unwrap();
+        let to_second = device.add_pip(first, second, false, 1).unwrap();
+        let bidirectional = device.add_pip(third, first, true, 1).unwrap();
+
+        assert_eq!(
+            device.routing_neighbors(first).unwrap(),
+            &[
+                (second, to_second),
+                (third, to_third),
+                (third, bidirectional),
+            ]
+        );
+        assert_eq!(
+            device.routing_neighbors(third).unwrap(),
+            &[(first, bidirectional)]
+        );
+        assert!(device.routing_neighbors(second).unwrap().is_empty());
     }
 }
