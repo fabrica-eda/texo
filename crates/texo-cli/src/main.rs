@@ -220,8 +220,9 @@ fn ecp5_demo(
         architecture.device().name()
     );
     println!(
-        "packed: {} LUT/FF pairs, {} BRAMs, {} global clocks",
+        "packed: {} LUT/FF pairs, {} carry pairs, {} BRAMs, {} global clocks",
         result.packing.lut_ff_pairs().len(),
+        result.packing.carry_pairs().len(),
         result.packing.block_rams().len(),
         result.packing.global_clocks().len()
     );
@@ -385,6 +386,12 @@ fn checkpoint_packing(result: &Ecp5FlowResult) -> Value {
         .iter()
         .map(|pair| json!({ "lut": pair.lut.0, "ff": pair.ff.0 }))
         .collect::<Vec<_>>();
+    let carry_pairs = result
+        .packing
+        .carry_pairs()
+        .iter()
+        .map(|pair| json!({ "first": pair[0].0, "second": pair[1].0 }))
+        .collect::<Vec<_>>();
     let block_rams = result
         .packing
         .block_rams()
@@ -437,6 +444,7 @@ fn checkpoint_packing(result: &Ecp5FlowResult) -> Value {
         .collect::<Vec<_>>();
     json!({
         "lut_ff_pairs": lut_ff_pairs,
+        "carry_pairs": carry_pairs,
         "general_routing_ffs": result.packing.general_routing_ffs().iter().map(|cell| cell.0).collect::<Vec<_>>(),
         "block_rams": block_rams,
         "global_clocks": global_clocks,
@@ -529,6 +537,16 @@ fn primitive_metadata_json(
 ) -> Value {
     let configuration = match metadata {
         PrimitiveMetadata::Lut4 { init } => json!({ "kind": "lut4", "init": init }),
+        PrimitiveMetadata::CarrySlice {
+            init,
+            inject,
+            slice,
+        } => json!({
+            "kind": "carry_slice",
+            "init": init,
+            "inject": inject,
+            "slice": slice,
+        }),
         PrimitiveMetadata::FlipFlop {
             edge,
             enable,

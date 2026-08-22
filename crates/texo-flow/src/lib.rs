@@ -211,6 +211,11 @@ pub fn implement_struo_ecp5(
 
     let mut design = imported.design().clone();
     let mut packing = pack_lut_ffs(&design, architecture)?;
+    packing.pack_carry_pairs(
+        &design,
+        architecture,
+        imported.carry_pairs().iter().copied(),
+    )?;
     let block_rams = imported
         .metadata()
         .iter()
@@ -380,14 +385,23 @@ fn ecp5_timing_model(
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
+    let carry_slices = packing
+        .carry_pairs()
+        .iter()
+        .flat_map(|pair| [(pair[0], "TRELLIS_CARRY0"), (pair[1], "TRELLIS_CARRY1")])
+        .collect::<BTreeMap<_, _>>();
     let mut model = TimingModel::new();
     for (index, cell) in design.cells().iter().enumerate() {
         let cell_id = CellId(index);
-        let cell_type = match cell.kind {
-            ResourceKind::Lut(4) => "TRELLIS_COMB",
-            ResourceKind::Register => "TRELLIS_FF",
-            ResourceKind::Clock => "DCCA",
-            _ => continue,
+        let cell_type = if let Some(&cell_type) = carry_slices.get(&cell_id) {
+            cell_type
+        } else {
+            match cell.kind {
+                ResourceKind::Lut(4) => "TRELLIS_COMB",
+                ResourceKind::Register => "TRELLIS_FF",
+                ResourceKind::Clock => "DCCA",
+                _ => continue,
+            }
         };
         let record =
             records
@@ -636,9 +650,13 @@ impl Error for MissingEvidence {}
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use struo_celox::ecp5_simulator;
-    use struo_ir::{ClockEdge, Netlist, RegisterCell};
-    use struo_target_ecp5::{Ecp5Netlist, map_to_ecp5};
+    use struo_ir::{ArithmeticOp, ClockEdge, Netlist, RegisterCell};
+    use struo_target_ecp5::{
+        ArithmeticMapping, Ecp5Netlist, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
+    };
     use texo_model::{BelId, CellId, Design, Device, PinDirection, ResourceKind};
     use texo_pnr::PlacementConstraints;
     use texo_struo::import_ecp5;
@@ -887,6 +905,50 @@ mod tests {
         assert_eq!(evidence, original);
         assert!(!evidence.contains(Gate::MappedNetlistComplete));
         assert!(!evidence.contains(Gate::PhysicalImplementation));
+    }
+
+    #[test]
+    fn applies_characterized_timing_to_split_carry_slices() {
+        let mut source = Netlist::new("carry");
+        let width = NonZeroU32::new(2).unwrap();
+        let lhs = source.add_input_port("lhs", width);
+        let rhs = source.add_input_port("rhs", width);
+        let sum = source
+            .add_arithmetic(ArithmeticOp::Add, &lhs, &rhs)
+            .unwrap();
+        source.add_output_port("sum", &sum).unwrap();
+        let mapped = map_to_ecp5_with_options(
+            &source,
+            MappingOptions {
+                arithmetic: ArithmeticMapping::CarryChain,
+            },
+        )
+        .unwrap();
+        let imported = import_ecp5(&mapped).unwrap();
+        let architecture = read_architecture(ECP5_FIXTURE.as_bytes()).unwrap();
+        let mut packing = pack_lut_ffs(imported.design(), &architecture).unwrap();
+        packing
+            .pack_carry_pairs(
+                imported.design(),
+                &architecture,
+                imported.carry_pairs().iter().copied(),
+            )
+            .unwrap();
+
+        let model = ecp5_timing_model(
+            imported.design(),
+            &packing,
+            &architecture.speed_grades()["6"],
+        )
+        .unwrap();
+        let pair = imported.carry_pairs()[0];
+        let first_a = find_cell_pin(imported.design(), pair[0], "A").unwrap();
+        let first_fco = find_cell_pin(imported.design(), pair[0], "FCO").unwrap();
+        let second_fci = find_cell_pin(imported.design(), pair[1], "FCI").unwrap();
+        let second_f = find_cell_pin(imported.design(), pair[1], "F").unwrap();
+
+        assert_eq!(model.cell_arc(first_a, first_fco).unwrap().max_ps, 447);
+        assert_eq!(model.cell_arc(second_fci, second_f).unwrap().max_ps, 474);
     }
 
     #[test]

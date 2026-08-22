@@ -40,7 +40,15 @@
         { "name": "DOB0_EBR" },
         { "name": "DOB1_EBR" },
         { "name": "CLKI_DCCA" },
-        { "name": "CLKO_DCCA" }
+        { "name": "CLKO_DCCA" },
+        { "name": "FCI_SLICE" },
+        { "name": "FCIA1_SLICE" },
+        { "name": "FCO1_SLICE" },
+        { "name": "A1_SLICE" },
+        { "name": "B1_SLICE" },
+        { "name": "C1_SLICE" },
+        { "name": "D1_SLICE" },
+        { "name": "F1_SLICE" }
       ],
       "bels": [
         {
@@ -52,7 +60,23 @@
             { "name": "B", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 1 } },
             { "name": "C", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 2 } },
             { "name": "D", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 3 } },
-            { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 4 } }
+            { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 4 } },
+            { "name": "FCI", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 28 } },
+            { "name": "FCO", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 29 } }
+          ]
+        },
+        {
+          "name": "SLICEA.K1",
+          "bel_type": "TRELLIS_COMB",
+          "z": 4,
+          "pins": [
+            { "name": "A", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 31 } },
+            { "name": "B", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 32 } },
+            { "name": "C", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 33 } },
+            { "name": "D", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 34 } },
+            { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 35 } },
+            { "name": "FCI", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 29 } },
+            { "name": "FCO", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 30 } }
           ]
         },
         {
@@ -185,7 +209,15 @@
         { "name": "PADDT_B" },
         { "name": "PADDI_C" },
         { "name": "PADDO_C" },
-        { "name": "PADDT_C" }
+        { "name": "PADDT_C" },
+        { "name": "FCI_SLICE" },
+        { "name": "FCIA1_SLICE" },
+        { "name": "FCO1_SLICE" },
+        { "name": "A1_SLICE" },
+        { "name": "B1_SLICE" },
+        { "name": "C1_SLICE" },
+        { "name": "D1_SLICE" },
+        { "name": "F1_SLICE" }
       ],
       "bels": [
         {
@@ -197,7 +229,23 @@
             { "name": "B", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 1 } },
             { "name": "C", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 2 } },
             { "name": "D", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 3 } },
-            { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 4 } }
+            { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 4 } },
+            { "name": "FCI", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 19 } },
+            { "name": "FCO", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 20 } }
+          ]
+        },
+        {
+          "name": "SLICEA.K1",
+          "bel_type": "TRELLIS_COMB",
+          "z": 4,
+          "pins": [
+            { "name": "A", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 22 } },
+            { "name": "B", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 23 } },
+            { "name": "C", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 24 } },
+            { "name": "D", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 25 } },
+            { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 26 } },
+            { "name": "FCI", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 20 } },
+            { "name": "FCO", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 21 } }
           ]
         },
         {
@@ -310,9 +358,9 @@
     {
       "name": "CABGA381",
       "pins": [
-        { "name": "A10", "x": 0, "y": 0, "bel": 1 },
-        { "name": "B10", "x": 1, "y": 0, "bel": 3 },
-        { "name": "C10", "x": 1, "y": 0, "bel": 4 }
+        { "name": "A10", "x": 0, "y": 0, "bel": 2 },
+        { "name": "B10", "x": 1, "y": 0, "bel": 4 },
+        { "name": "C10", "x": 1, "y": 0, "bel": 5 }
       ]
     }
   ],
@@ -352,6 +400,38 @@
             { "from_pin": "B", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
             { "from_pin": "C", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
             { "from_pin": "D", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } }
+          ],
+          "setup_holds": []
+        },
+        {
+          "cell_type": "TRELLIS_CARRY0",
+          "arcs": [
+            { "from_pin": "A", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "B", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "C", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "D", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "A", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "B", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "C", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "D", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "FCI", "to_pin": "F", "delay": { "min_ps": 244, "max_ps": 443 } },
+            { "from_pin": "FCI", "to_pin": "FCO", "delay": { "min_ps": 62, "max_ps": 71 } }
+          ],
+          "setup_holds": []
+        },
+        {
+          "cell_type": "TRELLIS_CARRY1",
+          "arcs": [
+            { "from_pin": "A", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "B", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "C", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "D", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "A", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "B", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "C", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "D", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "FCI", "to_pin": "F", "delay": { "min_ps": 357, "max_ps": 474 } },
+            { "from_pin": "FCI", "to_pin": "FCO", "delay": { "min_ps": 62, "max_ps": 71 } }
           ],
           "setup_holds": []
         },

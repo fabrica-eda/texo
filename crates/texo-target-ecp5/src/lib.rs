@@ -406,6 +406,8 @@ pub const ECP5_GLOBAL_CLOCK_COUNT: usize = 16;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Ecp5Packing {
     constraints: PlacementConstraints,
+    carry_pairs: Vec<[CellId; 2]>,
+    carry_pairs_packed: bool,
     lut_ff_pairs: Vec<LutFfPair>,
     general_routing_ffs: Vec<CellId>,
     block_rams: Vec<PackedBlockRam>,
@@ -437,6 +439,83 @@ impl Ecp5Packing {
     #[must_use]
     pub fn lut_ff_pairs(&self) -> &[LutFfPair] {
         &self.lut_ff_pairs
+    }
+
+    /// Split `CCU2C` pairs assigned to the two LUTs in one ECP5 slice.
+    #[must_use]
+    pub fn carry_pairs(&self) -> &[[CellId; 2]] {
+        &self.carry_pairs
+    }
+
+    /// Constrains each split `CCU2C` to adjacent K0/K1 `TRELLIS_COMB` BELs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate/invalid cells, unavailable compatible
+    /// slice pairs, or a second invocation.
+    pub fn pack_carry_pairs(
+        &mut self,
+        design: &Design,
+        architecture: &Ecp5Architecture,
+        pairs: impl IntoIterator<Item = [CellId; 2]>,
+    ) -> Result<(), PackingError> {
+        if self.carry_pairs_packed {
+            return Err(PackingError::CarryPairsAlreadyPacked);
+        }
+        let graph = UnifiedGraph::new(design, architecture.device());
+        let mut occupied = BTreeSet::new();
+        let mut groups = Vec::new();
+        let mut packed = Vec::new();
+        for pair in pairs {
+            for &cell in &pair {
+                let Some(logical) = design.cells().get(cell.0) else {
+                    return Err(PackingError::UnknownCarryCell(cell));
+                };
+                if !is_carry_slice(design, cell) {
+                    return Err(PackingError::CellIsNotCarrySlice {
+                        cell: logical.name.clone(),
+                    });
+                }
+                if !occupied.insert(cell) {
+                    return Err(PackingError::DuplicateCarryCell {
+                        cell: logical.name.clone(),
+                    });
+                }
+            }
+            let first_bels = graph.placement_candidates(pair[0])?;
+            let second_bels = graph.placement_candidates(pair[1])?;
+            let mut assignments = Vec::new();
+            for first in first_bels {
+                let first_metadata = &architecture.bel_metadata()[&first];
+                if first_metadata.bel_type != "TRELLIS_COMB" || first_metadata.z.rem_euclid(8) != 0
+                {
+                    continue;
+                }
+                for &second in &second_bels {
+                    let second_metadata = &architecture.bel_metadata()[&second];
+                    if second_metadata.bel_type == "TRELLIS_COMB"
+                        && architecture.device().bels()[first.0].point
+                            == architecture.device().bels()[second.0].point
+                        && first_metadata.z.checked_add(4) == Some(second_metadata.z)
+                    {
+                        assignments.push(vec![first, second]);
+                    }
+                }
+            }
+            if assignments.is_empty() {
+                return Err(PackingError::MissingCarrySlicePair {
+                    cell: design.cells()[pair[0].0].name.clone(),
+                });
+            }
+            groups.push((pair, assignments));
+            packed.push(pair);
+        }
+        for (pair, assignments) in groups {
+            self.constraints.add_group(pair, assignments);
+        }
+        self.carry_pairs = packed;
+        self.carry_pairs_packed = true;
+        Ok(())
     }
 
     /// FFs rebound from logical `DI` to the general-routing `M` pin (`SD=0`).
@@ -931,6 +1010,9 @@ pub fn pack_lut_ffs(
         let Some(lut) = lut_driver(design, data_pin) else {
             continue;
         };
+        if is_carry_slice(design, lut) {
+            continue;
+        }
         if paired_luts.contains(&lut) {
             continue;
         }
@@ -969,6 +1051,8 @@ pub fn pack_lut_ffs(
 
     Ok(Ecp5Packing {
         constraints,
+        carry_pairs: Vec::new(),
+        carry_pairs_packed: false,
         lut_ff_pairs,
         general_routing_ffs,
         block_rams: Vec::new(),
@@ -979,6 +1063,13 @@ pub fn pack_lut_ffs(
         clock_frequencies_hz: BTreeMap::new(),
         unsupported_lpf_commands: Vec::new(),
     })
+}
+
+fn is_carry_slice(design: &Design, cell: CellId) -> bool {
+    design.cells()[cell.0]
+        .pins()
+        .iter()
+        .any(|pin| design.pins()[pin.0].name == "FCO")
 }
 
 fn lut_driver(design: &Design, data_pin: CellPinId) -> Option<CellId> {
@@ -1037,6 +1128,25 @@ pub enum PackingError {
     /// No compatible physical FF exposed the general-routing `M` pin.
     MissingGeneralDataPin {
         /// Register cell name.
+        cell: String,
+    },
+    /// Carry-pair packing was invoked more than once.
+    CarryPairsAlreadyPacked,
+    /// A carry requirement referenced an unknown cell.
+    UnknownCarryCell(CellId),
+    /// A carry requirement referenced a cell without the carry pin surface.
+    CellIsNotCarrySlice {
+        /// Logical cell name.
+        cell: String,
+    },
+    /// One carry slice occurred in more than one pair.
+    DuplicateCarryCell {
+        /// Logical cell name.
+        cell: String,
+    },
+    /// No adjacent K0/K1 physical pair can implement a carry primitive.
+    MissingCarrySlicePair {
+        /// First logical slice name.
         cell: String,
     },
     /// A requirement referenced an unknown logical cell.
@@ -1156,6 +1266,7 @@ pub enum PackingError {
 }
 
 impl fmt::Display for PackingError {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Model(error) => write!(f, "invalid packing graph: {error}"),
@@ -1167,6 +1278,17 @@ impl fmt::Display for PackingError {
                     f,
                     "register `{cell}` has no compatible general-routing M pin"
                 )
+            }
+            Self::CarryPairsAlreadyPacked => write!(f, "carry pairs were already packed"),
+            Self::UnknownCarryCell(cell) => write!(f, "unknown carry cell ID {}", cell.0),
+            Self::CellIsNotCarrySlice { cell } => {
+                write!(f, "cell `{cell}` does not expose an ECP5 carry slice")
+            }
+            Self::DuplicateCarryCell { cell } => {
+                write!(f, "carry slice `{cell}` occurs in more than one pair")
+            }
+            Self::MissingCarrySlicePair { cell } => {
+                write!(f, "carry slice `{cell}` has no compatible K0/K1 BEL pair")
             }
             Self::UnknownBlockRamCell(cell) => {
                 write!(f, "unknown block RAM cell ID {}", cell.0)
@@ -1256,6 +1378,11 @@ impl Error for PackingError {
             Self::Model(error) => Some(error),
             Self::MissingFfDataPin { .. }
             | Self::MissingGeneralDataPin { .. }
+            | Self::CarryPairsAlreadyPacked
+            | Self::UnknownCarryCell(_)
+            | Self::CellIsNotCarrySlice { .. }
+            | Self::DuplicateCarryCell { .. }
+            | Self::MissingCarrySlicePair { .. }
             | Self::UnknownBlockRamCell(_)
             | Self::CellIsNotBlockRam { .. }
             | Self::DuplicateBlockRamRequirement { .. }
@@ -1771,11 +1898,15 @@ impl From<ModelError> for ImportError {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use struo_ir::{
-        ActiveLevel as StruoActiveLevel, ClockEdge as StruoClockEdge, EnableControl, MemoryCell,
-        Netlist, RegisterCell,
+        ActiveLevel as StruoActiveLevel, ArithmeticOp, ClockEdge as StruoClockEdge, EnableControl,
+        MemoryCell, Netlist, RegisterCell,
     };
-    use struo_target_ecp5::map_to_ecp5;
+    use struo_target_ecp5::{
+        ArithmeticMapping, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
+    };
     use texo_model::{CellId, Design, PinDirection, ResourceKind, UnifiedGraph};
     use texo_pnr::{place_and_route_with_constraints, place_with_constraints};
     use texo_struo::{PrimitiveMetadata, import_ecp5};
@@ -1794,8 +1925,8 @@ mod tests {
         let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
 
         assert_eq!(architecture.device().name(), "LFE5UM5G-85F-test");
-        assert_eq!(architecture.device().bels().len(), 10);
-        assert_eq!(architecture.device().wires().len(), 47);
+        assert_eq!(architecture.device().bels().len(), 12);
+        assert_eq!(architecture.device().wires().len(), 63);
         assert_eq!(architecture.device().pips().len(), 14);
         assert_eq!(architecture.packages()[0].pins.len(), 3);
         assert_eq!(
@@ -1840,7 +1971,7 @@ mod tests {
             .unwrap();
         let graph = UnifiedGraph::new(imported.design(), architecture.device());
 
-        assert_eq!(graph.placement_candidates(lut).unwrap().len(), 2);
+        assert_eq!(graph.placement_candidates(lut).unwrap().len(), 4);
         for (index, cell) in imported.design().cells().iter().enumerate() {
             if cell.kind == ResourceKind::Io {
                 assert_eq!(graph.placement_candidates(CellId(index)).unwrap().len(), 3);
@@ -1906,6 +2037,58 @@ mod tests {
             architecture.bel_metadata()[&lut_bel].z + 1,
             architecture.bel_metadata()[&ff_bel].z
         );
+    }
+
+    #[test]
+    fn packs_a_split_ccu2c_into_one_physical_slice() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut source = Netlist::new("carry");
+        let width = NonZeroU32::new(2).unwrap();
+        let lhs = source.add_input_port("lhs", width);
+        let rhs = source.add_input_port("rhs", width);
+        let sum = source
+            .add_arithmetic(ArithmeticOp::Add, &lhs, &rhs)
+            .unwrap();
+        source.add_output_port("sum", &sum).unwrap();
+        let mapped = map_to_ecp5_with_options(
+            &source,
+            MappingOptions {
+                arithmetic: ArithmeticMapping::CarryChain,
+            },
+        )
+        .unwrap();
+        let imported = import_ecp5(&mapped).unwrap();
+        let pair = imported.carry_pairs()[0];
+        let mut packing = pack_lut_ffs(imported.design(), &architecture).unwrap();
+
+        packing
+            .pack_carry_pairs(
+                imported.design(),
+                &architecture,
+                imported.carry_pairs().iter().copied(),
+            )
+            .unwrap();
+        assert_eq!(packing.carry_pairs(), &[pair]);
+        let group = packing
+            .constraints()
+            .groups()
+            .iter()
+            .find(|group| group.cells == pair)
+            .unwrap();
+        assert!(!group.assignments.is_empty());
+        for assignment in &group.assignments {
+            let [first, second] = assignment.as_slice() else {
+                panic!("carry assignment must contain two BELs")
+            };
+            assert_eq!(
+                architecture.device().bels()[first.0].point,
+                architecture.device().bels()[second.0].point
+            );
+            assert_eq!(
+                architecture.bel_metadata()[first].z + 4,
+                architecture.bel_metadata()[second].z
+            );
+        }
     }
 
     #[test]

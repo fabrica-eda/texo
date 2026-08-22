@@ -18,8 +18,8 @@ validate graph APIs and occupancy invariants before importing silicon data.
 - [x] Add a revision-pinned adapter crate for Struo's `Ecp5Netlist`.
 - [x] Consume Celox from crates.io at the workspace-pinned exact version; do not
   introduce a Celox Git dependency.
-- [x] Preserve LUT4 equations, `TRELLIS_FF` controls, `DP16KD`, constants, ports,
-  and clocks.
+- [x] Preserve LUT4 equations, split `CCU2C` carry slices, `TRELLIS_FF`
+  controls, `DP16KD`, constants, ports, and clocks.
 - [ ] Import user constraints alongside the mapped object.
 - [x] Add programmatic mapped-netlist fixtures for LUT4, `TRELLIS_FF`, and
   `DP16KD` import plus crates.io Celox artifact validation.
@@ -41,6 +41,8 @@ same mapped design still passes Celox simulation.
   `TRELLIS_COMB` and `PIO` BELs.
 - [x] Atomically place LUT-driven FFs in matching `TRELLIS_COMB(z)` /
   `TRELLIS_FF(z+1)` slots; bind unpaired FF data through the `M` input.
+- [x] Split Struo `CCU2C` cells and atomically place each K0/K1 pair on one
+  physical slice with characterized FCI/FCO timing.
 - [x] Convert resolved package-pin bindings into fixed PIO placement groups.
 - [x] Parse LPF `LOCATE COMP` and `IOBUF PORT` constraints, resolve scalar and
   vector Struo port cells, and retain unsupported commands for diagnostics.
@@ -48,8 +50,8 @@ same mapped design still passes Celox simulation.
   resolve clock ports to logical IO cells.
 - [ ] Generate and characterize a complete production device snapshot using a
   locally built `pytrellis` and `prjtrellis-db` checkout.
-- [x] Import speed-grade PIP classes, LUT arcs, FF clock-to-Q/setup/hold, and
-  DCCA arcs from Project Trellis timing data.
+- [x] Import speed-grade PIP classes, LUT/carry arcs, FF
+  clock-to-Q/setup/hold, and DCCA arcs from Project Trellis timing data.
 - [x] Validate DP16KD width/depth modes, constrain each BRAM to compatible
   BELs, and assign stable WID configuration values with explicit errors.
 - [x] Rank clock nets by FF/BRAM clock-pin fanout, insert DCCA cells for at most

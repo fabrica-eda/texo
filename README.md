@@ -37,7 +37,8 @@ algorithms.
 
 `texo-struo` pins Struo to one exact Git revision because it is not published
 on crates.io. Celox is pinned to `=0.3.1` from crates.io and is never replaced
-with a Git dependency.
+with a Git dependency. The adapter accepts current Struo `CCU2C` output by
+splitting each primitive into two atomically packed ECP5 carry slices.
 
 ## Try it
 

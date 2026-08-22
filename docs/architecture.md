@@ -19,7 +19,7 @@ The inspected upstream versions are:
 
 | Project | Dependency policy | Relevant contract |
 |---|---|---|
-| `fabrica-eda/struo` | `fd994db45f792fb4a019d57575fbb1239eae21ae` | `Ecp5Netlist`, `Ecp5Cell`, mapped ports, nextpnr-compatible JSON, verification policy |
+| `fabrica-eda/struo` | `8dad8c2e27f4dacd6283bb4015ad99208618c228` | `Ecp5Netlist`, `Ecp5Cell`, `CCU2C`, mapped ports, nextpnr-compatible JSON, verification policy |
 | `celox` | crates.io exact version `=0.3.1` | `FrontendArtifact` and native post-map simulation |
 | `YosysHQ/prjtrellis` | exporter inspected at `3afe7b52b30f4b4417ee98f03016767a502006e3` | deduplicated chip database, relative resource references, package IO database |
 | `prjtrellis-db` | snapshot records the exact revision; fixture uses `015e0330630d7c238c0e4f2cdd9c8157eb78c54a` | ECP5 routing, package, cell timing, and interconnect timing data |
@@ -31,10 +31,11 @@ Git `[patch.crates-io]` entry. Both adapters require fixture tests before an
 upgrade.
 
 `texo-struo` implements that boundary. It consumes Struo's in-memory
-`Ecp5Netlist`, creates explicit logical pins for LUT4, TRELLIS_FF, DP16KD,
-constant networks, and every top-level port bit, then connects them through
-Texo nets without serializing JSON. ECP5 configuration metadata remains in the
-adapter beside the target-neutral graph. The same mapped object can be turned
+`Ecp5Netlist`, creates explicit logical pins for LUT4, CCU2C carry slices,
+TRELLIS_FF, DP16KD, constant networks, and every top-level port bit, then
+connects them through Texo nets without serializing JSON. Each compound CCU2C
+is split into two cells joined by an adapter-local carry net while INIT and
+INJECT configuration remains in metadata. The same mapped object can be turned
 into a crates.io Celox `FrontendArtifact` for post-map verification.
 
 `texo-flow::verify_post_map_with_celox` records simulation evidence only after
@@ -108,6 +109,11 @@ netlist. For ECP5, a LUT-driven FF is grouped with `TRELLIS_COMB(z)` and
 `TRELLIS_FF(z+1)` and keeps the dedicated `DI` path. An unpaired FF maps its
 logical `DI` terminal to the general-routing `M` pin. Package constraints use
 the same mechanism as a one-cell group with one PIO BEL assignment.
+The two cells from a split CCU2C form another atomic group: K0 and K1 share one
+physical slice and their `TRELLIS_COMB` z values differ by four. Their FCI/FCO
+arcs use speed-grade `SCCU2C` characterization imported as conservative
+per-slice timing arcs.
+
 Each logical memory must also supply its Struo-derived depth, logical word
 width, and physical port width. The ECP5 packer accepts only DP16KD modes
 `1/2/4/9/18`, checks the corresponding `16384/8192/4096/2048/1024` depth

@@ -21,6 +21,8 @@ pub enum MappedSignal {
     One,
     /// Numbered mapped wire.
     Wire(u32),
+    /// Adapter-local connection introduced while splitting a compound primitive.
+    Synthetic(u32),
 }
 
 impl From<Bit> for MappedSignal {
@@ -97,6 +99,15 @@ pub enum PrimitiveMetadata {
         /// Complete truth table.
         init: u16,
     },
+    /// One half of a Struo `CCU2C`, implemented by one `TRELLIS_COMB` BEL.
+    CarrySlice {
+        /// LUT truth table for this carry slice.
+        init: u16,
+        /// Whether this slice suppresses its incoming carry.
+        inject: bool,
+        /// Slice index inside the source `CCU2C`.
+        slice: u8,
+    },
     /// `TRELLIS_FF` configuration.
     FlipFlop {
         /// Active clock edge.
@@ -156,6 +167,7 @@ pub struct ImportedEcp5Design {
     metadata: BTreeMap<CellId, PrimitiveMetadata>,
     absorbed_inputs: BTreeMap<CellId, BTreeMap<String, bool>>,
     ports: Vec<ImportedPort>,
+    carry_pairs: Vec<[CellId; 2]>,
 }
 
 impl ImportedEcp5Design {
@@ -187,6 +199,12 @@ impl ImportedEcp5Design {
     #[must_use]
     pub fn ports(&self) -> &[ImportedPort] {
         &self.ports
+    }
+
+    /// Two-slice carry primitives that must occupy one ECP5 slice atomically.
+    #[must_use]
+    pub fn carry_pairs(&self) -> &[[CellId; 2]] {
+        &self.carry_pairs
     }
 
     /// Moves out the generic logical design.
@@ -235,6 +253,8 @@ struct Importer {
     metadata: BTreeMap<CellId, PrimitiveMetadata>,
     absorbed_inputs: BTreeMap<CellId, BTreeMap<String, bool>>,
     ports: Vec<ImportedPort>,
+    carry_pairs: Vec<[CellId; 2]>,
+    next_synthetic_signal: u32,
     drivers: BTreeMap<MappedSignal, CellPinId>,
     sinks: BTreeMap<MappedSignal, Vec<CellPinId>>,
 }
@@ -286,9 +306,56 @@ impl Importer {
     fn add_primitive(&mut self, primitive: &Ecp5Cell) -> Result<(), AdapterError> {
         match primitive {
             Ecp5Cell::Lut4 { .. } => self.add_lut(primitive),
+            Ecp5Cell::Ccu2c { .. } => self.add_ccu2c(primitive),
             Ecp5Cell::FlipFlop { .. } => self.add_flip_flop(primitive),
             Ecp5Cell::BlockRam { .. } => self.add_block_ram(primitive),
         }
+    }
+
+    fn add_ccu2c(&mut self, primitive: &Ecp5Cell) -> Result<(), AdapterError> {
+        let Ecp5Cell::Ccu2c {
+            name,
+            inputs,
+            carry_in,
+            sums,
+            carry_out,
+            init,
+            inject,
+        } = primitive
+        else {
+            unreachable!("dispatch guarantees CCU2C")
+        };
+        let internal_carry = MappedSignal::Synthetic(self.next_synthetic_signal);
+        self.next_synthetic_signal += 1;
+        let mut slices = [CellId(0); 2];
+        for slice in 0..2 {
+            let cell = self.add_cell(
+                format!("{name}$slice{slice}"),
+                ResourceKind::Lut(4),
+                PrimitiveMetadata::CarrySlice {
+                    init: init[slice],
+                    inject: inject[slice],
+                    slice: u8::try_from(slice).expect("CCU2C has two slices"),
+                },
+            );
+            slices[slice] = cell;
+            for (pin_name, bit) in ["A", "B", "C", "D"].into_iter().zip(inputs[slice]) {
+                self.add_absorbable_input(cell, pin_name, bit)?;
+            }
+            if slice == 0 {
+                self.add_absorbable_input(cell, "FCI", *carry_in)?;
+            } else {
+                self.add_signal_input(cell, "FCI", internal_carry)?;
+            }
+            self.add_output(cell, "F", sums[slice])?;
+            if slice == 0 {
+                self.add_signal_output(cell, "FCO", internal_carry)?;
+            } else {
+                self.add_output(cell, "FCO", *carry_out)?;
+            }
+        }
+        self.carry_pairs.push(slices);
+        Ok(())
     }
 
     fn add_lut(&mut self, primitive: &Ecp5Cell) -> Result<(), AdapterError> {
@@ -493,6 +560,17 @@ impl Importer {
         Ok(())
     }
 
+    fn add_signal_input(
+        &mut self,
+        cell: CellId,
+        name: impl Into<String>,
+        signal: MappedSignal,
+    ) -> Result<(), AdapterError> {
+        let pin = self.design.add_pin(cell, name, PinDirection::Input)?;
+        self.sinks.entry(signal).or_default().push(pin);
+        Ok(())
+    }
+
     fn add_absorbable_input(
         &mut self,
         cell: CellId,
@@ -544,6 +622,16 @@ impl Importer {
         self.claim_driver(MappedSignal::Wire(wire), pin)
     }
 
+    fn add_signal_output(
+        &mut self,
+        cell: CellId,
+        name: impl Into<String>,
+        signal: MappedSignal,
+    ) -> Result<(), AdapterError> {
+        let pin = self.design.add_pin(cell, name, PinDirection::Output)?;
+        self.claim_driver(signal, pin)
+    }
+
     fn add_sink(&mut self, bit: Bit, pin: CellPinId) {
         self.sinks.entry(bit.into()).or_default().push(pin);
     }
@@ -564,7 +652,9 @@ impl Importer {
                 match signal {
                     MappedSignal::Zero => self.add_constant_driver(false)?,
                     MappedSignal::One => self.add_constant_driver(true)?,
-                    MappedSignal::Wire(_) => return Err(AdapterError::MissingDriver(signal)),
+                    MappedSignal::Wire(_) | MappedSignal::Synthetic(_) => {
+                        return Err(AdapterError::MissingDriver(signal));
+                    }
                 }
             };
             self.design.add_net(signal_name(signal), driver, sinks)?;
@@ -575,6 +665,7 @@ impl Importer {
             metadata: self.metadata,
             absorbed_inputs: self.absorbed_inputs,
             ports: self.ports,
+            carry_pairs: self.carry_pairs,
         })
     }
 }
@@ -611,6 +702,7 @@ fn signal_name(signal: MappedSignal) -> String {
         MappedSignal::Zero => "$false".into(),
         MappedSignal::One => "$true".into(),
         MappedSignal::Wire(wire) => format!("$wire{wire}"),
+        MappedSignal::Synthetic(signal) => format!("$carry{signal}"),
     }
 }
 
@@ -657,10 +749,11 @@ impl From<ModelError> for AdapterError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::num::NonZeroU32;
 
     use struo_ir::{
-        ActiveLevel as StruoActiveLevel, ClockEdge as StruoClockEdge, EnableControl, MemoryCell,
-        Netlist, RegisterCell, ResetControl,
+        ActiveLevel as StruoActiveLevel, ArithmeticOp, ClockEdge as StruoClockEdge, EnableControl,
+        MemoryCell, Netlist, RegisterCell, ResetControl,
     };
     use struo_target_ecp5::map_to_ecp5;
     use texo_model::{CellId, ResourceKind};
@@ -733,6 +826,46 @@ mod tests {
 
         assert_eq!(artifact.module_name(), "logic");
         assert_eq!(artifact.port_order().len(), 3);
+    }
+
+    #[test]
+    fn splits_ccu2c_into_atomic_carry_slice_pairs() {
+        let mut source = Netlist::new("carry");
+        let width = NonZeroU32::new(8).unwrap();
+        let lhs = source.add_input_port("lhs", width);
+        let rhs = source.add_input_port("rhs", width);
+        let sum = source
+            .add_arithmetic(ArithmeticOp::Add, &lhs, &rhs)
+            .unwrap();
+        source.add_output_port("sum", &sum).unwrap();
+
+        let imported = import_ecp5(&map_to_ecp5(&source).unwrap()).unwrap();
+
+        assert_eq!(imported.carry_pairs().len(), 4);
+        for pair in imported.carry_pairs() {
+            for (slice, &cell) in pair.iter().enumerate() {
+                assert!(matches!(
+                    imported.metadata()[&cell],
+                    PrimitiveMetadata::CarrySlice {
+                        init: 0x96aa,
+                        inject: false,
+                        slice: actual,
+                    } if usize::from(actual) == slice
+                ));
+            }
+            let first_pins = imported.design().cells()[pair[0].0]
+                .pins()
+                .iter()
+                .map(|pin| imported.design().pins()[pin.0].name.as_str())
+                .collect::<Vec<_>>();
+            let second_pins = imported.design().cells()[pair[1].0]
+                .pins()
+                .iter()
+                .map(|pin| imported.design().pins()[pin.0].name.as_str())
+                .collect::<Vec<_>>();
+            assert!(first_pins.contains(&"FCO"));
+            assert!(second_pins.contains(&"FCI"));
+        }
     }
 
     #[test]
