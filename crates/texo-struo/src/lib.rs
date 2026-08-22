@@ -644,7 +644,100 @@ impl Importer {
         }
     }
 
+    fn insert_carry_feedouts(&mut self) -> Result<(), AdapterError> {
+        let feedout_signals = self
+            .sinks
+            .iter()
+            .filter_map(|(&signal, sinks)| {
+                let driver = *self.drivers.get(&signal)?;
+                (self.design.pins()[driver.0].name == "FCO"
+                    && sinks
+                        .iter()
+                        .any(|sink| self.design.pins()[sink.0].name != "FCI"))
+                .then_some(signal)
+            })
+            .collect::<Vec<_>>();
+
+        for (feedout_index, signal) in feedout_signals.into_iter().enumerate() {
+            let original_sinks = self.sinks.remove(&signal).unwrap_or_default();
+            let (carry_sinks, general_sinks): (Vec<_>, Vec<_>) = original_sinks
+                .into_iter()
+                .partition(|sink| self.design.pins()[sink.0].name == "FCI");
+            let sum_signal = self.fresh_synthetic_signal();
+            let internal_carry = self.fresh_synthetic_signal();
+            let continued_carry = self.fresh_synthetic_signal();
+            let name = format!("$carry_feedout{feedout_index}");
+
+            let first = self.add_cell(
+                format!("{name}$slice0"),
+                ResourceKind::Lut(4),
+                PrimitiveMetadata::CarrySlice {
+                    init: 0,
+                    inject: false,
+                    slice: 0,
+                },
+            );
+            for pin in ["A", "B", "C", "D"] {
+                self.record_absorbed_input(first, pin, false);
+            }
+            self.add_signal_input(first, "FCI", signal)?;
+            self.add_signal_output(first, "F", sum_signal)?;
+            self.add_signal_output(first, "FCO", internal_carry)?;
+
+            let second = self.add_cell(
+                format!("{name}$slice1"),
+                ResourceKind::Lut(4),
+                PrimitiveMetadata::CarrySlice {
+                    init: 10,
+                    inject: false,
+                    slice: 1,
+                },
+            );
+            if carry_sinks.is_empty() {
+                self.record_absorbed_input(second, "A", false);
+            } else {
+                let pin = self.design.add_pin(second, "A", PinDirection::Input)?;
+                self.sinks.entry(sum_signal).or_default().push(pin);
+            }
+            for pin in ["B", "C", "D"] {
+                self.record_absorbed_input(second, pin, false);
+            }
+            self.add_signal_input(second, "FCI", internal_carry)?;
+            let unused_sum = self.fresh_synthetic_signal();
+            self.add_signal_output(second, "F", unused_sum)?;
+            self.add_signal_output(second, "FCO", continued_carry)?;
+
+            self.sinks.insert(
+                signal,
+                vec![
+                    self.design.cells()[first.0]
+                        .pins()
+                        .iter()
+                        .copied()
+                        .find(|pin| self.design.pins()[pin.0].name == "FCI")
+                        .expect("feed-out FCI was just inserted"),
+                ],
+            );
+            self.sinks
+                .entry(sum_signal)
+                .or_default()
+                .extend(general_sinks);
+            if !carry_sinks.is_empty() {
+                self.sinks.insert(continued_carry, carry_sinks);
+            }
+            self.carry_pairs.push([first, second]);
+        }
+        Ok(())
+    }
+
+    fn fresh_synthetic_signal(&mut self) -> MappedSignal {
+        let signal = MappedSignal::Synthetic(self.next_synthetic_signal);
+        self.next_synthetic_signal += 1;
+        signal
+    }
+
     fn finish(mut self, name: &str) -> Result<ImportedEcp5Design, AdapterError> {
+        self.insert_carry_feedouts()?;
         for (signal, sinks) in std::mem::take(&mut self.sinks) {
             let driver = if let Some(driver) = self.drivers.get(&signal) {
                 *driver
@@ -752,8 +845,8 @@ mod tests {
     use std::num::NonZeroU32;
 
     use struo_ir::{
-        ActiveLevel as StruoActiveLevel, ArithmeticOp, ClockEdge as StruoClockEdge, EnableControl,
-        MemoryCell, Netlist, RegisterCell, ResetControl,
+        ActiveLevel as StruoActiveLevel, ArithmeticOp, ClockEdge as StruoClockEdge, ComparisonOp,
+        EnableControl, MemoryCell, Netlist, RegisterCell, ResetControl,
     };
     use struo_target_ecp5::map_to_ecp5;
     use texo_model::{CellId, ResourceKind};
@@ -865,6 +958,49 @@ mod tests {
                 .collect::<Vec<_>>();
             assert!(first_pins.contains(&"FCO"));
             assert!(second_pins.contains(&"FCI"));
+        }
+    }
+
+    #[test]
+    fn inserts_a_ccu2c_feedout_before_general_carry_consumers() {
+        let mut source = Netlist::new("comparison");
+        let width = NonZeroU32::new(8).unwrap();
+        let lhs = source.add_input_port("lhs", width);
+        let rhs = source.add_input_port("rhs", width);
+        let result = source
+            .add_comparison(ComparisonOp::LessThanUnsigned, &lhs, &rhs)
+            .unwrap();
+        source.add_output("result", result);
+
+        let imported = import_ecp5(&map_to_ecp5(&source).unwrap()).unwrap();
+        let feedout = imported.carry_pairs().last().unwrap();
+
+        assert_eq!(imported.carry_pairs().len(), 5);
+        assert!(matches!(
+            imported.metadata()[&feedout[0]],
+            PrimitiveMetadata::CarrySlice {
+                init: 0,
+                inject: false,
+                slice: 0,
+            }
+        ));
+        assert!(matches!(
+            imported.metadata()[&feedout[1]],
+            PrimitiveMetadata::CarrySlice {
+                init: 10,
+                inject: false,
+                slice: 1,
+            }
+        ));
+        for net in imported.design().nets() {
+            let driver = &imported.design().pins()[net.driver.0];
+            if driver.name == "FCO" {
+                assert!(
+                    net.sinks
+                        .iter()
+                        .all(|sink| imported.design().pins()[sink.0].name == "FCI")
+                );
+            }
         }
     }
 

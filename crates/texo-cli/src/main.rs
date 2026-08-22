@@ -15,8 +15,8 @@ use struo_ir::Netlist;
 use struo_synth::synthesize;
 use struo_target_ecp5::map_to_ecp5;
 use texo_flow::{
-    Ecp5FlowOptions, Ecp5FlowResult, Evidence, Gate, implement, implement_struo_ecp5,
-    verify_post_map_with_celox,
+    Ecp5FlowOptions, Ecp5FlowResult, Ecp5FlowStage, Evidence, Gate, RoutingProgress, implement,
+    implement_struo_ecp5_with_progress, verify_post_map_with_celox,
 };
 use texo_model::{Design, Device, PinDirection, ResourceKind};
 use texo_struo::{ActiveLevel, ClockEdge, PortDirection, PrimitiveMetadata, import_ecp5};
@@ -253,7 +253,8 @@ fn ecp5_demo(
         }
         Ok(())
     })?;
-    let result = implement_struo_ecp5(
+    let mut phase_started = Instant::now();
+    let result = implement_struo_ecp5_with_progress(
         &imported,
         &architecture,
         Ecp5FlowOptions {
@@ -263,6 +264,7 @@ fn ecp5_demo(
             ..Ecp5FlowOptions::default()
         },
         &mut evidence,
+        |stage| report_flow_stage(stage, &mut phase_started),
     )?;
 
     println!("Celox post-map XOR truth table: passed");
@@ -367,7 +369,8 @@ fn axi4_pnr(
     let architecture = load_architecture(architecture_path)?;
     println!("architecture loaded in {:.2?}", started.elapsed());
     let lpf = parse_lpf(File::open(lpf_path)?)?;
-    let result = implement_struo_ecp5(
+    let mut phase_started = Instant::now();
+    let result = implement_struo_ecp5_with_progress(
         &imported,
         &architecture,
         Ecp5FlowOptions {
@@ -377,6 +380,7 @@ fn axi4_pnr(
             ..Ecp5FlowOptions::default()
         },
         &mut evidence,
+        |stage| report_flow_stage(stage, &mut phase_started),
     )?;
 
     println!(
@@ -408,6 +412,52 @@ fn axi4_pnr(
         println!("checkpoint: {path}");
     }
     Ok(())
+}
+
+fn report_flow_stage(stage: Ecp5FlowStage, started: &mut Instant) {
+    if let Ecp5FlowStage::Routing(event) | Ecp5FlowStage::TimingDrivenRouting(event) = stage {
+        let label = match stage {
+            Ecp5FlowStage::Routing(_) => "routing",
+            Ecp5FlowStage::TimingDrivenRouting(_) => "timing-driven routing",
+            _ => unreachable!("routing variants were matched above"),
+        };
+        match event {
+            RoutingProgress::Iteration { iteration, nets } => {
+                println!("{label} iteration {}: {nets} nets", iteration + 1);
+            }
+            RoutingProgress::Net {
+                iteration,
+                ordinal,
+                total,
+                net,
+            } => {
+                if env::var_os("TEXO_ROUTE_TRACE").is_some() {
+                    println!(
+                        "{label} iteration {} net {ordinal}/{total}: {}",
+                        iteration + 1,
+                        net.0
+                    );
+                }
+            }
+        }
+        return;
+    }
+    let name = match stage {
+        Ecp5FlowStage::Packed => "packing",
+        Ecp5FlowStage::Placed => "placement",
+        Ecp5FlowStage::GlobalClocksRouted => "global clock routing",
+        Ecp5FlowStage::Routing(_) => unreachable!("routing progress returned above"),
+        Ecp5FlowStage::Routed => "negotiated routing",
+        Ecp5FlowStage::TimingDrivenPlaced => "timing-driven placement",
+        Ecp5FlowStage::TimingDrivenGlobalClocksRouted => "timing-driven global clock routing",
+        Ecp5FlowStage::TimingDrivenRouting(_) => {
+            unreachable!("routing progress returned above")
+        }
+        Ecp5FlowStage::TimingDrivenRouted => "timing-driven negotiated routing",
+        Ecp5FlowStage::Timed => "timing analysis",
+    };
+    println!("{name} completed in {:.2?}", started.elapsed());
+    *started = Instant::now();
 }
 
 fn load_architecture(path: &str) -> Result<Ecp5Architecture, Box<dyn Error>> {
@@ -626,10 +676,20 @@ fn checkpoint_timing(result: &Ecp5FlowResult) -> Value {
         .net_delays
         .iter()
         .map(|delay| {
+            let net = &result.design.nets()[delay.net.0];
+            let driver = &result.design.pins()[net.driver.0];
+            let sink = &result.design.pins()[delay.sink.0];
             json!({
                 "net_id": delay.net.0,
-                "net": result.design.nets()[delay.net.0].name,
+                "net": net.name,
+                "driver_pin_id": net.driver.0,
+                "driver_pin": driver.name,
+                "driver_cell_id": driver.cell.0,
+                "driver_cell": result.design.cells()[driver.cell.0].name,
                 "sink_pin_id": delay.sink.0,
+                "sink_pin": sink.name,
+                "sink_cell_id": sink.cell.0,
+                "sink_cell": result.design.cells()[sink.cell.0].name,
                 "min_delay_ps": delay.delay.min_ps,
                 "max_delay_ps": delay.delay.max_ps,
             })
@@ -650,6 +710,19 @@ fn checkpoint_timing(result: &Ecp5FlowResult) -> Value {
                 "setup_ps": check.setup_ps,
                 "required_ps": check.required_ps,
                 "slack_ps": check.slack_ps,
+            })
+        })
+        .collect::<Vec<_>>();
+    let net_setup_slacks = result
+        .timing
+        .net_setup_slacks
+        .iter()
+        .map(|edge| {
+            json!({
+                "net_id": edge.net.0,
+                "net": result.design.nets()[edge.net.0].name,
+                "sink_pin_id": edge.sink.0,
+                "slack_ps": edge.slack_ps,
             })
         })
         .collect::<Vec<_>>();
@@ -674,6 +747,7 @@ fn checkpoint_timing(result: &Ecp5FlowResult) -> Value {
     json!({
         "delay_model": "project_trellis_speed_grade_min_max_ps",
         "net_delays": net_delays,
+        "net_setup_slacks": net_setup_slacks,
         "setup_checks": setup_checks,
         "hold_checks": hold_checks,
         "worst_slack_ps": result.timing.worst_slack_ps,

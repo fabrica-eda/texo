@@ -1,7 +1,7 @@
 //! Deterministic reference placement and routing on the unified problem graph.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -33,6 +33,38 @@ pub struct PlacementConstraints {
     groups: Vec<PlacementGroup>,
     pin_bindings: BTreeMap<(CellPinId, BelId), BelPinId>,
     pin_name_bindings: BTreeMap<CellPinId, String>,
+}
+
+/// Target-supplied immutable portions of logical net trees.
+///
+/// This is used for architecture resources whose legal topology cannot be
+/// discovered from local congestion costs alone, such as an ECP5 primary
+/// clock spine. The generic router grows any still-unconnected sinks from the
+/// locked tree and accounts for every fixed wire and PIP normally.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RoutingConstraints {
+    routes: BTreeMap<NetId, NetRoute>,
+}
+
+impl RoutingConstraints {
+    /// Creates an unconstrained routing problem.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            routes: BTreeMap::new(),
+        }
+    }
+
+    /// Sets the immutable route tree for one logical net.
+    pub fn add_route(&mut self, route: NetRoute) {
+        self.routes.insert(route.net, route);
+    }
+
+    /// Immutable route trees indexed by logical net.
+    #[must_use]
+    pub const fn routes(&self) -> &BTreeMap<NetId, NetRoute> {
+        &self.routes
+    }
 }
 
 impl PlacementConstraints {
@@ -163,6 +195,29 @@ pub struct PnrResult {
     pub total_pips: usize,
 }
 
+/// Deterministic progress event from negotiated routing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutingProgress {
+    /// One Pathfinder iteration is about to reroute its conflicting nets.
+    Iteration {
+        /// Zero-based iteration number.
+        iteration: u32,
+        /// Nets selected for this iteration.
+        nets: usize,
+    },
+    /// One logical net is about to be routed.
+    Net {
+        /// Zero-based iteration number.
+        iteration: u32,
+        /// One-based ordinal within this iteration.
+        ordinal: usize,
+        /// Nets selected for this iteration.
+        total: usize,
+        /// Logical net being routed.
+        net: NetId,
+    },
+}
+
 /// Places and routes a design on a typed unified graph.
 ///
 /// The placer traverses lazily generated `Cell → BEL` candidates and orders
@@ -187,9 +242,67 @@ pub fn place_and_route_with_constraints(
     device: &Device,
     constraints: &PlacementConstraints,
 ) -> Result<PnrResult, PnrError> {
+    place_and_route_with_all_constraints(design, device, constraints, &RoutingConstraints::new())
+}
+
+/// Places and routes with target-supplied placement and routing constraints.
+///
+/// # Errors
+///
+/// Returns a descriptive constraint, model, legality, or routability error.
+pub fn place_and_route_with_all_constraints(
+    design: &Design,
+    device: &Device,
+    placement_constraints: &PlacementConstraints,
+    routing_constraints: &RoutingConstraints,
+) -> Result<PnrResult, PnrError> {
     let graph = UnifiedGraph::new(design, device);
-    let placement = place(&graph, constraints)?;
-    let routes = route(&graph, &placement)?;
+    let placement = place(&graph, placement_constraints, None)?;
+    finish_routing(&graph, placement, routing_constraints, &mut |_| {})
+}
+
+/// Routes a design from an already selected legal placement.
+///
+/// # Errors
+///
+/// Returns an invalid routing-constraint, model, or routability error.
+pub fn route_with_placement(
+    design: &Design,
+    device: &Device,
+    placement: Placement,
+    routing_constraints: &RoutingConstraints,
+) -> Result<PnrResult, PnrError> {
+    route_with_placement_and_progress(design, device, placement, routing_constraints, |_| {})
+}
+
+/// Routes an existing placement while reporting deterministic progress.
+///
+/// # Errors
+///
+/// Returns an invalid routing-constraint, model, or routability error.
+pub fn route_with_placement_and_progress(
+    design: &Design,
+    device: &Device,
+    placement: Placement,
+    routing_constraints: &RoutingConstraints,
+    mut progress: impl FnMut(RoutingProgress),
+) -> Result<PnrResult, PnrError> {
+    finish_routing(
+        &UnifiedGraph::new(design, device),
+        placement,
+        routing_constraints,
+        &mut progress,
+    )
+}
+
+fn finish_routing(
+    graph: &UnifiedGraph<'_>,
+    placement: Placement,
+    routing_constraints: &RoutingConstraints,
+    progress: &mut impl FnMut(RoutingProgress),
+) -> Result<PnrResult, PnrError> {
+    validate_routing_constraints(graph, &placement, routing_constraints)?;
+    let routes = route(graph, &placement, routing_constraints, progress)?;
     let total_pips = routes.iter().map(|route| route.pips.len()).sum();
     Ok(PnrResult {
         placement,
@@ -208,7 +321,28 @@ pub fn place_with_constraints(
     device: &Device,
     constraints: &PlacementConstraints,
 ) -> Result<Placement, PnrError> {
-    place(&UnifiedGraph::new(design, device), constraints)
+    place(&UnifiedGraph::new(design, device), constraints, None)
+}
+
+/// Places a design with deterministic per-net timing weights.
+///
+/// A missing net has weight one. Larger values make Manhattan distance on
+/// that net more expensive during both initial placement and refinement.
+///
+/// # Errors
+///
+/// Returns a descriptive constraint, model, or BEL-exhaustion error.
+pub fn place_with_net_weights(
+    design: &Design,
+    device: &Device,
+    constraints: &PlacementConstraints,
+    net_weights: &BTreeMap<NetId, u64>,
+) -> Result<Placement, PnrError> {
+    place(
+        &UnifiedGraph::new(design, device),
+        constraints,
+        Some(net_weights),
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +357,45 @@ enum PlacementChoices {
     SingleCell(Arc<[BelId]>),
 }
 
+impl PlacementChoices {
+    fn len(&self) -> usize {
+        match self {
+            Self::Shared(assignments) => assignments.len(),
+            Self::SingleCell(candidates) => candidates.len(),
+        }
+    }
+
+    fn assignment(&self, index: usize) -> &[BelId] {
+        match self {
+            Self::Shared(assignments) => &assignments[index],
+            Self::SingleCell(candidates) => std::slice::from_ref(&candidates[index]),
+        }
+    }
+
+    fn cache_key(&self) -> (u8, usize) {
+        match self {
+            Self::Shared(assignments) => (0, Arc::as_ptr(assignments).cast::<()>() as usize),
+            Self::SingleCell(candidates) => (1, Arc::as_ptr(candidates).cast::<()>() as usize),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SpatialChoiceIndex {
+    by_point: Vec<Vec<usize>>,
+}
+
+impl SpatialChoiceIndex {
+    fn new(choices: &PlacementChoices, device: &Device) -> Self {
+        let mut by_point = vec![Vec::new(); (device.width() * device.height()) as usize];
+        for index in 0..choices.len() {
+            let point = device.bels()[choices.assignment(index)[0].0].point;
+            by_point[(point.y * device.width() + point.x) as usize].push(index);
+        }
+        Self { by_point }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PlacementCandidateKey {
     kind: texo_model::ResourceKind,
@@ -232,28 +405,17 @@ struct PlacementCandidateKey {
 fn place(
     graph: &UnifiedGraph<'_>,
     constraints: &PlacementConstraints,
+    net_weights: Option<&BTreeMap<NetId, u64>>,
 ) -> Result<Placement, PnrError> {
     let design = graph.design();
     let device = graph.device();
-    let mut degree = vec![0_usize; design.cells().len()];
-    let mut neighbors = vec![Vec::new(); design.cells().len()];
-    for net in design.nets() {
-        let driver = design.pins()[net.driver.0].cell;
-        for sink in &net.sinks {
-            let sink = design.pins()[sink.0].cell;
-            if driver != sink {
-                degree[driver.0] += 1;
-                degree[sink.0] += 1;
-                neighbors[driver.0].push(sink);
-                neighbors[sink.0].push(driver);
-            }
-        }
-    }
+    let (degree, neighbors) = placement_neighbors(design, net_weights);
 
     let mut candidate_cache = BTreeMap::new();
     let mut units = placement_units(graph, constraints, &mut candidate_cache)?;
     units.sort_by_key(|unit| {
         (
+            unit.choices.len(),
             std::cmp::Reverse(unit.cells.iter().map(|cell| degree[cell.0]).sum::<usize>()),
             unit.cells[0],
         )
@@ -261,7 +423,7 @@ fn place(
 
     let mut placed = vec![None; design.cells().len()];
     let mut occupied = BTreeSet::new();
-    for unit in units {
+    for unit in &units {
         let choice = match &unit.choices {
             PlacementChoices::Shared(assignments) => choose_assignment(
                 &unit.cells,
@@ -283,11 +445,20 @@ fn place(
         let assignment = choice.ok_or_else(|| PnrError::NoBel {
             cell: design.cells()[unit.cells[0].0].name.clone(),
         })?;
-        for (cell, bel) in unit.cells.into_iter().zip(assignment) {
+        for (&cell, bel) in unit.cells.iter().zip(assignment) {
             occupied.insert(bel);
             placed[cell.0] = Some(bel);
         }
     }
+
+    refine_placement(
+        graph,
+        constraints,
+        &units,
+        &neighbors,
+        &mut placed,
+        &mut occupied,
+    );
 
     let bindings = placed
         .into_iter()
@@ -319,11 +490,45 @@ fn place(
     })
 }
 
+fn placement_neighbors(
+    design: &Design,
+    net_weights: Option<&BTreeMap<NetId, u64>>,
+) -> (Vec<usize>, Vec<Vec<(CellId, u64)>>) {
+    let mut degree = vec![0_usize; design.cells().len()];
+    let mut neighbors = vec![Vec::new(); design.cells().len()];
+    for (net_index, net) in design.nets().iter().enumerate() {
+        let driver = design.pins()[net.driver.0].cell;
+        let edge_weight = if design.cells()[driver.0].kind == texo_model::ResourceKind::Clock {
+            0
+        } else {
+            let fanout_weight = (64_u64 / net.sinks.len().max(1) as u64).max(1);
+            fanout_weight.saturating_mul(
+                net_weights
+                    .and_then(|weights| weights.get(&NetId(net_index)))
+                    .copied()
+                    .unwrap_or(1),
+            )
+        };
+        for sink in &net.sinks {
+            let sink = design.pins()[sink.0].cell;
+            if driver != sink {
+                degree[driver.0] += 1;
+                degree[sink.0] += 1;
+                if edge_weight != 0 {
+                    neighbors[driver.0].push((sink, edge_weight));
+                    neighbors[sink.0].push((driver, edge_weight));
+                }
+            }
+        }
+    }
+    (degree, neighbors)
+}
+
 fn choose_assignment<'a>(
     cells: &[CellId],
     assignments: impl Iterator<Item = &'a [BelId]>,
     device: &Device,
-    neighbors: &[Vec<CellId>],
+    neighbors: &[Vec<(CellId, u64)>],
     placed: &[Option<BelId>],
     occupied: &BTreeSet<BelId>,
 ) -> Option<Vec<BelId>> {
@@ -337,8 +542,12 @@ fn choose_assignment<'a>(
                     let point = device.bels()[bel.0].point;
                     neighbors[cell.0]
                         .iter()
-                        .filter_map(|neighbor| placed[neighbor.0])
-                        .map(|neighbor_bel| point.manhattan(device.bels()[neighbor_bel.0].point))
+                        .filter_map(|&(neighbor, weight)| {
+                            placed[neighbor.0].map(|neighbor_bel| (neighbor_bel, weight))
+                        })
+                        .map(|(neighbor_bel, weight)| {
+                            weight * point.manhattan(device.bels()[neighbor_bel.0].point)
+                        })
                         .sum::<u64>()
                 })
                 .sum::<u64>();
@@ -350,6 +559,374 @@ fn choose_assignment<'a>(
         })
         .min()
         .map(|(_, _, assignment)| assignment.to_vec())
+}
+
+const MAX_PLACEMENT_REFINEMENT_PASSES: usize = 2;
+const PLACEMENT_REFINEMENT_CANDIDATES: usize = 64;
+
+#[allow(clippy::too_many_lines)]
+fn refine_placement(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    units: &[PlacementUnit],
+    neighbors: &[Vec<(CellId, u64)>],
+    placed: &mut [Option<BelId>],
+    occupied: &mut BTreeSet<BelId>,
+) {
+    let device = graph.device();
+    let mut pin_usage = HashMap::new();
+    for unit in units {
+        let assignment = unit
+            .cells
+            .iter()
+            .map(|cell| placed[cell.0].expect("initial placement is complete"))
+            .collect::<Vec<_>>();
+        update_pin_usage(
+            graph,
+            constraints,
+            &unit.cells,
+            &assignment,
+            &mut pin_usage,
+            true,
+        );
+    }
+    let mut spatial_indexes = BTreeMap::new();
+    let mut order = (0..units.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&index| {
+        let unit = &units[index];
+        (
+            Reverse(
+                unit.cells
+                    .iter()
+                    .flat_map(|cell| &neighbors[cell.0])
+                    .map(|(_, weight)| *weight)
+                    .sum::<u64>(),
+            ),
+            unit.cells[0],
+        )
+    });
+
+    for _ in 0..MAX_PLACEMENT_REFINEMENT_PASSES {
+        let mut moved = 0;
+        for &index in &order {
+            let unit = &units[index];
+            if unit.choices.len() <= 1 {
+                continue;
+            }
+            let current = unit
+                .cells
+                .iter()
+                .map(|cell| placed[cell.0].expect("initial placement is complete"))
+                .collect::<Vec<_>>();
+            let current_cost =
+                assignment_wirelength(&unit.cells, &current, device, neighbors, placed);
+            for &bel in &current {
+                occupied.remove(&bel);
+            }
+            for &cell in &unit.cells {
+                placed[cell.0] = None;
+            }
+            update_pin_usage(
+                graph,
+                constraints,
+                &unit.cells,
+                &current,
+                &mut pin_usage,
+                false,
+            );
+            let current_is_legal = assignment_pin_wires_are_legal(
+                graph,
+                constraints,
+                &unit.cells,
+                &current,
+                &pin_usage,
+            );
+            let spatial_index = spatial_indexes
+                .entry(unit.choices.cache_key())
+                .or_insert_with(|| SpatialChoiceIndex::new(&unit.choices, device));
+            let Some(best) = choose_refined_assignment(
+                unit,
+                spatial_index,
+                graph,
+                constraints,
+                neighbors,
+                placed,
+                occupied,
+                &pin_usage,
+            ) else {
+                for (&cell, &bel) in unit.cells.iter().zip(&current) {
+                    occupied.insert(bel);
+                    placed[cell.0] = Some(bel);
+                }
+                update_pin_usage(
+                    graph,
+                    constraints,
+                    &unit.cells,
+                    &current,
+                    &mut pin_usage,
+                    true,
+                );
+                continue;
+            };
+            let best_cost = assignment_wirelength(&unit.cells, &best, device, neighbors, placed);
+            let selected = if !current_is_legal || best_cost < current_cost {
+                moved += 1;
+                best
+            } else {
+                current
+            };
+            for (&cell, &bel) in unit.cells.iter().zip(&selected) {
+                occupied.insert(bel);
+                placed[cell.0] = Some(bel);
+            }
+            update_pin_usage(
+                graph,
+                constraints,
+                &unit.cells,
+                &selected,
+                &mut pin_usage,
+                true,
+            );
+        }
+        if moved == 0 {
+            break;
+        }
+    }
+}
+
+fn refinement_target(
+    unit: &PlacementUnit,
+    device: &Device,
+    neighbors: &[Vec<(CellId, u64)>],
+    placed: &[Option<BelId>],
+) -> Option<Point> {
+    let mut weighted_x = 0_u64;
+    let mut weighted_y = 0_u64;
+    let mut total_weight = 0_u64;
+    for &cell in &unit.cells {
+        for &(neighbor, weight) in &neighbors[cell.0] {
+            if unit.cells.contains(&neighbor) {
+                continue;
+            }
+            let Some(neighbor_bel) = placed[neighbor.0] else {
+                continue;
+            };
+            let point = device.bels()[neighbor_bel.0].point;
+            weighted_x = weighted_x.saturating_add(u64::from(point.x) * weight);
+            weighted_y = weighted_y.saturating_add(u64::from(point.y) * weight);
+            total_weight = total_weight.saturating_add(weight);
+        }
+    }
+    (total_weight != 0).then(|| {
+        Point::new(
+            u32::try_from(weighted_x / total_weight).expect("device x coordinate fits u32"),
+            u32::try_from(weighted_y / total_weight).expect("device y coordinate fits u32"),
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn choose_refined_assignment(
+    unit: &PlacementUnit,
+    spatial_index: &SpatialChoiceIndex,
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    neighbors: &[Vec<(CellId, u64)>],
+    placed: &[Option<BelId>],
+    occupied: &BTreeSet<BelId>,
+    pin_usage: &HashMap<WireId, HashMap<NetId, usize>>,
+) -> Option<Vec<BelId>> {
+    let device = graph.device();
+    let target = refinement_target(unit, device, neighbors, placed)?;
+    let nearest = nearest_legal_assignments(
+        unit,
+        spatial_index,
+        graph,
+        constraints,
+        target,
+        occupied,
+        pin_usage,
+    );
+    nearest
+        .into_iter()
+        .map(|index| {
+            let assignment = unit.choices.assignment(index);
+            (
+                assignment_wirelength(&unit.cells, assignment, device, neighbors, placed),
+                index,
+            )
+        })
+        .min()
+        .map(|(_, index)| unit.choices.assignment(index).to_vec())
+}
+
+fn nearest_legal_assignments(
+    unit: &PlacementUnit,
+    spatial_index: &SpatialChoiceIndex,
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    target: Point,
+    occupied: &BTreeSet<BelId>,
+    pin_usage: &HashMap<WireId, HashMap<NetId, usize>>,
+) -> Vec<usize> {
+    let device = graph.device();
+    let mut nearest = Vec::new();
+    let max_radius = device.width() + device.height();
+    for radius in 0..max_radius {
+        for y in 0..device.height() {
+            let dy = y.abs_diff(target.y);
+            if dy > radius {
+                continue;
+            }
+            let dx = radius - dy;
+            for (side, x) in [target.x.checked_sub(dx), target.x.checked_add(dx)]
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if x >= device.width() || (dx == 0 && side == 1) {
+                    continue;
+                }
+                let bucket = &spatial_index.by_point[(y * device.width() + x) as usize];
+                for &index in bucket {
+                    let assignment = unit.choices.assignment(index);
+                    if assignment.iter().all(|bel| !occupied.contains(bel))
+                        && assignment_pin_wires_are_legal(
+                            graph,
+                            constraints,
+                            &unit.cells,
+                            assignment,
+                            pin_usage,
+                        )
+                    {
+                        nearest.push(index);
+                    }
+                }
+            }
+        }
+        if nearest.len() >= PLACEMENT_REFINEMENT_CANDIDATES {
+            nearest.sort_unstable();
+            nearest.truncate(PLACEMENT_REFINEMENT_CANDIDATES);
+            break;
+        }
+    }
+    nearest
+}
+
+fn assignment_pin_wires_are_legal(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    cells: &[CellId],
+    assignment: &[BelId],
+    usage: &HashMap<WireId, HashMap<NetId, usize>>,
+) -> bool {
+    let mut candidate = HashMap::<WireId, BTreeSet<NetId>>::new();
+    for (wire, net) in assignment_pin_resources(graph, constraints, cells, assignment) {
+        candidate.entry(wire).or_default().insert(net);
+    }
+    candidate.into_iter().all(|(wire, nets)| {
+        let mut distinct = nets;
+        if let Some(existing) = usage.get(&wire) {
+            distinct.extend(existing.keys().copied());
+        }
+        distinct.len() <= usize::from(graph.device().wires()[wire.0].capacity)
+    })
+}
+
+fn update_pin_usage(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    cells: &[CellId],
+    assignment: &[BelId],
+    usage: &mut HashMap<WireId, HashMap<NetId, usize>>,
+    add: bool,
+) {
+    for (wire, net) in assignment_pin_resources(graph, constraints, cells, assignment) {
+        if add {
+            *usage.entry(wire).or_default().entry(net).or_default() += 1;
+        } else {
+            let remove_wire = {
+                let nets = usage
+                    .get_mut(&wire)
+                    .expect("placed pin wire is present in usage");
+                let count = nets
+                    .get_mut(&net)
+                    .expect("placed pin net is present in usage");
+                *count -= 1;
+                if *count == 0 {
+                    nets.remove(&net);
+                }
+                nets.is_empty()
+            };
+            if remove_wire {
+                usage.remove(&wire);
+            }
+        }
+    }
+}
+
+fn assignment_pin_resources(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    cells: &[CellId],
+    assignment: &[BelId],
+) -> Vec<(WireId, NetId)> {
+    cells
+        .iter()
+        .zip(assignment)
+        .flat_map(|(&cell, &bel)| {
+            graph.design().cells()[cell.0]
+                .pins()
+                .iter()
+                .filter_map(move |&pin| {
+                    let net = graph.design().pins()[pin.0].net()?;
+                    let wire = candidate_pin_wire(graph, constraints, pin, bel)
+                        .expect("placement candidate has every bound physical pin");
+                    Some((wire, net))
+                })
+        })
+        .collect()
+}
+
+fn candidate_pin_wire(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    pin: CellPinId,
+    bel: BelId,
+) -> Option<WireId> {
+    if let Some(&bel_pin) = constraints.pin_bindings.get(&(pin, bel)) {
+        return Some(graph.device().bel_pins()[bel_pin.0].wire);
+    }
+    if let Some(name) = constraints.pin_name_bindings.get(&pin) {
+        return physical_pin_by_name(graph, pin, bel, name)
+            .map(|bel_pin| graph.device().bel_pins()[bel_pin.0].wire);
+    }
+    graph.bound_wire(pin, bel).ok()
+}
+
+fn assignment_wirelength(
+    cells: &[CellId],
+    assignment: &[BelId],
+    device: &Device,
+    neighbors: &[Vec<(CellId, u64)>],
+    placed: &[Option<BelId>],
+) -> u64 {
+    cells
+        .iter()
+        .zip(assignment)
+        .map(|(&cell, &bel)| {
+            let point = device.bels()[bel.0].point;
+            neighbors[cell.0]
+                .iter()
+                .filter(|(neighbor, _)| !cells.contains(neighbor))
+                .filter_map(|&(neighbor, weight)| {
+                    placed[neighbor.0].map(|neighbor_bel| {
+                        weight * point.manhattan(device.bels()[neighbor_bel.0].point)
+                    })
+                })
+                .sum::<u64>()
+        })
+        .sum()
 }
 
 fn placement_units(
@@ -598,7 +1175,108 @@ fn placement_candidates(
 
 const MAX_ROUTING_ITERATIONS: u32 = 32;
 
-fn route(graph: &UnifiedGraph<'_>, placement: &Placement) -> Result<Vec<NetRoute>, PnrError> {
+fn validate_routing_constraints(
+    graph: &UnifiedGraph<'_>,
+    placement: &Placement,
+    constraints: &RoutingConstraints,
+) -> Result<(), PnrError> {
+    let design = graph.design();
+    let device = graph.device();
+    for (&net_id, route) in constraints.routes() {
+        let Some(net) = design.nets().get(net_id.0) else {
+            return Err(PnrError::InvalidRoutingConstraint {
+                net: net_id,
+                reason: "net ID is outside the design".into(),
+            });
+        };
+        if route.net != net_id {
+            return Err(PnrError::InvalidRoutingConstraint {
+                net: net_id,
+                reason: "route key and route net differ".into(),
+            });
+        }
+        let wires = route.wires.iter().copied().collect::<BTreeSet<_>>();
+        if wires.len() != route.wires.len() {
+            return Err(PnrError::InvalidRoutingConstraint {
+                net: net_id,
+                reason: "wire list contains duplicates".into(),
+            });
+        }
+        if route.pips.iter().copied().collect::<BTreeSet<_>>().len() != route.pips.len() {
+            return Err(PnrError::InvalidRoutingConstraint {
+                net: net_id,
+                reason: "PIP list contains duplicates".into(),
+            });
+        }
+        for &wire in &route.wires {
+            if wire.0 >= device.wires().len() {
+                return Err(PnrError::InvalidRoutingConstraint {
+                    net: net_id,
+                    reason: format!("unknown wire {wire:?}"),
+                });
+            }
+        }
+        for &pip in &route.pips {
+            let Some(pip_data) = device.pips().get(pip.0) else {
+                return Err(PnrError::InvalidRoutingConstraint {
+                    net: net_id,
+                    reason: format!("unknown PIP {pip:?}"),
+                });
+            };
+            if !wires.contains(&pip_data.from) || !wires.contains(&pip_data.to) {
+                return Err(PnrError::InvalidRoutingConstraint {
+                    net: net_id,
+                    reason: format!("PIP {pip:?} has an endpoint outside the locked tree"),
+                });
+            }
+        }
+        let driver_cell = design.pins()[net.driver.0].cell;
+        let driver_bel = placement
+            .bel(driver_cell)
+            .ok_or(PnrError::MissingPlacement { cell: driver_cell })?;
+        let driver_wire = bound_wire(graph, placement, net.driver, driver_bel)?;
+        if !wires.contains(&driver_wire) {
+            return Err(PnrError::InvalidRoutingConstraint {
+                net: net_id,
+                reason: "locked tree does not contain the placed driver wire".into(),
+            });
+        }
+        let mut outgoing = BTreeMap::<WireId, Vec<WireId>>::new();
+        for &pip in &route.pips {
+            let pip = &device.pips()[pip.0];
+            outgoing.entry(pip.from).or_default().push(pip.to);
+            if pip.bidirectional {
+                outgoing.entry(pip.to).or_default().push(pip.from);
+            }
+        }
+        let mut reachable = BTreeSet::from([driver_wire]);
+        let mut pending = vec![driver_wire];
+        while let Some(wire) = pending.pop() {
+            for &next in outgoing.get(&wire).map_or(&[][..], Vec::as_slice) {
+                if reachable.insert(next) {
+                    pending.push(next);
+                }
+            }
+        }
+        if reachable != wires {
+            return Err(PnrError::InvalidRoutingConstraint {
+                net: net_id,
+                reason: format!(
+                    "locked tree has {} wires disconnected from its driver",
+                    wires.len() - reachable.len()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn route(
+    graph: &UnifiedGraph<'_>,
+    placement: &Placement,
+    constraints: &RoutingConstraints,
+    progress: &mut impl FnMut(RoutingProgress),
+) -> Result<Vec<NetRoute>, PnrError> {
     let design = graph.design();
     let device = graph.device();
     let mut wire_occupancy = vec![0_u16; device.wires().len()];
@@ -606,66 +1284,56 @@ fn route(graph: &UnifiedGraph<'_>, placement: &Placement) -> Result<Vec<NetRoute
     let mut wire_history = vec![0_u32; device.wires().len()];
     let mut pip_history = vec![0_u32; device.pips().len()];
     let mut routes = vec![None; design.nets().len()];
+    for (&net, route) in constraints.routes() {
+        routes[net.0] = Some(route.clone());
+        add_route(route, &mut wire_occupancy, &mut pip_occupancy);
+    }
+    let mut routing_order = (0..design.nets().len()).collect::<Vec<_>>();
+    routing_order.sort_by_key(|&index| {
+        (
+            !constraints.routes().contains_key(&NetId(index)),
+            Reverse(design.nets()[index].sinks.len()),
+            index,
+        )
+    });
+    let mut dirty = (0..design.nets().len()).collect::<BTreeSet<_>>();
     let mut search = RouteSearch::new(device.wires().len());
     for iteration in 0..MAX_ROUTING_ITERATIONS {
         let present_factor = 1_u32 << iteration.min(12);
-        for (index, net) in design.nets().iter().enumerate() {
+        progress(RoutingProgress::Iteration {
+            iteration,
+            nets: dirty.len(),
+        });
+        for &index in &dirty {
             if let Some(previous) = routes[index].take() {
                 remove_route(&previous, &mut wire_occupancy, &mut pip_occupancy);
             }
-            let net_id = NetId(index);
-            let driver_cell = design.pins()[net.driver.0].cell;
-            let driver_bel = placement
-                .bel(driver_cell)
-                .ok_or(PnrError::MissingPlacement { cell: driver_cell })?;
-            let driver_wire = bound_wire(graph, placement, net.driver, driver_bel)?;
-            let mut tree_wires = BTreeSet::from([driver_wire]);
-            let mut tree_pips = BTreeSet::new();
-
-            for sink_pin in &net.sinks {
-                let sink_cell = design.pins()[sink_pin.0].cell;
-                let sink_bel = placement
-                    .bel(sink_cell)
-                    .ok_or(PnrError::MissingPlacement { cell: sink_cell })?;
-                let sink_wire = bound_wire(graph, placement, *sink_pin, sink_bel)?;
-                if tree_wires.contains(&sink_wire) {
-                    continue;
-                }
-                let (path_wires, path_pips) = search
-                    .shortest_path(
-                        graph,
-                        &tree_wires,
-                        sink_wire,
-                        &wire_occupancy,
-                        &pip_occupancy,
-                        &wire_history,
-                        &pip_history,
-                        present_factor,
-                    )
-                    .ok_or_else(|| PnrError::Unroutable {
-                        net: net.name.clone(),
-                        driver: format!(
-                            "{}.{} via {}",
-                            design.cells()[driver_cell.0].name,
-                            design.pins()[net.driver.0].name,
-                            device.wires()[driver_wire.0].name
-                        ),
-                        sink: format!(
-                            "{}.{} via {}",
-                            design.cells()[sink_cell.0].name,
-                            design.pins()[sink_pin.0].name,
-                            device.wires()[sink_wire.0].name
-                        ),
-                    })?;
-                tree_wires.extend(path_wires);
-                tree_pips.extend(path_pips);
+        }
+        let mut ordinal = 0;
+        for &index in &routing_order {
+            if !dirty.contains(&index) {
+                continue;
             }
-
-            let route = NetRoute {
-                net: net_id,
-                wires: tree_wires.into_iter().collect(),
-                pips: tree_pips.into_iter().collect(),
-            };
+            ordinal += 1;
+            progress(RoutingProgress::Net {
+                iteration,
+                ordinal,
+                total: dirty.len(),
+                net: NetId(index),
+            });
+            let net_id = NetId(index);
+            let route = route_net(
+                graph,
+                placement,
+                constraints.routes().get(&net_id),
+                net_id,
+                &wire_occupancy,
+                &pip_occupancy,
+                &wire_history,
+                &pip_history,
+                present_factor,
+                &mut search,
+            )?;
             add_route(&route, &mut wire_occupancy, &mut pip_occupancy);
             routes[index] = Some(route);
         }
@@ -686,6 +1354,7 @@ fn route(graph: &UnifiedGraph<'_>, placement: &Placement) -> Result<Vec<NetRoute
                 .map(|route| route.expect("every net was routed in this iteration"))
                 .collect());
         }
+        dirty = congested_routes(device, &routes, &wire_occupancy, &pip_occupancy);
     }
 
     let overused_wires = count_overused(
@@ -698,6 +1367,103 @@ fn route(graph: &UnifiedGraph<'_>, placement: &Placement) -> Result<Vec<NetRoute
         iterations: MAX_ROUTING_ITERATIONS,
         overused_wires,
         overused_pips,
+    })
+}
+
+fn congested_routes(
+    device: &Device,
+    routes: &[Option<NetRoute>],
+    wire_occupancy: &[u16],
+    pip_occupancy: &[u16],
+) -> BTreeSet<usize> {
+    routes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, route)| {
+            let route = route
+                .as_ref()
+                .expect("every net was routed before congestion analysis");
+            (route
+                .wires
+                .iter()
+                .any(|wire| wire_occupancy[wire.0] > device.wires()[wire.0].capacity)
+                || route
+                    .pips
+                    .iter()
+                    .any(|pip| pip_occupancy[pip.0] > device.pips()[pip.0].capacity))
+            .then_some(index)
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_net(
+    graph: &UnifiedGraph<'_>,
+    placement: &Placement,
+    fixed: Option<&NetRoute>,
+    net_id: NetId,
+    wire_occupancy: &[u16],
+    pip_occupancy: &[u16],
+    wire_history: &[u32],
+    pip_history: &[u32],
+    present_factor: u32,
+    search: &mut RouteSearch,
+) -> Result<NetRoute, PnrError> {
+    let design = graph.design();
+    let device = graph.device();
+    let net = &design.nets()[net_id.0];
+    let driver_cell = design.pins()[net.driver.0].cell;
+    let driver_bel = placement
+        .bel(driver_cell)
+        .ok_or(PnrError::MissingPlacement { cell: driver_cell })?;
+    let driver_wire = bound_wire(graph, placement, net.driver, driver_bel)?;
+    let mut tree_wires =
+        fixed.map_or_else(BTreeSet::new, |route| route.wires.iter().copied().collect());
+    tree_wires.insert(driver_wire);
+    let mut tree_pips =
+        fixed.map_or_else(BTreeSet::new, |route| route.pips.iter().copied().collect());
+    for sink_pin in &net.sinks {
+        let sink_cell = design.pins()[sink_pin.0].cell;
+        let sink_bel = placement
+            .bel(sink_cell)
+            .ok_or(PnrError::MissingPlacement { cell: sink_cell })?;
+        let sink_wire = bound_wire(graph, placement, *sink_pin, sink_bel)?;
+        if tree_wires.contains(&sink_wire) {
+            continue;
+        }
+        let (path_wires, path_pips) = search
+            .shortest_path(
+                graph,
+                &tree_wires,
+                sink_wire,
+                wire_occupancy,
+                pip_occupancy,
+                wire_history,
+                pip_history,
+                present_factor,
+            )
+            .ok_or_else(|| PnrError::Unroutable {
+                net: net.name.clone(),
+                driver: format!(
+                    "{}.{} via {}",
+                    design.cells()[driver_cell.0].name,
+                    design.pins()[net.driver.0].name,
+                    device.wires()[driver_wire.0].name
+                ),
+                sink: format!(
+                    "{}.{} via {}",
+                    design.cells()[sink_cell.0].name,
+                    design.pins()[sink_pin.0].name,
+                    device.wires()[sink_wire.0].name
+                ),
+            })?;
+        tree_wires.extend(path_wires);
+        tree_pips.extend(path_pips);
+    }
+    Ok(NetRoute {
+        net: net_id,
+        wires: tree_wires.into_iter().collect(),
+        pips: tree_pips.into_iter().collect(),
     })
 }
 
@@ -894,6 +1660,13 @@ pub enum PnrError {
         /// Specific invariant that failed.
         reason: String,
     },
+    /// A target supplied a malformed immutable route tree.
+    InvalidRoutingConstraint {
+        /// Logical net named by the constraint.
+        net: NetId,
+        /// Specific invariant that failed.
+        reason: String,
+    },
     /// Internal or externally supplied placement omitted a cell.
     MissingPlacement {
         /// Missing cell ID.
@@ -941,6 +1714,9 @@ impl fmt::Display for PnrError {
                     pin.0
                 )
             }
+            Self::InvalidRoutingConstraint { net, reason } => {
+                write!(f, "invalid routing constraint for net {}: {reason}", net.0)
+            }
             Self::MissingPlacement { cell } => {
                 write!(f, "placement is missing cell ID {}", cell.0)
             }
@@ -968,6 +1744,7 @@ impl Error for PnrError {
             | Self::InvalidPlacementConstraint { .. }
             | Self::InvalidPinBinding { .. }
             | Self::InvalidPinNameBinding { .. }
+            | Self::InvalidRoutingConstraint { .. }
             | Self::MissingPlacement { .. }
             | Self::Unroutable { .. }
             | Self::CongestionNotResolved { .. } => None,
@@ -1119,6 +1896,60 @@ mod tests {
 
         assert_eq!(placement.bel(cell), Some(compatible));
         assert_eq!(placement.pin_binding(logical_pin), Some(physical_pin));
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn placement_separates_distinct_nets_on_shared_bel_pin_wires() {
+        let mut design = Design::new();
+        let source_a = design.add_cell("source_a", ResourceKind::Logic);
+        let source_a_pin = design.add_pin(source_a, "A", PinDirection::Output).unwrap();
+        let source_b = design.add_cell("source_b", ResourceKind::Logic);
+        let source_b_pin = design.add_pin(source_b, "B", PinDirection::Output).unwrap();
+        let sink_a = design.add_cell("sink_a", ResourceKind::Register);
+        let sink_a_pin = design.add_pin(sink_a, "D", PinDirection::Input).unwrap();
+        let sink_b = design.add_cell("sink_b", ResourceKind::Register);
+        let sink_b_pin = design.add_pin(sink_b, "D", PinDirection::Input).unwrap();
+        design.add_net("a", source_a_pin, [sink_a_pin]).unwrap();
+        design.add_net("b", source_b_pin, [sink_b_pin]).unwrap();
+
+        let mut device = Device::new("shared-register-input", 4, 1).unwrap();
+        let source_a_wire = device.add_wire("A", Point::new(0, 0), 1).unwrap();
+        let shared_input = device.add_wire("shared-D", Point::new(1, 0), 1).unwrap();
+        let separate_input = device.add_wire("separate-D", Point::new(2, 0), 1).unwrap();
+        let source_b_wire = device.add_wire("B", Point::new(3, 0), 1).unwrap();
+        let source_a_bel = device
+            .add_bel("source-A", ResourceKind::Logic, Point::new(0, 0))
+            .unwrap();
+        device
+            .add_bel_pin(source_a_bel, "A", PinDirection::Output, source_a_wire)
+            .unwrap();
+        let source_b_bel = device
+            .add_bel("source-B", ResourceKind::Logic, Point::new(3, 0))
+            .unwrap();
+        device
+            .add_bel_pin(source_b_bel, "B", PinDirection::Output, source_b_wire)
+            .unwrap();
+        for (name, point, wire) in [
+            ("ff-shared-0", Point::new(1, 0), shared_input),
+            ("ff-shared-1", Point::new(2, 0), shared_input),
+            ("ff-separate", Point::new(2, 0), separate_input),
+        ] {
+            let bel = device.add_bel(name, ResourceKind::Register, point).unwrap();
+            device
+                .add_bel_pin(bel, "D", PinDirection::Input, wire)
+                .unwrap();
+        }
+
+        let placement =
+            place_with_constraints(&design, &device, &PlacementConstraints::new()).unwrap();
+        let sink_wire = |cell| {
+            let bel = placement.bel(cell).unwrap();
+            let pin = device.bels()[bel.0].pins()[0];
+            device.bel_pins()[pin.0].wire
+        };
+
+        assert_ne!(sink_wire(sink_a), sink_wire(sink_b));
     }
 
     #[test]

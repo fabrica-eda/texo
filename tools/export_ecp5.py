@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DIRECTIONS = {0: "input", 1: "output", 2: "inout"}
 SPEED_GRADES = ["6", "7", "8", "8_5G"]
 
@@ -75,6 +75,21 @@ def export_packages(pytrellis, graph, database, device):
                 pins.append({"name": pin_name, "x": x, "y": y, "bel": bel})
         packages.append({"name": package_name, "pins": pins})
     return packages
+
+
+def export_global_info(chip, x, y):
+    quadrant = chip.global_data.get_quadrant(y, x)
+    tap = chip.global_data.get_tap_driver(y, x)
+    spine = None
+    if tap.col == x:
+        driver = chip.global_data.get_spine_driver(quadrant, x)
+        spine = {"x": driver.second, "y": driver.first}
+    return {
+        "quadrant": quadrant.lower(),
+        "tap_direction": "left" if int(tap.dir) == 0 else "right",
+        "tap_column": tap.col,
+        "spine": spine,
+    }
 
 
 def absolute_wire_name(pytrellis, graph, location, reference):
@@ -359,7 +374,12 @@ def main():
         for x in range(chip.get_max_col() + 1):
             key = checksum_key(graph.typeAtLocation[pytrellis.Location(x, y)])
             locations.append(
-                {"x": x, "y": y, "location_type": location_type_keys.index(key)}
+                {
+                    "x": x,
+                    "y": y,
+                    "location_type": location_type_keys.index(key),
+                    "global": export_global_info(chip, x, y),
+                }
             )
 
     output = {

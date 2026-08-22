@@ -207,6 +207,17 @@ pub struct NetDelay {
     pub delay: DelayRange,
 }
 
+/// Setup slack contributed by one logical net edge to a constrained endpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetSetupSlack {
+    /// Logical net.
+    pub net: NetId,
+    /// Logical sink pin for this fanout edge.
+    pub sink: CellPinId,
+    /// Required arrival minus the late arrival through this edge.
+    pub slack_ps: i128,
+}
+
 /// One register data setup check.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SetupCheck {
@@ -254,6 +265,8 @@ pub struct HoldCheck {
 pub struct TimingReport {
     /// Per-sink routed net delays.
     pub net_delays: Vec<NetDelay>,
+    /// Per-sink setup slack after backward required-time propagation.
+    pub net_setup_slacks: Vec<NetSetupSlack>,
     /// Constrained register setup checks.
     pub setup_checks: Vec<SetupCheck>,
     /// Constrained register hold checks.
@@ -346,13 +359,85 @@ pub fn analyze_timing(
     }
     let worst_slack_ps = setup_checks.iter().map(|check| check.slack_ps).min();
     let worst_hold_slack_ps = hold_checks.iter().map(|check| check.slack_ps).min();
+    let net_setup_slacks = net_setup_slacks(design, &net_delays, model, &arrivals, &setup_checks)?;
     Ok(TimingReport {
         net_delays,
+        net_setup_slacks,
         setup_checks,
         hold_checks,
         worst_slack_ps,
         worst_hold_slack_ps,
     })
+}
+
+fn net_setup_slacks(
+    design: &Design,
+    net_delays: &[NetDelay],
+    model: &TimingModel,
+    arrivals: &[Option<DelayRange>],
+    setup_checks: &[SetupCheck],
+) -> Result<Vec<NetSetupSlack>, TimingError> {
+    let mut edges = vec![Vec::<(CellPinId, u64)>::new(); design.pins().len()];
+    let mut indegree = vec![0_usize; design.pins().len()];
+    for delay in net_delays {
+        let driver = design.nets()[delay.net.0].driver;
+        edges[driver.0].push((delay.sink, delay.delay.max_ps));
+        indegree[delay.sink.0] += 1;
+    }
+    for (&(from, to), &delay) in &model.cell_arcs {
+        edges[from.0].push((to, delay.max_ps));
+        indegree[to.0] += 1;
+    }
+
+    let mut ready = VecDeque::new();
+    for (index, &degree) in indegree.iter().enumerate() {
+        if degree == 0 {
+            ready.push_back(CellPinId(index));
+        }
+    }
+    let mut order = Vec::with_capacity(design.pins().len());
+    while let Some(pin) = ready.pop_front() {
+        order.push(pin);
+        for &(next, _) in &edges[pin.0] {
+            indegree[next.0] -= 1;
+            if indegree[next.0] == 0 {
+                ready.push_back(next);
+            }
+        }
+    }
+    if order.len() != design.pins().len() {
+        return Err(TimingError::CombinationalCycle);
+    }
+
+    let mut required = vec![None::<i128>; design.pins().len()];
+    for check in setup_checks {
+        let entry = &mut required[check.data_pin.0];
+        *entry = Some(entry.map_or(check.required_ps, |known| known.min(check.required_ps)));
+    }
+    for &from in order.iter().rev() {
+        for &(to, delay_ps) in &edges[from.0] {
+            let Some(to_required) = required[to.0] else {
+                continue;
+            };
+            let candidate = to_required - i128::from(delay_ps);
+            let entry = &mut required[from.0];
+            *entry = Some(entry.map_or(candidate, |known| known.min(candidate)));
+        }
+    }
+
+    Ok(net_delays
+        .iter()
+        .filter_map(|delay| {
+            let driver = design.nets()[delay.net.0].driver;
+            Some(NetSetupSlack {
+                net: delay.net,
+                sink: delay.sink,
+                slack_ps: required[delay.sink.0]?
+                    - i128::from(arrivals[driver.0]?.max_ps)
+                    - i128::from(delay.delay.max_ps),
+            })
+        })
+        .collect())
 }
 
 fn validate_model(design: &Design, model: &TimingModel) -> Result<(), TimingError> {
@@ -771,6 +856,13 @@ mod tests {
         .unwrap();
         assert_eq!(passed.worst_slack_ps, Some(10));
         assert_eq!(passed.worst_hold_slack_ps, Some(110));
+        assert_eq!(passed.net_setup_slacks.len(), 2);
+        assert!(
+            passed
+                .net_setup_slacks
+                .iter()
+                .all(|edge| edge.slack_ps == 10)
+        );
         assert!(passed.met_timing());
     }
 

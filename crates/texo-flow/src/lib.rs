@@ -5,7 +5,11 @@ use std::error::Error;
 use std::fmt;
 
 use texo_model::{CellId, CellPinId, Design, Device, NetId, PinDirection, PipId, ResourceKind};
-use texo_pnr::{PlacementConstraints, PnrError, PnrResult, place_and_route_with_constraints};
+pub use texo_pnr::RoutingProgress;
+use texo_pnr::{
+    PlacementConstraints, PnrError, PnrResult, place_and_route_with_constraints,
+    place_with_constraints, place_with_net_weights, route_with_placement_and_progress,
+};
 use texo_struo::{ImportedEcp5Design, PrimitiveMetadata};
 use texo_target_ecp5::{
     BlockRamRequirement, DEFAULT_GLOBAL_CLOCK_FANOUT, DelayRangeRecord, Ecp5Architecture,
@@ -179,6 +183,31 @@ pub struct Ecp5FlowResult {
     pub timing: TimingReport,
 }
 
+/// Completed milestones emitted by the native ECP5 implementation flow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ecp5FlowStage {
+    /// Target packing and external constraints are complete.
+    Packed,
+    /// Deterministic cost-based placement is complete.
+    Placed,
+    /// Dedicated primary-clock trees are locked.
+    GlobalClocksRouted,
+    /// Progress within deterministic negotiated routing.
+    Routing(RoutingProgress),
+    /// Negotiated routing is complete.
+    Routed,
+    /// STA-weighted deterministic replacement is complete.
+    TimingDrivenPlaced,
+    /// Dedicated primary-clock trees for the timing-driven placement are locked.
+    TimingDrivenGlobalClocksRouted,
+    /// Progress within timing-driven negotiated routing.
+    TimingDrivenRouting(RoutingProgress),
+    /// Timing-driven negotiated routing is complete.
+    TimingDrivenRouted,
+    /// Post-route static timing analysis is complete.
+    Timed,
+}
+
 /// Runs the complete physical flow for one directly imported Struo design.
 ///
 /// The mapped object remains immutable for Celox. Its Texo design is cloned,
@@ -198,6 +227,21 @@ pub fn implement_struo_ecp5(
     options: Ecp5FlowOptions<'_>,
     evidence: &mut Evidence,
 ) -> Result<Ecp5FlowResult, Ecp5FlowError> {
+    implement_struo_ecp5_with_progress(imported, architecture, options, evidence, |_| {})
+}
+
+/// Runs the complete Struo-to-ECP5 flow and reports completed phase boundaries.
+///
+/// # Errors
+///
+/// Returns the same errors as [`implement_struo_ecp5`].
+pub fn implement_struo_ecp5_with_progress(
+    imported: &ImportedEcp5Design,
+    architecture: &Ecp5Architecture,
+    options: Ecp5FlowOptions<'_>,
+    evidence: &mut Evidence,
+    mut progress: impl FnMut(Ecp5FlowStage),
+) -> Result<Ecp5FlowResult, Ecp5FlowError> {
     if !evidence.contains(Gate::PostMapSimulation) {
         return Err(Ecp5FlowError::MissingPostMapSimulation);
     }
@@ -216,25 +260,7 @@ pub fn implement_struo_ecp5(
         architecture,
         imported.carry_pairs().iter().copied(),
     )?;
-    let block_rams = imported
-        .metadata()
-        .iter()
-        .filter_map(|(&cell, metadata)| match metadata {
-            PrimitiveMetadata::BlockRam {
-                depth,
-                word_width,
-                physical_width,
-                ..
-            } => Some(BlockRamRequirement {
-                cell,
-                depth: *depth,
-                word_width: *word_width,
-                physical_width: *physical_width,
-            }),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    packing.pack_block_rams(&design, architecture, block_rams)?;
+    packing.pack_block_rams(&design, architecture, block_ram_requirements(imported))?;
 
     let global_clocks = find_global_clock_requirements(&design, options.global_clock_fanout);
     packing.promote_global_clocks(&mut design, architecture, global_clocks)?;
@@ -251,26 +277,44 @@ pub fn implement_struo_ecp5(
         )?;
         packing.apply_resolved_lpf(&design, architecture, package, &resolved)?;
     }
+    progress(Ecp5FlowStage::Packed);
 
     let mut staged_evidence = evidence.clone();
     staged_evidence.record(Gate::MappedNetlistComplete);
-    let implementation = implement_with_constraints(
+    let placement = place_with_constraints(&design, architecture.device(), packing.constraints())?;
+    progress(Ecp5FlowStage::Placed);
+    let routing = packing.global_routing_constraints(&design, architecture, &placement)?;
+    progress(Ecp5FlowStage::GlobalClocksRouted);
+    let initial_implementation = route_with_placement_and_progress(
         &design,
         architecture.device(),
-        packing.constraints(),
-        &mut staged_evidence,
+        placement,
+        &routing,
+        |event| progress(Ecp5FlowStage::Routing(event)),
     )?;
-    let pip_delays = ecp5_pip_delays(architecture, speed_grade, &implementation)?;
+    progress(Ecp5FlowStage::Routed);
     let timing_model = ecp5_timing_model(&design, &packing, speed_grade)?;
     let timing_constraints = ecp5_timing_constraints(&design, &packing)?;
-    let timing = analyze_timing(
+    let initial_timing = analyze_ecp5_implementation(
         &design,
-        architecture.device(),
-        &implementation,
-        &pip_delays,
+        architecture,
+        speed_grade,
+        &initial_implementation,
         &timing_model,
         &timing_constraints,
     )?;
+
+    let (implementation, timing) = TimingDrivenContext {
+        design: &design,
+        architecture,
+        packing: &packing,
+        speed_grade,
+        timing_model: &timing_model,
+        timing_constraints: &timing_constraints,
+    }
+    .optimize(initial_implementation, initial_timing, &mut progress)?;
+    progress(Ecp5FlowStage::Timed);
+    staged_evidence.record(Gate::PhysicalImplementation);
     if timing.met_timing() {
         staged_evidence.record(Gate::TimingClosure);
     }
@@ -285,6 +329,132 @@ pub fn implement_struo_ecp5(
         implementation,
         timing,
     })
+}
+
+fn block_ram_requirements(imported: &ImportedEcp5Design) -> Vec<BlockRamRequirement> {
+    imported
+        .metadata()
+        .iter()
+        .filter_map(|(&cell, metadata)| match metadata {
+            PrimitiveMetadata::BlockRam {
+                depth,
+                word_width,
+                physical_width,
+                ..
+            } => Some(BlockRamRequirement {
+                cell,
+                depth: *depth,
+                word_width: *word_width,
+                physical_width: *physical_width,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+struct TimingDrivenContext<'a> {
+    design: &'a Design,
+    architecture: &'a Ecp5Architecture,
+    packing: &'a Ecp5Packing,
+    speed_grade: &'a SpeedGradeRecord,
+    timing_model: &'a TimingModel,
+    timing_constraints: &'a TimingConstraints,
+}
+
+impl TimingDrivenContext<'_> {
+    fn optimize(
+        &self,
+        initial_implementation: PnrResult,
+        initial_timing: TimingReport,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<(PnrResult, TimingReport), Ecp5FlowError> {
+        if initial_timing.met_timing() {
+            return Ok((initial_implementation, initial_timing));
+        }
+        let net_weights = timing_net_weights(&initial_timing, self.timing_constraints);
+        let placement = place_with_net_weights(
+            self.design,
+            self.architecture.device(),
+            self.packing.constraints(),
+            &net_weights,
+        )?;
+        progress(Ecp5FlowStage::TimingDrivenPlaced);
+        let routing =
+            self.packing
+                .global_routing_constraints(self.design, self.architecture, &placement)?;
+        progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
+        let implementation = route_with_placement_and_progress(
+            self.design,
+            self.architecture.device(),
+            placement,
+            &routing,
+            |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
+        )?;
+        progress(Ecp5FlowStage::TimingDrivenRouted);
+        let timing = analyze_ecp5_implementation(
+            self.design,
+            self.architecture,
+            self.speed_grade,
+            &implementation,
+            self.timing_model,
+            self.timing_constraints,
+        )?;
+        if timing_score(&timing) > timing_score(&initial_timing) {
+            Ok((implementation, timing))
+        } else {
+            Ok((initial_implementation, initial_timing))
+        }
+    }
+}
+
+fn analyze_ecp5_implementation(
+    design: &Design,
+    architecture: &Ecp5Architecture,
+    speed_grade: &SpeedGradeRecord,
+    implementation: &PnrResult,
+    timing_model: &TimingModel,
+    timing_constraints: &TimingConstraints,
+) -> Result<TimingReport, Ecp5FlowError> {
+    let pip_delays = ecp5_pip_delays(architecture, speed_grade, implementation)?;
+    Ok(analyze_timing(
+        design,
+        architecture.device(),
+        implementation,
+        &pip_delays,
+        timing_model,
+        timing_constraints,
+    )?)
+}
+
+fn timing_net_weights(
+    timing: &TimingReport,
+    constraints: &TimingConstraints,
+) -> BTreeMap<NetId, u64> {
+    let Some(period_ps) = constraints.clock_periods_ps().values().copied().min() else {
+        return BTreeMap::new();
+    };
+    let Some(worst_slack_ps) = timing.worst_slack_ps else {
+        return BTreeMap::new();
+    };
+    let period_ps = i128::from(period_ps.max(1));
+    let critical_limit = worst_slack_ps + period_ps;
+    let mut weights = BTreeMap::<NetId, u64>::new();
+    for edge in &timing.net_setup_slacks {
+        let urgency = (critical_limit - edge.slack_ps).clamp(0, period_ps);
+        let weight = 1 + u64::try_from((urgency * 63) / period_ps).unwrap_or(63);
+        weights
+            .entry(edge.net)
+            .and_modify(|known| *known = (*known).max(weight))
+            .or_insert(weight);
+    }
+    weights
+}
+
+fn timing_score(timing: &TimingReport) -> (i128, i128) {
+    (
+        timing.worst_slack_ps.unwrap_or(i128::MIN),
+        timing.worst_hold_slack_ps.unwrap_or(i128::MIN),
+    )
 }
 
 fn ecp5_timing_constraints(

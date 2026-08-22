@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "provenance": {
     "project_trellis_revision": "3afe7b52b30f4b4417ee98f03016767a502006e3",
     "database_revision": "015e0330630d7c238c0e4f2cdd9c8157eb78c54a",
@@ -76,7 +76,7 @@
             { "name": "D", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 34 } },
             { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 35 } },
             { "name": "FCI", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 29 } },
-            { "name": "FCO", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 30 } }
+            { "name": "FCO", "direction": "output", "wire": { "dx": 1, "dy": 0, "index": 19 } }
           ]
         },
         {
@@ -351,8 +351,8 @@
     }
   ],
   "locations": [
-    { "x": 0, "y": 0, "location_type": 0 },
-    { "x": 1, "y": 0, "location_type": 1 }
+    { "x": 0, "y": 0, "location_type": 0, "global": { "quadrant": "ul", "tap_direction": "left", "tap_column": 0, "spine": { "x": 0, "y": 0 } } },
+    { "x": 1, "y": 0, "location_type": 1, "global": { "quadrant": "ur", "tap_direction": "right", "tap_column": 1, "spine": { "x": 1, "y": 0 } } }
   ],
   "packages": [
     {

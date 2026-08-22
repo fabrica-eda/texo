@@ -11,7 +11,7 @@ pub use lpf::{
     resolve_lpf_ports,
 };
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::io::{Read, Write};
@@ -22,13 +22,13 @@ use texo_model::{
     BelId, BelPinId, BufferSpec, CellId, CellPinId, Design, Device, ModelError, NetId,
     PinDirection, PipId, Point, ResourceKind, UnifiedGraph, WireId,
 };
-use texo_pnr::PlacementConstraints;
+use texo_pnr::{NetRoute, Placement, PlacementConstraints, RoutingConstraints};
 
 /// Current on-disk architecture schema version.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Version of the expanded binary architecture cache.
-pub const ARCHITECTURE_CACHE_VERSION: u32 = 1;
+pub const ARCHITECTURE_CACHE_VERSION: u32 = 2;
 
 /// Provenance required for every generated architecture snapshot.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -144,6 +144,56 @@ pub struct LocationRecord {
     pub y: u32,
     /// Index into [`ArchitectureFile::location_types`].
     pub location_type: usize,
+    /// ECP5 global-clock quadrant, tap, and spine mapping at this location.
+    pub global: GlobalInfoRecord,
+}
+
+/// One of the four ECP5 primary-clock quadrants.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GlobalQuadrant {
+    /// Upper-left quadrant.
+    Ul,
+    /// Upper-right quadrant.
+    Ur,
+    /// Lower-left quadrant.
+    Ll,
+    /// Lower-right quadrant.
+    Lr,
+}
+
+impl GlobalQuadrant {
+    fn wire_prefix(self) -> &'static str {
+        match self {
+            Self::Ul => "UL",
+            Self::Ur => "UR",
+            Self::Ll => "LL",
+            Self::Lr => "LR",
+        }
+    }
+}
+
+/// Direction from a logic tile toward its ECP5 global-clock tap column.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GlobalTapDirection {
+    /// Use the left-going tap segment.
+    Left,
+    /// Use the right-going tap segment.
+    Right,
+}
+
+/// Target-specific global-clock topology attached to one grid location.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GlobalInfoRecord {
+    /// Clock quadrant containing this location.
+    pub quadrant: GlobalQuadrant,
+    /// Horizontal tap-segment direction.
+    pub tap_direction: GlobalTapDirection,
+    /// Column containing the tap driver.
+    pub tap_column: u32,
+    /// Spine driver coordinate when this location is itself a tap column.
+    pub spine: Option<Point>,
 }
 
 /// One package pin bound to a PIO BEL.
@@ -324,6 +374,7 @@ pub struct Ecp5Architecture {
     metadata_strings: Vec<String>,
     bel_metadata: Vec<CompactBelMetadata>,
     pip_metadata: Vec<CompactPipMetadata>,
+    global_info: Vec<GlobalInfoRecord>,
     packages: Vec<Package>,
     speed_grades: BTreeMap<String, SpeedGradeRecord>,
 }
@@ -397,6 +448,17 @@ impl Ecp5Architecture {
             let pip = PipId(index);
             (pip, self.pip_metadata(pip))
         })
+    }
+
+    /// ECP5 global-clock topology at one device coordinate.
+    #[must_use]
+    pub fn global_info(&self, point: Point) -> Option<GlobalInfoRecord> {
+        if point.x >= self.device.width() || point.y >= self.device.height() {
+            return None;
+        }
+        self.global_info
+            .get((point.y * self.device.width() + point.x) as usize)
+            .copied()
     }
 
     /// Resolved package pin tables.
@@ -526,7 +588,8 @@ impl Ecp5Packing {
         &self.carry_pairs
     }
 
-    /// Constrains each split `CCU2C` to adjacent K0/K1 `TRELLIS_COMB` BELs.
+    /// Constrains complete split `CCU2C` chains to dedicated carry-connected
+    /// K0/K1 `TRELLIS_COMB` BEL sequences.
     ///
     /// # Errors
     ///
@@ -561,15 +624,23 @@ impl Ecp5Packing {
             }
             packed.push(pair);
         }
-        let assignments: Arc<[Vec<BelId>]> = carry_pair_assignments(architecture).into();
-        if !packed.is_empty() && assignments.is_empty() {
-            return Err(PackingError::MissingCarrySlicePair {
-                cell: design.cells()[packed[0][0].0].name.clone(),
-            });
-        }
-        for &pair in &packed {
+        let chains = logical_carry_chains(design, &packed)?;
+        let mut assignments_by_length = BTreeMap::<usize, Arc<[Vec<BelId>]>>::new();
+        for chain in chains {
+            let assignments = assignments_by_length
+                .entry(chain.len())
+                .or_insert_with(|| Arc::from(carry_chain_assignments(architecture, chain.len())));
+            if assignments.is_empty() {
+                return Err(PackingError::MissingCarrySlicePair {
+                    cell: design.cells()[packed[chain[0]][0].0].name.clone(),
+                });
+            }
+            let cells = chain
+                .iter()
+                .flat_map(|&pair| packed[pair])
+                .collect::<Vec<_>>();
             self.constraints
-                .add_group_with_shared_assignments(pair, Arc::clone(&assignments));
+                .add_group_with_shared_assignments(cells, Arc::clone(assignments));
         }
         self.carry_pairs = packed;
         self.carry_pairs_packed = true;
@@ -958,9 +1029,354 @@ impl Ecp5Packing {
         self.global_clocks_packed = true;
         Ok(())
     }
+
+    /// Builds one locked ECP5 primary-clock tree per promoted DCCA net.
+    ///
+    /// Placement must already be complete because the local `HPBX → CLK`
+    /// branches depend on sink BEL coordinates. Each clock receives a stable,
+    /// distinct global network index. The result uses ordinary [`WireId`] and
+    /// [`PipId`] resources, including the fixed spine/tap aliases expanded
+    /// from the architecture's global metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when placement is incomplete or the exported global
+    /// topology cannot connect a DCCA to every placed clock sink.
+    pub fn global_routing_constraints(
+        &self,
+        design: &Design,
+        architecture: &Ecp5Architecture,
+        placement: &Placement,
+    ) -> Result<RoutingConstraints, PackingError> {
+        let device = architecture.device();
+        let graph = UnifiedGraph::new(design, device);
+        let incoming = incoming_pips(device);
+        let mut reverse_search = GlobalReverseSearch::new(device.wires().len());
+        let wire_lookup = device
+            .wires()
+            .iter()
+            .enumerate()
+            .map(|(index, wire)| ((wire.point, wire_basename(&wire.name)), WireId(index)))
+            .collect::<HashMap<_, _>>();
+        let mut constraints = RoutingConstraints::new();
+        for (network, clock) in self.global_clocks.iter().enumerate() {
+            let net = &design.nets()[clock.global_net.0];
+            let source = placed_pin_wire(&graph, placement, net.driver)?;
+            let mut wires = BTreeSet::from([source]);
+            let mut pips = BTreeSet::new();
+
+            for quadrant in [
+                GlobalQuadrant::Ul,
+                GlobalQuadrant::Ur,
+                GlobalQuadrant::Ll,
+                GlobalQuadrant::Lr,
+            ] {
+                let root_name = format!("G_{}PCLK{network}", quadrant.wire_prefix());
+                let root = unique_wire_with_basename(device, &root_name).ok_or_else(|| {
+                    global_route_error(net, format!("missing quadrant root `{root_name}`"))
+                })?;
+                let (path_wires, path_pips) =
+                    forward_route(device, source, root).ok_or_else(|| {
+                        global_route_error(net, format!("DCCA cannot reach `{root_name}`"))
+                    })?;
+                wires.extend(path_wires);
+                pips.extend(path_pips);
+            }
+
+            let tile_name = format!("G_HPBX{network:02}00");
+            for &sink in &net.sinks {
+                let sink_wire = placed_pin_wire(&graph, placement, sink)?;
+                if wires.contains(&sink_wire) {
+                    continue;
+                }
+                let (join, branch_wires, branch_pips) = reverse_search
+                    .route(device, &incoming, sink_wire, &wires, &tile_name)
+                    .ok_or_else(|| {
+                        global_route_error(
+                            net,
+                            format!(
+                                "cannot reach `{tile_name}` from sink wire `{}`",
+                                device.wires()[sink_wire.0].name
+                            ),
+                        )
+                    })?;
+                wires.extend(branch_wires);
+                pips.extend(branch_pips);
+                if !wires.contains(&join) {
+                    return Err(global_route_error(
+                        net,
+                        "local branch did not join its tree",
+                    ));
+                }
+                if wire_basename(&device.wires()[join.0].name) == tile_name {
+                    add_global_trunk(
+                        architecture,
+                        &incoming,
+                        &wire_lookup,
+                        network,
+                        join,
+                        &mut wires,
+                        &mut pips,
+                    )
+                    .map_err(|reason| global_route_error(net, reason))?;
+                }
+            }
+            constraints.add_route(NetRoute {
+                net: clock.global_net,
+                wires: wires.into_iter().collect(),
+                pips: pips.into_iter().collect(),
+            });
+        }
+        Ok(constraints)
+    }
 }
 
-fn carry_pair_assignments(architecture: &Ecp5Architecture) -> Vec<Vec<BelId>> {
+fn global_route_error(net: &texo_model::Net, reason: impl Into<String>) -> PackingError {
+    PackingError::GlobalClockRouting {
+        net: net.name.clone(),
+        reason: reason.into(),
+    }
+}
+
+fn placed_pin_wire(
+    graph: &UnifiedGraph<'_>,
+    placement: &Placement,
+    pin: CellPinId,
+) -> Result<WireId, PackingError> {
+    let cell = graph.design().pins()[pin.0].cell;
+    let bel = placement
+        .bel(cell)
+        .ok_or_else(|| PackingError::GlobalClockRouting {
+            net: graph.design().cells()[cell.0].name.clone(),
+            reason: "cell is missing from placement".into(),
+        })?;
+    if let Some(bel_pin) = placement.pin_binding(pin) {
+        Ok(graph.device().bel_pins()[bel_pin.0].wire)
+    } else {
+        Ok(graph.bound_wire(pin, bel)?)
+    }
+}
+
+fn incoming_pips(device: &Device) -> Vec<Vec<PipId>> {
+    let mut incoming = vec![Vec::new(); device.wires().len()];
+    for (index, pip) in device.pips().iter().enumerate() {
+        incoming[pip.to.0].push(PipId(index));
+    }
+    incoming
+}
+
+fn unique_wire_with_basename(device: &Device, name: &str) -> Option<WireId> {
+    let mut matches = device
+        .wires()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, wire)| (wire_basename(&wire.name) == name).then_some(WireId(index)));
+    let wire = matches.next()?;
+    matches.next().is_none().then_some(wire)
+}
+
+fn forward_route(
+    device: &Device,
+    source: WireId,
+    target: WireId,
+) -> Option<(Vec<WireId>, Vec<PipId>)> {
+    let mut seen = vec![false; device.wires().len()];
+    let mut previous = vec![None; device.wires().len()];
+    let mut queue = VecDeque::from([source]);
+    seen[source.0] = true;
+    while let Some(mut wire) = queue.pop_front() {
+        if wire == target {
+            let mut wires = vec![wire];
+            let mut pips = Vec::new();
+            while let Some((prior, pip)) = previous[wire.0] {
+                pips.push(pip);
+                wire = prior;
+                wires.push(wire);
+            }
+            return Some((wires, pips));
+        }
+        for &(next, pip) in device.routing_neighbors(wire).ok()? {
+            if !seen[next.0] {
+                seen[next.0] = true;
+                previous[next.0] = Some((wire, pip));
+                queue.push_back(next);
+            }
+        }
+    }
+    None
+}
+
+struct GlobalReverseSearch {
+    epoch: u32,
+    seen: Vec<u32>,
+    next_wire: Vec<usize>,
+    next_pip: Vec<usize>,
+}
+
+impl GlobalReverseSearch {
+    fn new(wire_count: usize) -> Self {
+        Self {
+            epoch: 0,
+            seen: vec![0; wire_count],
+            next_wire: vec![usize::MAX; wire_count],
+            next_pip: vec![usize::MAX; wire_count],
+        }
+    }
+
+    fn route(
+        &mut self,
+        device: &Device,
+        incoming: &[Vec<PipId>],
+        sink: WireId,
+        tree: &BTreeSet<WireId>,
+        target_name: &str,
+    ) -> Option<(WireId, Vec<WireId>, Vec<PipId>)> {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.seen.fill(0);
+            self.epoch = 1;
+        }
+        let epoch = self.epoch;
+        let mut queue = VecDeque::from([sink]);
+        self.seen[sink.0] = epoch;
+        self.next_wire[sink.0] = usize::MAX;
+        self.next_pip[sink.0] = usize::MAX;
+        while let Some(mut wire) = queue.pop_front() {
+            if tree.contains(&wire) || wire_basename(&device.wires()[wire.0].name) == target_name {
+                let join = wire;
+                let mut wires = vec![wire];
+                let mut pips = Vec::new();
+                while self.next_wire[wire.0] != usize::MAX {
+                    pips.push(PipId(self.next_pip[wire.0]));
+                    wire = WireId(self.next_wire[wire.0]);
+                    wires.push(wire);
+                }
+                return Some((join, wires, pips));
+            }
+            for &pip in &incoming[wire.0] {
+                let prior = device.pips()[pip.0].from;
+                if self.seen[prior.0] != epoch {
+                    self.seen[prior.0] = epoch;
+                    self.next_wire[prior.0] = wire.0;
+                    self.next_pip[prior.0] = pip.0;
+                    queue.push_back(prior);
+                }
+            }
+        }
+        None
+    }
+}
+
+fn add_global_trunk(
+    architecture: &Ecp5Architecture,
+    incoming: &[Vec<PipId>],
+    wire_lookup: &HashMap<(Point, &str), WireId>,
+    network: usize,
+    tile: WireId,
+    wires: &mut BTreeSet<WireId>,
+    pips: &mut BTreeSet<PipId>,
+) -> Result<(), String> {
+    let device = architecture.device();
+    let point = device.wires()[tile.0].point;
+    let info = architecture
+        .global_info(point)
+        .ok_or_else(|| "tile has no global metadata".to_owned())?;
+    let side = match info.tap_direction {
+        GlobalTapDirection::Left => 'L',
+        GlobalTapDirection::Right => 'R',
+    };
+    let tap_name = format!("{side}_HPBX{network:02}00");
+    let tap = wire_at(wire_lookup, Point::new(info.tap_column, point.y), &tap_name)
+        .ok_or_else(|| format!("missing tap wire `{tap_name}`"))?;
+    add_exact_pip(device, tap, tile, wires, pips)?;
+
+    let tap_pip = only_original_incoming(architecture, incoming, tap)?;
+    add_pip_to_tree(device, tap_pip, wires, pips);
+    let tap_source = device.pips()[tap_pip.0].from;
+    let tap_info = architecture
+        .global_info(device.wires()[tap_source.0].point)
+        .ok_or_else(|| "tap source has no global metadata".to_owned())?;
+    let spine_point = tap_info
+        .spine
+        .ok_or_else(|| "tap source has no spine coordinate".to_owned())?;
+    let spine_name = wire_basename(&device.wires()[tap_source.0].name);
+    let spine = wire_at(wire_lookup, spine_point, spine_name)
+        .ok_or_else(|| format!("missing spine wire `{spine_name}`"))?;
+    add_exact_pip(device, spine, tap_source, wires, pips)?;
+
+    let spine_pip = only_original_incoming(architecture, incoming, spine)?;
+    add_pip_to_tree(device, spine_pip, wires, pips);
+    let spine_source = device.pips()[spine_pip.0].from;
+    let root_name = format!("G_{}PCLK{network}", tap_info.quadrant.wire_prefix());
+    let root = unique_wire_with_basename(device, &root_name)
+        .ok_or_else(|| format!("missing unique quadrant root `{root_name}`"))?;
+    add_exact_pip(device, root, spine_source, wires, pips)
+}
+
+fn wire_at(
+    wire_lookup: &HashMap<(Point, &str), WireId>,
+    point: Point,
+    name: &str,
+) -> Option<WireId> {
+    wire_lookup.get(&(point, name)).copied()
+}
+
+fn only_original_incoming(
+    architecture: &Ecp5Architecture,
+    incoming: &[Vec<PipId>],
+    wire: WireId,
+) -> Result<PipId, String> {
+    let candidates = incoming[wire.0]
+        .iter()
+        .copied()
+        .filter(|&pip| architecture.pip_metadata(pip).tile_type != "TEXO_GLOBAL_ALIAS")
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [pip] => Ok(*pip),
+        _ => Err(format!(
+            "wire `{}` has {} physical incoming PIPs instead of one",
+            architecture.device().wires()[wire.0].name,
+            candidates.len()
+        )),
+    }
+}
+
+fn add_exact_pip(
+    device: &Device,
+    from: WireId,
+    to: WireId,
+    wires: &mut BTreeSet<WireId>,
+    pips: &mut BTreeSet<PipId>,
+) -> Result<(), String> {
+    let pip = device
+        .routing_neighbors(from)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .find_map(|&(neighbor, pip)| (neighbor == to).then_some(pip))
+        .ok_or_else(|| {
+            format!(
+                "missing fixed connection `{}` -> `{}`",
+                device.wires()[from.0].name,
+                device.wires()[to.0].name
+            )
+        })?;
+    add_pip_to_tree(device, pip, wires, pips);
+    Ok(())
+}
+
+fn add_pip_to_tree(
+    device: &Device,
+    pip: PipId,
+    wires: &mut BTreeSet<WireId>,
+    pips: &mut BTreeSet<PipId>,
+) {
+    let pip_data = &device.pips()[pip.0];
+    wires.insert(pip_data.from);
+    wires.insert(pip_data.to);
+    pips.insert(pip);
+}
+
+fn physical_carry_pairs(architecture: &Ecp5Architecture) -> Vec<[BelId; 2]> {
     let mut comb_by_slot = BTreeMap::new();
     for &bel in architecture.device().bels_of_kind(ResourceKind::Lut(4)) {
         let metadata = architecture.bel_metadata(bel);
@@ -976,10 +1392,193 @@ fn carry_pair_assignments(architecture: &Ecp5Architecture) -> Vec<Vec<BelId>> {
         if let Some(second_z) = z.checked_add(4)
             && let Some(&second) = comb_by_slot.get(&(point, second_z))
         {
-            assignments.push(vec![first, second]);
+            let Some(first_fco) = find_bel_pin(architecture.device(), first, "FCO") else {
+                continue;
+            };
+            if find_bel_pin(architecture.device(), first, "FCI").is_none() {
+                continue;
+            }
+            let Some(second_fci) = find_bel_pin(architecture.device(), second, "FCI") else {
+                continue;
+            };
+            if find_bel_pin(architecture.device(), second, "FCO").is_none() {
+                continue;
+            }
+            if architecture.device().bel_pins()[first_fco.0].wire
+                == architecture.device().bel_pins()[second_fci.0].wire
+            {
+                assignments.push([first, second]);
+            }
         }
     }
     assignments
+}
+
+fn carry_chain_assignments(architecture: &Ecp5Architecture, pair_count: usize) -> Vec<Vec<BelId>> {
+    let pairs = physical_carry_pairs(architecture);
+    if pair_count == 0 {
+        return Vec::new();
+    }
+    let mut pairs_by_fci_wire = BTreeMap::<WireId, Vec<usize>>::new();
+    let mut fco_wires = Vec::with_capacity(pairs.len());
+    for (index, pair) in pairs.iter().enumerate() {
+        let fci = find_bel_pin(architecture.device(), pair[0], "FCI")
+            .expect("physical carry pairs require first FCI");
+        let fco = find_bel_pin(architecture.device(), pair[1], "FCO")
+            .expect("physical carry pairs require second FCO");
+        pairs_by_fci_wire
+            .entry(architecture.device().bel_pins()[fci.0].wire)
+            .or_default()
+            .push(index);
+        fco_wires.push(architecture.device().bel_pins()[fco.0].wire);
+    }
+    let successors = fco_wires
+        .iter()
+        .map(|&wire| fixed_carry_successors(architecture, wire, &pairs_by_fci_wire))
+        .collect::<Vec<_>>();
+
+    let mut sequences = (0..pairs.len())
+        .map(|index| vec![index])
+        .collect::<Vec<_>>();
+    for _ in 1..pair_count {
+        let mut extended = Vec::new();
+        for sequence in sequences {
+            let Some(&last) = sequence.last() else {
+                continue;
+            };
+            for &successor in &successors[last] {
+                if sequence.contains(&successor) {
+                    continue;
+                }
+                let mut next = sequence.clone();
+                next.push(successor);
+                extended.push(next);
+            }
+        }
+        sequences = extended;
+    }
+    sequences
+        .into_iter()
+        .map(|sequence| sequence.into_iter().flat_map(|pair| pairs[pair]).collect())
+        .collect()
+}
+
+fn fixed_carry_successors(
+    architecture: &Ecp5Architecture,
+    start: WireId,
+    pairs_by_fci_wire: &BTreeMap<WireId, Vec<usize>>,
+) -> Vec<usize> {
+    let mut queue = VecDeque::from([start]);
+    let mut visited = BTreeSet::from([start]);
+    let mut successors = BTreeSet::new();
+    while let Some(wire) = queue.pop_front() {
+        if let Some(pairs) = pairs_by_fci_wire.get(&wire) {
+            successors.extend(pairs.iter().copied());
+            if wire != start {
+                continue;
+            }
+        }
+        for &(neighbor, pip) in architecture
+            .device()
+            .routing_neighbors(wire)
+            .expect("routing index contains every wire")
+        {
+            if architecture.pip_metadata(pip).fixed && visited.insert(neighbor) {
+                queue.push_back(neighbor);
+            }
+        }
+    }
+    successors.into_iter().collect()
+}
+
+fn logical_carry_chains(
+    design: &Design,
+    pairs: &[[CellId; 2]],
+) -> Result<Vec<Vec<usize>>, PackingError> {
+    let pair_by_cell = pairs
+        .iter()
+        .enumerate()
+        .flat_map(|(index, pair)| [(pair[0], index), (pair[1], index)])
+        .collect::<BTreeMap<_, _>>();
+    let mut successor = vec![None; pairs.len()];
+    let mut predecessor = vec![None; pairs.len()];
+    for (index, pair) in pairs.iter().enumerate() {
+        let fco = design.cells()[pair[1].0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == "FCO")
+            .expect("carry surface was validated");
+        let Some(net) = design.pins()[fco.0].net().map(|net| &design.nets()[net.0]) else {
+            continue;
+        };
+        let mut successor_pair = None;
+        for &sink in &net.sinks {
+            let sink_pin = &design.pins()[sink.0];
+            if sink_pin.name != "FCI" {
+                return Err(PackingError::InvalidCarryConnection {
+                    cell: design.cells()[pair[1].0].name.clone(),
+                    reason: format!(
+                        "FCO directly drives general-routing pin {}.{}; a carry feed-out is required",
+                        design.cells()[sink_pin.cell.0].name,
+                        sink_pin.name
+                    ),
+                });
+            }
+            let Some(&next_pair) = pair_by_cell.get(&sink_pin.cell) else {
+                return Err(PackingError::InvalidCarryConnection {
+                    cell: design.cells()[pair[1].0].name.clone(),
+                    reason: format!(
+                        "FCI sink cell ID {} is not in a carry pair",
+                        sink_pin.cell.0
+                    ),
+                });
+            };
+            if successor_pair.replace(next_pair).is_some() {
+                return Err(PackingError::InvalidCarryConnection {
+                    cell: design.cells()[pair[1].0].name.clone(),
+                    reason: "FCO drives more than one carry successor".into(),
+                });
+            }
+        }
+        if let Some(next_pair) = successor_pair {
+            if predecessor[next_pair].replace(index).is_some() {
+                return Err(PackingError::InvalidCarryConnection {
+                    cell: design.cells()[pairs[next_pair][0].0].name.clone(),
+                    reason: "carry pair has more than one predecessor".into(),
+                });
+            }
+            successor[index] = Some(next_pair);
+        }
+    }
+
+    let mut visited = BTreeSet::new();
+    let mut chains = Vec::new();
+    for root in (0..pairs.len()).filter(|&index| predecessor[index].is_none()) {
+        let mut chain = Vec::new();
+        let mut cursor = Some(root);
+        while let Some(index) = cursor {
+            if !visited.insert(index) {
+                return Err(PackingError::InvalidCarryConnection {
+                    cell: design.cells()[pairs[index][0].0].name.clone(),
+                    reason: "carry chain contains a cycle".into(),
+                });
+            }
+            chain.push(index);
+            cursor = successor[index];
+        }
+        chains.push(chain);
+    }
+    if visited.len() != pairs.len() {
+        let index = (0..pairs.len())
+            .find(|index| !visited.contains(index))
+            .expect("length mismatch guarantees an unvisited pair");
+        return Err(PackingError::InvalidCarryConnection {
+            cell: design.cells()[pairs[index][0].0].name.clone(),
+            reason: "carry chain contains a cycle".into(),
+        });
+    }
+    Ok(chains)
 }
 
 /// Selects nets with at least `minimum_clock_sinks` recognized clock pins.
@@ -1221,6 +1820,13 @@ pub enum PackingError {
         /// Logical cell name.
         cell: String,
     },
+    /// Carry net topology cannot be implemented by the dedicated chain.
+    InvalidCarryConnection {
+        /// Logical carry slice where the invalid connection originates.
+        cell: String,
+        /// Structural reason.
+        reason: String,
+    },
     /// No adjacent K0/K1 physical pair can implement a carry primitive.
     MissingCarrySlicePair {
         /// First logical slice name.
@@ -1296,6 +1902,13 @@ pub enum PackingError {
     },
     /// Global clock promotion was requested twice for one packing result.
     GlobalClocksAlreadyPacked,
+    /// A promoted clock could not be mapped onto the exported spine/tap graph.
+    GlobalClockRouting {
+        /// Promoted logical net name.
+        net: String,
+        /// Physical topology or placement reason.
+        reason: String,
+    },
     /// Selected package is not present in the architecture snapshot.
     UnknownPackage(String),
     /// Package pin is not present in the selected package.
@@ -1364,6 +1977,12 @@ impl fmt::Display for PackingError {
             Self::DuplicateCarryCell { cell } => {
                 write!(f, "carry slice `{cell}` occurs in more than one pair")
             }
+            Self::InvalidCarryConnection { cell, reason } => {
+                write!(
+                    f,
+                    "carry slice `{cell}` has an invalid connection: {reason}"
+                )
+            }
             Self::MissingCarrySlicePair { cell } => {
                 write!(f, "carry slice `{cell}` has no compatible K0/K1 BEL pair")
             }
@@ -1423,6 +2042,9 @@ impl fmt::Display for PackingError {
             Self::GlobalClocksAlreadyPacked => {
                 write!(f, "global clocks were already promoted")
             }
+            Self::GlobalClockRouting { net, reason } => {
+                write!(f, "global clock `{net}` cannot be routed: {reason}")
+            }
             Self::UnknownPackage(package) => write!(f, "unknown ECP5 package `{package}`"),
             Self::UnknownPackagePin { package, pin } => {
                 write!(f, "package `{package}` has no pin `{pin}`")
@@ -1459,6 +2081,7 @@ impl Error for PackingError {
             | Self::UnknownCarryCell(_)
             | Self::CellIsNotCarrySlice { .. }
             | Self::DuplicateCarryCell { .. }
+            | Self::InvalidCarryConnection { .. }
             | Self::MissingCarrySlicePair { .. }
             | Self::UnknownBlockRamCell(_)
             | Self::CellIsNotBlockRam { .. }
@@ -1474,6 +2097,7 @@ impl Error for PackingError {
             | Self::GlobalClockHasNoClockSinks { .. }
             | Self::InsufficientGlobalClockBels { .. }
             | Self::GlobalClocksAlreadyPacked
+            | Self::GlobalClockRouting { .. }
             | Self::UnknownPackage(_)
             | Self::UnknownPackagePin { .. }
             | Self::UnknownIoCell(_)
@@ -1557,6 +2181,16 @@ pub fn expand(file: ArchitectureFile) -> Result<Ecp5Architecture, ImportError> {
     let mut bel_metadata = Vec::new();
     let mut pip_metadata = Vec::new();
     let locations = indexed_locations(&file)?;
+    let mut global_info = vec![None; (file.width * file.height) as usize];
+    for location in &file.locations {
+        global_info[(location.y * file.width + location.x) as usize] = Some(location.global);
+    }
+    let global_info = global_info.into_iter().collect::<Option<Vec<_>>>().ok_or(
+        ImportError::IncompleteLocationGrid {
+            expected: (file.width * file.height) as usize,
+            actual: file.locations.len(),
+        },
+    )?;
 
     for location in &file.locations {
         let location_type = &file.location_types[location.location_type];
@@ -1613,6 +2247,13 @@ pub fn expand(file: ArchitectureFile) -> Result<Ecp5Architecture, ImportError> {
         }
     }
 
+    add_global_clock_aliases(
+        &mut device,
+        &global_info,
+        &mut metadata_strings,
+        &mut pip_metadata,
+    )?;
+
     let packages = resolve_packages(&file.packages, &bels, &device)?;
     let speed_grades = file
         .speed_grades
@@ -1625,9 +2266,160 @@ pub fn expand(file: ArchitectureFile) -> Result<Ecp5Architecture, ImportError> {
         metadata_strings: metadata_strings.into_values(),
         bel_metadata,
         pip_metadata,
+        global_info,
         packages,
         speed_grades,
     })
+}
+
+fn add_global_clock_aliases(
+    device: &mut Device,
+    global_info: &[GlobalInfoRecord],
+    metadata_strings: &mut StringInterner,
+    pip_metadata: &mut Vec<CompactPipMetadata>,
+) -> Result<(), ImportError> {
+    let wire_by_location_and_name = device
+        .wires()
+        .iter()
+        .enumerate()
+        .map(|(index, wire)| {
+            (
+                (wire.point, wire_basename(&wire.name).to_owned()),
+                WireId(index),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let wire_by_name = device
+        .wires()
+        .iter()
+        .enumerate()
+        .map(|(index, wire)| (wire_basename(&wire.name).to_owned(), WireId(index)))
+        .collect::<BTreeMap<_, _>>();
+    let mut incoming = vec![Vec::new(); device.wires().len()];
+    for (index, pip) in device.pips().iter().enumerate() {
+        incoming[pip.to.0].push(PipId(index));
+    }
+    let mut aliases = BTreeSet::new();
+
+    for network in 0..ECP5_GLOBAL_CLOCK_COUNT {
+        let tile_name = format!("G_HPBX{network:02}00");
+        for ((point, name), &tile_wire) in &wire_by_location_and_name {
+            if name != &tile_name {
+                continue;
+            }
+            let info = global_info_at(device, global_info, *point)?;
+            let tap_point = Point::new(info.tap_column, point.y);
+            let tap_side = match info.tap_direction {
+                GlobalTapDirection::Left => 'L',
+                GlobalTapDirection::Right => 'R',
+            };
+            let tap_name = format!("{tap_side}_HPBX{network:02}00");
+            let tap_wire = required_global_wire(
+                &wire_by_location_and_name,
+                tap_point,
+                &tap_name,
+                "logic-tile tap",
+            )?;
+            aliases.insert((tap_wire, tile_wire));
+
+            let tap_pip = single_incoming_pip(device, &incoming, tap_wire, "tap driver")?;
+            let tap_source = device.pips()[tap_pip.0].from;
+            let tap_source_info =
+                global_info_at(device, global_info, device.wires()[tap_source.0].point)?;
+            let spine_point =
+                tap_source_info
+                    .spine
+                    .ok_or_else(|| ImportError::InvalidGlobalTopology {
+                        point: device.wires()[tap_source.0].point,
+                        reason: "tap driver has no spine coordinate".into(),
+                    })?;
+            let spine_name = wire_basename(&device.wires()[tap_source.0].name);
+            let spine_wire = required_global_wire(
+                &wire_by_location_and_name,
+                spine_point,
+                spine_name,
+                "spine transmitter",
+            )?;
+            aliases.insert((spine_wire, tap_source));
+
+            let spine_pip = single_incoming_pip(device, &incoming, spine_wire, "spine driver")?;
+            let spine_source = device.pips()[spine_pip.0].from;
+            let root_name = format!("G_{}PCLK{network}", tap_source_info.quadrant.wire_prefix());
+            let root = wire_by_name.get(&root_name).copied().ok_or_else(|| {
+                ImportError::InvalidGlobalTopology {
+                    point: spine_point,
+                    reason: format!("missing quadrant root `{root_name}`"),
+                }
+            })?;
+            aliases.insert((root, spine_source));
+        }
+    }
+
+    let tile_type = metadata_strings.intern("TEXO_GLOBAL_ALIAS")?;
+    let timing_class = metadata_strings.intern("zero")?;
+    for (from, to) in aliases {
+        let id = device.add_pip(from, to, false, 1)?;
+        debug_assert_eq!(id.0, pip_metadata.len());
+        pip_metadata.push(CompactPipMetadata {
+            fixed: true,
+            tile_type,
+            timing_class,
+            lutperm_flags: 0,
+        });
+    }
+    Ok(())
+}
+
+fn wire_basename(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+fn global_info_at(
+    device: &Device,
+    global_info: &[GlobalInfoRecord],
+    point: Point,
+) -> Result<GlobalInfoRecord, ImportError> {
+    global_info
+        .get((point.y * device.width() + point.x) as usize)
+        .copied()
+        .ok_or_else(|| ImportError::InvalidGlobalTopology {
+            point,
+            reason: "coordinate is outside the global-information table".into(),
+        })
+}
+
+fn required_global_wire(
+    wires: &BTreeMap<(Point, String), WireId>,
+    point: Point,
+    name: &str,
+    role: &str,
+) -> Result<WireId, ImportError> {
+    wires
+        .get(&(point, name.to_owned()))
+        .copied()
+        .ok_or_else(|| ImportError::InvalidGlobalTopology {
+            point,
+            reason: format!("missing {role} wire `{name}`"),
+        })
+}
+
+fn single_incoming_pip(
+    device: &Device,
+    incoming: &[Vec<PipId>],
+    wire: WireId,
+    role: &str,
+) -> Result<PipId, ImportError> {
+    match incoming[wire.0].as_slice() {
+        [pip] => Ok(*pip),
+        pips => Err(ImportError::InvalidGlobalTopology {
+            point: device.wires()[wire.0].point,
+            reason: format!(
+                "{role} wire `{}` has {} incoming PIPs instead of one",
+                device.wires()[wire.0].name,
+                pips.len()
+            ),
+        }),
+    }
 }
 
 #[derive(Default)]
@@ -1680,6 +2472,23 @@ fn validate_header(file: &ArchitectureFile) -> Result<(), ImportError> {
                 y: location.y,
             });
         }
+        if location.global.tap_column >= file.width
+            || location
+                .global
+                .spine
+                .is_some_and(|point| point.x >= file.width || point.y >= file.height)
+        {
+            return Err(ImportError::InvalidGlobalTopology {
+                point: Point::new(location.x, location.y),
+                reason: "tap or spine coordinate is outside the device".into(),
+            });
+        }
+    }
+    if file.locations.len() != (file.width * file.height) as usize {
+        return Err(ImportError::IncompleteLocationGrid {
+            expected: (file.width * file.height) as usize,
+            actual: file.locations.len(),
+        });
     }
     Ok(())
 }
@@ -1895,6 +2704,20 @@ pub enum ImportError {
         /// Y coordinate.
         y: u32,
     },
+    /// The dense device grid omitted one or more coordinates.
+    IncompleteLocationGrid {
+        /// Width multiplied by height.
+        expected: usize,
+        /// Number of unique location records supplied.
+        actual: usize,
+    },
+    /// ECP5 quadrant, tap, or spine metadata was inconsistent with the graph.
+    InvalidGlobalTopology {
+        /// Coordinate at which reconstruction failed.
+        point: Point,
+        /// Specific topology invariant that failed.
+        reason: String,
+    },
     /// A resource was repeated within one coordinate.
     DuplicateResource {
         /// X coordinate.
@@ -1991,6 +2814,15 @@ impl fmt::Display for ImportError {
                 write!(f, "location ({x}, {y}) is outside the device")
             }
             Self::DuplicateLocation { x, y } => write!(f, "duplicate location ({x}, {y})"),
+            Self::IncompleteLocationGrid { expected, actual } => write!(
+                f,
+                "architecture location grid has {actual} entries, expected {expected}"
+            ),
+            Self::InvalidGlobalTopology { point, reason } => write!(
+                f,
+                "invalid ECP5 global-clock topology at ({}, {}): {reason}",
+                point.x, point.y
+            ),
             Self::DuplicateResource { x, y, index } => {
                 write!(f, "duplicate resource {index} at ({x}, {y})")
             }
@@ -2065,7 +2897,7 @@ mod tests {
 
     use super::{
         ArchitectureFile, BlockRamRequirement, GlobalClockRequirement, ImportError, LogicalPort,
-        PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, expand,
+        PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, expand, find_bel_pin,
         find_global_clock_requirements, pack_lut_ffs, parse_lpf, read_architecture,
         read_architecture_cache, resolve_lpf_port_cells, resolve_lpf_ports,
         write_architecture_cache,
@@ -2267,6 +3099,59 @@ mod tests {
             assert_eq!(
                 architecture.bel_metadata(*first).z + 4,
                 architecture.bel_metadata(*second).z
+            );
+        }
+    }
+
+    #[test]
+    fn packs_connected_ccu2c_pairs_as_one_physical_carry_chain() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut source = Netlist::new("carry_chain");
+        let width = NonZeroU32::new(4).unwrap();
+        let lhs = source.add_input_port("lhs", width);
+        let rhs = source.add_input_port("rhs", width);
+        let sum = source
+            .add_arithmetic(ArithmeticOp::Add, &lhs, &rhs)
+            .unwrap();
+        source.add_output_port("sum", &sum).unwrap();
+        let mapped = map_to_ecp5_with_options(
+            &source,
+            MappingOptions {
+                arithmetic: ArithmeticMapping::CarryChain,
+            },
+        )
+        .unwrap();
+        let imported = import_ecp5(&mapped).unwrap();
+        let mut packing = pack_lut_ffs(imported.design(), &architecture).unwrap();
+
+        packing
+            .pack_carry_pairs(
+                imported.design(),
+                &architecture,
+                imported.carry_pairs().iter().copied(),
+            )
+            .unwrap();
+
+        assert_eq!(imported.carry_pairs().len(), 2);
+        let cells = imported
+            .carry_pairs()
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let group = packing
+            .constraints()
+            .groups()
+            .iter()
+            .find(|group| group.cells == cells)
+            .unwrap();
+        assert!(!group.assignments.is_empty());
+        for assignment in group.assignments.iter() {
+            let first_fco = find_bel_pin(architecture.device(), assignment[1], "FCO").unwrap();
+            let second_fci = find_bel_pin(architecture.device(), assignment[2], "FCI").unwrap();
+            assert_eq!(
+                architecture.device().bel_pins()[first_fco.0].wire,
+                architecture.device().bel_pins()[second_fci.0].wire
             );
         }
     }
