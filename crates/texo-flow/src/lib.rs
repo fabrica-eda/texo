@@ -8,16 +8,17 @@ use std::fmt;
 use texo_model::{CellId, CellPinId, Design, Device, NetId, PinDirection, PipId, ResourceKind};
 pub use texo_pnr::RoutingProgress;
 use texo_pnr::{
-    Placement, PlacementConstraints, PnrError, PnrResult, RoutingConstraints, RoutingCosts,
-    place_and_route_with_constraints, place_with_constraints, place_with_net_weights,
-    refine_placement_with_net_weights, route_with_placement_and_progress,
-    route_with_timing_costs_and_progress,
+    NetRoute, Placement, PlacementConstraints, PnrError, PnrResult, RoutingConstraints,
+    RoutingCosts, place_and_route_with_constraints, place_with_constraints,
+    place_with_net_sink_weights, refine_placement_with_net_sink_weights_limited,
+    route_with_placement_and_progress, route_with_timing_costs_and_progress,
 };
 use texo_struo::{ImportedEcp5Design, PrimitiveMetadata};
 use texo_target_ecp5::{
     BlockRamRequirement, DEFAULT_GLOBAL_CLOCK_FANOUT, DelayRangeRecord, Ecp5Architecture,
-    Ecp5Packing, LpfConstraints, LpfError, PackingError, PipClassTimingRecord, SpeedGradeRecord,
-    find_global_clock_requirements, pack_lut_ffs_excluding, resolve_lpf_port_cells,
+    Ecp5GlobalRoutingCache, Ecp5Packing, LpfConstraints, LpfError, PackingError,
+    PipClassTimingRecord, SpeedGradeRecord, find_global_clock_requirements, pack_lut_ffs_excluding,
+    resolve_lpf_port_cells,
 };
 use texo_timing::{
     DelayRange, PICOSECONDS_PER_SECOND, TimingConstraints, TimingError, TimingModel, TimingReport,
@@ -289,7 +290,13 @@ pub fn implement_struo_ecp5_with_progress(
     staged_evidence.record(Gate::MappedNetlistComplete);
     let placement = place_with_constraints(&design, architecture.device(), packing.constraints())?;
     progress(Ecp5FlowStage::Placed);
-    let routing = packing.global_routing_constraints(&design, architecture, &placement)?;
+    let mut global_routing_cache = architecture.global_routing_cache();
+    let routing = packing.global_routing_constraints_cached(
+        &design,
+        architecture,
+        &placement,
+        &mut global_routing_cache,
+    )?;
     progress(Ecp5FlowStage::GlobalClocksRouted);
     let initial_implementation = route_with_placement_and_progress(
         &design,
@@ -314,6 +321,7 @@ pub fn implement_struo_ecp5_with_progress(
         design: &design,
         architecture,
         packing: &packing,
+        global_routing_cache: &mut global_routing_cache,
         speed_grade,
         timing_model: &timing_model,
         timing_constraints: &timing_constraints,
@@ -362,6 +370,7 @@ struct TimingDrivenContext<'a> {
     design: &'a Design,
     architecture: &'a Ecp5Architecture,
     packing: &'a Ecp5Packing,
+    global_routing_cache: &'a mut Ecp5GlobalRoutingCache<'a>,
     speed_grade: &'a SpeedGradeRecord,
     timing_model: &'a TimingModel,
     timing_constraints: &'a TimingConstraints,
@@ -369,7 +378,7 @@ struct TimingDrivenContext<'a> {
 
 impl TimingDrivenContext<'_> {
     fn optimize(
-        &self,
+        &mut self,
         initial_implementation: PnrResult,
         initial_timing: TimingReport,
         progress: &mut impl FnMut(Ecp5FlowStage),
@@ -378,16 +387,19 @@ impl TimingDrivenContext<'_> {
             return Ok((initial_implementation, initial_timing));
         }
         let placement_weights = timing_placement_weights(&initial_timing, self.timing_constraints);
-        let placement = place_with_net_weights(
+        let placement = place_with_net_sink_weights(
             self.design,
             self.architecture.device(),
             self.packing.constraints(),
             &placement_weights,
         )?;
         progress(Ecp5FlowStage::TimingDrivenPlaced);
-        let routing =
-            self.packing
-                .global_routing_constraints(self.design, self.architecture, &placement)?;
+        let routing = self.packing.global_routing_constraints_cached(
+            self.design,
+            self.architecture,
+            &placement,
+            self.global_routing_cache,
+        )?;
         progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
         let (implementation, timing) =
             self.route_and_analyze(placement, &routing, None, progress)?;
@@ -412,63 +424,124 @@ impl TimingDrivenContext<'_> {
             if archive.iter().any(|(_, timing)| timing.met_timing()) {
                 break;
             }
-            let mut children = Vec::with_capacity(active.len() * 2);
+            let mut children = Vec::with_capacity(active.len());
             for (implementation, timing) in &active {
                 children.extend(self.refine_candidates(
-                    &implementation.placement,
+                    implementation,
                     timing,
                     &mut routing_costs,
                     progress,
                 )?);
             }
-            active = select_timing_beam(children);
+            let setup_focused = archive
+                .iter()
+                .any(|(_, timing)| timing.worst_hold_slack_ps.is_some_and(|slack| slack >= 0))
+                || children
+                    .iter()
+                    .any(|(_, timing)| timing.worst_hold_slack_ps.is_some_and(|slack| slack >= 0));
+            active = select_timing_beam(children, setup_focused);
             let mut expanded_archive = archive;
             expanded_archive.extend(active.iter().cloned());
             archive = select_timing_frontier(expanded_archive);
         }
+        let mut hold_repairs = Vec::new();
+        for (implementation, timing) in &archive {
+            if let Some(repaired) =
+                self.repair_hold_locally(implementation, timing, &mut routing_costs, progress)?
+            {
+                hold_repairs.push(repaired);
+            }
+        }
+        archive.extend(hold_repairs);
+        archive = select_timing_frontier(archive);
         Ok(archive
             .into_iter()
             .max_by_key(|(_, timing)| timing_score(timing))
             .expect("the timing archive is non-empty"))
     }
 
-    fn refine_candidates(
+    fn repair_hold_locally(
         &self,
-        placement: &Placement,
+        implementation: &PnrResult,
+        timing: &TimingReport,
+        routing_costs: &mut RoutingCosts,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<Option<TimingCandidate>, Ecp5FlowError> {
+        let minimums = hold_sink_min_delays(timing);
+        if minimums.is_empty() {
+            return Ok(None);
+        }
+        let repair_nets = minimums
+            .keys()
+            .map(|(net, _)| *net)
+            .collect::<BTreeSet<_>>();
+        let frozen = freeze_routes_except(&implementation.routes, &repair_nets);
+        routing_costs.set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
+        routing_costs.set_sink_min_delays_ps(minimums);
+        match self.route_and_analyze(
+            implementation.placement.clone(),
+            &frozen,
+            Some(routing_costs),
+            progress,
+        ) {
+            Ok(repaired) => Ok(Some(repaired)),
+            Err(Ecp5FlowError::Pnr(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn refine_candidates(
+        &mut self,
+        implementation: &PnrResult,
         timing: &TimingReport,
         routing_costs: &mut RoutingCosts,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<Vec<(PnrResult, TimingReport)>, Ecp5FlowError> {
         let refinement_weights = timing_placement_weights(timing, self.timing_constraints);
-        let refined_placement = refine_placement_with_net_weights(
+        let refined_placement = refine_placement_with_net_sink_weights_limited(
             self.design,
             self.architecture.device(),
             self.packing.constraints(),
-            placement.clone(),
+            implementation.placement.clone(),
             &refinement_weights,
+            MAX_REFINED_PLACEMENT_UNITS,
         )?;
         progress(Ecp5FlowStage::TimingDrivenPlaced);
-        let refined_routing = self.packing.global_routing_constraints(
+        let refined_routing = self.packing.global_routing_constraints_cached(
             self.design,
             self.architecture,
             &refined_placement,
+            self.global_routing_cache,
         )?;
         progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
-        let (refined_implementation, refined_timing) =
-            self.route_and_analyze(refined_placement, &refined_routing, None, progress)?;
-        routing_costs
-            .set_net_criticalities(timing_net_weights(&refined_timing, self.timing_constraints));
-        routing_costs.set_sink_min_delays_ps(hold_sink_min_delays(&refined_timing));
-        let (refined_timing_implementation, refined_timing_routed) = self.route_and_analyze(
-            refined_implementation.placement.clone(),
+        let criticalities = timing_net_weights(timing, self.timing_constraints);
+        let mut ranked_critical_nets = criticalities
+            .iter()
+            .filter_map(|(&net, &weight)| (weight > 1).then_some((Reverse(weight), net)))
+            .collect::<Vec<_>>();
+        ranked_critical_nets.sort_unstable();
+        let mut released = ranked_critical_nets
+            .into_iter()
+            .take(MAX_RELEASED_CRITICAL_NETS)
+            .map(|(_, net)| net)
+            .collect::<BTreeSet<_>>();
+        released.extend(hold_sink_min_delays(timing).keys().map(|(net, _)| *net));
+        let incremental_routing = freeze_unchanged_routes(
+            self.design,
+            implementation,
+            &refined_placement,
             &refined_routing,
+            &released,
+        );
+        routing_costs.set_net_criticalities(criticalities);
+        routing_costs.set_sink_min_delays_ps(hold_sink_min_delays(timing));
+        let refined = self.route_and_analyze(
+            refined_placement,
+            &incremental_routing,
             Some(routing_costs),
             progress,
         )?;
-        Ok(vec![
-            (refined_implementation, refined_timing),
-            (refined_timing_implementation, refined_timing_routed),
-        ])
+        Ok(vec![refined])
     }
 
     fn route_and_analyze(
@@ -509,8 +582,11 @@ impl TimingDrivenContext<'_> {
     }
 }
 
-const MAX_INCREMENTAL_REFINEMENTS: usize = 8;
+const MAX_INCREMENTAL_REFINEMENTS: usize = 4;
 const TIMING_FRONTIER_WIDTH: usize = 3;
+const SETUP_FOCUSED_BEAM_WIDTH: usize = 2;
+const MAX_REFINED_PLACEMENT_UNITS: usize = 32;
+const MAX_RELEASED_CRITICAL_NETS: usize = 64;
 
 fn ecp5_routing_costs(
     architecture: &Ecp5Architecture,
@@ -592,27 +668,30 @@ fn timing_net_weights(
 fn timing_placement_weights(
     timing: &TimingReport,
     constraints: &TimingConstraints,
-) -> BTreeMap<NetId, u64> {
+) -> BTreeMap<(NetId, CellPinId), u64> {
     let Some(period_ps) = constraints.clock_periods_ps().values().copied().min() else {
         return BTreeMap::new();
     };
-    let delays =
-        timing
-            .net_delays
-            .iter()
-            .fold(BTreeMap::<NetId, u64>::new(), |mut delays, edge| {
-                delays
-                    .entry(edge.net)
-                    .and_modify(|known| *known = (*known).max(edge.delay.max_ps))
-                    .or_insert(edge.delay.max_ps);
-                delays
-            });
-    timing_net_weights(timing, constraints)
-        .into_iter()
-        .map(|(net, criticality)| {
-            let delay_ps = delays.get(&net).copied().unwrap_or(0);
+    let Some(worst_slack_ps) = timing.worst_slack_ps else {
+        return BTreeMap::new();
+    };
+    let delays = timing
+        .net_delays
+        .iter()
+        .map(|edge| ((edge.net, edge.sink), edge.delay.max_ps))
+        .collect::<BTreeMap<_, _>>();
+    let period = i128::from(period_ps.max(1));
+    let critical_limit = worst_slack_ps + period;
+    timing
+        .net_setup_slacks
+        .iter()
+        .map(|edge| {
+            let urgency = (critical_limit - edge.slack_ps).clamp(0, period);
+            let criticality = criticality_weight(urgency, period);
+            let key = (edge.net, edge.sink);
+            let delay_ps = delays.get(&key).copied().unwrap_or(0);
             (
-                net,
+                key,
                 delay_weighted_criticality(criticality, delay_ps, period_ps),
             )
         })
@@ -650,6 +729,47 @@ fn hold_sink_min_delays(timing: &TimingReport) -> BTreeMap<(NetId, CellPinId), u
             .or_insert(minimum_ps);
     }
     minimums
+}
+
+fn freeze_routes_except(routes: &[NetRoute], released: &BTreeSet<NetId>) -> RoutingConstraints {
+    let mut frozen = RoutingConstraints::new();
+    for route in routes {
+        if !released.contains(&route.net) {
+            frozen.add_route(route.clone());
+        }
+    }
+    frozen
+}
+
+fn freeze_unchanged_routes(
+    design: &Design,
+    implementation: &PnrResult,
+    placement: &Placement,
+    base: &RoutingConstraints,
+    released: &BTreeSet<NetId>,
+) -> RoutingConstraints {
+    let moved = implementation
+        .placement
+        .bindings()
+        .iter()
+        .zip(placement.bindings())
+        .enumerate()
+        .filter_map(|(index, (before, after))| (before != after).then_some(CellId(index)))
+        .collect::<BTreeSet<_>>();
+    let mut frozen = base.clone();
+    for route in &implementation.routes {
+        if base.routes().contains_key(&route.net) || released.contains(&route.net) {
+            continue;
+        }
+        let net = &design.nets()[route.net.0];
+        let touches_moved_cell = std::iter::once(net.driver)
+            .chain(net.sinks.iter().copied())
+            .any(|pin| moved.contains(&design.pins()[pin.0].cell));
+        if !touches_moved_cell {
+            frozen.add_route(route.clone());
+        }
+    }
+    frozen
 }
 
 fn criticality_weight(urgency: i128, period_ps: i128) -> u64 {
@@ -694,7 +814,10 @@ fn select_timing_frontier(candidates: Vec<TimingCandidate>) -> Vec<TimingCandida
         .collect()
 }
 
-fn select_timing_beam(candidates: Vec<TimingCandidate>) -> Vec<TimingCandidate> {
+fn select_timing_beam(
+    candidates: Vec<TimingCandidate>,
+    setup_focused: bool,
+) -> Vec<TimingCandidate> {
     let axes = candidates
         .iter()
         .map(|(implementation, timing)| {
@@ -705,16 +828,68 @@ fn select_timing_beam(candidates: Vec<TimingCandidate>) -> Vec<TimingCandidate> 
             )
         })
         .collect::<Vec<_>>();
-    let selected = extreme_axes_indices(
-        &axes,
-        &(0..axes.len()).collect::<Vec<_>>(),
-        TIMING_FRONTIER_WIDTH,
-    );
+    let eligible = (0..axes.len()).collect::<Vec<_>>();
+    let selected = if setup_focused {
+        setup_focused_axes_indices(&axes, &eligible, SETUP_FOCUSED_BEAM_WIDTH)
+    } else {
+        extreme_axes_indices(&axes, &eligible, TIMING_FRONTIER_WIDTH)
+    };
     let mut candidates = candidates.into_iter().map(Some).collect::<Vec<_>>();
     selected
         .into_iter()
         .map(|index| candidates[index].take().expect("a beam index is unique"))
         .collect()
+}
+
+fn setup_focused_axes_indices(axes: &[TimingAxes], eligible: &[usize], width: usize) -> Vec<usize> {
+    let mut selected = BTreeSet::new();
+    if let Some(balanced) = eligible
+        .iter()
+        .copied()
+        .max_by_key(|&index| timing_objective_rank(axes[index], index, TimingObjective::Balanced))
+    {
+        selected.insert(balanced);
+    }
+    let hold_clean = eligible
+        .iter()
+        .copied()
+        .filter(|&index| axes[index].1 >= 0)
+        .collect::<Vec<_>>();
+    let setup_pool = if hold_clean.is_empty() {
+        eligible
+    } else {
+        &hold_clean
+    };
+    if let Some(setup) = setup_pool
+        .iter()
+        .copied()
+        .max_by_key(|&index| timing_objective_rank(axes[index], index, TimingObjective::Setup))
+    {
+        selected.insert(setup);
+    }
+    let mut balanced = eligible.to_vec();
+    balanced.sort_by_key(|&index| {
+        Reverse(timing_objective_rank(
+            axes[index],
+            index,
+            TimingObjective::Balanced,
+        ))
+    });
+    for index in balanced {
+        if selected.len() == width {
+            break;
+        }
+        selected.insert(index);
+    }
+    let mut selected = selected.into_iter().collect::<Vec<_>>();
+    selected.sort_by_key(|&index| {
+        Reverse(timing_objective_rank(
+            axes[index],
+            index,
+            TimingObjective::Balanced,
+        ))
+    });
+    selected
 }
 
 fn pareto_axes_indices(axes: &[TimingAxes], width: usize) -> Vec<usize> {
@@ -1185,8 +1360,8 @@ mod tests {
     use struo_target_ecp5::{
         ArithmeticMapping, Ecp5Netlist, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
     };
-    use texo_model::{BelId, CellId, Design, Device, PinDirection, ResourceKind};
-    use texo_pnr::PlacementConstraints;
+    use texo_model::{BelId, CellId, Design, Device, NetId, PinDirection, ResourceKind};
+    use texo_pnr::{NetRoute, PlacementConstraints};
     use texo_struo::import_ecp5;
     use texo_target_ecp5::{
         PipClassTimingRecord, TimingCornersRecord, find_global_clock_requirements, pack_lut_ffs,
@@ -1196,9 +1371,9 @@ mod tests {
     use super::{
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, criticality_weight,
         delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model,
-        extreme_axes_indices, find_cell_pin, implement, implement_struo_ecp5,
+        extreme_axes_indices, find_cell_pin, freeze_routes_except, implement, implement_struo_ecp5,
         implement_with_constraints, pareto_axes_indices, pip_class_delay,
-        verify_post_map_with_celox,
+        setup_focused_axes_indices, verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -1242,6 +1417,42 @@ mod tests {
         ];
 
         assert_eq!(extreme_axes_indices(&axes, &[0, 1, 2, 3], 3), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn setup_focused_beam_protects_a_hold_clean_candidate() {
+        let axes = [
+            (-100, -10, 100),
+            (-200, 20, 90),
+            (-300, 50, 80),
+            (-50, -500, 70),
+        ];
+
+        assert_eq!(
+            setup_focused_axes_indices(&axes, &[0, 1, 2, 3], 2),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn local_hold_repair_releases_only_violating_nets() {
+        let routes = [
+            NetRoute {
+                net: NetId(0),
+                wires: Vec::new(),
+                pips: Vec::new(),
+            },
+            NetRoute {
+                net: NetId(1),
+                wires: Vec::new(),
+                pips: Vec::new(),
+            },
+        ];
+
+        let frozen = freeze_routes_except(&routes, &std::collections::BTreeSet::from([NetId(1)]));
+
+        assert!(frozen.routes().contains_key(&NetId(0)));
+        assert!(!frozen.routes().contains_key(&NetId(1)));
     }
 
     #[test]

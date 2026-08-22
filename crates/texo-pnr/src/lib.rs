@@ -321,7 +321,7 @@ pub fn place_and_route_with_all_constraints(
     routing_constraints: &RoutingConstraints,
 ) -> Result<PnrResult, PnrError> {
     let graph = UnifiedGraph::new(design, device);
-    let placement = place(&graph, placement_constraints, None)?;
+    let placement = place(&graph, placement_constraints, None, None)?;
     finish_routing(&graph, placement, routing_constraints, None, &mut |_| {})
 }
 
@@ -416,7 +416,7 @@ pub fn place_with_constraints(
     device: &Device,
     constraints: &PlacementConstraints,
 ) -> Result<Placement, PnrError> {
-    place(&UnifiedGraph::new(design, device), constraints, None)
+    place(&UnifiedGraph::new(design, device), constraints, None, None)
 }
 
 /// Places a design with deterministic per-net timing weights.
@@ -437,6 +437,30 @@ pub fn place_with_net_weights(
         &UnifiedGraph::new(design, device),
         constraints,
         Some(net_weights),
+        None,
+    )
+}
+
+/// Places a design with deterministic per-net-sink timing weights.
+///
+/// A missing sink has weight one. Unlike a per-net weight, this lets timing
+/// feedback pull one critical fanout toward its driver without also pulling
+/// every non-critical fanout of the same logical net.
+///
+/// # Errors
+///
+/// Returns a descriptive constraint, model, or BEL-exhaustion error.
+pub fn place_with_net_sink_weights(
+    design: &Design,
+    device: &Device,
+    constraints: &PlacementConstraints,
+    sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
+) -> Result<Placement, PnrError> {
+    place(
+        &UnifiedGraph::new(design, device),
+        constraints,
+        None,
+        Some(sink_weights),
     )
 }
 
@@ -458,7 +482,7 @@ pub fn refine_placement_with_net_weights(
     net_weights: &BTreeMap<NetId, u64>,
 ) -> Result<Placement, PnrError> {
     let graph = UnifiedGraph::new(design, device);
-    let (_, neighbors) = placement_neighbors(design, Some(net_weights));
+    let (_, neighbors) = placement_neighbors(design, Some(net_weights), None);
     let mut candidate_cache = BTreeMap::new();
     let units = placement_units(&graph, constraints, &mut candidate_cache)?;
     let mut placed = validate_refinement_start(&graph, &units, placement)?;
@@ -470,6 +494,78 @@ pub fn refine_placement_with_net_weights(
         &neighbors,
         &mut placed,
         &mut occupied,
+        None,
+    );
+    finish_placement(&graph, constraints, placed)
+}
+
+/// Refines an existing legal placement with per-net-sink timing weights.
+///
+/// Only the specified driver-to-sink edges receive the larger timing cost, so
+/// a high-fanout net does not collapse all of its sinks around the driver when
+/// only one sink is timing-critical.
+///
+/// # Errors
+///
+/// Returns a descriptive error when the supplied placement does not match the
+/// design, device, or placement constraints.
+pub fn refine_placement_with_net_sink_weights(
+    design: &Design,
+    device: &Device,
+    constraints: &PlacementConstraints,
+    placement: Placement,
+    sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
+) -> Result<Placement, PnrError> {
+    let graph = UnifiedGraph::new(design, device);
+    let (_, neighbors) = placement_neighbors(design, None, Some(sink_weights));
+    let mut candidate_cache = BTreeMap::new();
+    let units = placement_units(&graph, constraints, &mut candidate_cache)?;
+    let mut placed = validate_refinement_start(&graph, &units, placement)?;
+    let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
+    refine_placement(
+        &graph,
+        constraints,
+        &units,
+        &neighbors,
+        &mut placed,
+        &mut occupied,
+        None,
+    );
+    finish_placement(&graph, constraints, placed)
+}
+
+/// Refines at most `max_moved_units` placement units using per-sink weights.
+///
+/// Units are considered in deterministic criticality order. Bounding accepted
+/// moves keeps incremental routing local instead of invalidating the complete
+/// design after every timing update.
+///
+/// # Errors
+///
+/// Returns a descriptive error when the supplied placement does not match the
+/// design, device, or placement constraints.
+pub fn refine_placement_with_net_sink_weights_limited(
+    design: &Design,
+    device: &Device,
+    constraints: &PlacementConstraints,
+    placement: Placement,
+    sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
+    max_moved_units: usize,
+) -> Result<Placement, PnrError> {
+    let graph = UnifiedGraph::new(design, device);
+    let (_, neighbors) = placement_neighbors(design, None, Some(sink_weights));
+    let mut candidate_cache = BTreeMap::new();
+    let units = placement_units(&graph, constraints, &mut candidate_cache)?;
+    let mut placed = validate_refinement_start(&graph, &units, placement)?;
+    let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
+    refine_placement(
+        &graph,
+        constraints,
+        &units,
+        &neighbors,
+        &mut placed,
+        &mut occupied,
+        Some(max_moved_units),
     );
     finish_placement(&graph, constraints, placed)
 }
@@ -560,10 +656,11 @@ fn place(
     graph: &UnifiedGraph<'_>,
     constraints: &PlacementConstraints,
     net_weights: Option<&BTreeMap<NetId, u64>>,
+    sink_weights: Option<&BTreeMap<(NetId, CellPinId), u64>>,
 ) -> Result<Placement, PnrError> {
     let design = graph.design();
     let device = graph.device();
-    let (degree, neighbors) = placement_neighbors(design, net_weights);
+    let (degree, neighbors) = placement_neighbors(design, net_weights, sink_weights);
 
     let mut candidate_cache = BTreeMap::new();
     let mut units = placement_units(graph, constraints, &mut candidate_cache)?;
@@ -612,6 +709,7 @@ fn place(
         &neighbors,
         &mut placed,
         &mut occupied,
+        None,
     );
 
     finish_placement(graph, constraints, placed)
@@ -701,23 +799,28 @@ fn validate_refinement_start(
 fn placement_neighbors(
     design: &Design,
     net_weights: Option<&BTreeMap<NetId, u64>>,
+    sink_weights: Option<&BTreeMap<(NetId, CellPinId), u64>>,
 ) -> (Vec<usize>, Vec<Vec<PlacementNeighbor>>) {
     let mut degree = vec![0_usize; design.cells().len()];
     let mut neighbors = vec![Vec::new(); design.cells().len()];
     for (net_index, net) in design.nets().iter().enumerate() {
         let driver = design.pins()[net.driver.0].cell;
-        let timing_weight = net_weights
+        let net_timing_weight = net_weights
             .and_then(|weights| weights.get(&NetId(net_index)))
             .copied()
             .unwrap_or(1);
-        let edge_weight = if design.cells()[driver.0].kind == texo_model::ResourceKind::Clock {
-            0
-        } else {
-            let fanout_weight = (64_u64 / net.sinks.len().max(1) as u64).max(1);
-            fanout_weight.saturating_mul(timing_weight)
-        };
-        for sink in &net.sinks {
-            let sink = design.pins()[sink.0].cell;
+        let fanout_weight = (64_u64 / net.sinks.len().max(1) as u64).max(1);
+        for &sink_pin in &net.sinks {
+            let timing_weight = sink_weights
+                .and_then(|weights| weights.get(&(NetId(net_index), sink_pin)))
+                .copied()
+                .unwrap_or(net_timing_weight);
+            let edge_weight = if design.cells()[driver.0].kind == texo_model::ResourceKind::Clock {
+                0
+            } else {
+                fanout_weight.saturating_mul(timing_weight)
+            };
+            let sink = design.pins()[sink_pin.0].cell;
             if driver != sink {
                 degree[driver.0] += 1;
                 degree[sink.0] += 1;
@@ -792,6 +895,7 @@ fn refine_placement(
     neighbors: &[Vec<PlacementNeighbor>],
     placed: &mut [Option<BelId>],
     occupied: &mut BTreeSet<BelId>,
+    move_limit: Option<usize>,
 ) {
     let device = graph.device();
     let mut pin_usage = HashMap::new();
@@ -907,8 +1011,11 @@ fn refine_placement(
                 &mut pin_usage,
                 true,
             );
+            if move_limit.is_some_and(|limit| moved >= limit) {
+                break;
+            }
         }
-        if moved == 0 {
+        if moved == 0 || move_limit.is_some_and(|limit| moved >= limit) {
             break;
         }
     }
@@ -1571,7 +1678,9 @@ fn route(
     }
     let mut routing_order = (0..design.nets().len()).collect::<Vec<_>>();
     routing_order.sort_by_key(|&index| routing_order_key(design, constraints, costs, index));
-    let mut dirty = (0..design.nets().len()).collect::<BTreeSet<_>>();
+    let mut dirty = (0..design.nets().len())
+        .filter(|index| !constraints.routes().contains_key(&NetId(*index)))
+        .collect::<BTreeSet<_>>();
     let mut search = RouteSearch::new(device.wires().len());
     for iteration in 0..MAX_ROUTING_ITERATIONS {
         let present_factor = 1_u32 << iteration.min(12);
@@ -2348,7 +2457,8 @@ mod tests {
     use super::{
         Placement, PlacementConstraints, PlacementNeighbor, PnrError, RouteSearch,
         RoutingConstraints, RoutingCosts, place_and_route, place_with_constraints,
-        refine_placement_with_net_weights, refinement_edge_cost,
+        placement_neighbors, refine_placement_with_net_sink_weights_limited,
+        refine_placement_with_net_weights, refinement_edge_cost, route_with_placement_and_progress,
         route_with_timing_costs_and_progress, routing_step_cost, timing_tree_cost,
     };
 
@@ -2425,6 +2535,39 @@ mod tests {
     }
 
     #[test]
+    fn sink_weights_do_not_promote_unrelated_fanout_edges() {
+        let mut design = Design::new();
+        let source = design.add_cell("source", ResourceKind::Logic);
+        let source_out = design.add_pin(source, "out", PinDirection::Output).unwrap();
+        let critical = design.add_cell("critical", ResourceKind::Logic);
+        let critical_in = design.add_pin(critical, "in", PinDirection::Input).unwrap();
+        let ordinary = design.add_cell("ordinary", ResourceKind::Logic);
+        let ordinary_in = design.add_pin(ordinary, "in", PinDirection::Input).unwrap();
+        design
+            .add_net("fanout", source_out, [critical_in, ordinary_in])
+            .unwrap();
+
+        let (_, neighbors) = placement_neighbors(
+            &design,
+            None,
+            Some(&BTreeMap::from([((NetId(0), critical_in), 64)])),
+        );
+        let critical_edge = neighbors[source.0]
+            .iter()
+            .find(|edge| edge.cell == critical)
+            .unwrap();
+        let ordinary_edge = neighbors[source.0]
+            .iter()
+            .find(|edge| edge.cell == ordinary)
+            .unwrap();
+
+        assert_eq!(critical_edge.weight, 2_048);
+        assert!(critical_edge.timing_driven);
+        assert_eq!(ordinary_edge.weight, 32);
+        assert!(!ordinary_edge.timing_driven);
+    }
+
+    #[test]
     fn incremental_refinement_starts_from_the_supplied_placement() {
         let design = two_cell_design();
         let device = Device::rectangular_logic(5, 1).unwrap();
@@ -2445,6 +2588,59 @@ mod tests {
         let sink = refined.point(CellId(1), &device).unwrap();
 
         assert!(source.manhattan(sink) < 4);
+    }
+
+    #[test]
+    fn locked_routes_are_not_marked_dirty() {
+        let design = two_cell_design();
+        let device = Device::rectangular_logic(4, 1).unwrap();
+        let implementation = place_and_route(&design, &device).unwrap();
+        let mut constraints = RoutingConstraints::new();
+        constraints.add_route(implementation.routes[0].clone());
+        let mut iterations = Vec::new();
+
+        route_with_placement_and_progress(
+            &design,
+            &device,
+            implementation.placement,
+            &constraints,
+            |event| {
+                if let super::RoutingProgress::Iteration { nets, .. } = event {
+                    iterations.push(nets);
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(iterations, vec![0]);
+    }
+
+    #[test]
+    fn limited_refinement_bounds_changed_units() {
+        let design = two_cell_design();
+        let device = Device::rectangular_logic(5, 1).unwrap();
+        let initial = Placement {
+            bindings: vec![BelId(0), BelId(4)],
+            pin_bindings: BTreeMap::new(),
+        };
+
+        let refined = refine_placement_with_net_sink_weights_limited(
+            &design,
+            &device,
+            &PlacementConstraints::new(),
+            initial.clone(),
+            &BTreeMap::new(),
+            1,
+        )
+        .unwrap();
+        let changed = initial
+            .bindings()
+            .iter()
+            .zip(refined.bindings())
+            .filter(|(before, after)| before != after)
+            .count();
+
+        assert!(changed <= 1);
     }
 
     #[test]

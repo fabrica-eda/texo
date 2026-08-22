@@ -379,6 +379,20 @@ pub struct Ecp5Architecture {
     speed_grades: BTreeMap<String, SpeedGradeRecord>,
 }
 
+/// Reusable reverse-routing indexes for ECP5 global-clock construction.
+///
+/// Large devices contain millions of wires and PIPs. Building these immutable
+/// indexes once per placement candidate dominates timing-driven `PnR`, so callers
+/// that evaluate multiple placements should retain one cache for the full run.
+#[derive(Debug)]
+pub struct Ecp5GlobalRoutingCache<'a> {
+    incoming: Vec<Vec<PipId>>,
+    wire_lookup: HashMap<(Point, &'a str), WireId>,
+    unique_wires: HashMap<&'a str, Option<WireId>>,
+    forward_routes: HashMap<(WireId, WireId), (Vec<WireId>, Vec<PipId>)>,
+    reverse_search: GlobalReverseSearch,
+}
+
 #[derive(Deserialize, Serialize)]
 struct ArchitectureCache {
     version: u32,
@@ -1048,16 +1062,28 @@ impl Ecp5Packing {
         architecture: &Ecp5Architecture,
         placement: &Placement,
     ) -> Result<RoutingConstraints, PackingError> {
+        let mut cache = architecture.global_routing_cache();
+        self.global_routing_constraints_cached(design, architecture, placement, &mut cache)
+    }
+
+    /// Builds global-clock constraints using indexes retained by the caller.
+    ///
+    /// This is equivalent to [`Self::global_routing_constraints`] but avoids
+    /// rebuilding device-wide reverse-routing indexes for every placement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when placement is incomplete or the exported global
+    /// topology cannot connect a DCCA to every placed clock sink.
+    pub fn global_routing_constraints_cached(
+        &self,
+        design: &Design,
+        architecture: &Ecp5Architecture,
+        placement: &Placement,
+        cache: &mut Ecp5GlobalRoutingCache<'_>,
+    ) -> Result<RoutingConstraints, PackingError> {
         let device = architecture.device();
         let graph = UnifiedGraph::new(design, device);
-        let incoming = incoming_pips(device);
-        let mut reverse_search = GlobalReverseSearch::new(device.wires().len());
-        let wire_lookup = device
-            .wires()
-            .iter()
-            .enumerate()
-            .map(|(index, wire)| ((wire.point, wire_basename(&wire.name)), WireId(index)))
-            .collect::<HashMap<_, _>>();
         let mut constraints = RoutingConstraints::new();
         for (network, clock) in self.global_clocks.iter().enumerate() {
             let net = &design.nets()[clock.global_net.0];
@@ -1072,11 +1098,11 @@ impl Ecp5Packing {
                 GlobalQuadrant::Lr,
             ] {
                 let root_name = format!("G_{}PCLK{network}", quadrant.wire_prefix());
-                let root = unique_wire_with_basename(device, &root_name).ok_or_else(|| {
+                let root = cache.unique_wire(&root_name).ok_or_else(|| {
                     global_route_error(net, format!("missing quadrant root `{root_name}`"))
                 })?;
                 let (path_wires, path_pips) =
-                    forward_route(device, source, root).ok_or_else(|| {
+                    cache.forward_route(device, source, root).ok_or_else(|| {
                         global_route_error(net, format!("DCCA cannot reach `{root_name}`"))
                     })?;
                 wires.extend(path_wires);
@@ -1089,8 +1115,8 @@ impl Ecp5Packing {
                 if wires.contains(&sink_wire) {
                     continue;
                 }
-                let (join, branch_wires, branch_pips) = reverse_search
-                    .route(device, &incoming, sink_wire, &wires, &tile_name)
+                let (join, branch_wires, branch_pips) = cache
+                    .reverse_route(device, sink_wire, &wires, &tile_name)
                     .ok_or_else(|| {
                         global_route_error(
                             net,
@@ -1109,16 +1135,8 @@ impl Ecp5Packing {
                     ));
                 }
                 if wire_basename(&device.wires()[join.0].name) == tile_name {
-                    add_global_trunk(
-                        architecture,
-                        &incoming,
-                        &wire_lookup,
-                        network,
-                        join,
-                        &mut wires,
-                        &mut pips,
-                    )
-                    .map_err(|reason| global_route_error(net, reason))?;
+                    add_global_trunk(architecture, cache, network, join, &mut wires, &mut pips)
+                        .map_err(|reason| global_route_error(net, reason))?;
                 }
             }
             constraints.add_route(NetRoute {
@@ -1128,6 +1146,66 @@ impl Ecp5Packing {
             });
         }
         Ok(constraints)
+    }
+}
+
+impl Ecp5Architecture {
+    /// Builds immutable indexes shared by repeated global-clock routes.
+    #[must_use]
+    pub fn global_routing_cache(&self) -> Ecp5GlobalRoutingCache<'_> {
+        let device = self.device();
+        let incoming = incoming_pips(device);
+        let wire_lookup = device
+            .wires()
+            .iter()
+            .enumerate()
+            .map(|(index, wire)| ((wire.point, wire_basename(&wire.name)), WireId(index)))
+            .collect::<HashMap<_, _>>();
+        let mut unique_wires = HashMap::new();
+        for (index, wire) in device.wires().iter().enumerate() {
+            unique_wires
+                .entry(wire_basename(&wire.name))
+                .and_modify(|known| *known = None)
+                .or_insert(Some(WireId(index)));
+        }
+        Ecp5GlobalRoutingCache {
+            incoming,
+            wire_lookup,
+            unique_wires,
+            forward_routes: HashMap::new(),
+            reverse_search: GlobalReverseSearch::new(device.wires().len()),
+        }
+    }
+}
+
+impl Ecp5GlobalRoutingCache<'_> {
+    fn unique_wire(&self, name: &str) -> Option<WireId> {
+        self.unique_wires.get(name).copied().flatten()
+    }
+
+    fn forward_route(
+        &mut self,
+        device: &Device,
+        source: WireId,
+        target: WireId,
+    ) -> Option<(Vec<WireId>, Vec<PipId>)> {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.forward_routes.entry((source, target))
+        {
+            entry.insert(forward_route(device, source, target)?);
+        }
+        self.forward_routes.get(&(source, target)).cloned()
+    }
+
+    fn reverse_route(
+        &mut self,
+        device: &Device,
+        sink: WireId,
+        tree: &BTreeSet<WireId>,
+        target_name: &str,
+    ) -> Option<(WireId, Vec<WireId>, Vec<PipId>)> {
+        self.reverse_search
+            .route(device, &self.incoming, sink, tree, target_name)
     }
 }
 
@@ -1165,16 +1243,6 @@ fn incoming_pips(device: &Device) -> Vec<Vec<PipId>> {
     incoming
 }
 
-fn unique_wire_with_basename(device: &Device, name: &str) -> Option<WireId> {
-    let mut matches = device
-        .wires()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, wire)| (wire_basename(&wire.name) == name).then_some(WireId(index)));
-    let wire = matches.next()?;
-    matches.next().is_none().then_some(wire)
-}
-
 fn forward_route(
     device: &Device,
     source: WireId,
@@ -1206,6 +1274,7 @@ fn forward_route(
     None
 }
 
+#[derive(Debug)]
 struct GlobalReverseSearch {
     epoch: u32,
     seen: Vec<u32>,
@@ -1269,8 +1338,7 @@ impl GlobalReverseSearch {
 
 fn add_global_trunk(
     architecture: &Ecp5Architecture,
-    incoming: &[Vec<PipId>],
-    wire_lookup: &HashMap<(Point, &str), WireId>,
+    cache: &Ecp5GlobalRoutingCache<'_>,
     network: usize,
     tile: WireId,
     wires: &mut BTreeSet<WireId>,
@@ -1286,11 +1354,15 @@ fn add_global_trunk(
         GlobalTapDirection::Right => 'R',
     };
     let tap_name = format!("{side}_HPBX{network:02}00");
-    let tap = wire_at(wire_lookup, Point::new(info.tap_column, point.y), &tap_name)
-        .ok_or_else(|| format!("missing tap wire `{tap_name}`"))?;
+    let tap = wire_at(
+        &cache.wire_lookup,
+        Point::new(info.tap_column, point.y),
+        &tap_name,
+    )
+    .ok_or_else(|| format!("missing tap wire `{tap_name}`"))?;
     add_exact_pip(device, tap, tile, wires, pips)?;
 
-    let tap_pip = only_original_incoming(architecture, incoming, tap)?;
+    let tap_pip = only_original_incoming(architecture, &cache.incoming, tap)?;
     add_pip_to_tree(device, tap_pip, wires, pips);
     let tap_source = device.pips()[tap_pip.0].from;
     let tap_info = architecture
@@ -1300,15 +1372,19 @@ fn add_global_trunk(
         .spine
         .ok_or_else(|| "tap source has no spine coordinate".to_owned())?;
     let spine_name = wire_basename(&device.wires()[tap_source.0].name);
-    let spine = wire_at(wire_lookup, spine_point, spine_name)
+    let spine = wire_at(&cache.wire_lookup, spine_point, spine_name)
         .ok_or_else(|| format!("missing spine wire `{spine_name}`"))?;
     add_exact_pip(device, spine, tap_source, wires, pips)?;
 
-    let spine_pip = only_original_incoming(architecture, incoming, spine)?;
+    let spine_pip = only_original_incoming(architecture, &cache.incoming, spine)?;
     add_pip_to_tree(device, spine_pip, wires, pips);
     let spine_source = device.pips()[spine_pip.0].from;
     let root_name = format!("G_{}PCLK{network}", tap_info.quadrant.wire_prefix());
-    let root = unique_wire_with_basename(device, &root_name)
+    let root = cache
+        .unique_wires
+        .get(root_name.as_str())
+        .copied()
+        .flatten()
         .ok_or_else(|| format!("missing unique quadrant root `{root_name}`"))?;
     add_exact_pip(device, root, spine_source, wires, pips)
 }
