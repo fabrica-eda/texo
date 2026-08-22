@@ -50,7 +50,8 @@ same mapped design still passes Celox simulation.
   metadata already preserved by the importer.
 - [x] Validate DP16KD width/depth modes, constrain each BRAM to compatible
   BELs, and assign stable WID configuration values with explicit errors.
-- [ ] Pack global clocks with explicit legality errors.
+- [x] Rank clock nets by FF/BRAM clock-pin fanout, insert DCCA cells for at most
+  16 global networks, and constrain them to compatible BELs transactionally.
 - [x] Fold LUT constants into INIT, absorb FF/BRAM constants into input-mux
   metadata, and synthesize shared constant LUTs only for residual nets.
 
@@ -61,8 +62,8 @@ device/package and a checker can reconstruct all occupancy.
 
 - Add timing/congestion cost models and incremental bounding-box updates.
 - Implement simulated annealing first; evaluate analytical placement later.
-- Add dedicated clock placement constraints; extend the existing fixed IO and
-  DP16KD groups as new target rules require.
+- Extend the existing DCCA, fixed IO, and DP16KD placement groups as new target
+  rules require.
 - Emit deterministic checkpoints and machine-readable quality metrics.
 
 Exit criterion: the blinky and AXI4 fixture place legally, repeatably, and with

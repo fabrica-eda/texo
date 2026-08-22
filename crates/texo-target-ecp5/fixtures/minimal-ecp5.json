@@ -38,7 +38,9 @@
         { "name": "ADB2_EBR" },
         { "name": "CLKB_EBR" },
         { "name": "DOB0_EBR" },
-        { "name": "DOB1_EBR" }
+        { "name": "DOB1_EBR" },
+        { "name": "CLKI_DCCA" },
+        { "name": "CLKO_DCCA" }
       ],
       "bels": [
         {
@@ -93,6 +95,15 @@
             { "name": "DOB0", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 24 } },
             { "name": "DOB1", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 25 } }
           ]
+        },
+        {
+          "name": "DCCA0",
+          "bel_type": "DCCA",
+          "z": 24,
+          "pins": [
+            { "name": "CLKI", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 26 } },
+            { "name": "CLKO", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 27 } }
+          ]
         }
       ],
       "pips": [
@@ -101,6 +112,22 @@
           "to": { "dx": 1, "dy": 0, "index": 5 },
           "fixed": false,
           "tile_type": "PLC2",
+          "delay": 1,
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 6 },
+          "to": { "dx": 0, "dy": 0, "index": 26 },
+          "fixed": false,
+          "tile_type": "EFB1_PICB1",
+          "delay": 1,
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 27 },
+          "to": { "dx": 0, "dy": 0, "index": 11 },
+          "fixed": false,
+          "tile_type": "EFB1_PICB1",
           "delay": 1,
           "lutperm_flags": 0
         }

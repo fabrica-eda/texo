@@ -96,6 +96,15 @@ width, and physical port width. The ECP5 packer accepts only DP16KD modes
 limits, constrains the cell to compatible `DP16KD` BELs, and assigns stable
 WID values from 3 in CellId order. Missing metadata and illegal geometries are
 reported before any packing constraint is mutated.
+Global-clock promotion uses the same graph instead of a separate clock model.
+The packer ranks nets by recognized FF/BRAM clock-pin fanout (five sinks by
+default), selects at most the 16 ECP5 primary clock networks, and inserts a
+logical DCCA cell with `CLKI` and `CLKO` pins. A target-neutral net-splitting
+operation moves only clock sinks behind `CLKO`; mixed data sinks remain on the
+original net. The DCCA cell is then constrained to compatible physical DCCA
+BELs, so both sides are routed through the ordinary Wire/PIP graph. Unknown
+nets, duplicate requests, non-clock nets, and insufficient DCCA resources are
+transactional packing errors.
 `texo-flow::implement_with_constraints` carries these packing decisions through
 placement and routing before recording physical-implementation evidence.
 

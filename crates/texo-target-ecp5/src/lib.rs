@@ -18,8 +18,8 @@ use std::io::Read;
 
 use serde::{Deserialize, Serialize};
 use texo_model::{
-    BelId, BelPinId, CellId, CellPinId, Design, Device, ModelError, PinDirection, PipId, Point,
-    ResourceKind, UnifiedGraph, WireId,
+    BelId, BelPinId, BufferSpec, CellId, CellPinId, Design, Device, ModelError, NetId,
+    PinDirection, PipId, Point, ResourceKind, UnifiedGraph, WireId,
 };
 use texo_pnr::PlacementConstraints;
 
@@ -301,6 +301,30 @@ pub struct PackedBlockRam {
     pub physical_width: u8,
 }
 
+/// One logical net selected for promotion onto an ECP5 global clock network.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GlobalClockRequirement {
+    /// Source net before DCCA insertion.
+    pub net: NetId,
+}
+
+/// One inserted and legally constrained ECP5 DCCA clock buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PackedGlobalClock {
+    /// Original source net driving `CLKI`.
+    pub source_net: NetId,
+    /// Inserted DCCA logical cell.
+    pub buffer: CellId,
+    /// New global net driven by `CLKO`.
+    pub global_net: NetId,
+}
+
+/// nextpnr-compatible minimum clock-pin fanout for automatic promotion.
+pub const DEFAULT_GLOBAL_CLOCK_FANOUT: usize = 5;
+
+/// Number of global primary clock networks in an ECP5 device.
+pub const ECP5_GLOBAL_CLOCK_COUNT: usize = 16;
+
 /// Target packing decisions consumed by grouped placement and configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Ecp5Packing {
@@ -309,6 +333,8 @@ pub struct Ecp5Packing {
     general_routing_ffs: Vec<CellId>,
     block_rams: Vec<PackedBlockRam>,
     block_rams_packed: bool,
+    global_clocks: Vec<PackedGlobalClock>,
+    global_clocks_packed: bool,
     io_attributes: BTreeMap<CellId, BTreeMap<String, String>>,
     unsupported_lpf_commands: Vec<String>,
 }
@@ -345,6 +371,12 @@ impl Ecp5Packing {
     #[must_use]
     pub fn block_rams(&self) -> &[PackedBlockRam] {
         &self.block_rams
+    }
+
+    /// Inserted DCCA buffers in stable source-net order.
+    #[must_use]
+    pub fn global_clocks(&self) -> &[PackedGlobalClock] {
+        &self.global_clocks
     }
 
     /// LPF `IOBUF` attributes resolved to logical IO cells.
@@ -577,6 +609,171 @@ impl Ecp5Packing {
         self.block_rams_packed = true;
         Ok(())
     }
+
+    /// Inserts and constrains DCCA buffers for selected clock nets.
+    ///
+    /// Only recognized clock sinks move behind `CLKO`; any data sinks remain
+    /// directly connected to the original net. Requirements are processed in
+    /// stable net-ID order, independent of input order. Both the design and
+    /// packing constraints are updated transactionally.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown or duplicate net, a net without a
+    /// recognized clock sink, insufficient compatible DCCA BELs, graph/model
+    /// failures, or a second invocation on the same packing result.
+    pub fn promote_global_clocks(
+        &mut self,
+        design: &mut Design,
+        architecture: &Ecp5Architecture,
+        requirements: impl IntoIterator<Item = GlobalClockRequirement>,
+    ) -> Result<(), PackingError> {
+        if self.global_clocks_packed {
+            return Err(PackingError::GlobalClocksAlreadyPacked);
+        }
+
+        let mut requirements_by_net = BTreeMap::new();
+        for requirement in requirements {
+            let Some(net) = design.nets().get(requirement.net.0) else {
+                return Err(PackingError::Model(ModelError::UnknownNet(requirement.net)));
+            };
+            if requirements_by_net
+                .insert(requirement.net, requirement)
+                .is_some()
+            {
+                return Err(PackingError::DuplicateGlobalClockRequirement {
+                    net: net.name.clone(),
+                });
+            }
+        }
+
+        let pending = requirements_by_net
+            .values()
+            .map(|requirement| {
+                let net = &design.nets()[requirement.net.0];
+                let sinks = net
+                    .sinks
+                    .iter()
+                    .copied()
+                    .filter(|&pin| is_clock_sink(design, pin))
+                    .collect::<Vec<_>>();
+                if sinks.is_empty() {
+                    Err(PackingError::GlobalClockHasNoClockSinks {
+                        net: net.name.clone(),
+                    })
+                } else {
+                    Ok((requirement.net, net.name.clone(), sinks))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let dcca_bels = compatible_dcca_bels(architecture);
+        let available_global_clocks = dcca_bels.len().min(ECP5_GLOBAL_CLOCK_COUNT);
+        if pending.len() > available_global_clocks {
+            return Err(PackingError::InsufficientGlobalClockBels {
+                required: pending.len(),
+                available: available_global_clocks,
+            });
+        }
+
+        let mut transformed = design.clone();
+        let mut constraints = self.constraints.clone();
+        let mut packed = Vec::new();
+        for (source_net, net_name, sinks) in pending {
+            let inserted = transformed.insert_buffer_on_net(
+                source_net,
+                sinks,
+                BufferSpec {
+                    cell_name: format!("$gbuf${net_name}"),
+                    kind: ResourceKind::Clock,
+                    input_pin: "CLKI".into(),
+                    output_pin: "CLKO".into(),
+                    output_net: format!("$glbnet${net_name}"),
+                },
+            )?;
+            let assignments = UnifiedGraph::new(&transformed, architecture.device())
+                .placement_candidates(inserted.cell)?
+                .into_iter()
+                .filter(|bel| architecture.bel_metadata()[bel].bel_type == "DCCA")
+                .map(|bel| vec![bel])
+                .collect::<Vec<_>>();
+            if assignments.is_empty() {
+                return Err(PackingError::InsufficientGlobalClockBels {
+                    required: 1,
+                    available: 0,
+                });
+            }
+            constraints.add_group([inserted.cell], assignments);
+            packed.push(PackedGlobalClock {
+                source_net,
+                buffer: inserted.cell,
+                global_net: inserted.output_net,
+            });
+        }
+
+        *design = transformed;
+        self.constraints = constraints;
+        self.global_clocks = packed;
+        self.global_clocks_packed = true;
+        Ok(())
+    }
+}
+
+/// Selects nets with at least `minimum_clock_sinks` recognized clock pins.
+///
+/// A zero threshold is treated as one. Register `CLK` and block-RAM
+/// `CLKA`/`CLKB` pins are recognized. At most 16 nets are returned, choosing
+/// the highest fanout first with stable net-ID tie breaking; the returned set
+/// itself is ordered by net ID.
+#[must_use]
+pub fn find_global_clock_requirements(
+    design: &Design,
+    minimum_clock_sinks: usize,
+) -> Vec<GlobalClockRequirement> {
+    let minimum_clock_sinks = minimum_clock_sinks.max(1);
+    let mut candidates = design
+        .nets()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, net)| {
+            let clock_sinks = net
+                .sinks
+                .iter()
+                .filter(|&&pin| is_clock_sink(design, pin))
+                .count();
+            (clock_sinks >= minimum_clock_sinks).then_some((NetId(index), clock_sinks))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(net, clock_sinks)| (std::cmp::Reverse(*clock_sinks), *net));
+    candidates.truncate(ECP5_GLOBAL_CLOCK_COUNT);
+    candidates.sort_by_key(|(net, _)| *net);
+    candidates
+        .into_iter()
+        .map(|(net, _)| GlobalClockRequirement { net })
+        .collect()
+}
+
+fn is_clock_sink(design: &Design, pin: CellPinId) -> bool {
+    let pin = &design.pins()[pin.0];
+    let kind = design.cells()[pin.cell.0].kind;
+    (kind == ResourceKind::Register && pin.name == "CLK")
+        || (kind == ResourceKind::Memory && matches!(pin.name.as_str(), "CLKA" | "CLKB"))
+}
+
+fn compatible_dcca_bels(architecture: &Ecp5Architecture) -> Vec<BelId> {
+    architecture
+        .bel_metadata()
+        .iter()
+        .filter_map(|(&bel, metadata)| {
+            let input = find_bel_pin(architecture.device(), bel, "CLKI")
+                .map(|pin| architecture.device().bel_pins()[pin.0].direction);
+            let output = find_bel_pin(architecture.device(), bel, "CLKO")
+                .map(|pin| architecture.device().bel_pins()[pin.0].direction);
+            (metadata.bel_type == "DCCA"
+                && input == Some(PinDirection::Input)
+                && output == Some(PinDirection::Output))
+            .then_some(bel)
+        })
+        .collect()
 }
 
 fn dp16kd_max_depth(physical_width: u8) -> Option<u32> {
@@ -671,6 +868,8 @@ pub fn pack_lut_ffs(
         general_routing_ffs,
         block_rams: Vec::new(),
         block_rams_packed: false,
+        global_clocks: Vec::new(),
+        global_clocks_packed: false,
         io_attributes: BTreeMap::new(),
         unsupported_lpf_commands: Vec::new(),
     })
@@ -785,6 +984,25 @@ pub enum PackingError {
     BlockRamsAlreadyPacked,
     /// Stable WID assignment exceeded its representable range.
     TooManyBlockRams,
+    /// One source net was selected for global promotion more than once.
+    DuplicateGlobalClockRequirement {
+        /// Logical source net name.
+        net: String,
+    },
+    /// A selected net did not drive any recognized clock terminal.
+    GlobalClockHasNoClockSinks {
+        /// Logical source net name.
+        net: String,
+    },
+    /// The architecture has too few compatible DCCA BELs.
+    InsufficientGlobalClockBels {
+        /// Number of selected global clock nets.
+        required: usize,
+        /// Number of compatible DCCA BELs.
+        available: usize,
+    },
+    /// Global clock promotion was requested twice for one packing result.
+    GlobalClocksAlreadyPacked,
     /// Selected package is not present in the architecture snapshot.
     UnknownPackage(String),
     /// Package pin is not present in the selected package.
@@ -879,6 +1097,22 @@ impl fmt::Display for PackingError {
             }
             Self::BlockRamsAlreadyPacked => write!(f, "block RAMs were already packed"),
             Self::TooManyBlockRams => write!(f, "too many block RAMs for stable WID assignment"),
+            Self::DuplicateGlobalClockRequirement { net } => {
+                write!(f, "clock net `{net}` was selected more than once")
+            }
+            Self::GlobalClockHasNoClockSinks { net } => {
+                write!(f, "net `{net}` has no recognized ECP5 clock sinks")
+            }
+            Self::InsufficientGlobalClockBels {
+                required,
+                available,
+            } => write!(
+                f,
+                "global clock promotion requires {required} DCCA BELs but only {available} are compatible"
+            ),
+            Self::GlobalClocksAlreadyPacked => {
+                write!(f, "global clocks were already promoted")
+            }
             Self::UnknownPackage(package) => write!(f, "unknown ECP5 package `{package}`"),
             Self::UnknownPackagePin { package, pin } => {
                 write!(f, "package `{package}` has no pin `{pin}`")
@@ -918,6 +1152,10 @@ impl Error for PackingError {
             | Self::MissingBlockRamBel { .. }
             | Self::BlockRamsAlreadyPacked
             | Self::TooManyBlockRams
+            | Self::DuplicateGlobalClockRequirement { .. }
+            | Self::GlobalClockHasNoClockSinks { .. }
+            | Self::InsufficientGlobalClockBels { .. }
+            | Self::GlobalClocksAlreadyPacked
             | Self::UnknownPackage(_)
             | Self::UnknownPackagePin { .. }
             | Self::UnknownIoCell(_)
@@ -1140,6 +1378,7 @@ fn resource_kind(bel_type: &str) -> ResourceKind {
         "TRELLIS_COMB" => ResourceKind::Lut(4),
         "TRELLIS_FF" => ResourceKind::Register,
         "DP16KD" => ResourceKind::Memory,
+        "DCCA" => ResourceKind::Clock,
         "PIO" | "TRELLIS_IO" => ResourceKind::Io,
         _ => ResourceKind::Logic,
     }
@@ -1293,17 +1532,17 @@ impl From<ModelError> for ImportError {
 mod tests {
     use struo_ir::{
         ActiveLevel as StruoActiveLevel, ClockEdge as StruoClockEdge, EnableControl, MemoryCell,
-        Netlist,
+        Netlist, RegisterCell,
     };
     use struo_target_ecp5::map_to_ecp5;
     use texo_model::{CellId, Design, PinDirection, ResourceKind, UnifiedGraph};
-    use texo_pnr::place_with_constraints;
+    use texo_pnr::{place_and_route_with_constraints, place_with_constraints};
     use texo_struo::{PrimitiveMetadata, import_ecp5};
 
     use super::{
-        BlockRamRequirement, LogicalPort, PackagePinBinding, PackedBlockRam, PackingError,
-        PipMetadata, pack_lut_ffs, parse_lpf, read_architecture, resolve_lpf_port_cells,
-        resolve_lpf_ports,
+        BlockRamRequirement, GlobalClockRequirement, LogicalPort, PackagePinBinding,
+        PackedBlockRam, PackingError, PipMetadata, find_global_clock_requirements, pack_lut_ffs,
+        parse_lpf, read_architecture, resolve_lpf_port_cells, resolve_lpf_ports,
     };
 
     const FIXTURE: &str = include_str!("../fixtures/minimal-ecp5.json");
@@ -1313,9 +1552,9 @@ mod tests {
         let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
 
         assert_eq!(architecture.device().name(), "LFE5UM5G-85F-test");
-        assert_eq!(architecture.device().bels().len(), 7);
-        assert_eq!(architecture.device().wires().len(), 39);
-        assert_eq!(architecture.device().pips().len(), 1);
+        assert_eq!(architecture.device().bels().len(), 8);
+        assert_eq!(architecture.device().wires().len(), 41);
+        assert_eq!(architecture.device().pips().len(), 3);
         assert_eq!(architecture.packages()[0].pins.len(), 1);
         assert_eq!(
             architecture.pip_metadata().values().next(),
@@ -1715,6 +1954,150 @@ mod tests {
         assert_eq!(packing.block_rams()[0].word_width, 2);
         assert_eq!(packing.block_rams()[0].physical_width, 2);
         assert_eq!(packing.constraints().groups().len(), 1);
+    }
+
+    #[test]
+    fn inserts_places_and_routes_a_dcca_global_clock() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let input = design.add_cell("clock", ResourceKind::Io);
+        let driver = design.add_pin(input, "O", PinDirection::Output).unwrap();
+        let ff = add_ff(&mut design, "state");
+        let clock = design.cells()[ff.0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == "CLK")
+            .unwrap();
+        let source_net = design.add_net("clock", driver, [clock]).unwrap();
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+        packing
+            .bind_package_pins(
+                &design,
+                &architecture,
+                "CABGA381",
+                [PackagePinBinding {
+                    cell: input,
+                    pin: "A10".into(),
+                }],
+            )
+            .unwrap();
+
+        let requirements = find_global_clock_requirements(&design, 1);
+        packing
+            .promote_global_clocks(&mut design, &architecture, requirements)
+            .unwrap();
+        let result =
+            place_and_route_with_constraints(&design, architecture.device(), packing.constraints())
+                .unwrap();
+
+        assert_eq!(packing.global_clocks().len(), 1);
+        let promoted = packing.global_clocks()[0];
+        assert_eq!(promoted.source_net, source_net);
+        assert_eq!(design.pins()[clock.0].net(), Some(promoted.global_net));
+        assert_eq!(design.nets()[source_net.0].sinks.len(), 1);
+        assert_eq!(
+            architecture.bel_metadata()[&result.placement.bel(promoted.buffer).unwrap()].bel_type,
+            "DCCA"
+        );
+        assert_eq!(result.routes.len(), 2);
+        assert_eq!(result.total_pips, 2);
+    }
+
+    #[test]
+    fn global_clock_failure_does_not_mutate_the_design_or_constraints() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let source = design.add_cell("source", ResourceKind::Logic);
+        let driver = design.add_pin(source, "out", PinDirection::Output).unwrap();
+        let sink = design.add_cell("sink", ResourceKind::Logic);
+        let input = design.add_pin(sink, "in", PinDirection::Input).unwrap();
+        let net = design.add_net("data", driver, [input]).unwrap();
+        let original = design.clone();
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+        let original_constraints = packing.constraints().clone();
+
+        assert_eq!(
+            packing.promote_global_clocks(
+                &mut design,
+                &architecture,
+                [GlobalClockRequirement { net }]
+            ),
+            Err(PackingError::GlobalClockHasNoClockSinks { net: "data".into() })
+        );
+        assert_eq!(design, original);
+        assert_eq!(packing.constraints(), &original_constraints);
+        assert!(packing.global_clocks().is_empty());
+    }
+
+    #[test]
+    fn rejects_more_global_clocks_than_the_architecture_can_place() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        for index in 0..2 {
+            let source = design.add_cell(format!("source_{index}"), ResourceKind::Logic);
+            let driver = design.add_pin(source, "out", PinDirection::Output).unwrap();
+            let ff = add_ff(&mut design, &format!("state_{index}"));
+            let clock = design.cells()[ff.0]
+                .pins()
+                .iter()
+                .copied()
+                .find(|pin| design.pins()[pin.0].name == "CLK")
+                .unwrap();
+            design
+                .add_net(format!("clock_{index}"), driver, [clock])
+                .unwrap();
+        }
+        let original = design.clone();
+        let requirements = find_global_clock_requirements(&design, 1);
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+
+        assert_eq!(
+            packing.promote_global_clocks(&mut design, &architecture, requirements),
+            Err(PackingError::InsufficientGlobalClockBels {
+                required: 2,
+                available: 1,
+            })
+        );
+        assert_eq!(design, original);
+        assert!(packing.global_clocks().is_empty());
+    }
+
+    #[test]
+    fn promotes_a_clock_from_a_direct_struo_import() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut source = Netlist::new("state");
+        let data = source.add_input("data");
+        let clock = source.add_input("clock");
+        let output = source.add_register_output("state");
+        source.add_register(RegisterCell::new(
+            "state",
+            output,
+            data,
+            clock,
+            StruoClockEdge::Rising,
+            None,
+            None,
+        ));
+        source.add_output("state", output);
+        let imported = import_ecp5(&map_to_ecp5(&source).unwrap()).unwrap();
+        let mut design = imported.into_design();
+        let requirements = find_global_clock_requirements(&design, 1);
+        let clock_net_name = design.nets()[requirements[0].net.0].name.clone();
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+
+        assert_eq!(requirements.len(), 1);
+        packing
+            .promote_global_clocks(&mut design, &architecture, requirements)
+            .unwrap();
+
+        assert_eq!(packing.global_clocks().len(), 1);
+        let buffer = packing.global_clocks()[0].buffer;
+        assert_eq!(design.cells()[buffer.0].kind, ResourceKind::Clock);
+        assert_eq!(
+            design.cells()[buffer.0].name,
+            format!("$gbuf${clock_net_name}")
+        );
     }
 
     fn add_ff(design: &mut Design, name: &str) -> CellId {

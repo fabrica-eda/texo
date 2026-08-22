@@ -5,6 +5,7 @@
 //! placement/binding candidate edges lazily, avoiding a materialized
 //! `cells × BELs` cross product.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
@@ -70,6 +71,8 @@ pub enum ResourceKind {
     Register,
     /// Embedded memory.
     Memory,
+    /// Dedicated clock-distribution primitive.
+    Clock,
     /// Package-facing input/output resource.
     Io,
     /// Dedicated constant network source.
@@ -152,6 +155,34 @@ pub struct Design {
     cells: Vec<Cell>,
     pins: Vec<CellPin>,
     nets: Vec<Net>,
+}
+
+/// Names and resource class for a buffer inserted into an existing net.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BufferSpec {
+    /// Generated logical cell name.
+    pub cell_name: String,
+    /// Physical resource class required by the buffer.
+    pub kind: ResourceKind,
+    /// Buffer input pin name.
+    pub input_pin: String,
+    /// Buffer output pin name.
+    pub output_pin: String,
+    /// Generated downstream net name.
+    pub output_net: String,
+}
+
+/// Stable IDs created by [`Design::insert_buffer_on_net`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InsertedBuffer {
+    /// Inserted logical buffer cell.
+    pub cell: CellId,
+    /// Input pin connected to the original net.
+    pub input_pin: CellPinId,
+    /// Output pin driving the new downstream net.
+    pub output_pin: CellPinId,
+    /// New downstream net.
+    pub output_net: NetId,
 }
 
 impl Design {
@@ -254,6 +285,94 @@ impl Design {
             self.pins[terminal.0].net = Some(id);
         }
         Ok(id)
+    }
+
+    /// Inserts a buffer and moves selected sinks to its output net.
+    ///
+    /// The original net keeps its driver and unselected sinks, and gains the
+    /// buffer input as a sink. Selected sinks retain their original order on a
+    /// newly appended net driven by the buffer output. Validation completes
+    /// before the design is mutated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown net or pin, no selected sinks, repeated
+    /// sinks, a sink not connected to the selected net, or duplicate buffer
+    /// pin names.
+    pub fn insert_buffer_on_net(
+        &mut self,
+        net: NetId,
+        sinks: impl IntoIterator<Item = CellPinId>,
+        spec: BufferSpec,
+    ) -> Result<InsertedBuffer, ModelError> {
+        if spec.input_pin == spec.output_pin {
+            return Err(ModelError::DuplicatePin(spec.input_pin));
+        }
+        let selected = sinks.into_iter().collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Err(ModelError::NoSinks);
+        }
+        let source = self.net(net)?;
+        let mut selected_set = BTreeSet::new();
+        for &sink in &selected {
+            self.pin(sink)?;
+            if !selected_set.insert(sink) {
+                return Err(ModelError::DuplicateTerminal(sink));
+            }
+            if !source.sinks.contains(&sink) {
+                return Err(ModelError::PinIsNotNetSink { pin: sink, net });
+            }
+        }
+        let downstream_sinks = source
+            .sinks
+            .iter()
+            .copied()
+            .filter(|sink| selected_set.contains(sink))
+            .collect::<Vec<_>>();
+
+        let cell = CellId(self.cells.len());
+        let input_pin = CellPinId(self.pins.len());
+        let output_pin = CellPinId(self.pins.len() + 1);
+        self.cells.push(Cell {
+            name: spec.cell_name,
+            kind: spec.kind,
+            pins: vec![input_pin, output_pin],
+        });
+        self.pins.push(CellPin {
+            name: spec.input_pin,
+            cell,
+            direction: PinDirection::Input,
+            net: None,
+        });
+        self.pins.push(CellPin {
+            name: spec.output_pin,
+            cell,
+            direction: PinDirection::Output,
+            net: None,
+        });
+        let output_net = NetId(self.nets.len());
+
+        self.nets[net.0]
+            .sinks
+            .retain(|sink| !selected_set.contains(sink));
+        self.nets[net.0].sinks.push(input_pin);
+        self.pins[input_pin.0].net = Some(net);
+        for &sink in &downstream_sinks {
+            self.pins[sink.0].net = Some(output_net);
+        }
+        self.pins[output_pin.0].net = Some(output_net);
+        self.nets.push(Net {
+            name: spec.output_net,
+            driver: output_pin,
+            sinks: downstream_sinks,
+        });
+
+        Ok(InsertedBuffer {
+            cell,
+            input_pin,
+            output_pin,
+            output_net,
+        })
     }
 
     /// Cells in stable ID order.
@@ -926,6 +1045,13 @@ pub enum ModelError {
     DuplicateTerminal(CellPinId),
     /// A logical pin already belongs to another net.
     PinAlreadyConnected(CellPinId),
+    /// A selected pin is not a sink of the selected net.
+    PinIsNotNetSink {
+        /// Selected logical pin.
+        pin: CellPinId,
+        /// Selected logical net.
+        net: NetId,
+    },
     /// A physical device had no usable area.
     EmptyDevice,
     /// A physical resource was outside the device bounds.
@@ -959,6 +1085,9 @@ impl fmt::Display for ModelError {
             Self::PinAlreadyConnected(id) => {
                 write!(f, "cell pin {} is already connected", id.0)
             }
+            Self::PinIsNotNetSink { pin, net } => {
+                write!(f, "cell pin {} is not a sink of net {}", pin.0, net.0)
+            }
             Self::EmptyDevice => write!(f, "device dimensions must be non-zero"),
             Self::PointOutsideDevice(point) => {
                 write!(f, "point ({}, {}) is outside the device", point.x, point.y)
@@ -976,7 +1105,8 @@ impl Error for ModelError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        Design, Device, GraphEdgeKind, GraphNode, PinDirection, ResourceKind, UnifiedGraph,
+        BufferSpec, Design, Device, GraphEdgeKind, GraphNode, PinDirection, ResourceKind,
+        UnifiedGraph,
     };
 
     #[test]
@@ -987,6 +1117,43 @@ mod tests {
         let output = design.add_pin(cell, "out", PinDirection::Output).unwrap();
 
         assert!(design.add_net("bad", input, [output]).is_err());
+    }
+
+    #[test]
+    fn inserts_a_buffer_before_only_the_selected_sinks() {
+        let mut design = Design::new();
+        let source = design.add_cell("source", ResourceKind::Logic);
+        let driver = design.add_pin(source, "out", PinDirection::Output).unwrap();
+        let clocked = design.add_cell("clocked", ResourceKind::Register);
+        let clock = design.add_pin(clocked, "CLK", PinDirection::Input).unwrap();
+        let combinational = design.add_cell("combinational", ResourceKind::Logic);
+        let data = design
+            .add_pin(combinational, "in", PinDirection::Input)
+            .unwrap();
+        let source_net = design.add_net("mixed", driver, [clock, data]).unwrap();
+
+        let inserted = design
+            .insert_buffer_on_net(
+                source_net,
+                [clock],
+                BufferSpec {
+                    cell_name: "$buffer$mixed".into(),
+                    kind: ResourceKind::Clock,
+                    input_pin: "I".into(),
+                    output_pin: "O".into(),
+                    output_net: "$buffered$mixed".into(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            design.nets()[source_net.0].sinks,
+            [data, inserted.input_pin]
+        );
+        assert_eq!(design.nets()[inserted.output_net.0].sinks, [clock],);
+        assert_eq!(design.pins()[clock.0].net(), Some(inserted.output_net));
+        assert_eq!(design.pins()[data.0].net(), Some(source_net));
+        assert_eq!(design.cells()[inserted.cell.0].kind, ResourceKind::Clock);
     }
 
     #[test]
