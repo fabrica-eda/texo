@@ -269,12 +269,46 @@ pub struct LutFfPair {
     pub ff: CellId,
 }
 
+/// Structural information required to pack one logical memory into `DP16KD`.
+///
+/// Struo's ECP5 mapper exposes these values as immutable primitive metadata;
+/// keeping this type structural avoids coupling the target crate to one
+/// particular frontend adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockRamRequirement {
+    /// Logical memory cell.
+    pub cell: CellId,
+    /// Logical number of words.
+    pub depth: u32,
+    /// Logical word width.
+    pub word_width: u8,
+    /// Width selected for the physical ECP5 RAM ports.
+    pub physical_width: u8,
+}
+
+/// One legal `DP16KD` packing decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PackedBlockRam {
+    /// Logical memory cell.
+    pub cell: CellId,
+    /// Stable ECP5 write-ID configuration value.
+    pub wid: u32,
+    /// Logical number of words.
+    pub depth: u32,
+    /// Logical word width.
+    pub word_width: u8,
+    /// Width selected for the physical ECP5 RAM ports.
+    pub physical_width: u8,
+}
+
 /// Target packing decisions consumed by grouped placement and configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Ecp5Packing {
     constraints: PlacementConstraints,
     lut_ff_pairs: Vec<LutFfPair>,
     general_routing_ffs: Vec<CellId>,
+    block_rams: Vec<PackedBlockRam>,
+    block_rams_packed: bool,
     io_attributes: BTreeMap<CellId, BTreeMap<String, String>>,
     unsupported_lpf_commands: Vec<String>,
 }
@@ -305,6 +339,12 @@ impl Ecp5Packing {
     #[must_use]
     pub fn general_routing_ffs(&self) -> &[CellId] {
         &self.general_routing_ffs
+    }
+
+    /// Packed `DP16KD` memories in stable logical cell order.
+    #[must_use]
+    pub fn block_rams(&self) -> &[PackedBlockRam] {
+        &self.block_rams
     }
 
     /// LPF `IOBUF` attributes resolved to logical IO cells.
@@ -427,6 +467,127 @@ impl Ecp5Packing {
         }
         Ok(())
     }
+
+    /// Validates and constrains every logical memory to an ECP5 `DP16KD` BEL.
+    ///
+    /// Requirements are matched by cell ID, independent of input order. The
+    /// operation is transactional and assigns WID values starting at 3 in
+    /// stable cell order, matching the convention used by nextpnr-ecp5.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing, duplicate, unknown, non-memory, or
+    /// physically illegal requirements, an incompatible architecture, or a
+    /// second invocation on the same packing result.
+    pub fn pack_block_rams(
+        &mut self,
+        design: &Design,
+        architecture: &Ecp5Architecture,
+        requirements: impl IntoIterator<Item = BlockRamRequirement>,
+    ) -> Result<(), PackingError> {
+        if self.block_rams_packed {
+            return Err(PackingError::BlockRamsAlreadyPacked);
+        }
+
+        let mut requirements_by_cell = BTreeMap::new();
+        for requirement in requirements {
+            let Some(cell) = design.cells().get(requirement.cell.0) else {
+                return Err(PackingError::UnknownBlockRamCell(requirement.cell));
+            };
+            if cell.kind != ResourceKind::Memory {
+                return Err(PackingError::CellIsNotBlockRam {
+                    cell: cell.name.clone(),
+                });
+            }
+            if requirements_by_cell
+                .insert(requirement.cell, requirement)
+                .is_some()
+            {
+                return Err(PackingError::DuplicateBlockRamRequirement {
+                    cell: cell.name.clone(),
+                });
+            }
+        }
+
+        for (index, cell) in design.cells().iter().enumerate() {
+            let cell_id = CellId(index);
+            if cell.kind == ResourceKind::Memory && !requirements_by_cell.contains_key(&cell_id) {
+                return Err(PackingError::MissingBlockRamRequirement {
+                    cell: cell.name.clone(),
+                });
+            }
+        }
+
+        let graph = UnifiedGraph::new(design, architecture.device());
+        let mut groups = Vec::new();
+        let mut packed = Vec::new();
+        for (index, requirement) in requirements_by_cell.values().copied().enumerate() {
+            let cell_name = &design.cells()[requirement.cell.0].name;
+            let Some(max_depth) = dp16kd_max_depth(requirement.physical_width) else {
+                return Err(PackingError::InvalidBlockRamPhysicalWidth {
+                    cell: cell_name.clone(),
+                    physical_width: requirement.physical_width,
+                });
+            };
+            if requirement.word_width == 0 || requirement.word_width > requirement.physical_width {
+                return Err(PackingError::InvalidBlockRamWordWidth {
+                    cell: cell_name.clone(),
+                    word_width: requirement.word_width,
+                    physical_width: requirement.physical_width,
+                });
+            }
+            if requirement.depth == 0 || requirement.depth > max_depth {
+                return Err(PackingError::InvalidBlockRamDepth {
+                    cell: cell_name.clone(),
+                    depth: requirement.depth,
+                    max_depth,
+                });
+            }
+
+            let assignments = graph
+                .placement_candidates(requirement.cell)?
+                .into_iter()
+                .filter(|bel| architecture.bel_metadata()[bel].bel_type == "DP16KD")
+                .map(|bel| vec![bel])
+                .collect::<Vec<_>>();
+            if assignments.is_empty() {
+                return Err(PackingError::MissingBlockRamBel {
+                    cell: cell_name.clone(),
+                });
+            }
+
+            let wid = u32::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(3))
+                .ok_or(PackingError::TooManyBlockRams)?;
+            groups.push((requirement.cell, assignments));
+            packed.push(PackedBlockRam {
+                cell: requirement.cell,
+                wid,
+                depth: requirement.depth,
+                word_width: requirement.word_width,
+                physical_width: requirement.physical_width,
+            });
+        }
+
+        for (cell, assignments) in groups {
+            self.constraints.add_group([cell], assignments);
+        }
+        self.block_rams = packed;
+        self.block_rams_packed = true;
+        Ok(())
+    }
+}
+
+fn dp16kd_max_depth(physical_width: u8) -> Option<u32> {
+    match physical_width {
+        1 => Some(16_384),
+        2 => Some(8_192),
+        4 => Some(4_096),
+        9 => Some(2_048),
+        18 => Some(1_024),
+        _ => None,
+    }
 }
 
 /// Packs LUT-driven FFs into matching ECP5 logic-cell BEL pairs.
@@ -508,6 +669,8 @@ pub fn pack_lut_ffs(
         constraints,
         lut_ff_pairs,
         general_routing_ffs,
+        block_rams: Vec::new(),
+        block_rams_packed: false,
         io_attributes: BTreeMap::new(),
         unsupported_lpf_commands: Vec::new(),
     })
@@ -571,6 +734,57 @@ pub enum PackingError {
         /// Register cell name.
         cell: String,
     },
+    /// A requirement referenced an unknown logical cell.
+    UnknownBlockRamCell(CellId),
+    /// A requirement referenced a cell that is not a memory.
+    CellIsNotBlockRam {
+        /// Logical cell name.
+        cell: String,
+    },
+    /// One logical memory had more than one requirement.
+    DuplicateBlockRamRequirement {
+        /// Logical cell name.
+        cell: String,
+    },
+    /// A logical memory had no structural requirement.
+    MissingBlockRamRequirement {
+        /// Logical cell name.
+        cell: String,
+    },
+    /// Physical port width is not supported by `DP16KD`.
+    InvalidBlockRamPhysicalWidth {
+        /// Logical cell name.
+        cell: String,
+        /// Requested physical port width.
+        physical_width: u8,
+    },
+    /// Logical word width is zero or exceeds the selected physical width.
+    InvalidBlockRamWordWidth {
+        /// Logical cell name.
+        cell: String,
+        /// Requested logical word width.
+        word_width: u8,
+        /// Selected physical port width.
+        physical_width: u8,
+    },
+    /// Logical depth is zero or exceeds `DP16KD` capacity at this width.
+    InvalidBlockRamDepth {
+        /// Logical cell name.
+        cell: String,
+        /// Requested logical depth.
+        depth: u32,
+        /// Maximum legal depth at the selected physical width.
+        max_depth: u32,
+    },
+    /// No compatible physical `DP16KD` BEL exists.
+    MissingBlockRamBel {
+        /// Logical cell name.
+        cell: String,
+    },
+    /// BRAM packing was requested twice for the same packing result.
+    BlockRamsAlreadyPacked,
+    /// Stable WID assignment exceeded its representable range.
+    TooManyBlockRams,
     /// Selected package is not present in the architecture snapshot.
     UnknownPackage(String),
     /// Package pin is not present in the selected package.
@@ -625,6 +839,46 @@ impl fmt::Display for PackingError {
                     "register `{cell}` has no compatible general-routing M pin"
                 )
             }
+            Self::UnknownBlockRamCell(cell) => {
+                write!(f, "unknown block RAM cell ID {}", cell.0)
+            }
+            Self::CellIsNotBlockRam { cell } => {
+                write!(f, "cell `{cell}` is not a block RAM")
+            }
+            Self::DuplicateBlockRamRequirement { cell } => {
+                write!(f, "block RAM `{cell}` has more than one requirement")
+            }
+            Self::MissingBlockRamRequirement { cell } => {
+                write!(f, "block RAM `{cell}` has no structural requirement")
+            }
+            Self::InvalidBlockRamPhysicalWidth {
+                cell,
+                physical_width,
+            } => write!(
+                f,
+                "block RAM `{cell}` has unsupported physical width {physical_width}"
+            ),
+            Self::InvalidBlockRamWordWidth {
+                cell,
+                word_width,
+                physical_width,
+            } => write!(
+                f,
+                "block RAM `{cell}` word width {word_width} is invalid for physical width {physical_width}"
+            ),
+            Self::InvalidBlockRamDepth {
+                cell,
+                depth,
+                max_depth,
+            } => write!(
+                f,
+                "block RAM `{cell}` depth {depth} exceeds the legal range 1..={max_depth}"
+            ),
+            Self::MissingBlockRamBel { cell } => {
+                write!(f, "block RAM `{cell}` has no compatible DP16KD BEL")
+            }
+            Self::BlockRamsAlreadyPacked => write!(f, "block RAMs were already packed"),
+            Self::TooManyBlockRams => write!(f, "too many block RAMs for stable WID assignment"),
             Self::UnknownPackage(package) => write!(f, "unknown ECP5 package `{package}`"),
             Self::UnknownPackagePin { package, pin } => {
                 write!(f, "package `{package}` has no pin `{pin}`")
@@ -654,6 +908,16 @@ impl Error for PackingError {
             Self::Model(error) => Some(error),
             Self::MissingFfDataPin { .. }
             | Self::MissingGeneralDataPin { .. }
+            | Self::UnknownBlockRamCell(_)
+            | Self::CellIsNotBlockRam { .. }
+            | Self::DuplicateBlockRamRequirement { .. }
+            | Self::MissingBlockRamRequirement { .. }
+            | Self::InvalidBlockRamPhysicalWidth { .. }
+            | Self::InvalidBlockRamWordWidth { .. }
+            | Self::InvalidBlockRamDepth { .. }
+            | Self::MissingBlockRamBel { .. }
+            | Self::BlockRamsAlreadyPacked
+            | Self::TooManyBlockRams
             | Self::UnknownPackage(_)
             | Self::UnknownPackagePin { .. }
             | Self::UnknownIoCell(_)
@@ -1027,15 +1291,19 @@ impl From<ModelError> for ImportError {
 
 #[cfg(test)]
 mod tests {
-    use struo_ir::Netlist;
+    use struo_ir::{
+        ActiveLevel as StruoActiveLevel, ClockEdge as StruoClockEdge, EnableControl, MemoryCell,
+        Netlist,
+    };
     use struo_target_ecp5::map_to_ecp5;
     use texo_model::{CellId, Design, PinDirection, ResourceKind, UnifiedGraph};
     use texo_pnr::place_with_constraints;
-    use texo_struo::import_ecp5;
+    use texo_struo::{PrimitiveMetadata, import_ecp5};
 
     use super::{
-        LogicalPort, PackagePinBinding, PipMetadata, pack_lut_ffs, parse_lpf, read_architecture,
-        resolve_lpf_port_cells, resolve_lpf_ports,
+        BlockRamRequirement, LogicalPort, PackagePinBinding, PackedBlockRam, PackingError,
+        PipMetadata, pack_lut_ffs, parse_lpf, read_architecture, resolve_lpf_port_cells,
+        resolve_lpf_ports,
     };
 
     const FIXTURE: &str = include_str!("../fixtures/minimal-ecp5.json");
@@ -1045,8 +1313,8 @@ mod tests {
         let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
 
         assert_eq!(architecture.device().name(), "LFE5UM5G-85F-test");
-        assert_eq!(architecture.device().bels().len(), 5);
-        assert_eq!(architecture.device().wires().len(), 27);
+        assert_eq!(architecture.device().bels().len(), 7);
+        assert_eq!(architecture.device().wires().len(), 39);
         assert_eq!(architecture.device().pips().len(), 1);
         assert_eq!(architecture.packages()[0].pins.len(), 1);
         assert_eq!(
@@ -1268,6 +1536,187 @@ mod tests {
         assert_eq!(packing.io_attributes()[&input]["PULLMODE"], "UP");
     }
 
+    #[test]
+    fn packs_dp16kd_memories_in_stable_cell_order() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let first = add_block_ram(&mut design, "first");
+        let second = add_block_ram(&mut design, "second");
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+
+        packing
+            .pack_block_rams(
+                &design,
+                &architecture,
+                [
+                    BlockRamRequirement {
+                        cell: second,
+                        depth: 1_024,
+                        word_width: 18,
+                        physical_width: 18,
+                    },
+                    BlockRamRequirement {
+                        cell: first,
+                        depth: 8_192,
+                        word_width: 2,
+                        physical_width: 2,
+                    },
+                ],
+            )
+            .unwrap();
+        let placement =
+            place_with_constraints(&design, architecture.device(), packing.constraints()).unwrap();
+
+        assert_eq!(
+            packing.block_rams(),
+            [
+                PackedBlockRam {
+                    cell: first,
+                    wid: 3,
+                    depth: 8_192,
+                    word_width: 2,
+                    physical_width: 2,
+                },
+                PackedBlockRam {
+                    cell: second,
+                    wid: 4,
+                    depth: 1_024,
+                    word_width: 18,
+                    physical_width: 18,
+                },
+            ]
+        );
+        for memory in [first, second] {
+            let bel = placement.bel(memory).unwrap();
+            assert_eq!(architecture.bel_metadata()[&bel].bel_type, "DP16KD");
+        }
+    }
+
+    #[test]
+    fn rejects_illegal_dp16kd_shape_without_mutating_constraints() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let memory = add_block_ram(&mut design, "words");
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+
+        assert_eq!(
+            packing.pack_block_rams(
+                &design,
+                &architecture,
+                [BlockRamRequirement {
+                    cell: memory,
+                    depth: 2_049,
+                    word_width: 9,
+                    physical_width: 9,
+                }]
+            ),
+            Err(PackingError::InvalidBlockRamDepth {
+                cell: "words".into(),
+                depth: 2_049,
+                max_depth: 2_048,
+            })
+        );
+        assert!(packing.constraints().groups().is_empty());
+        assert!(packing.block_rams().is_empty());
+
+        packing
+            .pack_block_rams(
+                &design,
+                &architecture,
+                [BlockRamRequirement {
+                    cell: memory,
+                    depth: 2_048,
+                    word_width: 9,
+                    physical_width: 9,
+                }],
+            )
+            .unwrap();
+        assert_eq!(packing.constraints().groups().len(), 1);
+    }
+
+    #[test]
+    fn requires_structural_metadata_for_every_memory() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        add_block_ram(&mut design, "words");
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+
+        assert_eq!(
+            packing.pack_block_rams(&design, &architecture, []),
+            Err(PackingError::MissingBlockRamRequirement {
+                cell: "words".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn consumes_struo_block_ram_metadata_without_a_git_dependency() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut source = Netlist::new("memory");
+        let clock = source.add_input("clock");
+        let write_enable = source.add_input("write_enable");
+        let read_address = (0..2)
+            .map(|index| source.add_input(format!("read_address_{index}")))
+            .collect();
+        let write_address = (0..2)
+            .map(|index| source.add_input(format!("write_address_{index}")))
+            .collect();
+        let write_data = (0..2)
+            .map(|index| source.add_input(format!("write_data_{index}")))
+            .collect();
+        let read_data: Vec<_> = (0..2)
+            .map(|index| source.add_memory_output(format!("read_data_{index}")))
+            .collect();
+        source.add_memory(MemoryCell::new(
+            "words",
+            4,
+            read_address,
+            read_data.clone(),
+            None,
+            write_address,
+            write_data,
+            EnableControl {
+                signal: write_enable,
+                active: StruoActiveLevel::High,
+            },
+            clock,
+            StruoClockEdge::Rising,
+        ));
+        for (index, output) in read_data.into_iter().enumerate() {
+            source.add_output(format!("read_data_{index}"), output);
+        }
+        let imported = import_ecp5(&map_to_ecp5(&source).unwrap()).unwrap();
+        let requirements = imported
+            .metadata()
+            .iter()
+            .filter_map(|(&cell, metadata)| match metadata {
+                PrimitiveMetadata::BlockRam {
+                    depth,
+                    word_width,
+                    physical_width,
+                    ..
+                } => Some(BlockRamRequirement {
+                    cell,
+                    depth: *depth,
+                    word_width: *word_width,
+                    physical_width: *physical_width,
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut packing = pack_lut_ffs(imported.design(), &architecture).unwrap();
+
+        packing
+            .pack_block_rams(imported.design(), &architecture, requirements)
+            .unwrap();
+
+        assert_eq!(packing.block_rams().len(), 1);
+        assert_eq!(packing.block_rams()[0].depth, 4);
+        assert_eq!(packing.block_rams()[0].word_width, 2);
+        assert_eq!(packing.block_rams()[0].physical_width, 2);
+        assert_eq!(packing.constraints().groups().len(), 1);
+    }
+
     fn add_ff(design: &mut Design, name: &str) -> CellId {
         let ff = design.add_cell(name, ResourceKind::Register);
         for pin in ["DI", "CLK", "LSR", "CE"] {
@@ -1275,5 +1724,11 @@ mod tests {
         }
         design.add_pin(ff, "Q", PinDirection::Output).unwrap();
         ff
+    }
+
+    fn add_block_ram(design: &mut Design, name: &str) -> CellId {
+        let memory = design.add_cell(name, ResourceKind::Memory);
+        design.add_pin(memory, "CLKA", PinDirection::Input).unwrap();
+        memory
     }
 }

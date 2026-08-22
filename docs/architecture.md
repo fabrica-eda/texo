@@ -90,6 +90,12 @@ netlist. For ECP5, a LUT-driven FF is grouped with `TRELLIS_COMB(z)` and
 `TRELLIS_FF(z+1)` and keeps the dedicated `DI` path. An unpaired FF maps its
 logical `DI` terminal to the general-routing `M` pin. Package constraints use
 the same mechanism as a one-cell group with one PIO BEL assignment.
+Each logical memory must also supply its Struo-derived depth, logical word
+width, and physical port width. The ECP5 packer accepts only DP16KD modes
+`1/2/4/9/18`, checks the corresponding `16384/8192/4096/2048/1024` depth
+limits, constrains the cell to compatible `DP16KD` BELs, and assigns stable
+WID values from 3 in CellId order. Missing metadata and illegal geometries are
+reported before any packing constraint is mutated.
 `texo-flow::implement_with_constraints` carries these packing decisions through
 placement and routing before recording physical-implementation evidence.
 

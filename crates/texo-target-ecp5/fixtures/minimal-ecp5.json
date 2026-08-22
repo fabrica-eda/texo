@@ -27,7 +27,18 @@
         { "name": "CLK0_SLICE" },
         { "name": "LSR0_SLICE" },
         { "name": "CE0_SLICE" },
-        { "name": "Q0_SLICE" }
+        { "name": "Q0_SLICE" },
+        { "name": "CLKA_EBR" },
+        { "name": "ADA1_EBR" },
+        { "name": "ADA2_EBR" },
+        { "name": "DIA0_EBR" },
+        { "name": "DIA1_EBR" },
+        { "name": "WEA_EBR" },
+        { "name": "ADB1_EBR" },
+        { "name": "ADB2_EBR" },
+        { "name": "CLKB_EBR" },
+        { "name": "DOB0_EBR" },
+        { "name": "DOB1_EBR" }
       ],
       "bels": [
         {
@@ -64,6 +75,24 @@
             { "name": "CE", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 13 } },
             { "name": "Q", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 14 } }
           ]
+        },
+        {
+          "name": "EBR0",
+          "bel_type": "DP16KD",
+          "z": 16,
+          "pins": [
+            { "name": "CLKA", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 15 } },
+            { "name": "ADA1", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 16 } },
+            { "name": "ADA2", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 17 } },
+            { "name": "DIA0", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 18 } },
+            { "name": "DIA1", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 19 } },
+            { "name": "WEA", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 20 } },
+            { "name": "ADB1", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 21 } },
+            { "name": "ADB2", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 22 } },
+            { "name": "CLKB", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 23 } },
+            { "name": "DOB0", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 24 } },
+            { "name": "DOB1", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 25 } }
+          ]
         }
       ],
       "pips": [
@@ -90,7 +119,8 @@
         { "name": "CLK0_SLICE" },
         { "name": "LSR0_SLICE" },
         { "name": "CE0_SLICE" },
-        { "name": "Q0_SLICE" }
+        { "name": "Q0_SLICE" },
+        { "name": "CLKA_EBR" }
       ],
       "bels": [
         {
@@ -116,6 +146,14 @@
             { "name": "LSR", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 9 } },
             { "name": "CE", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 10 } },
             { "name": "Q", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 11 } }
+          ]
+        },
+        {
+          "name": "EBR0",
+          "bel_type": "DP16KD",
+          "z": 16,
+          "pins": [
+            { "name": "CLKA", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 12 } }
           ]
         }
       ],

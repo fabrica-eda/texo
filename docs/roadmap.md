@@ -48,7 +48,9 @@ same mapped design still passes Celox simulation.
   locally built `pytrellis` and `prjtrellis-db` checkout.
 - [ ] Model clock networks and timing arcs beyond the routing-graph delay
   metadata already preserved by the importer.
-- [ ] Pack BRAMs and global clocks with explicit legality errors.
+- [x] Validate DP16KD width/depth modes, constrain each BRAM to compatible
+  BELs, and assign stable WID configuration values with explicit errors.
+- [ ] Pack global clocks with explicit legality errors.
 - [x] Fold LUT constants into INIT, absorb FF/BRAM constants into input-mux
   metadata, and synthesize shared constant LUTs only for residual nets.
 
@@ -59,7 +61,8 @@ device/package and a checker can reconstruct all occupancy.
 
 - Add timing/congestion cost models and incremental bounding-box updates.
 - Implement simulated annealing first; evaluate analytical placement later.
-- Add dedicated clock/IO/BRAM placement constraints.
+- Add dedicated clock placement constraints; extend the existing fixed IO and
+  DP16KD groups as new target rules require.
 - Emit deterministic checkpoints and machine-readable quality metrics.
 
 Exit criterion: the blinky and AXI4 fixture place legally, repeatably, and with
