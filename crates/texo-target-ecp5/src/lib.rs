@@ -258,25 +258,39 @@ pub struct ArchitectureFile {
 }
 
 /// ECP5-specific properties attached to a generic BEL.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BelMetadata {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BelMetadata<'a> {
     /// Project Trellis BEL type.
-    pub bel_type: String,
+    pub bel_type: &'a str,
     /// Z-order within its grid location.
     pub z: i32,
 }
 
 /// ECP5-specific properties attached to a generic PIP.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PipMetadata {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PipMetadata<'a> {
     /// Whether the arc is always connected.
     pub fixed: bool,
     /// Project Trellis tile type.
-    pub tile_type: String,
+    pub tile_type: &'a str,
     /// Interconnect timing class resolved through a speed-grade table.
-    pub timing_class: String,
+    pub timing_class: &'a str,
     /// LUT permutation flags.
     pub lutperm_flags: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompactBelMetadata {
+    bel_type: u32,
+    z: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompactPipMetadata {
+    tile_type: u32,
+    timing_class: u32,
+    lutperm_flags: u16,
+    fixed: bool,
 }
 
 /// Resolved package pin table.
@@ -293,8 +307,9 @@ pub struct Package {
 pub struct Ecp5Architecture {
     provenance: Provenance,
     device: Device,
-    bel_metadata: BTreeMap<BelId, BelMetadata>,
-    pip_metadata: BTreeMap<PipId, PipMetadata>,
+    metadata_strings: Vec<String>,
+    bel_metadata: Vec<CompactBelMetadata>,
+    pip_metadata: Vec<CompactPipMetadata>,
     packages: Vec<Package>,
     speed_grades: BTreeMap<String, SpeedGradeRecord>,
 }
@@ -312,16 +327,50 @@ impl Ecp5Architecture {
         &self.device
     }
 
-    /// Target metadata for each BEL.
+    /// Target metadata for a BEL.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bel` does not belong to this architecture.
     #[must_use]
-    pub const fn bel_metadata(&self) -> &BTreeMap<BelId, BelMetadata> {
-        &self.bel_metadata
+    pub fn bel_metadata(&self, bel: BelId) -> BelMetadata<'_> {
+        let metadata = &self.bel_metadata[bel.0];
+        BelMetadata {
+            bel_type: self.metadata_string(metadata.bel_type),
+            z: metadata.z,
+        }
     }
 
-    /// Target metadata for each routing arc.
+    /// Target metadata for a routing arc.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pip` does not belong to this architecture.
     #[must_use]
-    pub const fn pip_metadata(&self) -> &BTreeMap<PipId, PipMetadata> {
-        &self.pip_metadata
+    pub fn pip_metadata(&self, pip: PipId) -> PipMetadata<'_> {
+        let metadata = &self.pip_metadata[pip.0];
+        PipMetadata {
+            fixed: metadata.fixed,
+            tile_type: self.metadata_string(metadata.tile_type),
+            timing_class: self.metadata_string(metadata.timing_class),
+            lutperm_flags: metadata.lutperm_flags,
+        }
+    }
+
+    /// BEL metadata in stable BEL ID order.
+    pub fn bel_metadata_iter(&self) -> impl Iterator<Item = (BelId, BelMetadata<'_>)> + '_ {
+        (0..self.bel_metadata.len()).map(|index| {
+            let bel = BelId(index);
+            (bel, self.bel_metadata(bel))
+        })
+    }
+
+    /// PIP metadata in stable PIP ID order.
+    pub fn pip_metadata_iter(&self) -> impl Iterator<Item = (PipId, PipMetadata<'_>)> + '_ {
+        (0..self.pip_metadata.len()).map(|index| {
+            let pip = PipId(index);
+            (pip, self.pip_metadata(pip))
+        })
     }
 
     /// Resolved package pin tables.
@@ -334,6 +383,10 @@ impl Ecp5Architecture {
     #[must_use]
     pub const fn speed_grades(&self) -> &BTreeMap<String, SpeedGradeRecord> {
         &self.speed_grades
+    }
+
+    fn metadata_string(&self, id: u32) -> &str {
+        &self.metadata_strings[id as usize]
     }
 }
 
@@ -486,13 +539,13 @@ impl Ecp5Packing {
             let second_bels = graph.placement_candidates(pair[1])?;
             let mut assignments = Vec::new();
             for first in first_bels {
-                let first_metadata = &architecture.bel_metadata()[&first];
+                let first_metadata = architecture.bel_metadata(first);
                 if first_metadata.bel_type != "TRELLIS_COMB" || first_metadata.z.rem_euclid(8) != 0
                 {
                     continue;
                 }
                 for &second in &second_bels {
-                    let second_metadata = &architecture.bel_metadata()[&second];
+                    let second_metadata = architecture.bel_metadata(second);
                     if second_metadata.bel_type == "TRELLIS_COMB"
                         && architecture.device().bels()[first.0].point
                             == architecture.device().bels()[second.0].point
@@ -763,7 +816,7 @@ impl Ecp5Packing {
             let assignments = graph
                 .placement_candidates(requirement.cell)?
                 .into_iter()
-                .filter(|bel| architecture.bel_metadata()[bel].bel_type == "DP16KD")
+                .filter(|bel| architecture.bel_metadata(*bel).bel_type == "DP16KD")
                 .map(|bel| vec![bel])
                 .collect::<Vec<_>>();
             if assignments.is_empty() {
@@ -877,7 +930,7 @@ impl Ecp5Packing {
             let assignments = UnifiedGraph::new(&transformed, architecture.device())
                 .placement_candidates(inserted.cell)?
                 .into_iter()
-                .filter(|bel| architecture.bel_metadata()[bel].bel_type == "DCCA")
+                .filter(|bel| architecture.bel_metadata(*bel).bel_type == "DCCA")
                 .map(|bel| vec![bel])
                 .collect::<Vec<_>>();
             if assignments.is_empty() {
@@ -945,9 +998,8 @@ fn is_clock_sink(design: &Design, pin: CellPinId) -> bool {
 
 fn compatible_dcca_bels(architecture: &Ecp5Architecture) -> Vec<BelId> {
     architecture
-        .bel_metadata()
-        .iter()
-        .filter_map(|(&bel, metadata)| {
+        .bel_metadata_iter()
+        .filter_map(|(bel, metadata)| {
             let input = find_bel_pin(architecture.device(), bel, "CLKI")
                 .map(|pin| architecture.device().bel_pins()[pin.0].direction);
             let output = find_bel_pin(architecture.device(), bel, "CLKO")
@@ -1033,7 +1085,7 @@ pub fn pack_lut_ffs(
         }
         let mut bound = false;
         for bel in graph.placement_candidates(ff)? {
-            if architecture.bel_metadata()[&bel].bel_type != "TRELLIS_FF" {
+            if architecture.bel_metadata(bel).bel_type != "TRELLIS_FF" {
                 continue;
             }
             if let Some(m_pin) = find_bel_pin(architecture.device(), bel, "M") {
@@ -1089,12 +1141,12 @@ fn lut_ff_assignments(
     let ff_bels = graph.placement_candidates(ff)?;
     let mut assignments = Vec::new();
     for lut_bel in lut_bels {
-        let lut_metadata = &architecture.bel_metadata()[&lut_bel];
+        let lut_metadata = architecture.bel_metadata(lut_bel);
         if lut_metadata.bel_type != "TRELLIS_COMB" {
             continue;
         }
         for &ff_bel in &ff_bels {
-            let ff_metadata = &architecture.bel_metadata()[&ff_bel];
+            let ff_metadata = architecture.bel_metadata(ff_bel);
             if ff_metadata.bel_type == "TRELLIS_FF"
                 && architecture.device().bels()[lut_bel.0].point
                     == architecture.device().bels()[ff_bel.0].point
@@ -1436,8 +1488,9 @@ pub fn expand(file: ArchitectureFile) -> Result<Ecp5Architecture, ImportError> {
     let mut device = Device::new(&file.device, file.width, file.height)?;
     let mut wires = BTreeMap::new();
     let mut bels = BTreeMap::new();
-    let mut bel_metadata = BTreeMap::new();
-    let mut pip_metadata = BTreeMap::new();
+    let mut metadata_strings = StringInterner::default();
+    let mut bel_metadata = Vec::new();
+    let mut pip_metadata = Vec::new();
     let locations = indexed_locations(&file)?;
 
     for location in &file.locations {
@@ -1467,13 +1520,11 @@ pub fn expand(file: ArchitectureFile) -> Result<Ecp5Architecture, ImportError> {
                 Point::new(location.x, location.y),
             )?;
             bels.insert((location.x, location.y, index), id);
-            bel_metadata.insert(
-                id,
-                BelMetadata {
-                    bel_type: bel.bel_type.clone(),
-                    z: bel.z,
-                },
-            );
+            debug_assert_eq!(id.0, bel_metadata.len());
+            bel_metadata.push(CompactBelMetadata {
+                bel_type: metadata_strings.intern(&bel.bel_type)?,
+                z: bel.z,
+            });
             for pin in &bel.pins {
                 let wire = resolve_wire(location, pin.wire, &locations, &file, &wires)?;
                 device.add_bel_pin(id, &pin.name, pin.direction.into(), wire)?;
@@ -1487,15 +1538,13 @@ pub fn expand(file: ArchitectureFile) -> Result<Ecp5Architecture, ImportError> {
             let from = resolve_wire(location, pip.from, &locations, &file, &wires)?;
             let to = resolve_wire(location, pip.to, &locations, &file, &wires)?;
             let id = device.add_pip(from, to, false, 1)?;
-            pip_metadata.insert(
-                id,
-                PipMetadata {
-                    fixed: pip.fixed,
-                    tile_type: pip.tile_type.clone(),
-                    timing_class: pip.timing_class.clone(),
-                    lutperm_flags: pip.lutperm_flags,
-                },
-            );
+            debug_assert_eq!(id.0, pip_metadata.len());
+            pip_metadata.push(CompactPipMetadata {
+                fixed: pip.fixed,
+                tile_type: metadata_strings.intern(&pip.tile_type)?,
+                timing_class: metadata_strings.intern(&pip.timing_class)?,
+                lutperm_flags: pip.lutperm_flags,
+            });
         }
     }
 
@@ -1508,11 +1557,36 @@ pub fn expand(file: ArchitectureFile) -> Result<Ecp5Architecture, ImportError> {
     Ok(Ecp5Architecture {
         provenance: file.provenance,
         device,
+        metadata_strings: metadata_strings.into_values(),
         bel_metadata,
         pip_metadata,
         packages,
         speed_grades,
     })
+}
+
+#[derive(Default)]
+struct StringInterner {
+    ids: BTreeMap<String, u32>,
+    values: Vec<String>,
+}
+
+impl StringInterner {
+    fn intern(&mut self, value: &str) -> Result<u32, ImportError> {
+        if let Some(&id) = self.ids.get(value) {
+            return Ok(id);
+        }
+        let id =
+            u32::try_from(self.values.len()).map_err(|_| ImportError::TooManyMetadataStrings)?;
+        let value = value.to_owned();
+        self.values.push(value.clone());
+        self.ids.insert(value, id);
+        Ok(id)
+    }
+
+    fn into_values(self) -> Vec<String> {
+        self.values
+    }
 }
 
 fn validate_header(file: &ArchitectureFile) -> Result<(), ImportError> {
@@ -1719,6 +1793,8 @@ pub enum ImportError {
     MissingProvenance,
     /// Fine-grained BEL mode is mandatory for Texo.
     SplitSliceRequired,
+    /// Architecture metadata contained more strings than a compact ID can address.
+    TooManyMetadataStrings,
     /// Architecture snapshot did not contain any speed-grade timing table.
     MissingSpeedGrades,
     /// A speed-grade name was empty or repeated.
@@ -1814,6 +1890,12 @@ impl fmt::Display for ImportError {
             Self::WrongFamily(family) => write!(f, "expected ECP5 family, found `{family}`"),
             Self::MissingProvenance => write!(f, "architecture provenance is incomplete"),
             Self::SplitSliceRequired => write!(f, "split-slice Project Trellis data is required"),
+            Self::TooManyMetadataStrings => {
+                write!(
+                    f,
+                    "architecture contains too many distinct metadata strings"
+                )
+            }
             Self::MissingSpeedGrades => {
                 write!(f, "architecture contains no speed-grade timing tables")
             }
@@ -1907,7 +1989,7 @@ mod tests {
     use struo_target_ecp5::{
         ArithmeticMapping, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
     };
-    use texo_model::{CellId, Design, PinDirection, ResourceKind, UnifiedGraph};
+    use texo_model::{CellId, Design, PinDirection, PipId, ResourceKind, UnifiedGraph};
     use texo_pnr::{place_and_route_with_constraints, place_with_constraints};
     use texo_struo::{PrimitiveMetadata, import_ecp5};
 
@@ -1930,13 +2012,13 @@ mod tests {
         assert_eq!(architecture.device().pips().len(), 14);
         assert_eq!(architecture.packages()[0].pins.len(), 3);
         assert_eq!(
-            architecture.pip_metadata().values().next(),
-            Some(&PipMetadata {
+            architecture.pip_metadata(PipId(0)),
+            PipMetadata {
                 fixed: false,
-                tile_type: "PLC2".into(),
-                timing_class: "default".into(),
+                tile_type: "PLC2",
+                timing_class: "default",
                 lutperm_flags: 0,
-            })
+            }
         );
         assert!(architecture.speed_grades().contains_key("6"));
     }
@@ -2034,8 +2116,8 @@ mod tests {
             architecture.device().bels()[ff_bel.0].point
         );
         assert_eq!(
-            architecture.bel_metadata()[&lut_bel].z + 1,
-            architecture.bel_metadata()[&ff_bel].z
+            architecture.bel_metadata(lut_bel).z + 1,
+            architecture.bel_metadata(ff_bel).z
         );
     }
 
@@ -2085,8 +2167,8 @@ mod tests {
                 architecture.device().bels()[second.0].point
             );
             assert_eq!(
-                architecture.bel_metadata()[first].z + 4,
-                architecture.bel_metadata()[second].z
+                architecture.bel_metadata(*first).z + 4,
+                architecture.bel_metadata(*second).z
             );
         }
     }
@@ -2266,7 +2348,7 @@ mod tests {
         );
         for memory in [first, second] {
             let bel = placement.bel(memory).unwrap();
-            assert_eq!(architecture.bel_metadata()[&bel].bel_type, "DP16KD");
+            assert_eq!(architecture.bel_metadata(bel).bel_type, "DP16KD");
         }
     }
 
@@ -2436,7 +2518,9 @@ mod tests {
         assert_eq!(design.pins()[clock.0].net(), Some(promoted.global_net));
         assert_eq!(design.nets()[source_net.0].sinks.len(), 1);
         assert_eq!(
-            architecture.bel_metadata()[&result.placement.bel(promoted.buffer).unwrap()].bel_type,
+            architecture
+                .bel_metadata(result.placement.bel(promoted.buffer).unwrap())
+                .bel_type,
             "DCCA"
         );
         assert_eq!(result.routes.len(), 2);

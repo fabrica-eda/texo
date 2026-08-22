@@ -127,9 +127,8 @@ fn target_info(path: &str) -> Result<(), Box<dyn Error>> {
     let architecture = read_architecture(File::open(path)?)?;
     let device = architecture.device();
     let fixed_pips = architecture
-        .pip_metadata()
-        .values()
-        .filter(|pip| pip.fixed)
+        .pip_metadata_iter()
+        .filter(|(_, pip)| pip.fixed)
         .count();
 
     println!("device: {}", device.name());

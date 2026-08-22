@@ -346,13 +346,13 @@ fn ecp5_pip_delays(
     selected
         .into_iter()
         .map(|pip_id| {
-            let metadata = &architecture.pip_metadata()[&pip_id];
+            let metadata = architecture.pip_metadata(pip_id);
             let class = speed_grade
                 .pip_classes
-                .get(&metadata.timing_class)
+                .get(metadata.timing_class)
                 .ok_or_else(|| Ecp5FlowError::MissingPipTimingClass {
                     speed_grade: speed_grade.name.clone(),
-                    timing_class: metadata.timing_class.clone(),
+                    timing_class: metadata.timing_class.to_owned(),
                 })?;
             let fanout = source_fanout[&device.pips()[pip_id.0].from];
             let min_ps = class
