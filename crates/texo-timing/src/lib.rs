@@ -66,6 +66,16 @@ impl DelayRange {
         }
     }
 
+    /// Creates early and late values fitted independently at two timing corners.
+    ///
+    /// Unlike [`Self::new`], this preserves the characterized values even when
+    /// model fitting makes the nominal minimum numerically greater than the
+    /// nominal maximum. Static timing propagates the two corners separately.
+    #[must_use]
+    pub const fn from_independent_corners(min_ps: u64, max_ps: u64) -> Self {
+        Self { min_ps, max_ps }
+    }
+
     /// Zero-delay range.
     #[must_use]
     pub const fn zero() -> Self {

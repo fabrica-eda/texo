@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "provenance": {
     "project_trellis_revision": "3afe7b52b30f4b4417ee98f03016767a502006e3",
     "database_revision": "015e0330630d7c238c0e4f2cdd9c8157eb78c54a",
@@ -369,16 +369,12 @@
       "name": "6",
       "pip_classes": {
         "default": {
-          "min_base_ps": 1,
-          "max_base_ps": 1,
-          "min_fanout_adder_ps": 0,
-          "max_fanout_adder_ps": 0
+          "base": { "min_ps": 1, "typ_ps": 1, "max_ps": 1 },
+          "fanout_adder": { "min_ps": 0, "typ_ps": 0, "max_ps": 0 }
         },
         "zero": {
-          "min_base_ps": 0,
-          "max_base_ps": 0,
-          "min_fanout_adder_ps": 0,
-          "max_fanout_adder_ps": 0
+          "base": { "min_ps": 0, "typ_ps": 0, "max_ps": 0 },
+          "fanout_adder": { "min_ps": 0, "typ_ps": 0, "max_ps": 0 }
         }
       },
       "cells": [

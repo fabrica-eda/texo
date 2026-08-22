@@ -161,9 +161,13 @@ references. Import occurs in three passes—wires, BELs/pins, then PIPs—so eve
 relative reference is validated before it reaches the solver. Package records
 must resolve to an IO BEL. ECP5-only data such as BEL type/Z, fixed-arc status,
 tile type, PIP timing class, and LUT permutation flags remains in side metadata
-keyed by the same stable IDs. Schema v2 also contains timing tables for speed
+keyed by the same stable IDs. Schema v3 also contains timing tables for speed
 grades `6`, `7`, `8`, and `8_5G`: interconnect base/fanout coefficients plus
-split `TRELLIS_COMB`, `TRELLIS_FF`, and DCCA cell arcs.
+split `TRELLIS_COMB`, `TRELLIS_FF`, and DCCA cell arcs. Interconnect
+coefficients retain Project Trellis's independently fitted `min/typ/max`
+corners without sorting them. Those fitted values are not necessarily
+monotonic; setup propagation selects `max`, while hold propagation selects
+`min`, matching the ECP5 timing database semantics used by nextpnr.
 
 Generate a snapshot from local, revision-controlled Project Trellis source and
 database checkouts:

@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DIRECTIONS = {0: "input", 1: "output", 2: "inout"}
 SPEED_GRADES = ["6", "7", "8", "8_5G"]
 
@@ -44,6 +44,10 @@ def relative(reference):
         "dy": reference.rel.y,
         "index": reference.id,
     }
+
+
+def checksum_key(checksum):
+    return (checksum.first, checksum.second)
 
 
 def find_bel_index(graph, location, name):
@@ -148,6 +152,14 @@ def merge_range(current, incoming):
     return {
         "min_ps": min(current["min_ps"], incoming["min_ps"]),
         "max_ps": max(current["max_ps"], incoming["max_ps"]),
+    }
+
+
+def timing_corners(samples, scale=1.0):
+    return {
+        "min_ps": int(samples[0] * scale),
+        "typ_ps": int(samples[1] * scale),
+        "max_ps": int(samples[2] * scale),
     }
 
 
@@ -274,22 +286,18 @@ def export_speed_grades(database):
         database_classes = interconnect_by_grade[grade]
         for name in sorted(known_classes):
             if name == "zero":
-                values = (0, 0, 0, 0)
+                base = timing_corners([0, 0, 0])
+                fanout_adder = timing_corners([0, 0, 0])
             elif name == "default" or name not in database_classes:
-                values = (50, 50, 0, 0)
+                base = timing_corners([50, 50, 50])
+                fanout_adder = timing_corners([0, 0, 0])
             else:
                 timing = database_classes[name]
-                values = (
-                    math.floor(timing["delay"][0] * 1.1),
-                    math.ceil(timing["delay"][2] * 1.1),
-                    math.floor(timing["fanout"][0]),
-                    math.ceil(timing["fanout"][2]),
-                )
+                base = timing_corners(timing["delay"], scale=1.1)
+                fanout_adder = timing_corners(timing["fanout"])
             classes[name] = {
-                "min_base_ps": values[0],
-                "max_base_ps": values[1],
-                "min_fanout_adder_ps": values[2],
-                "max_fanout_adder_ps": values[3],
+                "base": base,
+                "fanout_adder": fanout_adder,
             }
         speed_grades.append(
             {
@@ -325,18 +333,21 @@ def main():
     )
 
     speed_grades, known_classes = export_speed_grades(args.database.resolve())
-    location_type_keys = [entry.key() for entry in graph.locationTypes]
     representatives = {}
+    location_type_checksums = {}
     for y in range(chip.get_max_row() + 1):
         for x in range(chip.get_max_col() + 1):
             location = pytrellis.Location(x, y)
-            key = graph.typeAtLocation[location]
+            checksum = graph.typeAtLocation[location]
+            key = checksum_key(checksum)
             representatives.setdefault(key, location)
+            location_type_checksums.setdefault(key, checksum)
+    location_type_keys = list(representatives)
     location_types = [
         export_location_type(
             pytrellis,
             graph,
-            graph.locationTypes[key],
+            graph.locationTypes[location_type_checksums[key]],
             representatives[key],
             pip_classes,
             known_classes,
@@ -346,7 +357,7 @@ def main():
     locations = []
     for y in range(chip.get_max_row() + 1):
         for x in range(chip.get_max_col() + 1):
-            key = graph.typeAtLocation[pytrellis.Location(x, y)]
+            key = checksum_key(graph.typeAtLocation[pytrellis.Location(x, y)])
             locations.append(
                 {"x": x, "y": y, "location_type": location_type_keys.index(key)}
             )

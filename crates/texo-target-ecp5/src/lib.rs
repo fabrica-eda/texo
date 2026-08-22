@@ -24,7 +24,7 @@ use texo_model::{
 use texo_pnr::PlacementConstraints;
 
 /// Current on-disk architecture schema version.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Provenance required for every generated architecture snapshot.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -208,17 +208,27 @@ pub struct CellTimingRecord {
     pub setup_holds: Vec<SetupHoldTimingRecord>,
 }
 
+/// Independently characterized Project Trellis timing corners.
+///
+/// Project Trellis solves these corners independently, so their numeric values
+/// are not required to be monotonic.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TimingCornersRecord {
+    /// Value fitted from the minimum-delay SDF corner.
+    pub min_ps: u64,
+    /// Value fitted from the typical-delay SDF corner.
+    pub typ_ps: u64,
+    /// Value fitted from the maximum-delay SDF corner.
+    pub max_ps: u64,
+}
+
 /// Delay coefficients for one interconnect timing class.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PipClassTimingRecord {
-    /// Minimum fixed delay component.
-    pub min_base_ps: u64,
-    /// Maximum fixed delay component.
-    pub max_base_ps: u64,
-    /// Minimum delay added per enabled PIP leaving the same source wire.
-    pub min_fanout_adder_ps: u64,
-    /// Maximum delay added per enabled PIP leaving the same source wire.
-    pub max_fanout_adder_ps: u64,
+    /// Fixed delay component at each characterized corner.
+    pub base: TimingCornersRecord,
+    /// Delay added per enabled PIP leaving the same source wire.
+    pub fanout_adder: TimingCornersRecord,
 }
 
 /// Cell and interconnect timing for one ECP5 speed grade.
@@ -1641,16 +1651,6 @@ fn validate_timing(file: &ArchitectureFile) -> Result<(), ImportError> {
                 });
             }
         }
-        for (name, timing) in &grade.pip_classes {
-            if timing.min_base_ps > timing.max_base_ps
-                || timing.min_fanout_adder_ps > timing.max_fanout_adder_ps
-            {
-                return Err(ImportError::InvalidTimingRange {
-                    speed_grade: grade.name.clone(),
-                    subject: format!("PIP class {name}"),
-                });
-            }
-        }
         let mut cell_types = BTreeSet::new();
         for cell in &grade.cells {
             if cell.cell_type.is_empty() || !cell_types.insert(cell.cell_type.as_str()) {
@@ -2032,6 +2032,22 @@ mod tests {
             expand(file),
             Err(ImportError::MissingPipTimingClass { .. })
         ));
+    }
+
+    #[test]
+    fn preserves_independently_fitted_non_monotonic_pip_corners() {
+        let mut file: ArchitectureFile = serde_json::from_str(FIXTURE).unwrap();
+        let timing = file.speed_grades[0].pip_classes.get_mut("default").unwrap();
+        timing.base.min_ps = 59;
+        timing.base.typ_ps = 54;
+        timing.base.max_ps = 48;
+
+        let architecture = expand(file).unwrap();
+        let timing = &architecture.speed_grades()["6"].pip_classes["default"];
+        assert_eq!(
+            (timing.base.min_ps, timing.base.typ_ps, timing.base.max_ps),
+            (59, 54, 48)
+        );
     }
 
     #[test]

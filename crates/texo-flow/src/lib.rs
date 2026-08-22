@@ -9,7 +9,7 @@ use texo_pnr::{PlacementConstraints, PnrError, PnrResult, place_and_route_with_c
 use texo_struo::{ImportedEcp5Design, PrimitiveMetadata};
 use texo_target_ecp5::{
     BlockRamRequirement, DEFAULT_GLOBAL_CLOCK_FANOUT, DelayRangeRecord, Ecp5Architecture,
-    Ecp5Packing, LpfConstraints, LpfError, PackingError, SpeedGradeRecord,
+    Ecp5Packing, LpfConstraints, LpfError, PackingError, PipClassTimingRecord, SpeedGradeRecord,
     find_global_clock_requirements, pack_lut_ffs, resolve_lpf_port_cells,
 };
 use texo_timing::{
@@ -355,19 +355,25 @@ fn ecp5_pip_delays(
                     timing_class: metadata.timing_class.to_owned(),
                 })?;
             let fanout = source_fanout[&device.pips()[pip_id.0].from];
-            let min_ps = class
-                .min_fanout_adder_ps
-                .checked_mul(fanout)
-                .and_then(|delay| class.min_base_ps.checked_add(delay))
-                .ok_or(Ecp5FlowError::TimingDelayOverflow)?;
-            let max_ps = class
-                .max_fanout_adder_ps
-                .checked_mul(fanout)
-                .and_then(|delay| class.max_base_ps.checked_add(delay))
-                .ok_or(Ecp5FlowError::TimingDelayOverflow)?;
-            Ok((pip_id, DelayRange::new(min_ps, max_ps)?))
+            Ok((pip_id, pip_class_delay(class, fanout)?))
         })
         .collect()
+}
+
+fn pip_class_delay(class: &PipClassTimingRecord, fanout: u64) -> Result<DelayRange, Ecp5FlowError> {
+    let min_ps = class
+        .fanout_adder
+        .min_ps
+        .checked_mul(fanout)
+        .and_then(|delay| class.base.min_ps.checked_add(delay))
+        .ok_or(Ecp5FlowError::TimingDelayOverflow)?;
+    let max_ps = class
+        .fanout_adder
+        .max_ps
+        .checked_mul(fanout)
+        .and_then(|delay| class.base.max_ps.checked_add(delay))
+        .ok_or(Ecp5FlowError::TimingDelayOverflow)?;
+    Ok(DelayRange::from_independent_corners(min_ps, max_ps))
 }
 
 fn ecp5_timing_model(
@@ -661,17 +667,36 @@ mod tests {
     use texo_pnr::PlacementConstraints;
     use texo_struo::import_ecp5;
     use texo_target_ecp5::{
-        find_global_clock_requirements, pack_lut_ffs, parse_lpf, read_architecture,
-        resolve_lpf_port_cells,
+        PipClassTimingRecord, TimingCornersRecord, find_global_clock_requirements, pack_lut_ffs,
+        parse_lpf, read_architecture, resolve_lpf_port_cells,
     };
 
     use super::{
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, ecp5_timing_constraints, ecp5_timing_model,
         find_cell_pin, implement, implement_struo_ecp5, implement_with_constraints,
-        verify_post_map_with_celox,
+        pip_class_delay, verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
+
+    #[test]
+    fn preserves_non_monotonic_pip_corners_for_sta() {
+        let class = PipClassTimingRecord {
+            base: TimingCornersRecord {
+                min_ps: 59,
+                typ_ps: 54,
+                max_ps: 48,
+            },
+            fanout_adder: TimingCornersRecord {
+                min_ps: 7,
+                typ_ps: 5,
+                max_ps: 3,
+            },
+        };
+
+        let delay = pip_class_delay(&class, 2).unwrap();
+        assert_eq!((delay.min_ps, delay.max_ps), (73, 54));
+    }
 
     #[test]
     fn implementation_records_only_its_own_gate() {

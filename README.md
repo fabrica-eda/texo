@@ -58,8 +58,9 @@ cargo fmt --all -- --check
 ```
 
 `tools/export_ecp5.py` generates a deduplicated architecture snapshot from a
-local Project Trellis build and database. Schema v2 includes PIP timing classes
-and the `6/7/8/8_5G` speed-grade cell/interconnect tables. Production device
+local Project Trellis build and database. Schema v3 includes PIP timing classes
+with their independently fitted `min/typ/max` corners and the `6/7/8/8_5G`
+speed-grade cell/interconnect tables. Production device
 snapshots are generated artifacts; the repository keeps a small schema fixture
 for fast, deterministic tests.
 
