@@ -25,7 +25,7 @@ Usage:
   texo ecp5-demo <architecture> <package> <constraints.lpf> [checkpoint.json]
                                     run a verified Struo/Celox ECP5 XOR flow
   texo target-info <architecture>   inspect an ECP5 architecture snapshot
-  texo lpf-info <constraints.lpf>   inspect ECP5 pin and IOBUF constraints
+  texo lpf-info <constraints.lpf>   inspect ECP5 pin, IO, and clock constraints
   texo help                         show this help
 ";
 
@@ -99,6 +99,10 @@ fn lpf_info(path: &str) -> Result<(), Box<dyn Error>> {
             .collect::<Vec<_>>()
             .join(" ");
         println!("  {port}: {settings}");
+    }
+    println!("clock ports: {}", constraints.frequencies_hz().len());
+    for (port, frequency_hz) in constraints.frequencies_hz() {
+        println!("  {port}: {frequency_hz} Hz");
     }
     println!(
         "unsupported commands: {}",
@@ -204,6 +208,18 @@ fn ecp5_demo(
         result.implementation.routes.len(),
         result.implementation.total_pips
     );
+    match result.timing.worst_slack_ps {
+        Some(slack_ps) => println!(
+            "timing: {} setup checks, worst slack {slack_ps} ps ({})",
+            result.timing.setup_checks.len(),
+            if result.timing.met_timing() {
+                "passed"
+            } else {
+                "failed"
+            }
+        ),
+        None => println!("timing: no constrained sequential endpoints"),
+    }
     for (cell_id, &bel_id) in result
         .implementation
         .placement
@@ -261,6 +277,7 @@ fn ecp5_checkpoint(
         "packing": checkpoint_packing(result),
         "placement": checkpoint_placement(result, architecture),
         "routes": checkpoint_routes(result, architecture),
+        "timing": checkpoint_timing(result),
     })
 }
 
@@ -381,13 +398,66 @@ fn checkpoint_packing(result: &Ecp5FlowResult) -> Value {
             })
         })
         .collect::<Vec<_>>();
+    let clock_frequencies_hz = result
+        .packing
+        .clock_frequencies_hz()
+        .iter()
+        .map(|(cell, frequency_hz)| {
+            json!({
+                "cell_id": cell.0,
+                "cell": result.design.cells()[cell.0].name,
+                "frequency_hz": frequency_hz,
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
         "lut_ff_pairs": lut_ff_pairs,
         "general_routing_ffs": result.packing.general_routing_ffs().iter().map(|cell| cell.0).collect::<Vec<_>>(),
         "block_rams": block_rams,
         "global_clocks": global_clocks,
         "io_attributes": io_attributes,
+        "clock_frequencies_hz": clock_frequencies_hz,
         "unsupported_lpf_commands": result.packing.unsupported_lpf_commands(),
+    })
+}
+
+fn checkpoint_timing(result: &Ecp5FlowResult) -> Value {
+    let net_delays = result
+        .timing
+        .net_delays
+        .iter()
+        .map(|delay| {
+            json!({
+                "net_id": delay.net.0,
+                "net": result.design.nets()[delay.net.0].name,
+                "sink_pin_id": delay.sink.0,
+                "delay_ps": delay.delay_ps,
+            })
+        })
+        .collect::<Vec<_>>();
+    let setup_checks = result
+        .timing
+        .setup_checks
+        .iter()
+        .map(|check| {
+            json!({
+                "cell_id": check.cell.0,
+                "cell": result.design.cells()[check.cell.0].name,
+                "data_pin_id": check.data_pin.0,
+                "clock_net_id": check.clock_net.0,
+                "arrival_ps": check.arrival_ps,
+                "clock_arrival_ps": check.clock_arrival_ps,
+                "required_ps": check.required_ps,
+                "slack_ps": check.slack_ps,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "delay_model": "project_trellis_pip_ps_zero_cell_delay",
+        "net_delays": net_delays,
+        "setup_checks": setup_checks,
+        "worst_slack_ps": result.timing.worst_slack_ps,
+        "met_timing": result.timing.met_timing(),
     })
 }
 
@@ -560,6 +630,14 @@ mod tests {
         assert_eq!(checkpoint["metrics"]["routed_nets"], 3);
         assert_eq!(checkpoint["placement"].as_array().unwrap().len(), 4);
         assert_eq!(checkpoint["routes"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            checkpoint["timing"]["setup_checks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(checkpoint["timing"]["met_timing"], false);
         assert!(
             checkpoint["evidence"]
                 .as_array()

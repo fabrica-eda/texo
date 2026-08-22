@@ -4,13 +4,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use texo_model::{CellId, Design, Device};
+use texo_model::{CellId, Design, Device, NetId, PinDirection, PipId};
 use texo_pnr::{PlacementConstraints, PnrError, PnrResult, place_and_route_with_constraints};
 use texo_struo::{ImportedEcp5Design, PrimitiveMetadata};
 use texo_target_ecp5::{
     BlockRamRequirement, DEFAULT_GLOBAL_CLOCK_FANOUT, Ecp5Architecture, Ecp5Packing,
     LpfConstraints, LpfError, PackingError, find_global_clock_requirements, pack_lut_ffs,
     resolve_lpf_port_cells,
+};
+use texo_timing::{
+    PICOSECONDS_PER_SECOND, TimingConstraints, TimingError, TimingReport, analyze_timing,
 };
 
 /// Evidence required before a programmable artifact may be released.
@@ -166,6 +169,8 @@ pub struct Ecp5FlowResult {
     pub packing: Ecp5Packing,
     /// Legal placement and routed logical nets.
     pub implementation: PnrResult,
+    /// Post-route PIP-delay timing analysis.
+    pub timing: TimingReport,
 }
 
 /// Runs the complete physical flow for one directly imported Struo design.
@@ -237,6 +242,29 @@ pub fn implement_struo_ecp5(
         packing.constraints(),
         &mut staged_evidence,
     )?;
+    let pip_delays_ps = architecture
+        .pip_metadata()
+        .iter()
+        .map(|(&pip, metadata)| {
+            u64::try_from(metadata.delay)
+                .map(|delay| (pip, delay))
+                .map_err(|_| Ecp5FlowError::NegativePipDelay {
+                    pip,
+                    delay: metadata.delay,
+                })
+        })
+        .collect::<Result<BTreeMap<PipId, u64>, _>>()?;
+    let timing_constraints = ecp5_timing_constraints(&design, &packing)?;
+    let timing = analyze_timing(
+        &design,
+        architecture.device(),
+        &implementation,
+        &pip_delays_ps,
+        &timing_constraints,
+    )?;
+    if timing.met_timing() {
+        staged_evidence.record(Gate::TimingClosure);
+    }
     *evidence = staged_evidence;
 
     Ok(Ecp5FlowResult {
@@ -245,7 +273,62 @@ pub fn implement_struo_ecp5(
         absorbed_inputs: imported.absorbed_inputs().clone(),
         packing,
         implementation,
+        timing,
     })
+}
+
+fn ecp5_timing_constraints(
+    design: &Design,
+    packing: &Ecp5Packing,
+) -> Result<TimingConstraints, Ecp5FlowError> {
+    let mut constraints = TimingConstraints::new();
+    for (&cell_id, &frequency_hz) in packing.clock_frequencies_hz() {
+        let cell = &design.cells()[cell_id.0];
+        let driven_nets = cell
+            .pins()
+            .iter()
+            .filter_map(|&pin_id| {
+                let pin = &design.pins()[pin_id.0];
+                (pin.direction != PinDirection::Input)
+                    .then(|| pin.net())
+                    .flatten()
+            })
+            .collect::<BTreeSet<_>>();
+        if driven_nets.len() != 1 {
+            return Err(Ecp5FlowError::ClockIoNet {
+                cell: cell.name.clone(),
+            });
+        }
+        let period_ps = PICOSECONDS_PER_SECOND
+            .checked_div(frequency_hz)
+            .filter(|period| *period != 0)
+            .ok_or_else(|| Ecp5FlowError::ClockFrequencyOutOfRange {
+                cell: cell.name.clone(),
+                frequency_hz,
+            })?;
+        let source_net = *driven_nets.first().expect("set length was checked");
+        insert_clock_period(&mut constraints, source_net, period_ps)?;
+    }
+    for clock in packing.global_clocks() {
+        if let Some(&period_ps) = constraints.clock_periods_ps().get(&clock.source_net) {
+            insert_clock_period(&mut constraints, clock.global_net, period_ps)?;
+        }
+    }
+    Ok(constraints)
+}
+
+fn insert_clock_period(
+    constraints: &mut TimingConstraints,
+    net: NetId,
+    period_ps: u64,
+) -> Result<(), Ecp5FlowError> {
+    if let Some(&previous) = constraints.clock_periods_ps().get(&net)
+        && previous != period_ps
+    {
+        return Err(Ecp5FlowError::ConflictingClockPeriods { net });
+    }
+    constraints.set_clock_period_ps(net, period_ps);
+    Ok(())
 }
 
 /// Complete ECP5 flow orchestration failed.
@@ -261,6 +344,32 @@ pub enum Ecp5FlowError {
     Packing(PackingError),
     /// Placement or routing failed.
     Pnr(PnrError),
+    /// Project Trellis supplied a negative PIP delay.
+    NegativePipDelay {
+        /// Physical PIP.
+        pip: PipId,
+        /// Invalid delay value.
+        delay: i32,
+    },
+    /// A frequency-constrained IO cell does not drive exactly one net.
+    ClockIoNet {
+        /// Logical IO cell name.
+        cell: String,
+    },
+    /// A clock is too fast to represent with a non-zero picosecond period.
+    ClockFrequencyOutOfRange {
+        /// Logical IO cell name.
+        cell: String,
+        /// Requested frequency.
+        frequency_hz: u64,
+    },
+    /// More than one source assigned different periods to one logical net.
+    ConflictingClockPeriods {
+        /// Logical clock net.
+        net: NetId,
+    },
+    /// Static timing analysis failed.
+    Timing(TimingError),
 }
 
 impl fmt::Display for Ecp5FlowError {
@@ -275,6 +384,21 @@ impl fmt::Display for Ecp5FlowError {
             Self::Lpf(error) => write!(f, "LPF resolution failed: {error}"),
             Self::Packing(error) => write!(f, "ECP5 packing failed: {error}"),
             Self::Pnr(error) => write!(f, "ECP5 physical implementation failed: {error}"),
+            Self::NegativePipDelay { pip, delay } => {
+                write!(f, "ECP5 PIP {} has negative delay {delay}", pip.0)
+            }
+            Self::ClockIoNet { cell } => write!(
+                f,
+                "frequency-constrained IO cell `{cell}` must drive exactly one net"
+            ),
+            Self::ClockFrequencyOutOfRange { cell, frequency_hz } => write!(
+                f,
+                "clock IO cell `{cell}` frequency {frequency_hz} Hz is outside picosecond resolution"
+            ),
+            Self::ConflictingClockPeriods { net } => {
+                write!(f, "clock net {} has conflicting periods", net.0)
+            }
+            Self::Timing(error) => write!(f, "ECP5 static timing analysis failed: {error}"),
         }
     }
 }
@@ -285,7 +409,13 @@ impl Error for Ecp5FlowError {
             Self::Lpf(error) => Some(error),
             Self::Packing(error) => Some(error),
             Self::Pnr(error) => Some(error),
-            Self::MissingPostMapSimulation | Self::MissingPackageForLpf => None,
+            Self::Timing(error) => Some(error),
+            Self::MissingPostMapSimulation
+            | Self::MissingPackageForLpf
+            | Self::NegativePipDelay { .. }
+            | Self::ClockIoNet { .. }
+            | Self::ClockFrequencyOutOfRange { .. }
+            | Self::ConflictingClockPeriods { .. } => None,
         }
     }
 }
@@ -305,6 +435,12 @@ impl From<PackingError> for Ecp5FlowError {
 impl From<PnrError> for Ecp5FlowError {
     fn from(value: PnrError) -> Self {
         Self::Pnr(value)
+    }
+}
+
+impl From<TimingError> for Ecp5FlowError {
+    fn from(value: TimingError) -> Self {
+        Self::Timing(value)
     }
 }
 
@@ -333,16 +469,19 @@ impl Error for MissingEvidence {}
 #[cfg(test)]
 mod tests {
     use struo_celox::ecp5_simulator;
-    use struo_ir::Netlist;
+    use struo_ir::{ClockEdge, Netlist, RegisterCell};
     use struo_target_ecp5::{Ecp5Netlist, map_to_ecp5};
     use texo_model::{BelId, Design, Device, PinDirection, ResourceKind};
     use texo_pnr::PlacementConstraints;
     use texo_struo::import_ecp5;
-    use texo_target_ecp5::{parse_lpf, read_architecture};
+    use texo_target_ecp5::{
+        find_global_clock_requirements, pack_lut_ffs, parse_lpf, read_architecture,
+        resolve_lpf_port_cells,
+    };
 
     use super::{
-        Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, implement, implement_struo_ecp5,
-        implement_with_constraints, verify_post_map_with_celox,
+        Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, ecp5_timing_constraints, implement,
+        implement_struo_ecp5, implement_with_constraints, verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -457,6 +596,58 @@ mod tests {
             Err(Ecp5FlowError::MissingPostMapSimulation)
         ));
         assert_eq!(evidence, Evidence::new());
+    }
+
+    #[test]
+    fn propagates_an_lpf_clock_period_through_a_global_buffer() {
+        let mut source = Netlist::new("registered");
+        let data = source.add_input("data");
+        let clock = source.add_input("clock");
+        let state = source.add_register_output("state");
+        source.add_register(RegisterCell::new(
+            "state",
+            state,
+            data,
+            clock,
+            ClockEdge::Rising,
+            None,
+            None,
+        ));
+        let mapped = map_to_ecp5(&source).unwrap();
+        let imported = import_ecp5(&mapped).unwrap();
+        let architecture = read_architecture(ECP5_FIXTURE.as_bytes()).unwrap();
+        let lpf = parse_lpf(
+            br"
+                FREQUENCY PORT clock 25 MHZ;
+            "
+            .as_slice(),
+        )
+        .unwrap();
+        let mut design = imported.design().clone();
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+        let global_clocks = find_global_clock_requirements(&design, 1);
+        packing
+            .promote_global_clocks(&mut design, &architecture, global_clocks)
+            .unwrap();
+        let resolved = resolve_lpf_port_cells(
+            &lpf,
+            imported
+                .ports()
+                .iter()
+                .map(|port| (port.name.as_str(), port.bits.as_slice())),
+            true,
+        )
+        .unwrap();
+        packing
+            .apply_resolved_lpf(&design, &architecture, "CABGA381", &resolved)
+            .unwrap();
+
+        let constraints = ecp5_timing_constraints(&design, &packing).unwrap();
+        let global_net = packing.global_clocks()[0].global_net;
+
+        assert_eq!(packing.clock_frequencies_hz().len(), 1);
+        assert_eq!(constraints.clock_periods_ps().len(), 2);
+        assert_eq!(constraints.clock_periods_ps()[&global_net], 40_000);
     }
 
     #[test]

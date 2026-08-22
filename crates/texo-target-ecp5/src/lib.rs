@@ -336,6 +336,7 @@ pub struct Ecp5Packing {
     global_clocks: Vec<PackedGlobalClock>,
     global_clocks_packed: bool,
     io_attributes: BTreeMap<CellId, BTreeMap<String, String>>,
+    clock_frequencies_hz: BTreeMap<CellId, u64>,
     unsupported_lpf_commands: Vec<String>,
 }
 
@@ -385,13 +386,20 @@ impl Ecp5Packing {
         &self.io_attributes
     }
 
+    /// LPF clock frequencies resolved to logical IO cells.
+    #[must_use]
+    pub const fn clock_frequencies_hz(&self) -> &BTreeMap<CellId, u64> {
+        &self.clock_frequencies_hz
+    }
+
     /// LPF commands retained because this packing stage does not implement them.
     #[must_use]
     pub fn unsupported_lpf_commands(&self) -> &[String] {
         &self.unsupported_lpf_commands
     }
 
-    /// Applies resolved LPF locations and IO attributes atomically.
+    /// Applies resolved LPF locations, IO attributes, and clock frequencies
+    /// atomically.
     ///
     /// # Errors
     ///
@@ -428,6 +436,25 @@ impl Ecp5Packing {
             }
         }
 
+        let mut clock_frequencies_hz = self.clock_frequencies_hz.clone();
+        for (&cell_id, &frequency_hz) in &resolved.clock_frequencies_hz {
+            let Some(cell) = design.cells().get(cell_id.0) else {
+                return Err(PackingError::UnknownIoCell(cell_id));
+            };
+            if cell.kind != ResourceKind::Io {
+                return Err(PackingError::CellIsNotIo {
+                    cell: cell.name.clone(),
+                });
+            }
+            if let Some(previous) = clock_frequencies_hz.insert(cell_id, frequency_hz)
+                && previous != frequency_hz
+            {
+                return Err(PackingError::ConflictingClockFrequency {
+                    cell: cell.name.clone(),
+                });
+            }
+        }
+
         self.bind_package_pins(
             design,
             architecture,
@@ -435,6 +462,7 @@ impl Ecp5Packing {
             resolved.package_pins.clone(),
         )?;
         self.io_attributes = io_attributes;
+        self.clock_frequencies_hz = clock_frequencies_hz;
         self.unsupported_lpf_commands
             .extend(resolved.unsupported_commands.iter().cloned());
         Ok(())
@@ -871,6 +899,7 @@ pub fn pack_lut_ffs(
         global_clocks: Vec::new(),
         global_clocks_packed: false,
         io_attributes: BTreeMap::new(),
+        clock_frequencies_hz: BTreeMap::new(),
         unsupported_lpf_commands: Vec::new(),
     })
 }
@@ -1042,6 +1071,11 @@ pub enum PackingError {
         /// Attribute key.
         key: String,
     },
+    /// A later LPF application changed an existing clock frequency.
+    ConflictingClockFrequency {
+        /// Logical IO cell name.
+        cell: String,
+    },
 }
 
 impl fmt::Display for PackingError {
@@ -1132,6 +1166,9 @@ impl fmt::Display for PackingError {
             Self::ConflictingIoAttribute { cell, key } => {
                 write!(f, "IO cell `{cell}` has a conflicting `{key}` attribute")
             }
+            Self::ConflictingClockFrequency { cell } => {
+                write!(f, "IO cell `{cell}` has a conflicting clock frequency")
+            }
         }
     }
 }
@@ -1163,7 +1200,8 @@ impl Error for PackingError {
             | Self::DuplicateIoCell { .. }
             | Self::DuplicatePackagePin(_)
             | Self::IncompatiblePackagePin { .. }
-            | Self::ConflictingIoAttribute { .. } => None,
+            | Self::ConflictingIoAttribute { .. }
+            | Self::ConflictingClockFrequency { .. } => None,
         }
     }
 }
@@ -1746,6 +1784,7 @@ mod tests {
             br#"
                 LOCATE COMP "input" SITE "A10";
                 IOBUF PORT "input" IO_TYPE=LVCMOS33 PULLMODE=UP;
+                FREQUENCY PORT "input" 25 MHZ;
             "#
             .as_slice(),
         )
@@ -1773,6 +1812,7 @@ mod tests {
         );
         assert_eq!(packing.io_attributes()[&input]["IO_TYPE"], "LVCMOS33");
         assert_eq!(packing.io_attributes()[&input]["PULLMODE"], "UP");
+        assert_eq!(packing.clock_frequencies_hz()[&input], 25_000_000);
     }
 
     #[test]

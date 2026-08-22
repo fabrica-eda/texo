@@ -3213,6 +3213,7 @@ dependencies = [
  "texo-pnr",
  "texo-struo",
  "texo-target-ecp5",
+ "texo-timing",
 ]
 
 [[package]]
@@ -3248,6 +3249,14 @@ dependencies = [
  "texo-model",
  "texo-pnr",
  "texo-struo",
+]
+
+[[package]]
+name = "texo-timing"
+version = "0.1.0"
+dependencies = [
+ "texo-model",
+ "texo-pnr",
 ]
 
 [[package]]

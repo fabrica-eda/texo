@@ -191,6 +191,11 @@ intended release gates are:
 
 Celox is a functional simulator, not a gate-level timing simulator. Static
 timing and post-route delay validation therefore remain Texo responsibilities.
+The initial `texo-timing` pass sums Project Trellis delays along the selected
+PIP tree, propagates longest combinational arrivals, and checks register setup
+slack against LPF clock periods. Cell-internal, clock-to-Q, setup, and hold
+values remain zero until speed-grade timing tables are imported; a report with
+no constrained sequential endpoint does not satisfy the timing-closure gate.
 
 ## Reproducibility
 

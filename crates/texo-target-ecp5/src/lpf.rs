@@ -14,6 +14,7 @@ use crate::PackagePinBinding;
 pub struct LpfConstraints {
     locations: BTreeMap<String, String>,
     io_attributes: BTreeMap<String, BTreeMap<String, String>>,
+    frequencies_hz: BTreeMap<String, u64>,
     unsupported_commands: Vec<String>,
 }
 
@@ -28,6 +29,12 @@ impl LpfConstraints {
     #[must_use]
     pub const fn io_attributes(&self) -> &BTreeMap<String, BTreeMap<String, String>> {
         &self.io_attributes
+    }
+
+    /// Top-level clock port frequencies, normalized to hertz.
+    #[must_use]
+    pub const fn frequencies_hz(&self) -> &BTreeMap<String, u64> {
+        &self.frequencies_hz
     }
 
     /// Unsupported commands retained for diagnostics instead of silently lost.
@@ -53,11 +60,14 @@ pub struct ResolvedLpf {
     pub package_pins: Vec<PackagePinBinding>,
     /// IO attributes indexed by logical IO cell.
     pub io_attributes: BTreeMap<CellId, BTreeMap<String, String>>,
+    /// Clock frequencies indexed by the logical IO cell driving the clock.
+    pub clock_frequencies_hz: BTreeMap<CellId, u64>,
     /// Unsupported commands copied from the parsed file for diagnostics.
     pub unsupported_commands: Vec<String>,
 }
 
-/// Parses nextpnr-compatible `LOCATE COMP` and `IOBUF PORT` LPF commands.
+/// Parses nextpnr-compatible `LOCATE COMP`, `IOBUF PORT`, and
+/// `FREQUENCY PORT` LPF commands.
 ///
 /// `#` and `//` comments, quoted identifiers, multiple commands per line, and
 /// commands spanning lines are supported. Other LPF verbs are retained in
@@ -83,6 +93,7 @@ pub fn parse_lpf(mut reader: impl Read) -> Result<LpfConstraints, LpfError> {
         match words[0].as_str() {
             "LOCATE" => parse_locate(&mut parsed, &words, line)?,
             "IOBUF" => parse_iobuf(&mut parsed, &words, line)?,
+            "FREQUENCY" => parse_frequency(&mut parsed, &words, line)?,
             _ => parsed.unsupported_commands.push(command),
         }
     }
@@ -150,9 +161,23 @@ pub fn resolve_lpf_ports(
         }
     }
 
+    let mut clock_frequencies_hz = BTreeMap::new();
+    for (name, &frequency_hz) in &constraints.frequencies_hz {
+        let cell = aliases
+            .get(name)
+            .copied()
+            .ok_or_else(|| LpfError::UnknownPort(name.clone()))?;
+        if let Some(previous) = clock_frequencies_hz.insert(cell, frequency_hz)
+            && previous != frequency_hz
+        {
+            return Err(LpfError::ConflictingFrequency { cell });
+        }
+    }
+
     Ok(ResolvedLpf {
         package_pins,
         io_attributes,
+        clock_frequencies_hz,
         unsupported_commands: constraints.unsupported_commands.clone(),
     })
 }
@@ -237,6 +262,66 @@ fn parse_iobuf(parsed: &mut LpfConstraints, words: &[String], line: usize) -> Re
         }
     }
     Ok(())
+}
+
+fn parse_frequency(
+    parsed: &mut LpfConstraints,
+    words: &[String],
+    line: usize,
+) -> Result<(), LpfError> {
+    if words.len() != 5 || words[1] != "PORT" {
+        return Err(LpfError::MalformedCommand {
+            line,
+            expected: "FREQUENCY PORT <port> <value> <HZ|KHZ|MHZ|GHZ>",
+        });
+    }
+    let frequency_hz =
+        frequency_hz(&words[3], &words[4]).ok_or_else(|| LpfError::InvalidFrequency {
+            line,
+            value: words[3].clone(),
+            unit: words[4].clone(),
+        })?;
+    if parsed
+        .frequencies_hz
+        .insert(words[2].clone(), frequency_hz)
+        .is_some()
+    {
+        return Err(LpfError::DuplicateFrequency {
+            line,
+            port: words[2].clone(),
+        });
+    }
+    Ok(())
+}
+
+fn frequency_hz(value: &str, unit: &str) -> Option<u64> {
+    let multiplier = match unit.to_ascii_uppercase().as_str() {
+        "HZ" => 1_u128,
+        "KHZ" => 1_000,
+        "MHZ" => 1_000_000,
+        "GHZ" => 1_000_000_000,
+        _ => return None,
+    };
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let denominator = 10_u128.checked_pow(u32::try_from(fraction.len()).ok()?)?;
+    let whole = whole.parse::<u128>().ok()?;
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u128>().ok()?
+    };
+    let numerator = whole.checked_mul(denominator)?.checked_add(fraction)?;
+    let scaled = numerator.checked_mul(multiplier)?;
+    if scaled == 0 || scaled % denominator != 0 {
+        return None;
+    }
+    u64::try_from(scaled / denominator).ok()
 }
 
 fn port_aliases(
@@ -400,6 +485,22 @@ pub enum LpfError {
         /// Attribute key.
         key: String,
     },
+    /// One port had more than one `FREQUENCY` command.
+    DuplicateFrequency {
+        /// First line of the duplicate command.
+        line: usize,
+        /// Port name.
+        port: String,
+    },
+    /// A frequency value, unit, or normalized hertz value was invalid.
+    InvalidFrequency {
+        /// First line of the command.
+        line: usize,
+        /// Numeric token.
+        value: String,
+        /// Unit token.
+        unit: String,
+    },
     /// An LPF command references no known top-level port bit.
     UnknownPort(String),
     /// One logical port has no bits.
@@ -418,6 +519,11 @@ pub enum LpfError {
         cell: CellId,
         /// Attribute key.
         key: String,
+    },
+    /// Scalar and singleton aliases assigned different frequencies.
+    ConflictingFrequency {
+        /// Logical IO cell.
+        cell: CellId,
     },
 }
 
@@ -450,6 +556,13 @@ impl fmt::Display for LpfError {
                 f,
                 "LPF port `{port}` has a conflicting `{key}` attribute on line {line}"
             ),
+            Self::DuplicateFrequency { line, port } => write!(
+                f,
+                "LPF port `{port}` has a duplicate frequency on line {line}"
+            ),
+            Self::InvalidFrequency { line, value, unit } => {
+                write!(f, "invalid LPF frequency `{value} {unit}` on line {line}")
+            }
             Self::UnknownPort(port) => write!(f, "LPF references unknown port `{port}`"),
             Self::EmptyLogicalPort(port) => write!(f, "logical port `{port}` has no bits"),
             Self::DuplicateLogicalPort(port) => write!(f, "duplicate logical port `{port}`"),
@@ -473,6 +586,11 @@ impl fmt::Display for LpfError {
             Self::ConflictingIoAttribute { cell, key } => write!(
                 f,
                 "logical IO cell {} has conflicting `{key}` attributes",
+                cell.0
+            ),
+            Self::ConflictingFrequency { cell } => write!(
+                f,
+                "logical IO cell {} has conflicting clock frequencies",
                 cell.0
             ),
         }
@@ -504,7 +622,8 @@ mod tests {
         assert_eq!(parsed.locations()["led[0]"], "A10");
         assert_eq!(parsed.io_attributes()["led[0]"]["IO_TYPE"], "LVCMOS33");
         assert_eq!(parsed.io_attributes()["led[0]"]["DRIVE"], "8");
-        assert_eq!(parsed.unsupported_commands().len(), 1);
+        assert_eq!(parsed.frequencies_hz()["clk"], 25_000_000);
+        assert!(parsed.unsupported_commands().is_empty());
     }
 
     #[test]
@@ -568,5 +687,16 @@ mod tests {
         let error = parse_lpf(b"\nLOCATE COMP \"clk SITE A10;".as_slice()).unwrap_err();
 
         assert_eq!(error, LpfError::UnterminatedQuote { line: 2 });
+    }
+
+    #[test]
+    fn parses_exact_decimal_frequencies_and_rejects_fractional_hertz() {
+        let parsed = parse_lpf(b"FREQUENCY PORT clk 12.5 MHZ;".as_slice()).unwrap();
+        assert_eq!(parsed.frequencies_hz()["clk"], 12_500_000);
+
+        assert!(matches!(
+            parse_lpf(b"FREQUENCY PORT clk 0.1 HZ;".as_slice()),
+            Err(LpfError::InvalidFrequency { .. })
+        ));
     }
 }

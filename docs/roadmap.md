@@ -44,6 +44,8 @@ same mapped design still passes Celox simulation.
 - [x] Convert resolved package-pin bindings into fixed PIO placement groups.
 - [x] Parse LPF `LOCATE COMP` and `IOBUF PORT` constraints, resolve scalar and
   vector Struo port cells, and retain unsupported commands for diagnostics.
+- [x] Parse LPF `FREQUENCY PORT`, normalize exact decimal units to Hz, and
+  resolve clock ports to logical IO cells.
 - [ ] Generate and characterize a complete production device snapshot using a
   locally built `pytrellis` and `prjtrellis-db` checkout.
 - [ ] Model clock networks and timing arcs beyond the routing-graph delay
@@ -85,8 +87,12 @@ the route can be imported into Project Trellis configuration tooling.
 
 ## M5 — timing and bitstream release
 
-- Build a timing graph from cells, wires, PIPs, clocks, and constraints.
-- Implement setup/hold analysis, multicycle/false paths, and timing reports.
+- [x] Build a post-route timing graph from logical pins, selected PIPs, register
+  boundaries, and LPF clock constraints.
+- [x] Import Project Trellis PIP delays as picoseconds and emit deterministic
+  per-sink delays, setup checks, and worst slack in the checkpoint.
+- [ ] Import speed-grade cell arcs, clock-to-Q, setup, and hold timing tables.
+- [ ] Implement hold analysis, multicycle/false paths, and generated clocks.
 - Generate the Project Trellis textual configuration; use `ecppack` initially.
 - Require all functional, physical, and timing gates before bitstream release.
 - Add hardware smoke tests and nextpnr differential tests.
