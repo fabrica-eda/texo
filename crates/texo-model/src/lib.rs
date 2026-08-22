@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Stable index of a cell in a [`Design`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CellId(pub usize);
@@ -22,23 +24,23 @@ pub struct CellPinId(pub usize);
 pub struct NetId(pub usize);
 
 /// Stable index of a basic element in a [`Device`].
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct BelId(pub usize);
 
 /// Stable index of a basic-element pin in a [`Device`].
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct BelPinId(pub usize);
 
 /// Stable index of a routing wire in a [`Device`].
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct WireId(pub usize);
 
 /// Stable index of a programmable interconnect point in a [`Device`].
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct PipId(pub usize);
 
 /// Integer coordinate in the physical device model.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Point {
     /// Horizontal coordinate.
     pub x: u32,
@@ -61,7 +63,7 @@ impl Point {
 }
 
 /// Coarse resource class shared by logical cells and compatible BELs.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum ResourceKind {
     /// General combinational or sequential logic.
     Logic,
@@ -80,7 +82,7 @@ pub enum ResourceKind {
 }
 
 /// Signal direction at a logical or physical pin.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum PinDirection {
     /// Signal enters the owning object.
     Input,
@@ -407,7 +409,7 @@ impl Design {
 }
 
 /// A placeable physical basic element.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Bel {
     /// Unique architecture-local name.
     pub name: String,
@@ -427,7 +429,7 @@ impl Bel {
 }
 
 /// Physical pin connecting a BEL to one routing wire.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BelPin {
     /// Pin name matched against a logical cell pin.
     pub name: String,
@@ -440,7 +442,7 @@ pub struct BelPin {
 }
 
 /// A routing resource with finite sharing capacity.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Wire {
     /// Unique architecture-local name.
     pub name: String,
@@ -451,7 +453,7 @@ pub struct Wire {
 }
 
 /// A directed or bidirectional programmable connection between two wires.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Pip {
     /// Source wire.
     pub from: WireId,
@@ -464,7 +466,7 @@ pub struct Pip {
 }
 
 /// Physical target database.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Device {
     name: String,
     width: u32,

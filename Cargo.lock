@@ -3052,7 +3052,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "struo-example-axi4-smartconnect"
+version = "0.1.0"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=8dad8c2e27f4dacd6283bb4015ad99208618c228#8dad8c2e27f4dacd6283bb4015ad99208618c228"
+dependencies = [
+ "struo-frontend-veryl",
+ "struo-rtl",
+]
+
+[[package]]
+name = "struo-frontend-veryl"
+version = "0.1.0"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=8dad8c2e27f4dacd6283bb4015ad99208618c228#8dad8c2e27f4dacd6283bb4015ad99208618c228"
+dependencies = [
+ "struo-rtl",
+ "veryl-analyzer",
+ "veryl-metadata",
+ "veryl-parser",
+]
+
+[[package]]
 name = "struo-ir"
+version = "0.1.0"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=8dad8c2e27f4dacd6283bb4015ad99208618c228#8dad8c2e27f4dacd6283bb4015ad99208618c228"
+
+[[package]]
+name = "struo-rtl"
 version = "0.1.0"
 source = "git+https://github.com/fabrica-eda/struo.git?rev=8dad8c2e27f4dacd6283bb4015ad99208618c228#8dad8c2e27f4dacd6283bb4015ad99208618c228"
 
@@ -3060,6 +3085,15 @@ source = "git+https://github.com/fabrica-eda/struo.git?rev=8dad8c2e27f4dacd6283b
 name = "struo-sim"
 version = "0.1.0"
 source = "git+https://github.com/fabrica-eda/struo.git?rev=8dad8c2e27f4dacd6283bb4015ad99208618c228#8dad8c2e27f4dacd6283bb4015ad99208618c228"
+
+[[package]]
+name = "struo-synth"
+version = "0.1.0"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=8dad8c2e27f4dacd6283bb4015ad99208618c228#8dad8c2e27f4dacd6283bb4015ad99208618c228"
+dependencies = [
+ "struo-ir",
+ "struo-rtl",
+]
 
 [[package]]
 name = "struo-target-ecp5"
@@ -3194,7 +3228,9 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "struo-celox",
+ "struo-example-axi4-smartconnect",
  "struo-ir",
+ "struo-synth",
  "struo-target-ecp5",
  "texo-flow",
  "texo-model",
@@ -3219,6 +3255,9 @@ dependencies = [
 [[package]]
 name = "texo-model"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "texo-pnr"
@@ -3242,6 +3281,7 @@ dependencies = [
 name = "texo-target-ecp5"
 version = "0.1.0"
 dependencies = [
+ "postcard",
  "serde",
  "serde_json",
  "struo-ir",

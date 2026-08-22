@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 texo-model.workspace = true

@@ -12,7 +12,9 @@ path = "src/main.rs"
 [dependencies]
 serde_json.workspace = true
 struo-celox.workspace = true
+struo-example-axi4-smartconnect.workspace = true
 struo-ir.workspace = true
+struo-synth.workspace = true
 struo-target-ecp5.workspace = true
 texo-flow.workspace = true
 texo-model.workspace = true

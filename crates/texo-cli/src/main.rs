@@ -3,11 +3,16 @@
 use std::env;
 use std::error::Error;
 use std::fs::File;
+use std::io::{BufReader, BufWriter};
+use std::path::Path;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use serde_json::{Value, json};
 use struo_celox::ecp5_simulator;
+use struo_example_axi4_smartconnect::axi4_crossbar_self_test;
 use struo_ir::Netlist;
+use struo_synth::synthesize;
 use struo_target_ecp5::map_to_ecp5;
 use texo_flow::{
     Ecp5FlowOptions, Ecp5FlowResult, Evidence, Gate, implement, implement_struo_ecp5,
@@ -15,7 +20,10 @@ use texo_flow::{
 };
 use texo_model::{Design, Device, PinDirection, ResourceKind};
 use texo_struo::{ActiveLevel, ClockEdge, PortDirection, PrimitiveMetadata, import_ecp5};
-use texo_target_ecp5::{Ecp5Architecture, parse_lpf, read_architecture};
+use texo_target_ecp5::{
+    Ecp5Architecture, parse_lpf, read_architecture, read_architecture_cache,
+    write_architecture_cache,
+};
 
 const USAGE: &str = "\
 Texo FPGA place and route
@@ -24,7 +32,11 @@ Usage:
   texo demo                         run the deterministic abstract-grid PnR demo
   texo ecp5-demo <architecture> <package> <speed-grade> <constraints.lpf> [checkpoint.json]
                                     run a verified Struo/Celox ECP5 XOR flow
+  texo axi4-pnr <architecture> <package> <speed-grade> <constraints.lpf> [checkpoint.json]
+                                    run the Struo AXI4 self-test through native Texo PnR
   texo target-info <architecture>   inspect an ECP5 architecture snapshot
+  texo cache-architecture <architecture.json> <architecture.txdb>
+                                    cache the expanded routing graph for fast reuse
   texo lpf-info <constraints.lpf>   inspect ECP5 pin, IO, and clock constraints
   texo help                         show this help
 ";
@@ -68,6 +80,31 @@ fn run() -> Result<(), Box<dyn Error>> {
                 checkpoint.as_deref(),
             )
         }
+        Some("axi4-pnr") => {
+            let architecture = args
+                .next()
+                .ok_or_else(|| format!("axi4-pnr requires an architecture path\n\n{USAGE}"))?;
+            let package = args
+                .next()
+                .ok_or_else(|| format!("axi4-pnr requires a package name\n\n{USAGE}"))?;
+            let speed_grade = args
+                .next()
+                .ok_or_else(|| format!("axi4-pnr requires a speed grade\n\n{USAGE}"))?;
+            let lpf = args
+                .next()
+                .ok_or_else(|| format!("axi4-pnr requires an LPF path\n\n{USAGE}"))?;
+            let checkpoint = args.next();
+            if args.next().is_some() {
+                return Err(format!("axi4-pnr accepts at most five arguments\n\n{USAGE}").into());
+            }
+            axi4_pnr(
+                &architecture,
+                &package,
+                &speed_grade,
+                &lpf,
+                checkpoint.as_deref(),
+            )
+        }
         Some("target-info") => {
             let path = args
                 .next()
@@ -76,6 +113,21 @@ fn run() -> Result<(), Box<dyn Error>> {
                 return Err(format!("target-info accepts one architecture path\n\n{USAGE}").into());
             }
             target_info(&path)
+        }
+        Some("cache-architecture") => {
+            let source = args.next().ok_or_else(|| {
+                format!("cache-architecture requires a JSON architecture path\n\n{USAGE}")
+            })?;
+            let destination = args.next().ok_or_else(|| {
+                format!("cache-architecture requires an output .txdb path\n\n{USAGE}")
+            })?;
+            if args.next().is_some() {
+                return Err(format!(
+                    "cache-architecture accepts a source and destination path\n\n{USAGE}"
+                )
+                .into());
+            }
+            cache_architecture(&source, &destination)
         }
         Some("lpf-info") => {
             let path = args
@@ -124,7 +176,7 @@ fn lpf_info(path: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn target_info(path: &str) -> Result<(), Box<dyn Error>> {
-    let architecture = read_architecture(File::open(path)?)?;
+    let architecture = load_architecture(path)?;
     let device = architecture.device();
     let fixed_pips = architecture
         .pip_metadata_iter()
@@ -178,7 +230,7 @@ fn ecp5_demo(
     source.add_output("value", value);
     let mapped = map_to_ecp5(&source)?;
     let imported = import_ecp5(&mapped)?;
-    let architecture = read_architecture(File::open(architecture_path)?)?;
+    let architecture = load_architecture(architecture_path)?;
     let lpf = parse_lpf(File::open(lpf_path)?)?;
     let mut evidence = Evidence::new();
 
@@ -260,7 +312,7 @@ fn ecp5_demo(
     }
 
     if let Some(path) = checkpoint_path {
-        let checkpoint = ecp5_checkpoint(&result, &architecture, package, &evidence);
+        let checkpoint = ecp5_checkpoint("xor", &result, &architecture, package, &evidence);
         let destination = File::create(path)?;
         serde_json::to_writer_pretty(destination, &checkpoint)?;
         println!("checkpoint: {path}");
@@ -270,7 +322,122 @@ fn ecp5_demo(
     Ok(())
 }
 
+fn axi4_pnr(
+    architecture_path: &str,
+    package: &str,
+    speed_grade: &str,
+    lpf_path: &str,
+    checkpoint_path: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let rtl = axi4_crossbar_self_test()?;
+    let synthesized = synthesize(&rtl)?;
+    let mapped = map_to_ecp5(&synthesized.netlist)?;
+    let imported = import_ecp5(&mapped)?;
+    println!(
+        "Struo AXI4 self-test: {} Boolean nodes, {} registers, {} mapped cells",
+        synthesized.netlist.nodes().len(),
+        synthesized.netlist.registers().len(),
+        mapped.cells().len()
+    );
+
+    let mut evidence = Evidence::new();
+    verify_post_map_with_celox(&mut evidence, || -> Result<(), Box<dyn Error>> {
+        let mut simulator = ecp5_simulator(&mapped)?.build_native()?;
+        let clock = simulator.event("clk");
+        let reset = simulator.signal("rst_n");
+        let passed = simulator.signal("passed");
+        let failed = simulator.signal("failed");
+        simulator.modify(|io| io.set(reset, 0_u8))?;
+        simulator.tick(clock)?;
+        simulator.modify(|io| io.set(reset, 1_u8))?;
+        for _ in 0..12 {
+            if simulator.get(passed) == 1_u8.into() {
+                break;
+            }
+            simulator.tick(clock)?;
+        }
+        if simulator.get(passed) != 1_u8.into() || simulator.get(failed) != 0_u8.into() {
+            return Err("Celox AXI4 self-test did not pass".into());
+        }
+        Ok(())
+    })?;
+    println!("Celox post-map AXI4 self-test: passed");
+
+    let started = Instant::now();
+    let architecture = load_architecture(architecture_path)?;
+    println!("architecture loaded in {:.2?}", started.elapsed());
+    let lpf = parse_lpf(File::open(lpf_path)?)?;
+    let result = implement_struo_ecp5(
+        &imported,
+        &architecture,
+        Ecp5FlowOptions {
+            speed_grade: Some(speed_grade),
+            package: Some(package),
+            lpf: Some(&lpf),
+            ..Ecp5FlowOptions::default()
+        },
+        &mut evidence,
+    )?;
+
+    println!(
+        "native PnR: {} cells, {} routed nets, {} PIPs",
+        result.implementation.placement.bindings().len(),
+        result.implementation.routes.len(),
+        result.implementation.total_pips
+    );
+    if let Some(slack_ps) = result.timing.worst_slack_ps {
+        println!(
+            "speed {speed_grade}: worst setup {slack_ps} ps, worst hold {} ps ({})",
+            result.timing.worst_hold_slack_ps.unwrap_or(0),
+            if result.timing.met_timing() {
+                "passed"
+            } else {
+                "failed"
+            }
+        );
+    }
+    if let Some(path) = checkpoint_path {
+        let checkpoint = ecp5_checkpoint(
+            "axi4-crossbar-self-test",
+            &result,
+            &architecture,
+            package,
+            &evidence,
+        );
+        serde_json::to_writer_pretty(File::create(path)?, &checkpoint)?;
+        println!("checkpoint: {path}");
+    }
+    Ok(())
+}
+
+fn load_architecture(path: &str) -> Result<Ecp5Architecture, Box<dyn Error>> {
+    let reader = BufReader::new(File::open(path)?);
+    if Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        == Some("txdb")
+    {
+        Ok(read_architecture_cache(reader)?)
+    } else {
+        Ok(read_architecture(reader)?)
+    }
+}
+
+fn cache_architecture(source: &str, destination: &str) -> Result<(), Box<dyn Error>> {
+    let started = Instant::now();
+    let architecture = read_architecture(BufReader::new(File::open(source)?))?;
+    println!("architecture expanded in {:.2?}", started.elapsed());
+    let started = Instant::now();
+    write_architecture_cache(BufWriter::new(File::create(destination)?), &architecture)?;
+    println!(
+        "architecture cache written to {destination} in {:.2?}",
+        started.elapsed()
+    );
+    Ok(())
+}
+
 fn ecp5_checkpoint(
+    design_name: &str,
     result: &Ecp5FlowResult,
     architecture: &Ecp5Architecture,
     package: &str,
@@ -279,7 +446,7 @@ fn ecp5_checkpoint(
     let device = architecture.device();
     json!({
         "schema_version": 1,
-        "design": "xor",
+        "design": design_name,
         "target": {
             "family": "ECP5",
             "device": device.name(),

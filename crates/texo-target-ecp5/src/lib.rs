@@ -14,7 +14,8 @@ pub use lpf::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use texo_model::{
@@ -25,6 +26,9 @@ use texo_pnr::PlacementConstraints;
 
 /// Current on-disk architecture schema version.
 pub const SCHEMA_VERSION: u32 = 3;
+
+/// Version of the expanded binary architecture cache.
+pub const ARCHITECTURE_CACHE_VERSION: u32 = 1;
 
 /// Provenance required for every generated architecture snapshot.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -289,13 +293,13 @@ pub struct PipMetadata<'a> {
     pub lutperm_flags: u16,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct CompactBelMetadata {
     bel_type: u32,
     z: i32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct CompactPipMetadata {
     tile_type: u32,
     timing_class: u32,
@@ -304,7 +308,7 @@ struct CompactPipMetadata {
 }
 
 /// Resolved package pin table.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Package {
     /// Package name.
     pub name: String,
@@ -313,7 +317,7 @@ pub struct Package {
 }
 
 /// Expanded ECP5 device ready for Texo placement and routing.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Ecp5Architecture {
     provenance: Provenance,
     device: Device,
@@ -322,6 +326,18 @@ pub struct Ecp5Architecture {
     pip_metadata: Vec<CompactPipMetadata>,
     packages: Vec<Package>,
     speed_grades: BTreeMap<String, SpeedGradeRecord>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ArchitectureCache {
+    version: u32,
+    architecture: Ecp5Architecture,
+}
+
+#[derive(Serialize)]
+struct ArchitectureCacheRef<'a> {
+    version: u32,
+    architecture: &'a Ecp5Architecture,
 }
 
 impl Ecp5Architecture {
@@ -525,9 +541,7 @@ impl Ecp5Packing {
         if self.carry_pairs_packed {
             return Err(PackingError::CarryPairsAlreadyPacked);
         }
-        let graph = UnifiedGraph::new(design, architecture.device());
         let mut occupied = BTreeSet::new();
-        let mut groups = Vec::new();
         let mut packed = Vec::new();
         for pair in pairs {
             for &cell in &pair {
@@ -545,36 +559,17 @@ impl Ecp5Packing {
                     });
                 }
             }
-            let first_bels = graph.placement_candidates(pair[0])?;
-            let second_bels = graph.placement_candidates(pair[1])?;
-            let mut assignments = Vec::new();
-            for first in first_bels {
-                let first_metadata = architecture.bel_metadata(first);
-                if first_metadata.bel_type != "TRELLIS_COMB" || first_metadata.z.rem_euclid(8) != 0
-                {
-                    continue;
-                }
-                for &second in &second_bels {
-                    let second_metadata = architecture.bel_metadata(second);
-                    if second_metadata.bel_type == "TRELLIS_COMB"
-                        && architecture.device().bels()[first.0].point
-                            == architecture.device().bels()[second.0].point
-                        && first_metadata.z.checked_add(4) == Some(second_metadata.z)
-                    {
-                        assignments.push(vec![first, second]);
-                    }
-                }
-            }
-            if assignments.is_empty() {
-                return Err(PackingError::MissingCarrySlicePair {
-                    cell: design.cells()[pair[0].0].name.clone(),
-                });
-            }
-            groups.push((pair, assignments));
             packed.push(pair);
         }
-        for (pair, assignments) in groups {
-            self.constraints.add_group(pair, assignments);
+        let assignments: Arc<[Vec<BelId>]> = carry_pair_assignments(architecture).into();
+        if !packed.is_empty() && assignments.is_empty() {
+            return Err(PackingError::MissingCarrySlicePair {
+                cell: design.cells()[packed[0][0].0].name.clone(),
+            });
+        }
+        for &pair in &packed {
+            self.constraints
+                .add_group_with_shared_assignments(pair, Arc::clone(&assignments));
         }
         self.carry_pairs = packed;
         self.carry_pairs_packed = true;
@@ -965,6 +960,28 @@ impl Ecp5Packing {
     }
 }
 
+fn carry_pair_assignments(architecture: &Ecp5Architecture) -> Vec<Vec<BelId>> {
+    let mut comb_by_slot = BTreeMap::new();
+    for &bel in architecture.device().bels_of_kind(ResourceKind::Lut(4)) {
+        let metadata = architecture.bel_metadata(bel);
+        if metadata.bel_type == "TRELLIS_COMB" {
+            comb_by_slot.insert((architecture.device().bels()[bel.0].point, metadata.z), bel);
+        }
+    }
+    let mut assignments = Vec::new();
+    for (&(point, z), &first) in &comb_by_slot {
+        if z.rem_euclid(8) != 0 {
+            continue;
+        }
+        if let Some(second_z) = z.checked_add(4)
+            && let Some(&second) = comb_by_slot.get(&(point, second_z))
+        {
+            assignments.push(vec![first, second]);
+        }
+    }
+    assignments
+}
+
 /// Selects nets with at least `minimum_clock_sinks` recognized clock pins.
 ///
 /// A zero threshold is treated as one. Register `CLK` and block-RAM
@@ -1047,12 +1064,21 @@ pub fn pack_lut_ffs(
     design: &Design,
     architecture: &Ecp5Architecture,
 ) -> Result<Ecp5Packing, PackingError> {
-    let graph = UnifiedGraph::new(design, architecture.device());
     let mut constraints = PlacementConstraints::new();
     let mut paired_luts = BTreeSet::new();
     let mut paired_ffs = BTreeSet::new();
     let mut lut_ff_pairs = Vec::new();
     let mut ff_data_pins = BTreeMap::new();
+    let lut_ff_assignments: Arc<[Vec<BelId>]> = lut_ff_assignments(architecture).into();
+    let has_general_data_pin = architecture
+        .device()
+        .bels_of_kind(ResourceKind::Register)
+        .iter()
+        .copied()
+        .any(|bel| {
+            architecture.bel_metadata(bel).bel_type == "TRELLIS_FF"
+                && find_bel_pin(architecture.device(), bel, "M").is_some()
+        });
 
     for (index, cell) in design.cells().iter().enumerate() {
         if cell.kind != ResourceKind::Register {
@@ -1078,11 +1104,10 @@ pub fn pack_lut_ffs(
         if paired_luts.contains(&lut) {
             continue;
         }
-        let assignments = lut_ff_assignments(&graph, architecture, lut, ff)?;
-        if assignments.is_empty() {
+        if lut_ff_assignments.is_empty() {
             continue;
         }
-        constraints.add_group([lut, ff], assignments);
+        constraints.add_group_with_shared_assignments([lut, ff], Arc::clone(&lut_ff_assignments));
         paired_luts.insert(lut);
         paired_ffs.insert(ff);
         lut_ff_pairs.push(LutFfPair { lut, ff });
@@ -1093,21 +1118,12 @@ pub fn pack_lut_ffs(
         if paired_ffs.contains(&ff) {
             continue;
         }
-        let mut bound = false;
-        for bel in graph.placement_candidates(ff)? {
-            if architecture.bel_metadata(bel).bel_type != "TRELLIS_FF" {
-                continue;
-            }
-            if let Some(m_pin) = find_bel_pin(architecture.device(), bel, "M") {
-                constraints.bind_pin(data_pin, bel, m_pin);
-                bound = true;
-            }
-        }
-        if !bound {
+        if !has_general_data_pin {
             return Err(PackingError::MissingGeneralDataPin {
                 cell: design.cells()[ff.0].name.clone(),
             });
         }
+        constraints.bind_pin_name(data_pin, "M");
         general_routing_ffs.push(ff);
     }
 
@@ -1141,32 +1157,31 @@ fn lut_driver(design: &Design, data_pin: CellPinId) -> Option<CellId> {
         .then_some(driver.cell)
 }
 
-fn lut_ff_assignments(
-    graph: &UnifiedGraph<'_>,
-    architecture: &Ecp5Architecture,
-    lut: CellId,
-    ff: CellId,
-) -> Result<Vec<Vec<BelId>>, ModelError> {
-    let lut_bels = graph.placement_candidates(lut)?;
-    let ff_bels = graph.placement_candidates(ff)?;
+fn lut_ff_assignments(architecture: &Ecp5Architecture) -> Vec<Vec<BelId>> {
+    let mut ff_by_slot = BTreeMap::new();
+    for &ff_bel in architecture.device().bels_of_kind(ResourceKind::Register) {
+        let metadata = architecture.bel_metadata(ff_bel);
+        if metadata.bel_type == "TRELLIS_FF" {
+            ff_by_slot.insert(
+                (architecture.device().bels()[ff_bel.0].point, metadata.z),
+                ff_bel,
+            );
+        }
+    }
     let mut assignments = Vec::new();
-    for lut_bel in lut_bels {
+    for &lut_bel in architecture.device().bels_of_kind(ResourceKind::Lut(4)) {
         let lut_metadata = architecture.bel_metadata(lut_bel);
         if lut_metadata.bel_type != "TRELLIS_COMB" {
             continue;
         }
-        for &ff_bel in &ff_bels {
-            let ff_metadata = architecture.bel_metadata(ff_bel);
-            if ff_metadata.bel_type == "TRELLIS_FF"
-                && architecture.device().bels()[lut_bel.0].point
-                    == architecture.device().bels()[ff_bel.0].point
-                && lut_metadata.z.checked_add(1) == Some(ff_metadata.z)
-            {
-                assignments.push(vec![lut_bel, ff_bel]);
-            }
+        if let Some(ff_z) = lut_metadata.z.checked_add(1)
+            && let Some(&ff_bel) =
+                ff_by_slot.get(&(architecture.device().bels()[lut_bel.0].point, ff_z))
+        {
+            assignments.push(vec![lut_bel, ff_bel]);
         }
     }
-    Ok(assignments)
+    assignments
 }
 
 fn find_bel_pin(device: &Device, bel: BelId, name: &str) -> Option<BelPinId> {
@@ -1488,6 +1503,46 @@ pub fn read_architecture(reader: impl Read) -> Result<Ecp5Architecture, ImportEr
     expand(file)
 }
 
+/// Writes an expanded architecture cache without rebuilding its routing graph.
+///
+/// The cache is a Postcard-encoded, versioned representation of the complete
+/// [`Ecp5Architecture`], including the physical routing adjacency index.
+///
+/// # Errors
+///
+/// Returns an error when binary serialization or output fails.
+pub fn write_architecture_cache(
+    writer: impl Write,
+    architecture: &Ecp5Architecture,
+) -> Result<(), ImportError> {
+    postcard::to_io(
+        &ArchitectureCacheRef {
+            version: ARCHITECTURE_CACHE_VERSION,
+            architecture,
+        },
+        writer,
+    )?;
+    Ok(())
+}
+
+/// Reads a previously expanded binary architecture cache.
+///
+/// # Errors
+///
+/// Returns an error for malformed binary data or an unsupported cache version.
+pub fn read_architecture_cache(reader: impl Read) -> Result<Ecp5Architecture, ImportError> {
+    let mut scratch = [0_u8; 16 * 1024];
+    let (cache, _) = postcard::from_io((reader, &mut scratch))?;
+    let ArchitectureCache {
+        version,
+        architecture,
+    } = cache;
+    if version != ARCHITECTURE_CACHE_VERSION {
+        return Err(ImportError::UnsupportedCacheVersion(version));
+    }
+    Ok(architecture)
+}
+
 /// Expands an already decoded architecture snapshot.
 ///
 /// # Errors
@@ -1783,10 +1838,14 @@ fn qualified_name(x: u32, y: u32, local: &str) -> String {
 pub enum ImportError {
     /// JSON decoding failed.
     Json(serde_json::Error),
+    /// Expanded binary cache encoding or decoding failed.
+    Binary(postcard::Error),
     /// Generic target model construction failed.
     Model(ModelError),
     /// File uses an unsupported schema version.
     UnsupportedSchema(u32),
+    /// Binary cache uses an unsupported schema version.
+    UnsupportedCacheVersion(u32),
     /// File describes another FPGA family.
     WrongFamily(String),
     /// One or both source revisions were omitted.
@@ -1883,9 +1942,13 @@ impl fmt::Display for ImportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Json(error) => write!(f, "invalid architecture JSON: {error}"),
+            Self::Binary(error) => write!(f, "invalid architecture cache: {error}"),
             Self::Model(error) => write!(f, "invalid physical model: {error}"),
             Self::UnsupportedSchema(version) => {
                 write!(f, "unsupported architecture schema version {version}")
+            }
+            Self::UnsupportedCacheVersion(version) => {
+                write!(f, "unsupported architecture cache version {version}")
             }
             Self::WrongFamily(family) => write!(f, "expected ECP5 family, found `{family}`"),
             Self::MissingProvenance => write!(f, "architecture provenance is incomplete"),
@@ -1960,6 +2023,7 @@ impl Error for ImportError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Json(error) => Some(error),
+            Self::Binary(error) => Some(error),
             Self::Model(error) => Some(error),
             _ => None,
         }
@@ -1969,6 +2033,12 @@ impl Error for ImportError {
 impl From<serde_json::Error> for ImportError {
     fn from(value: serde_json::Error) -> Self {
         Self::Json(value)
+    }
+}
+
+impl From<postcard::Error> for ImportError {
+    fn from(value: postcard::Error) -> Self {
+        Self::Binary(value)
     }
 }
 
@@ -1997,7 +2067,8 @@ mod tests {
         ArchitectureFile, BlockRamRequirement, GlobalClockRequirement, ImportError, LogicalPort,
         PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, expand,
         find_global_clock_requirements, pack_lut_ffs, parse_lpf, read_architecture,
-        resolve_lpf_port_cells, resolve_lpf_ports,
+        read_architecture_cache, resolve_lpf_port_cells, resolve_lpf_ports,
+        write_architecture_cache,
     };
 
     const FIXTURE: &str = include_str!("../fixtures/minimal-ecp5.json");
@@ -2021,6 +2092,17 @@ mod tests {
             }
         );
         assert!(architecture.speed_grades().contains_key("6"));
+    }
+
+    #[test]
+    fn round_trips_the_expanded_architecture_cache() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut encoded = Vec::new();
+
+        write_architecture_cache(&mut encoded, &architecture).unwrap();
+        let decoded = read_architecture_cache(encoded.as_slice()).unwrap();
+
+        assert_eq!(decoded, architecture);
     }
 
     #[test]
@@ -2174,7 +2256,7 @@ mod tests {
             .find(|group| group.cells == pair)
             .unwrap();
         assert!(!group.assignments.is_empty());
-        for assignment in &group.assignments {
+        for assignment in group.assignments.iter() {
             let [first, second] = assignment.as_slice() else {
                 panic!("carry assignment must contain two BELs")
             };
@@ -2208,6 +2290,11 @@ mod tests {
 
         assert!(packing.lut_ff_pairs().is_empty());
         assert_eq!(packing.general_routing_ffs(), &[ff]);
+        assert!(packing.constraints().pin_bindings().is_empty());
+        assert_eq!(
+            packing.constraints().pin_name_bindings().get(&data_pin),
+            Some(&"M".to_owned())
+        );
         assert_eq!(architecture.device().bel_pins()[physical_pin.0].name, "M");
     }
 
