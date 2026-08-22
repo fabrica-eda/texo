@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "provenance": {
     "project_trellis_revision": "3afe7b52b30f4b4417ee98f03016767a502006e3",
     "database_revision": "015e0330630d7c238c0e4f2cdd9c8157eb78c54a",
@@ -112,7 +112,7 @@
           "to": { "dx": 1, "dy": 0, "index": 5 },
           "fixed": false,
           "tile_type": "PLC2",
-          "delay": 1,
+          "timing_class": "default",
           "lutperm_flags": 0
         },
         {
@@ -120,7 +120,7 @@
           "to": { "dx": 0, "dy": 0, "index": 26 },
           "fixed": false,
           "tile_type": "EFB1_PICB1",
-          "delay": 1,
+          "timing_class": "default",
           "lutperm_flags": 0
         },
         {
@@ -128,7 +128,7 @@
           "to": { "dx": 0, "dy": 0, "index": 11 },
           "fixed": false,
           "tile_type": "EFB1_PICB1",
-          "delay": 1,
+          "timing_class": "default",
           "lutperm_flags": 0
         },
         {
@@ -136,7 +136,7 @@
           "to": { "dx": 0, "dy": 0, "index": 5 },
           "fixed": false,
           "tile_type": "PLC2",
-          "delay": 1,
+          "timing_class": "default",
           "lutperm_flags": 0
         },
         {
@@ -144,7 +144,7 @@
           "to": { "dx": 0, "dy": 0, "index": 0 },
           "fixed": false,
           "tile_type": "PLC2",
-          "delay": 1,
+          "timing_class": "default",
           "lutperm_flags": 0
         },
         {
@@ -152,7 +152,7 @@
           "to": { "dx": 0, "dy": 0, "index": 1 },
           "fixed": false,
           "tile_type": "PLC2",
-          "delay": 1,
+          "timing_class": "default",
           "lutperm_flags": 0
         },
         {
@@ -160,7 +160,7 @@
           "to": { "dx": 1, "dy": 0, "index": 17 },
           "fixed": false,
           "tile_type": "PLC2",
-          "delay": 1,
+          "timing_class": "default",
           "lutperm_flags": 0
         }
       ]
@@ -248,7 +248,7 @@
           "to": { "dx": 0, "dy": 0, "index": 0 },
           "fixed": false,
           "tile_type": "PLC2",
-          "delay": 1,
+          "timing_class": "default",
           "lutperm_flags": 0
         },
         {
@@ -256,7 +256,7 @@
           "to": { "dx": 0, "dy": 0, "index": 1 },
           "fixed": false,
           "tile_type": "PLC2",
-          "delay": 1,
+          "timing_class": "default",
           "lutperm_flags": 0
         },
         {
@@ -264,7 +264,7 @@
           "to": { "dx": 0, "dy": 0, "index": 0 },
           "fixed": false,
           "tile_type": "PLC2",
-          "delay": 1,
+          "timing_class": "default",
           "lutperm_flags": 0
         },
         {
@@ -272,7 +272,7 @@
           "to": { "dx": 0, "dy": 0, "index": 1 },
           "fixed": false,
           "tile_type": "PLC2",
-          "delay": 1,
+          "timing_class": "default",
           "lutperm_flags": 0
         },
         {
@@ -280,7 +280,7 @@
           "to": { "dx": 0, "dy": 0, "index": 17 },
           "fixed": false,
           "tile_type": "PLC2",
-          "delay": 1,
+          "timing_class": "default",
           "lutperm_flags": 0
         },
         {
@@ -288,7 +288,7 @@
           "to": { "dx": -1, "dy": 0, "index": 0 },
           "fixed": false,
           "tile_type": "PLC2",
-          "delay": 1,
+          "timing_class": "default",
           "lutperm_flags": 0
         },
         {
@@ -296,7 +296,7 @@
           "to": { "dx": -1, "dy": 0, "index": 1 },
           "fixed": false,
           "tile_type": "PLC2",
-          "delay": 1,
+          "timing_class": "default",
           "lutperm_flags": 0
         }
       ]
@@ -313,6 +313,80 @@
         { "name": "A10", "x": 0, "y": 0, "bel": 1 },
         { "name": "B10", "x": 1, "y": 0, "bel": 3 },
         { "name": "C10", "x": 1, "y": 0, "bel": 4 }
+      ]
+    }
+  ],
+  "speed_grades": [
+    {
+      "name": "6",
+      "pip_classes": {
+        "default": {
+          "min_base_ps": 1,
+          "max_base_ps": 1,
+          "min_fanout_adder_ps": 0,
+          "max_fanout_adder_ps": 0
+        },
+        "zero": {
+          "min_base_ps": 0,
+          "max_base_ps": 0,
+          "min_fanout_adder_ps": 0,
+          "max_fanout_adder_ps": 0
+        }
+      },
+      "cells": [
+        {
+          "cell_type": "DCCA",
+          "arcs": [
+            {
+              "from_pin": "CLKI",
+              "to_pin": "CLKO",
+              "delay": { "min_ps": 0, "max_ps": 0 }
+            }
+          ],
+          "setup_holds": []
+        },
+        {
+          "cell_type": "TRELLIS_COMB",
+          "arcs": [
+            { "from_pin": "A", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "B", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "C", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "D", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } }
+          ],
+          "setup_holds": []
+        },
+        {
+          "cell_type": "TRELLIS_FF",
+          "arcs": [
+            { "from_pin": "CLK", "to_pin": "Q", "delay": { "min_ps": 430, "max_ps": 525 } }
+          ],
+          "setup_holds": [
+            {
+              "signal_pin": "DI",
+              "clock_pin": "CLK",
+              "setup": { "min_ps": 0, "max_ps": 0 },
+              "hold": { "min_ps": 267, "max_ps": 303 }
+            },
+            {
+              "signal_pin": "M",
+              "clock_pin": "CLK",
+              "setup": { "min_ps": 0, "max_ps": 0 },
+              "hold": { "min_ps": 233, "max_ps": 303 }
+            },
+            {
+              "signal_pin": "CE",
+              "clock_pin": "CLK",
+              "setup": { "min_ps": 0, "max_ps": 0 },
+              "hold": { "min_ps": 144, "max_ps": 152 }
+            },
+            {
+              "signal_pin": "LSR",
+              "clock_pin": "CLK",
+              "setup": { "min_ps": 271, "max_ps": 424 },
+              "hold": { "min_ps": 0, "max_ps": 0 }
+            }
+          ]
+        }
       ]
     }
   ]

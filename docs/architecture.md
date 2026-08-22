@@ -22,7 +22,7 @@ The inspected upstream versions are:
 | `fabrica-eda/struo` | `fd994db45f792fb4a019d57575fbb1239eae21ae` | `Ecp5Netlist`, `Ecp5Cell`, mapped ports, nextpnr-compatible JSON, verification policy |
 | `celox` | crates.io exact version `=0.3.1` | `FrontendArtifact` and native post-map simulation |
 | `YosysHQ/prjtrellis` | exporter inspected at `3afe7b52b30f4b4417ee98f03016767a502006e3` | deduplicated chip database, relative resource references, package IO database |
-| `prjtrellis-db` | snapshot records the exact revision; fixture uses `015e0330630d7c238c0e4f2cdd9c8157eb78c54a` | ECP5 routing and package data |
+| `prjtrellis-db` | snapshot records the exact revision; fixture uses `015e0330630d7c238c0e4f2cdd9c8157eb78c54a` | ECP5 routing, package, cell timing, and interconnect timing data |
 
 Struo is not currently published on crates.io, so its first adapter will pin an
 exact Git revision. Celox must be consumed from crates.io and pinned to an exact
@@ -51,8 +51,9 @@ The `texo ecp5-demo` executable exercises that boundary without intermediate
 netlist serialization. Its schema-versioned JSON checkpoint is deterministic
 and records architecture/database provenance, verification evidence, mapped
 primitive configuration, absorbed inputs, target packing, final Cell-to-BEL
-bindings, and every routed Wire/PIP ID and name. It is an implementation
-checkpoint for later timing/configuration stages, not yet a bitstream.
+bindings, selected speed grade, every routed Wire/PIP ID and name, and min/max
+timing checks. It is an implementation checkpoint for later configuration
+stages, not yet a bitstream.
 
 ## Boundaries
 
@@ -126,8 +127,9 @@ transactional packing errors.
 placement and routing before recording mapped-netlist and physical evidence.
 
 The LPF boundary parses nextpnr-compatible `LOCATE COMP <port> SITE <pin>` and
-`IOBUF PORT <port> key=value...` commands. It supports quoted names, comments,
-multiline commands, scalar ports, and indexed vector bits. Resolution accepts a
+`IOBUF PORT <port> key=value...`, and `FREQUENCY PORT <port> <value> <unit>`
+commands. It supports quoted names, comments, multiline commands, exact
+Hz/kHz/MHz/GHz normalization, scalar ports, and indexed vector bits. Resolution accepts a
 borrowed `(port name, &[CellId])` iterator, so Struo's `ImportedPort` remains in
 the adapter crate. Locations become fixed package/PIO groups; IOBUF attributes
 remain indexed by logical IO CellId for configuration generation. Unknown port
@@ -152,8 +154,10 @@ location names one type, while BEL pins and PIPs use relative location/resource
 references. Import occurs in three passes—wires, BELs/pins, then PIPs—so every
 relative reference is validated before it reaches the solver. Package records
 must resolve to an IO BEL. ECP5-only data such as BEL type/Z, fixed-arc status,
-tile type, delay, and LUT permutation flags remains in side metadata keyed by
-the same stable IDs.
+tile type, PIP timing class, and LUT permutation flags remains in side metadata
+keyed by the same stable IDs. Schema v2 also contains timing tables for speed
+grades `6`, `7`, `8`, and `8_5G`: interconnect base/fanout coefficients plus
+split `TRELLIS_COMB`, `TRELLIS_FF`, and DCCA cell arcs.
 
 Generate a snapshot from local, revision-controlled Project Trellis source and
 database checkouts:
@@ -161,6 +165,7 @@ database checkouts:
 ```sh
 python3 tools/export_ecp5.py \
   -L /path/to/prjtrellis/libtrellis/build/libtrellis \
+  -L /path/to/prjtrellis/timing/util \
   --database /path/to/prjtrellis-db \
   --device LFE5UM5G-85F \
   --project-trellis-revision <source-commit> \
@@ -171,8 +176,11 @@ cargo run -- target-info artifacts/LFE5UM5G-85F.json
 ```
 
 The exporter deliberately enables Project Trellis's LUT-permutation PIPs and
-split-slice mode. The importer rejects snapshots that omit split-slice mode,
-use another schema/family, have incomplete provenance, or contain dangling
+split-slice mode. It classifies PIPs using Project Trellis's timing utilities,
+normalizes the characterized timing tables to integer picoseconds, and retains
+conservative min/max corners. The importer rejects snapshots that omit
+split-slice mode or speed-grade data, use another schema/family, have incomplete
+provenance, contain invalid timing ranges/classes, or contain dangling
 relative/package references.
 
 ## Verification policy
@@ -191,11 +199,15 @@ intended release gates are:
 
 Celox is a functional simulator, not a gate-level timing simulator. Static
 timing and post-route delay validation therefore remain Texo responsibilities.
-The initial `texo-timing` pass sums Project Trellis delays along the selected
-PIP tree, propagates longest combinational arrivals, and checks register setup
-slack against LPF clock periods. Cell-internal, clock-to-Q, setup, and hold
-values remain zero until speed-grade timing tables are imported; a report with
-no constrained sequential endpoint does not satisfy the timing-closure gate.
+`texo-timing` computes early/minimum and late/maximum arrival ranges through the
+selected PIP tree and characterized cell arcs. ECP5 STA includes PIP timing
+class and enabled-source fanout, LUT input-to-output delay, DCCA propagation,
+FF clock-to-Q, setup, and hold. Setup uses late data versus early capture clock;
+hold uses early data versus late capture clock. The speed grade is mandatory
+and recorded in the checkpoint. A report with no constrained sequential
+endpoint, negative setup slack, or negative hold slack does not satisfy the
+timing-closure gate. BRAM timing, generated clocks, multicycle paths, and false
+paths remain future work.
 
 ## Reproducibility
 

@@ -24,7 +24,7 @@ use texo_model::{
 use texo_pnr::PlacementConstraints;
 
 /// Current on-disk architecture schema version.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Provenance required for every generated architecture snapshot.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -114,8 +114,8 @@ pub struct PipRecord {
     pub fixed: bool,
     /// Project Trellis tile type owning the configuration bit.
     pub tile_type: String,
-    /// Relative delay value from the routing graph.
-    pub delay: i32,
+    /// Project Trellis interconnect timing class.
+    pub timing_class: String,
     /// LUT permutation metadata used during configuration generation.
     pub lutperm_flags: u16,
 }
@@ -164,6 +164,74 @@ pub struct PackageRecord {
     pub pins: Vec<PackagePinRecord>,
 }
 
+/// Minimum and maximum characterized delay in picoseconds.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DelayRangeRecord {
+    /// Earliest characterized delay.
+    pub min_ps: u64,
+    /// Latest characterized delay.
+    pub max_ps: u64,
+}
+
+/// One combinational or clock-to-output cell arc.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CellArcTimingRecord {
+    /// Source pin name on the split BEL surface.
+    pub from_pin: String,
+    /// Destination pin name on the split BEL surface.
+    pub to_pin: String,
+    /// Characterized delay range.
+    pub delay: DelayRangeRecord,
+}
+
+/// One sequential input timing check against a clock pin.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SetupHoldTimingRecord {
+    /// Data or control pin name on the split BEL surface.
+    pub signal_pin: String,
+    /// Associated clock pin name.
+    pub clock_pin: String,
+    /// Setup requirement range.
+    pub setup: DelayRangeRecord,
+    /// Hold requirement range.
+    pub hold: DelayRangeRecord,
+}
+
+/// Timing arcs for one split ECP5 cell type.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CellTimingRecord {
+    /// Project Trellis/nextpnr split cell type.
+    pub cell_type: String,
+    /// Combinational and clock-to-output arcs.
+    pub arcs: Vec<CellArcTimingRecord>,
+    /// Sequential input checks.
+    pub setup_holds: Vec<SetupHoldTimingRecord>,
+}
+
+/// Delay coefficients for one interconnect timing class.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PipClassTimingRecord {
+    /// Minimum fixed delay component.
+    pub min_base_ps: u64,
+    /// Maximum fixed delay component.
+    pub max_base_ps: u64,
+    /// Minimum delay added per enabled PIP leaving the same source wire.
+    pub min_fanout_adder_ps: u64,
+    /// Maximum delay added per enabled PIP leaving the same source wire.
+    pub max_fanout_adder_ps: u64,
+}
+
+/// Cell and interconnect timing for one ECP5 speed grade.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SpeedGradeRecord {
+    /// ECP5 speed-grade name such as `6`, `7`, `8`, or `8_5G`.
+    pub name: String,
+    /// Interconnect coefficients indexed by timing class.
+    pub pip_classes: BTreeMap<String, PipClassTimingRecord>,
+    /// Split-cell timing records.
+    pub cells: Vec<CellTimingRecord>,
+}
+
 /// Versioned output of the Project Trellis exporter.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArchitectureFile {
@@ -185,6 +253,8 @@ pub struct ArchitectureFile {
     pub locations: Vec<LocationRecord>,
     /// Package databases available for this device.
     pub packages: Vec<PackageRecord>,
+    /// Characterized timing tables by speed grade.
+    pub speed_grades: Vec<SpeedGradeRecord>,
 }
 
 /// ECP5-specific properties attached to a generic BEL.
@@ -203,8 +273,8 @@ pub struct PipMetadata {
     pub fixed: bool,
     /// Project Trellis tile type.
     pub tile_type: String,
-    /// Relative routing-graph delay.
-    pub delay: i32,
+    /// Interconnect timing class resolved through a speed-grade table.
+    pub timing_class: String,
     /// LUT permutation flags.
     pub lutperm_flags: u16,
 }
@@ -226,6 +296,7 @@ pub struct Ecp5Architecture {
     bel_metadata: BTreeMap<BelId, BelMetadata>,
     pip_metadata: BTreeMap<PipId, PipMetadata>,
     packages: Vec<Package>,
+    speed_grades: BTreeMap<String, SpeedGradeRecord>,
 }
 
 impl Ecp5Architecture {
@@ -257,6 +328,12 @@ impl Ecp5Architecture {
     #[must_use]
     pub fn packages(&self) -> &[Package] {
         &self.packages
+    }
+
+    /// Available speed-grade timing tables.
+    #[must_use]
+    pub const fn speed_grades(&self) -> &BTreeMap<String, SpeedGradeRecord> {
+        &self.speed_grades
     }
 }
 
@@ -1288,7 +1365,7 @@ pub fn expand(file: ArchitectureFile) -> Result<Ecp5Architecture, ImportError> {
                 PipMetadata {
                     fixed: pip.fixed,
                     tile_type: pip.tile_type.clone(),
-                    delay: pip.delay,
+                    timing_class: pip.timing_class.clone(),
                     lutperm_flags: pip.lutperm_flags,
                 },
             );
@@ -1296,12 +1373,18 @@ pub fn expand(file: ArchitectureFile) -> Result<Ecp5Architecture, ImportError> {
     }
 
     let packages = resolve_packages(&file.packages, &bels, &device)?;
+    let speed_grades = file
+        .speed_grades
+        .into_iter()
+        .map(|grade| (grade.name.clone(), grade))
+        .collect();
     Ok(Ecp5Architecture {
         provenance: file.provenance,
         device,
         bel_metadata,
         pip_metadata,
         packages,
+        speed_grades,
     })
 }
 
@@ -1320,6 +1403,7 @@ fn validate_header(file: &ArchitectureFile) -> Result<(), ImportError> {
     if !file.provenance.split_slice_mode {
         return Err(ImportError::SplitSliceRequired);
     }
+    validate_timing(file)?;
     for location in &file.locations {
         if location.location_type >= file.location_types.len() {
             return Err(ImportError::UnknownLocationType(location.location_type));
@@ -1332,6 +1416,73 @@ fn validate_header(file: &ArchitectureFile) -> Result<(), ImportError> {
         }
     }
     Ok(())
+}
+
+fn validate_timing(file: &ArchitectureFile) -> Result<(), ImportError> {
+    if file.speed_grades.is_empty() {
+        return Err(ImportError::MissingSpeedGrades);
+    }
+    let used_classes = file
+        .location_types
+        .iter()
+        .flat_map(|location| location.pips.iter().map(|pip| pip.timing_class.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut grade_names = BTreeSet::new();
+    for grade in &file.speed_grades {
+        if grade.name.is_empty() || !grade_names.insert(grade.name.as_str()) {
+            return Err(ImportError::DuplicateSpeedGrade(grade.name.clone()));
+        }
+        for class in &used_classes {
+            if !grade.pip_classes.contains_key(*class) {
+                return Err(ImportError::MissingPipTimingClass {
+                    speed_grade: grade.name.clone(),
+                    timing_class: (*class).into(),
+                });
+            }
+        }
+        for (name, timing) in &grade.pip_classes {
+            if timing.min_base_ps > timing.max_base_ps
+                || timing.min_fanout_adder_ps > timing.max_fanout_adder_ps
+            {
+                return Err(ImportError::InvalidTimingRange {
+                    speed_grade: grade.name.clone(),
+                    subject: format!("PIP class {name}"),
+                });
+            }
+        }
+        let mut cell_types = BTreeSet::new();
+        for cell in &grade.cells {
+            if cell.cell_type.is_empty() || !cell_types.insert(cell.cell_type.as_str()) {
+                return Err(ImportError::DuplicateCellTiming {
+                    speed_grade: grade.name.clone(),
+                    cell_type: cell.cell_type.clone(),
+                });
+            }
+            for arc in &cell.arcs {
+                validate_delay_range(&grade.name, &cell.cell_type, arc.delay)?;
+            }
+            for check in &cell.setup_holds {
+                validate_delay_range(&grade.name, &cell.cell_type, check.setup)?;
+                validate_delay_range(&grade.name, &cell.cell_type, check.hold)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_delay_range(
+    speed_grade: &str,
+    subject: &str,
+    delay: DelayRangeRecord,
+) -> Result<(), ImportError> {
+    if delay.min_ps > delay.max_ps {
+        Err(ImportError::InvalidTimingRange {
+            speed_grade: speed_grade.into(),
+            subject: subject.into(),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn indexed_locations(file: &ArchitectureFile) -> Result<BTreeMap<(u32, u32), usize>, ImportError> {
@@ -1441,6 +1592,31 @@ pub enum ImportError {
     MissingProvenance,
     /// Fine-grained BEL mode is mandatory for Texo.
     SplitSliceRequired,
+    /// Architecture snapshot did not contain any speed-grade timing table.
+    MissingSpeedGrades,
+    /// A speed-grade name was empty or repeated.
+    DuplicateSpeedGrade(String),
+    /// A routed PIP class had no timing coefficients in one speed grade.
+    MissingPipTimingClass {
+        /// Speed-grade name.
+        speed_grade: String,
+        /// Missing timing class.
+        timing_class: String,
+    },
+    /// A split cell type had more than one timing record in one speed grade.
+    DuplicateCellTiming {
+        /// Speed-grade name.
+        speed_grade: String,
+        /// Repeated cell type.
+        cell_type: String,
+    },
+    /// A timing range had a minimum greater than its maximum.
+    InvalidTimingRange {
+        /// Speed-grade name.
+        speed_grade: String,
+        /// Timing object being validated.
+        subject: String,
+    },
     /// A location referenced a missing location type.
     UnknownLocationType(usize),
     /// A location coordinate exceeded the declared dimensions.
@@ -1511,6 +1687,33 @@ impl fmt::Display for ImportError {
             Self::WrongFamily(family) => write!(f, "expected ECP5 family, found `{family}`"),
             Self::MissingProvenance => write!(f, "architecture provenance is incomplete"),
             Self::SplitSliceRequired => write!(f, "split-slice Project Trellis data is required"),
+            Self::MissingSpeedGrades => {
+                write!(f, "architecture contains no speed-grade timing tables")
+            }
+            Self::DuplicateSpeedGrade(speed_grade) => {
+                write!(f, "duplicate or empty speed grade `{speed_grade}`")
+            }
+            Self::MissingPipTimingClass {
+                speed_grade,
+                timing_class,
+            } => write!(
+                f,
+                "speed grade `{speed_grade}` has no PIP timing class `{timing_class}`"
+            ),
+            Self::DuplicateCellTiming {
+                speed_grade,
+                cell_type,
+            } => write!(
+                f,
+                "speed grade `{speed_grade}` repeats cell timing `{cell_type}`"
+            ),
+            Self::InvalidTimingRange {
+                speed_grade,
+                subject,
+            } => write!(
+                f,
+                "speed grade `{speed_grade}` has an invalid timing range for {subject}"
+            ),
             Self::UnknownLocationType(index) => write!(f, "unknown location type {index}"),
             Self::LocationOutsideDevice { x, y } => {
                 write!(f, "location ({x}, {y}) is outside the device")
@@ -1578,9 +1781,10 @@ mod tests {
     use texo_struo::{PrimitiveMetadata, import_ecp5};
 
     use super::{
-        BlockRamRequirement, GlobalClockRequirement, LogicalPort, PackagePinBinding,
-        PackedBlockRam, PackingError, PipMetadata, find_global_clock_requirements, pack_lut_ffs,
-        parse_lpf, read_architecture, resolve_lpf_port_cells, resolve_lpf_ports,
+        ArchitectureFile, BlockRamRequirement, GlobalClockRequirement, ImportError, LogicalPort,
+        PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, expand,
+        find_global_clock_requirements, pack_lut_ffs, parse_lpf, read_architecture,
+        resolve_lpf_port_cells, resolve_lpf_ports,
     };
 
     const FIXTURE: &str = include_str!("../fixtures/minimal-ecp5.json");
@@ -1599,10 +1803,22 @@ mod tests {
             Some(&PipMetadata {
                 fixed: false,
                 tile_type: "PLC2".into(),
-                delay: 1,
+                timing_class: "default".into(),
                 lutperm_flags: 0,
             })
         );
+        assert!(architecture.speed_grades().contains_key("6"));
+    }
+
+    #[test]
+    fn rejects_a_speed_grade_missing_a_used_pip_class() {
+        let mut file: ArchitectureFile = serde_json::from_str(FIXTURE).unwrap();
+        file.speed_grades[0].pip_classes.remove("default");
+
+        assert!(matches!(
+            expand(file),
+            Err(ImportError::MissingPipTimingClass { .. })
+        ));
     }
 
     #[test]

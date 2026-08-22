@@ -3,12 +3,14 @@
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DIRECTIONS = {0: "input", 1: "output", 2: "inout"}
+SPEED_GRADES = ["6", "7", "8", "8_5G"]
 
 
 def parse_args():
@@ -31,7 +33,7 @@ def parse_args():
         "--libdir",
         action="append",
         default=[],
-        help="directory containing the pytrellis module (repeatable)",
+        help="Python module directory; pass libtrellis and timing/util (repeatable)",
     )
     return parser.parse_args()
 
@@ -71,7 +73,29 @@ def export_packages(pytrellis, graph, database, device):
     return packages
 
 
-def export_location_type(graph, location_type):
+def absolute_wire_name(pytrellis, graph, location, reference):
+    x = location.x + reference.rel.x
+    y = location.y + reference.rel.y
+    target = pytrellis.Location(x, y)
+    location_type = graph.locationTypes[graph.typeAtLocation[target]]
+    wire = graph.to_str(location_type.wires[reference.id].name)
+    return f"R{y}C{x}_{wire}"
+
+
+def classify_pip(pip_classes, known_classes, source, sink):
+    if "FCO" in source or "FCI" in sink:
+        return "zero"
+    if "F5" in source or "FX" in source or "FXA" in sink or "FXB" in sink:
+        return "zero"
+    timing_class = pip_classes.get_pip_class(source, sink)
+    if timing_class is None or timing_class not in known_classes:
+        return "default"
+    return timing_class
+
+
+def export_location_type(
+    pytrellis, graph, location_type, representative, pip_classes, known_classes
+):
     wires = [{"name": graph.to_str(wire.name)} for wire in location_type.wires]
     bels = []
     for bel in location_type.bels:
@@ -94,17 +118,151 @@ def export_location_type(graph, location_type):
 
     pips = []
     for arc in location_type.arcs:
+        source = absolute_wire_name(pytrellis, graph, representative, arc.srcWire)
+        sink = absolute_wire_name(pytrellis, graph, representative, arc.sinkWire)
         pips.append(
             {
                 "from": relative(arc.srcWire),
                 "to": relative(arc.sinkWire),
                 "fixed": int(arc.cls) == 1,
                 "tile_type": graph.to_str(arc.tiletype),
-                "delay": arc.delay,
+                "timing_class": classify_pip(
+                    pip_classes, known_classes, source, sink
+                ),
                 "lutperm_flags": arc.lutperm_flags,
             }
         )
     return {"wires": wires, "bels": bels, "pips": pips}
+
+
+def delay_range(entry):
+    return {
+        "min_ps": min(entry["rising"][0], entry["falling"][0]),
+        "max_ps": max(entry["rising"][2], entry["falling"][2]),
+    }
+
+
+def merge_range(current, incoming):
+    if current is None:
+        return incoming
+    return {
+        "min_ps": min(current["min_ps"], incoming["min_ps"]),
+        "max_ps": max(current["max_ps"], incoming["max_ps"]),
+    }
+
+
+def export_cell_timings(cell_database):
+    slogic = cell_database["SLOGICB"]
+    lut_arcs = {}
+    ff_arcs = {}
+    ff_checks = {}
+    for entry in slogic:
+        if entry["type"] == "IOPath":
+            source = entry["from_pin"]
+            destination = entry["to_pin"]
+            if source in {"A0", "B0", "C0", "D0"} and destination == "F0":
+                key = (source[0], "F")
+                lut_arcs[key] = merge_range(lut_arcs.get(key), delay_range(entry))
+            elif source == "CLK" and destination == "Q0":
+                key = ("CLK", "Q")
+                ff_arcs[key] = merge_range(ff_arcs.get(key), delay_range(entry))
+        elif entry["type"] == "SetupHold" and not isinstance(entry["pin"], list):
+            normalized = {"DI0": "DI", "M0": "M"}.get(entry["pin"], entry["pin"])
+            if normalized not in {"DI", "M", "CE", "LSR"}:
+                continue
+            clock = entry["clock"][1]
+            key = (normalized, clock)
+            setup = {"min_ps": entry["setup"][0], "max_ps": entry["setup"][2]}
+            hold = {"min_ps": entry["hold"][0], "max_ps": entry["hold"][2]}
+            previous = ff_checks.get(key)
+            ff_checks[key] = {
+                "setup": merge_range(None if previous is None else previous["setup"], setup),
+                "hold": merge_range(None if previous is None else previous["hold"], hold),
+            }
+
+    def arcs(records):
+        return [
+            {"from_pin": source, "to_pin": sink, "delay": delay}
+            for (source, sink), delay in sorted(records.items())
+        ]
+
+    checks = [
+        {
+            "signal_pin": signal,
+            "clock_pin": clock,
+            "setup": values["setup"],
+            "hold": values["hold"],
+        }
+        for (signal, clock), values in sorted(ff_checks.items())
+    ]
+    return [
+        {
+            "cell_type": "DCCA",
+            "arcs": [
+                {
+                    "from_pin": "CLKI",
+                    "to_pin": "CLKO",
+                    "delay": {"min_ps": 0, "max_ps": 0},
+                }
+            ],
+            "setup_holds": [],
+        },
+        {
+            "cell_type": "TRELLIS_COMB",
+            "arcs": arcs(lut_arcs),
+            "setup_holds": [],
+        },
+        {
+            "cell_type": "TRELLIS_FF",
+            "arcs": arcs(ff_arcs),
+            "setup_holds": checks,
+        },
+    ]
+
+
+def export_speed_grades(database):
+    interconnect_by_grade = {}
+    cells_by_grade = {}
+    known_classes = {"default", "zero"}
+    for grade in SPEED_GRADES:
+        root = database / "ECP5" / "timing" / f"speed_{grade}"
+        with (root / "interconnect.json").open(encoding="utf-8") as source:
+            interconnect_by_grade[grade] = json.load(source)
+        with (root / "cells.json").open(encoding="utf-8") as source:
+            cells_by_grade[grade] = json.load(source)
+    known_classes.update(interconnect_by_grade["6"])
+
+    speed_grades = []
+    for grade in SPEED_GRADES:
+        classes = {}
+        database_classes = interconnect_by_grade[grade]
+        for name in sorted(known_classes):
+            if name == "zero":
+                values = (0, 0, 0, 0)
+            elif name == "default" or name not in database_classes:
+                values = (50, 50, 0, 0)
+            else:
+                timing = database_classes[name]
+                values = (
+                    math.floor(timing["delay"][0] * 1.1),
+                    math.ceil(timing["delay"][2] * 1.1),
+                    math.floor(timing["fanout"][0]),
+                    math.ceil(timing["fanout"][2]),
+                )
+            classes[name] = {
+                "min_base_ps": values[0],
+                "max_base_ps": values[1],
+                "min_fanout_adder_ps": values[2],
+                "max_fanout_adder_ps": values[3],
+            }
+        speed_grades.append(
+            {
+                "name": grade,
+                "pip_classes": classes,
+                "cells": export_cell_timings(cells_by_grade[grade]),
+            }
+        )
+    return speed_grades, known_classes
 
 
 def main():
@@ -116,6 +274,13 @@ def main():
         raise SystemExit(
             "unable to import pytrellis; pass its build directory with -L"
         ) from error
+    try:
+        import pip_classes
+    except ImportError as error:
+        raise SystemExit(
+            "unable to import Project Trellis timing utilities; add "
+            "-L /path/to/prjtrellis/timing/util"
+        ) from error
 
     pytrellis.load_database(str(args.database))
     chip = pytrellis.Chip(args.device)
@@ -123,9 +288,23 @@ def main():
         chip, include_lutperm_pips=True, split_slice_mode=True
     )
 
+    speed_grades, known_classes = export_speed_grades(args.database.resolve())
     location_type_keys = [entry.key() for entry in graph.locationTypes]
+    representatives = {}
+    for y in range(chip.get_max_row() + 1):
+        for x in range(chip.get_max_col() + 1):
+            location = pytrellis.Location(x, y)
+            key = graph.typeAtLocation[location]
+            representatives.setdefault(key, location)
     location_types = [
-        export_location_type(graph, graph.locationTypes[key])
+        export_location_type(
+            pytrellis,
+            graph,
+            graph.locationTypes[key],
+            representatives[key],
+            pip_classes,
+            known_classes,
+        )
         for key in location_type_keys
     ]
     locations = []
@@ -153,6 +332,7 @@ def main():
         "packages": export_packages(
             pytrellis, graph, args.database.resolve(), args.device
         ),
+        "speed_grades": speed_grades,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as destination:

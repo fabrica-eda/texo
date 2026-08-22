@@ -48,8 +48,8 @@ same mapped design still passes Celox simulation.
   resolve clock ports to logical IO cells.
 - [ ] Generate and characterize a complete production device snapshot using a
   locally built `pytrellis` and `prjtrellis-db` checkout.
-- [ ] Model clock networks and timing arcs beyond the routing-graph delay
-  metadata already preserved by the importer.
+- [x] Import speed-grade PIP classes, LUT arcs, FF clock-to-Q/setup/hold, and
+  DCCA arcs from Project Trellis timing data.
 - [x] Validate DP16KD width/depth modes, constrain each BRAM to compatible
   BELs, and assign stable WID configuration values with explicit errors.
 - [x] Rank clock nets by FF/BRAM clock-pin fanout, insert DCCA cells for at most
@@ -89,10 +89,11 @@ the route can be imported into Project Trellis configuration tooling.
 
 - [x] Build a post-route timing graph from logical pins, selected PIPs, register
   boundaries, and LPF clock constraints.
-- [x] Import Project Trellis PIP delays as picoseconds and emit deterministic
-  per-sink delays, setup checks, and worst slack in the checkpoint.
-- [ ] Import speed-grade cell arcs, clock-to-Q, setup, and hold timing tables.
-- [ ] Implement hold analysis, multicycle/false paths, and generated clocks.
+- [x] Evaluate Project Trellis PIP class/fanout delays as min/max picoseconds
+  and emit deterministic per-sink delays and worst setup/hold slack.
+- [x] Import speed-grade LUT arcs, FF clock-to-Q/setup/hold, and DCCA timing.
+- [x] Implement conservative early/late hold analysis.
+- [ ] Implement multicycle/false paths, generated clocks, and BRAM timing.
 - Generate the Project Trellis textual configuration; use `ecppack` initially.
 - Require all functional, physical, and timing gates before bitstream release.
 - Add hardware smoke tests and nextpnr differential tests.

@@ -4,16 +4,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use texo_model::{CellId, Design, Device, NetId, PinDirection, PipId};
+use texo_model::{CellId, CellPinId, Design, Device, NetId, PinDirection, PipId, ResourceKind};
 use texo_pnr::{PlacementConstraints, PnrError, PnrResult, place_and_route_with_constraints};
 use texo_struo::{ImportedEcp5Design, PrimitiveMetadata};
 use texo_target_ecp5::{
-    BlockRamRequirement, DEFAULT_GLOBAL_CLOCK_FANOUT, Ecp5Architecture, Ecp5Packing,
-    LpfConstraints, LpfError, PackingError, find_global_clock_requirements, pack_lut_ffs,
-    resolve_lpf_port_cells,
+    BlockRamRequirement, DEFAULT_GLOBAL_CLOCK_FANOUT, DelayRangeRecord, Ecp5Architecture,
+    Ecp5Packing, LpfConstraints, LpfError, PackingError, SpeedGradeRecord,
+    find_global_clock_requirements, pack_lut_ffs, resolve_lpf_port_cells,
 };
 use texo_timing::{
-    PICOSECONDS_PER_SECOND, TimingConstraints, TimingError, TimingReport, analyze_timing,
+    DelayRange, PICOSECONDS_PER_SECOND, TimingConstraints, TimingError, TimingModel, TimingReport,
+    analyze_timing,
 };
 
 /// Evidence required before a programmable artifact may be released.
@@ -135,6 +136,8 @@ pub fn verify_post_map_with_celox<E>(
 /// Configuration for the complete Struo-to-ECP5 physical implementation flow.
 #[derive(Clone, Copy, Debug)]
 pub struct Ecp5FlowOptions<'a> {
+    /// Exact ECP5 speed grade used for all timing arcs.
+    pub speed_grade: Option<&'a str>,
     /// Exact architecture package used to resolve LPF pin names.
     pub package: Option<&'a str>,
     /// Parsed LPF constraints, when supplied by the user.
@@ -148,6 +151,7 @@ pub struct Ecp5FlowOptions<'a> {
 impl Default for Ecp5FlowOptions<'_> {
     fn default() -> Self {
         Self {
+            speed_grade: None,
             package: None,
             lpf: None,
             allow_unconstrained_io: false,
@@ -159,6 +163,8 @@ impl Default for Ecp5FlowOptions<'_> {
 /// Owned output of a successful Struo-to-ECP5 implementation run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ecp5FlowResult {
+    /// Exact speed-grade timing table used by STA.
+    pub speed_grade: String,
     /// Logical design after target-inserted resources such as DCCA buffers.
     pub design: Design,
     /// Original mapped primitive configuration indexed by stable cell ID.
@@ -183,9 +189,9 @@ pub struct Ecp5FlowResult {
 ///
 /// # Errors
 ///
-/// Returns an error for missing simulation evidence or package selection, LPF
-/// resolution, target packing, placement, or routing. The input import and
-/// caller's evidence remain unchanged on every failure.
+/// Returns an error for missing simulation evidence, speed grade, or package
+/// selection, LPF resolution, target packing, placement, routing, or timing.
+/// The input import and caller's evidence remain unchanged on every failure.
 pub fn implement_struo_ecp5(
     imported: &ImportedEcp5Design,
     architecture: &Ecp5Architecture,
@@ -195,6 +201,13 @@ pub fn implement_struo_ecp5(
     if !evidence.contains(Gate::PostMapSimulation) {
         return Err(Ecp5FlowError::MissingPostMapSimulation);
     }
+    let speed_grade_name = options
+        .speed_grade
+        .ok_or(Ecp5FlowError::MissingSpeedGrade)?;
+    let speed_grade = architecture
+        .speed_grades()
+        .get(speed_grade_name)
+        .ok_or_else(|| Ecp5FlowError::UnknownSpeedGrade(speed_grade_name.into()))?;
 
     let mut design = imported.design().clone();
     let mut packing = pack_lut_ffs(&design, architecture)?;
@@ -242,24 +255,15 @@ pub fn implement_struo_ecp5(
         packing.constraints(),
         &mut staged_evidence,
     )?;
-    let pip_delays_ps = architecture
-        .pip_metadata()
-        .iter()
-        .map(|(&pip, metadata)| {
-            u64::try_from(metadata.delay)
-                .map(|delay| (pip, delay))
-                .map_err(|_| Ecp5FlowError::NegativePipDelay {
-                    pip,
-                    delay: metadata.delay,
-                })
-        })
-        .collect::<Result<BTreeMap<PipId, u64>, _>>()?;
+    let pip_delays = ecp5_pip_delays(architecture, speed_grade, &implementation)?;
+    let timing_model = ecp5_timing_model(&design, &packing, speed_grade)?;
     let timing_constraints = ecp5_timing_constraints(&design, &packing)?;
     let timing = analyze_timing(
         &design,
         architecture.device(),
         &implementation,
-        &pip_delays_ps,
+        &pip_delays,
+        &timing_model,
         &timing_constraints,
     )?;
     if timing.met_timing() {
@@ -268,6 +272,7 @@ pub fn implement_struo_ecp5(
     *evidence = staged_evidence;
 
     Ok(Ecp5FlowResult {
+        speed_grade: speed_grade_name.into(),
         design,
         primitive_metadata: imported.metadata().clone(),
         absorbed_inputs: imported.absorbed_inputs().clone(),
@@ -317,6 +322,136 @@ fn ecp5_timing_constraints(
     Ok(constraints)
 }
 
+fn ecp5_pip_delays(
+    architecture: &Ecp5Architecture,
+    speed_grade: &SpeedGradeRecord,
+    implementation: &PnrResult,
+) -> Result<BTreeMap<PipId, DelayRange>, Ecp5FlowError> {
+    let device = architecture.device();
+    let selected = implementation
+        .routes
+        .iter()
+        .flat_map(|route| route.pips.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut source_fanout = BTreeMap::new();
+    for &pip_id in &selected {
+        let pip = &device.pips()[pip_id.0];
+        *source_fanout.entry(pip.from).or_insert(0_u64) += 1;
+    }
+    selected
+        .into_iter()
+        .map(|pip_id| {
+            let metadata = &architecture.pip_metadata()[&pip_id];
+            let class = speed_grade
+                .pip_classes
+                .get(&metadata.timing_class)
+                .ok_or_else(|| Ecp5FlowError::MissingPipTimingClass {
+                    speed_grade: speed_grade.name.clone(),
+                    timing_class: metadata.timing_class.clone(),
+                })?;
+            let fanout = source_fanout[&device.pips()[pip_id.0].from];
+            let min_ps = class
+                .min_fanout_adder_ps
+                .checked_mul(fanout)
+                .and_then(|delay| class.min_base_ps.checked_add(delay))
+                .ok_or(Ecp5FlowError::TimingDelayOverflow)?;
+            let max_ps = class
+                .max_fanout_adder_ps
+                .checked_mul(fanout)
+                .and_then(|delay| class.max_base_ps.checked_add(delay))
+                .ok_or(Ecp5FlowError::TimingDelayOverflow)?;
+            Ok((pip_id, DelayRange::new(min_ps, max_ps)?))
+        })
+        .collect()
+}
+
+fn ecp5_timing_model(
+    design: &Design,
+    packing: &Ecp5Packing,
+    speed_grade: &SpeedGradeRecord,
+) -> Result<TimingModel, Ecp5FlowError> {
+    let records = speed_grade
+        .cells
+        .iter()
+        .map(|record| (record.cell_type.as_str(), record))
+        .collect::<BTreeMap<_, _>>();
+    let general_routing_ffs = packing
+        .general_routing_ffs()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut model = TimingModel::new();
+    for (index, cell) in design.cells().iter().enumerate() {
+        let cell_id = CellId(index);
+        let cell_type = match cell.kind {
+            ResourceKind::Lut(4) => "TRELLIS_COMB",
+            ResourceKind::Register => "TRELLIS_FF",
+            ResourceKind::Clock => "DCCA",
+            _ => continue,
+        };
+        let record =
+            records
+                .get(cell_type)
+                .copied()
+                .ok_or_else(|| Ecp5FlowError::MissingCellTiming {
+                    speed_grade: speed_grade.name.clone(),
+                    cell_type: cell_type.into(),
+                })?;
+        for arc in &record.arcs {
+            let Some(from) = find_cell_pin(design, cell_id, &arc.from_pin) else {
+                continue;
+            };
+            let Some(to) = find_cell_pin(design, cell_id, &arc.to_pin) else {
+                continue;
+            };
+            let delay = timing_delay(arc.delay)?;
+            if cell.kind == ResourceKind::Register && arc.from_pin == "CLK" && arc.to_pin == "Q" {
+                model.add_clock_to_q(from, to, delay)?;
+            } else {
+                model.add_cell_arc(from, to, delay)?;
+            }
+        }
+        for check in &record.setup_holds {
+            let using_general_routing = general_routing_ffs.contains(&cell_id);
+            if (check.signal_pin == "DI" && using_general_routing)
+                || (check.signal_pin == "M" && !using_general_routing)
+            {
+                continue;
+            }
+            let logical_signal = if check.signal_pin == "M" {
+                "DI"
+            } else {
+                &check.signal_pin
+            };
+            let Some(signal) = find_cell_pin(design, cell_id, logical_signal) else {
+                continue;
+            };
+            let Some(clock) = find_cell_pin(design, cell_id, &check.clock_pin) else {
+                continue;
+            };
+            model.add_setup_hold(
+                clock,
+                signal,
+                timing_delay(check.setup)?,
+                timing_delay(check.hold)?,
+            )?;
+        }
+    }
+    Ok(model)
+}
+
+fn timing_delay(record: DelayRangeRecord) -> Result<DelayRange, TimingError> {
+    DelayRange::new(record.min_ps, record.max_ps)
+}
+
+fn find_cell_pin(design: &Design, cell: CellId, name: &str) -> Option<CellPinId> {
+    design.cells()[cell.0]
+        .pins()
+        .iter()
+        .copied()
+        .find(|pin| design.pins()[pin.0].name == name)
+}
+
 fn insert_clock_period(
     constraints: &mut TimingConstraints,
     net: NetId,
@@ -338,19 +473,32 @@ pub enum Ecp5FlowError {
     MissingPostMapSimulation,
     /// LPF constraints were supplied without an exact package name.
     MissingPackageForLpf,
+    /// No exact ECP5 speed grade was selected.
+    MissingSpeedGrade,
+    /// Selected speed grade is absent from the architecture snapshot.
+    UnknownSpeedGrade(String),
     /// LPF name resolution failed.
     Lpf(LpfError),
     /// ECP5 packing failed.
     Packing(PackingError),
     /// Placement or routing failed.
     Pnr(PnrError),
-    /// Project Trellis supplied a negative PIP delay.
-    NegativePipDelay {
-        /// Physical PIP.
-        pip: PipId,
-        /// Invalid delay value.
-        delay: i32,
+    /// One selected PIP class was absent from the speed-grade table.
+    MissingPipTimingClass {
+        /// Speed-grade name.
+        speed_grade: String,
+        /// Missing timing class.
+        timing_class: String,
     },
+    /// A required split-cell timing record was absent.
+    MissingCellTiming {
+        /// Speed-grade name.
+        speed_grade: String,
+        /// Missing cell type.
+        cell_type: String,
+    },
+    /// Speed-grade delay arithmetic overflowed.
+    TimingDelayOverflow,
     /// A frequency-constrained IO cell does not drive exactly one net.
     ClockIoNet {
         /// Logical IO cell name.
@@ -381,12 +529,28 @@ impl fmt::Display for Ecp5FlowError {
             Self::MissingPackageForLpf => {
                 write!(f, "an exact ECP5 package is required when LPF is supplied")
             }
+            Self::MissingSpeedGrade => write!(f, "an exact ECP5 speed grade is required"),
+            Self::UnknownSpeedGrade(speed_grade) => {
+                write!(f, "architecture has no ECP5 speed grade `{speed_grade}`")
+            }
             Self::Lpf(error) => write!(f, "LPF resolution failed: {error}"),
             Self::Packing(error) => write!(f, "ECP5 packing failed: {error}"),
             Self::Pnr(error) => write!(f, "ECP5 physical implementation failed: {error}"),
-            Self::NegativePipDelay { pip, delay } => {
-                write!(f, "ECP5 PIP {} has negative delay {delay}", pip.0)
-            }
+            Self::MissingPipTimingClass {
+                speed_grade,
+                timing_class,
+            } => write!(
+                f,
+                "ECP5 speed grade `{speed_grade}` has no PIP timing class `{timing_class}`"
+            ),
+            Self::MissingCellTiming {
+                speed_grade,
+                cell_type,
+            } => write!(
+                f,
+                "ECP5 speed grade `{speed_grade}` has no cell timing for `{cell_type}`"
+            ),
+            Self::TimingDelayOverflow => write!(f, "ECP5 timing delay arithmetic overflowed"),
             Self::ClockIoNet { cell } => write!(
                 f,
                 "frequency-constrained IO cell `{cell}` must drive exactly one net"
@@ -412,7 +576,11 @@ impl Error for Ecp5FlowError {
             Self::Timing(error) => Some(error),
             Self::MissingPostMapSimulation
             | Self::MissingPackageForLpf
-            | Self::NegativePipDelay { .. }
+            | Self::MissingSpeedGrade
+            | Self::UnknownSpeedGrade(_)
+            | Self::MissingPipTimingClass { .. }
+            | Self::MissingCellTiming { .. }
+            | Self::TimingDelayOverflow
             | Self::ClockIoNet { .. }
             | Self::ClockFrequencyOutOfRange { .. }
             | Self::ConflictingClockPeriods { .. } => None,
@@ -471,7 +639,7 @@ mod tests {
     use struo_celox::ecp5_simulator;
     use struo_ir::{ClockEdge, Netlist, RegisterCell};
     use struo_target_ecp5::{Ecp5Netlist, map_to_ecp5};
-    use texo_model::{BelId, Design, Device, PinDirection, ResourceKind};
+    use texo_model::{BelId, CellId, Design, Device, PinDirection, ResourceKind};
     use texo_pnr::PlacementConstraints;
     use texo_struo::import_ecp5;
     use texo_target_ecp5::{
@@ -480,8 +648,9 @@ mod tests {
     };
 
     use super::{
-        Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, ecp5_timing_constraints, implement,
-        implement_struo_ecp5, implement_with_constraints, verify_post_map_with_celox,
+        Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, ecp5_timing_constraints, ecp5_timing_model,
+        find_cell_pin, implement, implement_struo_ecp5, implement_with_constraints,
+        verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -559,6 +728,7 @@ mod tests {
             &imported,
             &architecture,
             Ecp5FlowOptions {
+                speed_grade: Some("6"),
                 package: Some("CABGA381"),
                 lpf: Some(&lpf),
                 ..Ecp5FlowOptions::default()
@@ -571,6 +741,14 @@ mod tests {
         assert!(evidence.contains(Gate::MappedNetlistComplete));
         assert!(evidence.contains(Gate::PhysicalImplementation));
         assert!(!evidence.contains(Gate::TimingClosure));
+        assert_eq!(result.speed_grade, "6");
+        assert!(
+            result
+                .timing
+                .net_delays
+                .iter()
+                .all(|delay| delay.delay.min_ps <= delay.delay.max_ps)
+        );
         assert_eq!(result.design.cells().len(), 4);
         assert_eq!(result.primitive_metadata.len(), 4);
         assert!(!result.absorbed_inputs.is_empty());
@@ -596,6 +774,25 @@ mod tests {
             Err(Ecp5FlowError::MissingPostMapSimulation)
         ));
         assert_eq!(evidence, Evidence::new());
+    }
+
+    #[test]
+    fn requires_an_exact_ecp5_speed_grade() {
+        let mapped = mapped_xor();
+        let imported = import_ecp5(&mapped).unwrap();
+        let architecture = read_architecture(ECP5_FIXTURE.as_bytes()).unwrap();
+        let mut evidence = Evidence::new();
+        evidence.record(Gate::PostMapSimulation);
+
+        assert!(matches!(
+            implement_struo_ecp5(
+                &imported,
+                &architecture,
+                Ecp5FlowOptions::default(),
+                &mut evidence,
+            ),
+            Err(Ecp5FlowError::MissingSpeedGrade)
+        ));
     }
 
     #[test]
@@ -643,11 +840,23 @@ mod tests {
             .unwrap();
 
         let constraints = ecp5_timing_constraints(&design, &packing).unwrap();
+        let timing_model =
+            ecp5_timing_model(&design, &packing, &architecture.speed_grades()["6"]).unwrap();
         let global_net = packing.global_clocks()[0].global_net;
+        let ff = design
+            .cells()
+            .iter()
+            .position(|cell| cell.kind == ResourceKind::Register)
+            .map(CellId)
+            .unwrap();
+        let ff_data = find_cell_pin(&design, ff, "DI").unwrap();
+        let ff_q = find_cell_pin(&design, ff, "Q").unwrap();
 
         assert_eq!(packing.clock_frequencies_hz().len(), 1);
         assert_eq!(constraints.clock_periods_ps().len(), 2);
         assert_eq!(constraints.clock_periods_ps()[&global_net], 40_000);
+        assert_eq!(timing_model.clock_to_q(ff_q).unwrap().1.max_ps, 525);
+        assert_eq!(timing_model.setup_hold(ff_data).unwrap().2.min_ps, 233);
     }
 
     #[test]
@@ -665,6 +874,7 @@ mod tests {
                 &imported,
                 &architecture,
                 Ecp5FlowOptions {
+                    speed_grade: Some("6"),
                     package: Some("CABGA381"),
                     lpf: Some(&lpf),
                     allow_unconstrained_io: true,

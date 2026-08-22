@@ -22,7 +22,7 @@ Texo FPGA place and route
 
 Usage:
   texo demo                         run the deterministic abstract-grid PnR demo
-  texo ecp5-demo <architecture> <package> <constraints.lpf> [checkpoint.json]
+  texo ecp5-demo <architecture> <package> <speed-grade> <constraints.lpf> [checkpoint.json]
                                     run a verified Struo/Celox ECP5 XOR flow
   texo target-info <architecture>   inspect an ECP5 architecture snapshot
   texo lpf-info <constraints.lpf>   inspect ECP5 pin, IO, and clock constraints
@@ -50,14 +50,23 @@ fn run() -> Result<(), Box<dyn Error>> {
             let package = args
                 .next()
                 .ok_or_else(|| format!("ecp5-demo requires a package name\n\n{USAGE}"))?;
+            let speed_grade = args
+                .next()
+                .ok_or_else(|| format!("ecp5-demo requires a speed grade\n\n{USAGE}"))?;
             let lpf = args
                 .next()
                 .ok_or_else(|| format!("ecp5-demo requires an LPF path\n\n{USAGE}"))?;
             let checkpoint = args.next();
             if args.next().is_some() {
-                return Err(format!("ecp5-demo accepts at most four arguments\n\n{USAGE}").into());
+                return Err(format!("ecp5-demo accepts at most five arguments\n\n{USAGE}").into());
             }
-            ecp5_demo(&architecture, &package, &lpf, checkpoint.as_deref())
+            ecp5_demo(
+                &architecture,
+                &package,
+                &speed_grade,
+                &lpf,
+                checkpoint.as_deref(),
+            )
         }
         Some("target-info") => {
             let path = args
@@ -137,6 +146,15 @@ fn target_info(path: &str) -> Result<(), Box<dyn Error>> {
         .join(", ");
     println!("packages: {package_names}");
     println!(
+        "speed grades: {}",
+        architecture
+            .speed_grades()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
         "Project Trellis revision: {}",
         architecture.provenance().project_trellis_revision
     );
@@ -150,6 +168,7 @@ fn target_info(path: &str) -> Result<(), Box<dyn Error>> {
 fn ecp5_demo(
     architecture_path: &str,
     package: &str,
+    speed_grade: &str,
     lpf_path: &str,
     checkpoint_path: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
@@ -187,6 +206,7 @@ fn ecp5_demo(
         &imported,
         &architecture,
         Ecp5FlowOptions {
+            speed_grade: Some(speed_grade),
             package: Some(package),
             lpf: Some(&lpf),
             ..Ecp5FlowOptions::default()
@@ -195,7 +215,10 @@ fn ecp5_demo(
     )?;
 
     println!("Celox post-map XOR truth table: passed");
-    println!("device: {} ({package})", architecture.device().name());
+    println!(
+        "device: {} ({package}, speed {speed_grade})",
+        architecture.device().name()
+    );
     println!(
         "packed: {} LUT/FF pairs, {} BRAMs, {} global clocks",
         result.packing.lut_ff_pairs().len(),
@@ -210,8 +233,9 @@ fn ecp5_demo(
     );
     match result.timing.worst_slack_ps {
         Some(slack_ps) => println!(
-            "timing: {} setup checks, worst slack {slack_ps} ps ({})",
+            "timing: {} setup/hold checks, worst setup {slack_ps} ps, worst hold {} ps ({})",
             result.timing.setup_checks.len(),
+            result.timing.worst_hold_slack_ps.unwrap_or(0),
             if result.timing.met_timing() {
                 "passed"
             } else {
@@ -260,6 +284,7 @@ fn ecp5_checkpoint(
             "family": "ECP5",
             "device": device.name(),
             "package": package,
+            "speed_grade": result.speed_grade,
             "project_trellis_revision": architecture.provenance().project_trellis_revision,
             "database_revision": architecture.provenance().database_revision,
         },
@@ -431,7 +456,8 @@ fn checkpoint_timing(result: &Ecp5FlowResult) -> Value {
                 "net_id": delay.net.0,
                 "net": result.design.nets()[delay.net.0].name,
                 "sink_pin_id": delay.sink.0,
-                "delay_ps": delay.delay_ps,
+                "min_delay_ps": delay.delay.min_ps,
+                "max_delay_ps": delay.delay.max_ps,
             })
         })
         .collect::<Vec<_>>();
@@ -447,16 +473,37 @@ fn checkpoint_timing(result: &Ecp5FlowResult) -> Value {
                 "clock_net_id": check.clock_net.0,
                 "arrival_ps": check.arrival_ps,
                 "clock_arrival_ps": check.clock_arrival_ps,
+                "setup_ps": check.setup_ps,
+                "required_ps": check.required_ps,
+                "slack_ps": check.slack_ps,
+            })
+        })
+        .collect::<Vec<_>>();
+    let hold_checks = result
+        .timing
+        .hold_checks
+        .iter()
+        .map(|check| {
+            json!({
+                "cell_id": check.cell.0,
+                "cell": result.design.cells()[check.cell.0].name,
+                "data_pin_id": check.data_pin.0,
+                "clock_net_id": check.clock_net.0,
+                "arrival_ps": check.arrival_ps,
+                "clock_arrival_ps": check.clock_arrival_ps,
+                "hold_ps": check.hold_ps,
                 "required_ps": check.required_ps,
                 "slack_ps": check.slack_ps,
             })
         })
         .collect::<Vec<_>>();
     json!({
-        "delay_model": "project_trellis_pip_ps_zero_cell_delay",
+        "delay_model": "project_trellis_speed_grade_min_max_ps",
         "net_delays": net_delays,
         "setup_checks": setup_checks,
+        "hold_checks": hold_checks,
         "worst_slack_ps": result.timing.worst_slack_ps,
+        "worst_hold_slack_ps": result.timing.worst_hold_slack_ps,
         "met_timing": result.timing.met_timing(),
     })
 }
@@ -617,8 +664,8 @@ mod tests {
         let first_path = first.to_string_lossy();
         let second_path = second.to_string_lossy();
 
-        ecp5_demo(ARCHITECTURE, "CABGA381", LPF, Some(&first_path)).unwrap();
-        ecp5_demo(ARCHITECTURE, "CABGA381", LPF, Some(&second_path)).unwrap();
+        ecp5_demo(ARCHITECTURE, "CABGA381", "6", LPF, Some(&first_path)).unwrap();
+        ecp5_demo(ARCHITECTURE, "CABGA381", "6", LPF, Some(&second_path)).unwrap();
         let first_bytes = fs::read(&first).unwrap();
         let second_bytes = fs::read(&second).unwrap();
         let checkpoint: Value = serde_json::from_slice(&first_bytes).unwrap();
@@ -626,12 +673,20 @@ mod tests {
         assert_eq!(first_bytes, second_bytes);
         assert_eq!(checkpoint["schema_version"], 1);
         assert_eq!(checkpoint["target"]["package"], "CABGA381");
+        assert_eq!(checkpoint["target"]["speed_grade"], "6");
         assert_eq!(checkpoint["metrics"]["cells"], 4);
         assert_eq!(checkpoint["metrics"]["routed_nets"], 3);
         assert_eq!(checkpoint["placement"].as_array().unwrap().len(), 4);
         assert_eq!(checkpoint["routes"].as_array().unwrap().len(), 3);
         assert_eq!(
             checkpoint["timing"]["setup_checks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            checkpoint["timing"]["hold_checks"]
                 .as_array()
                 .unwrap()
                 .len(),

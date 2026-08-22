@@ -22,7 +22,7 @@ architecture data is introduced; it is not yet a production FPGA router.
 |---|---|
 | `texo-model` | Typed logical/physical arenas and their unified graph view |
 | `texo-pnr` | Atomic-group Cell-to-BEL placement and capacity-aware Wire/PIP routing |
-| `texo-timing` | Post-route timing graph, routed PIP delays, and register setup analysis |
+| `texo-timing` | Min/max post-route timing graph with setup and hold analysis |
 | `texo-flow` | Verified Struo-to-ECP5 orchestration and release gates |
 | `texo-struo` | Direct Struo ECP5 import and crates.io Celox verification boundary |
 | `texo-target-ecp5` | Project Trellis import, LUT/FF, DP16KD and DCCA packing, package-to-PIO binding |
@@ -46,6 +46,7 @@ cargo run -- demo
 cargo run -- ecp5-demo \
   crates/texo-target-ecp5/fixtures/minimal-ecp5.json \
   CABGA381 \
+  6 \
   crates/texo-target-ecp5/fixtures/xor.lpf \
   /tmp/texo-xor-checkpoint.json
 cargo run -- target-info crates/texo-target-ecp5/fixtures/minimal-ecp5.json
@@ -56,13 +57,14 @@ cargo fmt --all -- --check
 ```
 
 `tools/export_ecp5.py` generates a deduplicated architecture snapshot from a
-local Project Trellis build and database. Production device snapshots are
-generated artifacts; the repository keeps a small schema fixture for fast,
-deterministic tests.
+local Project Trellis build and database. Schema v2 includes PIP timing classes
+and the `6/7/8/8_5G` speed-grade cell/interconnect tables. Production device
+snapshots are generated artifacts; the repository keeps a small schema fixture
+for fast, deterministic tests.
 
 `ecp5-demo` builds an XOR through Struo, verifies its complete truth table with
-crates.io Celox, applies the selected package and LPF, runs the unified ECP5
-flow, and optionally writes a deterministic JSON checkpoint. The checkpoint
+crates.io Celox, applies the selected package, speed grade, and LPF, runs the
+unified ECP5 flow, and optionally writes a deterministic JSON checkpoint. The checkpoint
 contains provenance, evidence, primitive configuration, absorbed constants,
 packing decisions, IO/clock constraints, placement, Wire/PIP routes, and the
 post-route timing report.
