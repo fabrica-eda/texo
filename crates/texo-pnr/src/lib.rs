@@ -46,6 +46,36 @@ pub struct RoutingConstraints {
     routes: BTreeMap<NetId, NetRoute>,
 }
 
+/// Characterized costs used by timing-driven negotiated routing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutingCosts {
+    pip_delays_ps: Vec<u32>,
+    net_criticalities: BTreeMap<NetId, u64>,
+}
+
+impl RoutingCosts {
+    /// Creates costs indexed by stable PIP and logical net IDs.
+    #[must_use]
+    pub const fn new(pip_delays_ps: Vec<u32>, net_criticalities: BTreeMap<NetId, u64>) -> Self {
+        Self {
+            pip_delays_ps,
+            net_criticalities,
+        }
+    }
+
+    /// Estimated maximum delay for every physical PIP.
+    #[must_use]
+    pub fn pip_delays_ps(&self) -> &[u32] {
+        &self.pip_delays_ps
+    }
+
+    /// Criticality weights indexed by logical net.
+    #[must_use]
+    pub const fn net_criticalities(&self) -> &BTreeMap<NetId, u64> {
+        &self.net_criticalities
+    }
+}
+
 impl RoutingConstraints {
     /// Creates an unconstrained routing problem.
     #[must_use]
@@ -258,7 +288,7 @@ pub fn place_and_route_with_all_constraints(
 ) -> Result<PnrResult, PnrError> {
     let graph = UnifiedGraph::new(design, device);
     let placement = place(&graph, placement_constraints, None)?;
-    finish_routing(&graph, placement, routing_constraints, &mut |_| {})
+    finish_routing(&graph, placement, routing_constraints, None, &mut |_| {})
 }
 
 /// Routes a design from an already selected legal placement.
@@ -291,6 +321,29 @@ pub fn route_with_placement_and_progress(
         &UnifiedGraph::new(design, device),
         placement,
         routing_constraints,
+        None,
+        &mut progress,
+    )
+}
+
+/// Routes an existing placement with characterized timing costs and progress.
+///
+/// # Errors
+///
+/// Returns an invalid cost/constraint, model, or routability error.
+pub fn route_with_timing_costs_and_progress(
+    design: &Design,
+    device: &Device,
+    placement: Placement,
+    routing_constraints: &RoutingConstraints,
+    routing_costs: &RoutingCosts,
+    mut progress: impl FnMut(RoutingProgress),
+) -> Result<PnrResult, PnrError> {
+    finish_routing(
+        &UnifiedGraph::new(design, device),
+        placement,
+        routing_constraints,
+        Some(routing_costs),
         &mut progress,
     )
 }
@@ -299,10 +352,18 @@ fn finish_routing(
     graph: &UnifiedGraph<'_>,
     placement: Placement,
     routing_constraints: &RoutingConstraints,
+    routing_costs: Option<&RoutingCosts>,
     progress: &mut impl FnMut(RoutingProgress),
 ) -> Result<PnrResult, PnrError> {
     validate_routing_constraints(graph, &placement, routing_constraints)?;
-    let routes = route(graph, &placement, routing_constraints, progress)?;
+    validate_routing_costs(graph, routing_costs)?;
+    let routes = route(
+        graph,
+        &placement,
+        routing_constraints,
+        routing_costs,
+        progress,
+    )?;
     let total_pips = routes.iter().map(|route| route.pips.len()).sum();
     Ok(PnrResult {
         placement,
@@ -1302,10 +1363,42 @@ fn validate_routing_constraints(
     Ok(())
 }
 
+fn validate_routing_costs(
+    graph: &UnifiedGraph<'_>,
+    costs: Option<&RoutingCosts>,
+) -> Result<(), PnrError> {
+    let Some(costs) = costs else {
+        return Ok(());
+    };
+    if costs.pip_delays_ps.len() != graph.device().pips().len() {
+        return Err(PnrError::InvalidRoutingCosts {
+            reason: format!(
+                "expected {} PIP delays, received {}",
+                graph.device().pips().len(),
+                costs.pip_delays_ps.len()
+            ),
+        });
+    }
+    for (&net, &criticality) in &costs.net_criticalities {
+        if net.0 >= graph.design().nets().len() {
+            return Err(PnrError::InvalidRoutingCosts {
+                reason: format!("criticality names unknown net {}", net.0),
+            });
+        }
+        if !(1..=64).contains(&criticality) {
+            return Err(PnrError::InvalidRoutingCosts {
+                reason: format!("net {} criticality {criticality} is outside 1..=64", net.0),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn route(
     graph: &UnifiedGraph<'_>,
     placement: &Placement,
     constraints: &RoutingConstraints,
+    costs: Option<&RoutingCosts>,
     progress: &mut impl FnMut(RoutingProgress),
 ) -> Result<Vec<NetRoute>, PnrError> {
     let design = graph.design();
@@ -1323,6 +1416,12 @@ fn route(
     routing_order.sort_by_key(|&index| {
         (
             !constraints.routes().contains_key(&NetId(index)),
+            Reverse(
+                costs
+                    .and_then(|costs| costs.net_criticalities.get(&NetId(index)))
+                    .copied()
+                    .unwrap_or(0),
+            ),
             Reverse(design.nets()[index].sinks.len()),
             index,
         )
@@ -1363,6 +1462,7 @@ fn route(
                 &wire_history,
                 &pip_history,
                 present_factor,
+                costs,
                 &mut search,
             )?;
             add_route(&route, &mut wire_occupancy, &mut pip_occupancy);
@@ -1438,6 +1538,7 @@ fn route_net(
     wire_history: &[u32],
     pip_history: &[u32],
     present_factor: u32,
+    costs: Option<&RoutingCosts>,
     search: &mut RouteSearch,
 ) -> Result<NetRoute, PnrError> {
     let design = graph.design();
@@ -1453,6 +1554,15 @@ fn route_net(
     tree_wires.insert(driver_wire);
     let mut tree_pips =
         fixed.map_or_else(BTreeSet::new, |route| route.pips.iter().copied().collect());
+    let criticality = costs
+        .and_then(|costs| costs.net_criticalities.get(&net_id))
+        .copied()
+        .unwrap_or(0);
+    let mut tree_delays_ps = tree_wires
+        .iter()
+        .copied()
+        .map(|wire| (wire, 0_u64))
+        .collect::<BTreeMap<_, _>>();
     for sink_pin in &net.sinks {
         let sink_cell = design.pins()[sink_pin.0].cell;
         let sink_bel = placement
@@ -1472,6 +1582,9 @@ fn route_net(
                 wire_history,
                 pip_history,
                 present_factor,
+                costs,
+                criticality,
+                &tree_delays_ps,
             )
             .ok_or_else(|| PnrError::Unroutable {
                 net: net.name.clone(),
@@ -1488,6 +1601,18 @@ fn route_net(
                     device.wires()[sink_wire.0].name
                 ),
             })?;
+        if let Some(costs) = costs {
+            let mut arrival_ps = tree_delays_ps[path_wires
+                .last()
+                .expect("a routed path includes its tree start")];
+            for (&wire, &pip) in path_wires.iter().rev().skip(1).zip(path_pips.iter().rev()) {
+                arrival_ps = arrival_ps.saturating_add(u64::from(costs.pip_delays_ps[pip.0]));
+                tree_delays_ps
+                    .entry(wire)
+                    .and_modify(|known| *known = (*known).min(arrival_ps))
+                    .or_insert(arrival_ps);
+            }
+        }
         tree_wires.extend(path_wires);
         tree_pips.extend(path_pips);
     }
@@ -1556,6 +1681,7 @@ struct RouteSearch {
     epoch: u32,
     seen: Vec<u32>,
     distance: Vec<u64>,
+    arrival_ps: Vec<u64>,
     previous_wire: Vec<usize>,
     previous_pip: Vec<usize>,
 }
@@ -1566,6 +1692,7 @@ impl RouteSearch {
             epoch: 0,
             seen: vec![0; wire_count],
             distance: vec![0; wire_count],
+            arrival_ps: vec![0; wire_count],
             previous_wire: vec![usize::MAX; wire_count],
             previous_pip: vec![usize::MAX; wire_count],
         }
@@ -1582,6 +1709,9 @@ impl RouteSearch {
         wire_history: &[u32],
         pip_history: &[u32],
         present_factor: u32,
+        costs: Option<&RoutingCosts>,
+        criticality: u64,
+        tree_delays_ps: &BTreeMap<WireId, u64>,
     ) -> Option<(Vec<WireId>, Vec<PipId>)> {
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
@@ -1593,19 +1723,25 @@ impl RouteSearch {
         let goal_point = device.wires()[goal.0].point;
         let mut queue = BinaryHeap::new();
         for &start in starts {
+            let arrival_ps = tree_delays_ps.get(&start).copied().unwrap_or(0);
+            let distance = timing_tree_cost(arrival_ps, criticality);
             self.seen[start.0] = epoch;
-            self.distance[start.0] = 0;
+            self.distance[start.0] = distance;
+            self.arrival_ps[start.0] = arrival_ps;
             self.previous_wire[start.0] = usize::MAX;
             self.previous_pip[start.0] = usize::MAX;
             queue.push(Reverse((
-                device.wires()[start.0].point.manhattan(goal_point),
-                0_u64,
+                distance.saturating_add(device.wires()[start.0].point.manhattan(goal_point)),
+                distance,
+                arrival_ps,
                 start,
             )));
         }
 
-        while let Some(Reverse((_, distance, wire))) = queue.pop() {
-            if self.seen[wire.0] != epoch || self.distance[wire.0] != distance {
+        while let Some(Reverse((_, distance, arrival_ps, wire))) = queue.pop() {
+            if self.seen[wire.0] != epoch
+                || (self.distance[wire.0], self.arrival_ps[wire.0]) != (distance, arrival_ps)
+            {
                 continue;
             }
             if wire == goal {
@@ -1621,34 +1757,70 @@ impl RouteSearch {
             }
 
             for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
-                let step = 1_u64
-                    + congestion_cost(
-                        wire_occupancy[neighbor.0],
-                        device.wires()[neighbor.0].capacity,
-                        wire_history[neighbor.0],
-                        present_factor,
-                    )
-                    + congestion_cost(
-                        pip_occupancy[pip.0],
-                        device.pips()[pip.0].capacity,
-                        pip_history[pip.0],
-                        present_factor,
-                    );
+                let congestion = congestion_cost(
+                    wire_occupancy[neighbor.0],
+                    device.wires()[neighbor.0].capacity,
+                    wire_history[neighbor.0],
+                    present_factor,
+                ) + congestion_cost(
+                    pip_occupancy[pip.0],
+                    device.pips()[pip.0].capacity,
+                    pip_history[pip.0],
+                    present_factor,
+                );
+                let pip_delay_ps = costs.map_or(0, |costs| costs.pip_delays_ps[pip.0]);
+                let step = routing_step_cost(pip_delay_ps, criticality, congestion);
                 let next_distance = distance.saturating_add(step);
-                if self.seen[neighbor.0] == epoch && self.distance[neighbor.0] <= next_distance {
+                let next_arrival_ps = arrival_ps.saturating_add(u64::from(pip_delay_ps));
+                if self.seen[neighbor.0] == epoch
+                    && (self.distance[neighbor.0], self.arrival_ps[neighbor.0])
+                        <= (next_distance, next_arrival_ps)
+                {
                     continue;
                 }
                 self.seen[neighbor.0] = epoch;
                 self.distance[neighbor.0] = next_distance;
+                self.arrival_ps[neighbor.0] = next_arrival_ps;
                 self.previous_wire[neighbor.0] = wire.0;
                 self.previous_pip[neighbor.0] = pip.0;
                 let estimate = next_distance
                     .saturating_add(device.wires()[neighbor.0].point.manhattan(goal_point));
-                queue.push(Reverse((estimate, next_distance, neighbor)));
+                queue.push(Reverse((
+                    estimate,
+                    next_distance,
+                    next_arrival_ps,
+                    neighbor,
+                )));
             }
         }
         None
     }
+}
+
+const ROUTING_CRITICALITY_SCALE: u64 = 64;
+const ROUTING_DELAY_QUANTUM_PS: u64 = 50;
+
+fn timing_tree_cost(arrival_ps: u64, criticality: u64) -> u64 {
+    arrival_ps
+        .saturating_mul(criticality)
+        .div_ceil(ROUTING_CRITICALITY_SCALE * ROUTING_DELAY_QUANTUM_PS)
+}
+
+fn routing_step_cost(pip_delay_ps: u32, criticality: u64, congestion: u64) -> u64 {
+    if criticality == 0 {
+        return 1_u64.saturating_add(congestion);
+    }
+    let delay_ps = u64::from(pip_delay_ps);
+    let blended_ps = criticality
+        .saturating_mul(delay_ps)
+        .saturating_add(
+            (ROUTING_CRITICALITY_SCALE - criticality).saturating_mul(ROUTING_DELAY_QUANTUM_PS),
+        )
+        .div_ceil(ROUTING_CRITICALITY_SCALE);
+    blended_ps
+        .div_ceil(ROUTING_DELAY_QUANTUM_PS)
+        .max(1)
+        .saturating_add(congestion)
 }
 
 fn congestion_cost(occupancy: u16, capacity: u16, history: u32, present: u32) -> u64 {
@@ -1695,6 +1867,11 @@ pub enum PnrError {
     InvalidRoutingConstraint {
         /// Logical net named by the constraint.
         net: NetId,
+        /// Specific invariant that failed.
+        reason: String,
+    },
+    /// Target timing costs did not match the routed design or device.
+    InvalidRoutingCosts {
         /// Specific invariant that failed.
         reason: String,
     },
@@ -1748,6 +1925,7 @@ impl fmt::Display for PnrError {
             Self::InvalidRoutingConstraint { net, reason } => {
                 write!(f, "invalid routing constraint for net {}: {reason}", net.0)
             }
+            Self::InvalidRoutingCosts { reason } => write!(f, "invalid routing costs: {reason}"),
             Self::MissingPlacement { cell } => {
                 write!(f, "placement is missing cell ID {}", cell.0)
             }
@@ -1776,6 +1954,7 @@ impl Error for PnrError {
             | Self::InvalidPinBinding { .. }
             | Self::InvalidPinNameBinding { .. }
             | Self::InvalidRoutingConstraint { .. }
+            | Self::InvalidRoutingCosts { .. }
             | Self::MissingPlacement { .. }
             | Self::Unroutable { .. }
             | Self::CongestionNotResolved { .. } => None,
@@ -1791,11 +1970,17 @@ impl From<ModelError> for PnrError {
 
 #[cfg(test)]
 mod tests {
-    use texo_model::{BelId, CellId, Design, Device, PinDirection, Point, ResourceKind};
+    use std::collections::BTreeMap;
+
+    use texo_model::{
+        BelId, CellId, Design, Device, NetId, PinDirection, Point, ResourceKind, UnifiedGraph,
+        WireId,
+    };
 
     use super::{
-        PlacementConstraints, PlacementNeighbor, PnrError, place_and_route, place_with_constraints,
-        refinement_edge_cost,
+        PlacementConstraints, PlacementNeighbor, PnrError, RouteSearch, RoutingConstraints,
+        RoutingCosts, place_and_route, place_with_constraints, refinement_edge_cost,
+        route_with_timing_costs_and_progress, routing_step_cost, timing_tree_cost,
     };
 
     fn two_cell_design() -> Design {
@@ -1868,6 +2053,71 @@ mod tests {
 
         assert_eq!(refinement_edge_cost(ordinary, 3), 6);
         assert_eq!(refinement_edge_cost(critical, 3), 18);
+    }
+
+    #[test]
+    fn timing_routing_blends_delay_with_congestion() {
+        assert_eq!(routing_step_cost(1_000, 0, 2), 3);
+        assert_eq!(routing_step_cost(200, 64, 0), 4);
+        assert_eq!(routing_step_cost(200, 32, 0), 3);
+        assert_eq!(routing_step_cost(200, 64, 2), 6);
+        assert_eq!(timing_tree_cost(200, 64), 4);
+    }
+
+    #[test]
+    fn timing_routing_accounts_for_delay_to_each_tree_source() {
+        let design = Design::new();
+        let mut device = Device::new("tree-delay", 1, 1).unwrap();
+        let slow_tree = device.add_wire("slow-tree", Point::new(0, 0), 1).unwrap();
+        let fast_tree = device.add_wire("fast-tree", Point::new(0, 0), 1).unwrap();
+        let goal = device.add_wire("goal", Point::new(0, 0), 1).unwrap();
+        device.add_pip(slow_tree, goal, false, 1).unwrap();
+        device.add_pip(fast_tree, goal, false, 1).unwrap();
+        let graph = UnifiedGraph::new(&design, &device);
+        let costs = RoutingCosts::new(vec![10, 10], BTreeMap::new());
+        let mut search = RouteSearch::new(device.wires().len());
+        let starts = [slow_tree, fast_tree].into_iter().collect();
+        let tree_delays = BTreeMap::from([(slow_tree, 100), (fast_tree, 0)]);
+
+        let (wires, _) = search
+            .shortest_path(
+                &graph,
+                &starts,
+                goal,
+                &[0; 3],
+                &[0; 2],
+                &[0; 3],
+                &[0; 2],
+                1,
+                Some(&costs),
+                64,
+                &tree_delays,
+            )
+            .unwrap();
+
+        assert_eq!(wires.last(), Some(&fast_tree));
+        assert_ne!(wires.last(), Some(&WireId(0)));
+    }
+
+    #[test]
+    fn rejects_a_timing_table_that_does_not_cover_the_device() {
+        let design = two_cell_design();
+        let device = Device::rectangular_logic(2, 1).unwrap();
+        let placement =
+            place_with_constraints(&design, &device, &PlacementConstraints::new()).unwrap();
+        let costs = RoutingCosts::new(Vec::new(), BTreeMap::from([(NetId(0), 64)]));
+
+        assert!(matches!(
+            route_with_timing_costs_and_progress(
+                &design,
+                &device,
+                placement,
+                &RoutingConstraints::new(),
+                &costs,
+                |_| {},
+            ),
+            Err(PnrError::InvalidRoutingCosts { .. })
+        ));
     }
 
     #[test]

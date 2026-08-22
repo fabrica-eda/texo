@@ -7,8 +7,9 @@ use std::fmt;
 use texo_model::{CellId, CellPinId, Design, Device, NetId, PinDirection, PipId, ResourceKind};
 pub use texo_pnr::RoutingProgress;
 use texo_pnr::{
-    PlacementConstraints, PnrError, PnrResult, place_and_route_with_constraints,
+    PlacementConstraints, PnrError, PnrResult, RoutingCosts, place_and_route_with_constraints,
     place_with_constraints, place_with_net_weights, route_with_placement_and_progress,
+    route_with_timing_costs_and_progress,
 };
 use texo_struo::{ImportedEcp5Design, PrimitiveMetadata};
 use texo_target_ecp5::{
@@ -371,12 +372,12 @@ impl TimingDrivenContext<'_> {
         if initial_timing.met_timing() {
             return Ok((initial_implementation, initial_timing));
         }
-        let net_weights = timing_net_weights(&initial_timing, self.timing_constraints);
+        let placement_weights = timing_net_weights(&initial_timing, self.timing_constraints);
         let placement = place_with_net_weights(
             self.design,
             self.architecture.device(),
             self.packing.constraints(),
-            &net_weights,
+            &placement_weights,
         )?;
         progress(Ecp5FlowStage::TimingDrivenPlaced);
         let routing =
@@ -399,12 +400,65 @@ impl TimingDrivenContext<'_> {
             self.timing_model,
             self.timing_constraints,
         )?;
-        if timing_score(&timing) > timing_score(&initial_timing) {
-            Ok((implementation, timing))
-        } else {
-            Ok((initial_implementation, initial_timing))
-        }
+        let routing_weights = timing_net_weights(&timing, self.timing_constraints);
+        let routing_costs =
+            ecp5_routing_costs(self.architecture, self.speed_grade, routing_weights)?;
+        let timing_implementation = route_with_timing_costs_and_progress(
+            self.design,
+            self.architecture.device(),
+            implementation.placement.clone(),
+            &routing,
+            &routing_costs,
+            |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
+        )?;
+        progress(Ecp5FlowStage::TimingDrivenRouted);
+        let timing_routed = analyze_ecp5_implementation(
+            self.design,
+            self.architecture,
+            self.speed_grade,
+            &timing_implementation,
+            self.timing_model,
+            self.timing_constraints,
+        )?;
+        let candidates = [
+            (initial_implementation, initial_timing),
+            (implementation, timing),
+            (timing_implementation, timing_routed),
+        ];
+        Ok(candidates
+            .into_iter()
+            .max_by_key(|(_, timing)| timing_score(timing))
+            .expect("three timing candidates are present"))
     }
+}
+
+fn ecp5_routing_costs(
+    architecture: &Ecp5Architecture,
+    speed_grade: &SpeedGradeRecord,
+    net_criticalities: BTreeMap<NetId, u64>,
+) -> Result<RoutingCosts, Ecp5FlowError> {
+    let class_delays = speed_grade
+        .pip_classes
+        .iter()
+        .map(|(name, class)| {
+            let delay = pip_class_delay(class, 1)?.max_ps;
+            let delay = u32::try_from(delay).map_err(|_| Ecp5FlowError::TimingDelayOverflow)?;
+            Ok((name.as_str(), delay))
+        })
+        .collect::<Result<BTreeMap<_, _>, Ecp5FlowError>>()?;
+    let pip_delays_ps = architecture
+        .pip_metadata_iter()
+        .map(|(_, metadata)| {
+            class_delays
+                .get(metadata.timing_class)
+                .copied()
+                .ok_or_else(|| Ecp5FlowError::MissingPipTimingClass {
+                    speed_grade: speed_grade.name.clone(),
+                    timing_class: metadata.timing_class.to_owned(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RoutingCosts::new(pip_delays_ps, net_criticalities))
 }
 
 fn analyze_ecp5_implementation(
