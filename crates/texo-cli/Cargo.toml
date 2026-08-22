@@ -10,8 +10,13 @@ name = "texo"
 path = "src/main.rs"
 
 [dependencies]
+serde_json.workspace = true
+struo-celox.workspace = true
+struo-ir.workspace = true
+struo-target-ecp5.workspace = true
 texo-flow.workspace = true
 texo-model.workspace = true
+texo-struo.workspace = true
 texo-target-ecp5.workspace = true
 
 [lints]

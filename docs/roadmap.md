@@ -62,11 +62,12 @@ device/package and a checker can reconstruct all occupancy.
 
 ## M3 — placement
 
-- Add timing/congestion cost models and incremental bounding-box updates.
-- Implement simulated annealing first; evaluate analytical placement later.
-- Extend the existing DCCA, fixed IO, and DP16KD placement groups as new target
+- [ ] Add timing/congestion cost models and incremental bounding-box updates.
+- [ ] Implement simulated annealing first; evaluate analytical placement later.
+- [ ] Extend the existing DCCA, fixed IO, and DP16KD placement groups as new target
   rules require.
-- Emit deterministic checkpoints and machine-readable quality metrics.
+- [x] Emit schema-versioned deterministic JSON implementation checkpoints and
+  machine-readable occupancy metrics from the verified CLI flow.
 
 Exit criterion: the blinky and AXI4 fixture place legally, repeatably, and with
 quality measured against nextpnr.

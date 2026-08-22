@@ -42,6 +42,11 @@ with a Git dependency.
 
 ```sh
 cargo run -- demo
+cargo run -- ecp5-demo \
+  crates/texo-target-ecp5/fixtures/minimal-ecp5.json \
+  CABGA381 \
+  crates/texo-target-ecp5/fixtures/xor.lpf \
+  /tmp/texo-xor-checkpoint.json
 cargo run -- target-info crates/texo-target-ecp5/fixtures/minimal-ecp5.json
 cargo run -- lpf-info crates/texo-target-ecp5/fixtures/minimal.lpf
 cargo test --workspace
@@ -53,6 +58,12 @@ cargo fmt --all -- --check
 local Project Trellis build and database. Production device snapshots are
 generated artifacts; the repository keeps a small schema fixture for fast,
 deterministic tests.
+
+`ecp5-demo` builds an XOR through Struo, verifies its complete truth table with
+crates.io Celox, applies the selected package and LPF, runs the unified ECP5
+flow, and optionally writes a deterministic JSON checkpoint. The checkpoint
+contains provenance, evidence, primitive configuration, absorbed constants,
+packing decisions, IO attributes, placement, and Wire/PIP routes.
 
 See [docs/architecture.md](docs/architecture.md) for the integration boundary
 and [docs/roadmap.md](docs/roadmap.md) for the implementation sequence.

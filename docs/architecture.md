@@ -47,6 +47,13 @@ absorbed configuration inputs, packing decisions, placement, and routes for
 later timing and bitstream stages; the original mapped object remains available
 for further Celox verification.
 
+The `texo ecp5-demo` executable exercises that boundary without intermediate
+netlist serialization. Its schema-versioned JSON checkpoint is deterministic
+and records architecture/database provenance, verification evidence, mapped
+primitive configuration, absorbed inputs, target packing, final Cell-to-BEL
+bindings, and every routed Wire/PIP ID and name. It is an implementation
+checkpoint for later timing/configuration stages, not yet a bitstream.
+
 ## Boundaries
 
 ```text
