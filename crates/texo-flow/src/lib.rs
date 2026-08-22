@@ -116,7 +116,7 @@ impl Error for MissingEvidence {}
 
 #[cfg(test)]
 mod tests {
-    use texo_model::{Design, Device, ResourceKind};
+    use texo_model::{Design, Device, PinDirection, ResourceKind};
 
     use super::{Evidence, Gate, implement};
 
@@ -124,8 +124,10 @@ mod tests {
     fn implementation_records_only_its_own_gate() {
         let mut design = Design::new();
         let a = design.add_cell("a", ResourceKind::Logic);
+        let a_out = design.add_pin(a, "out", PinDirection::Output).unwrap();
         let b = design.add_cell("b", ResourceKind::Logic);
-        design.add_net("n", [a, b]).unwrap();
+        let b_in = design.add_pin(b, "in", PinDirection::Input).unwrap();
+        design.add_net("n", a_out, [b_in]).unwrap();
         let device = Device::rectangular_logic(4, 4).unwrap();
         let mut evidence = Evidence::new();
 

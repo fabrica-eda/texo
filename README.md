@@ -20,14 +20,17 @@ architecture data is introduced; it is not yet a production FPGA router.
 
 | Crate | Responsibility |
 |---|---|
-| `texo-model` | Frontend-independent logical and physical design model |
-| `texo-pnr` | Placement, routing, legality, and PnR result types |
+| `texo-model` | Typed logical/physical arenas and their unified graph view |
+| `texo-pnr` | Cell-to-BEL placement and capacity-aware Wire/PIP routing |
 | `texo-flow` | End-to-end stage orchestration and verification gates |
 | `texo-cli` | Command-line entry point |
 
 The PnR crates do not depend on Veryl, Struo, Celox, or a particular FPGA.
-Adapters and target databases stay at the boundary so upstream API changes do
-not leak into the algorithms.
+Cells, nets, BELs, BEL pins, wires, and PIPs are visible through one typed
+problem graph. Candidate binding edges are generated lazily, while the backing
+storage remains split into compact type-specific arenas. Adapters and target
+databases stay at the boundary so upstream API changes do not leak into the
+algorithms.
 
 ## Try it
 
@@ -40,4 +43,3 @@ cargo fmt --all -- --check
 
 See [docs/architecture.md](docs/architecture.md) for the integration boundary
 and [docs/roadmap.md](docs/roadmap.md) for the implementation sequence.
-

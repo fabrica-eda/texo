@@ -2,15 +2,16 @@
 
 ## M0 — workspace and executable reference model
 
-- [x] frontend-independent device, cell, net, placement, and route types
-- [x] deterministic connectivity-aware reference placer
-- [x] deterministic grid router with collision checks
+- [x] typed Cell/Pin/Net and BEL/BelPin/Wire/PIP arenas
+- [x] unified graph queries with lazily generated placement/binding candidates
+- [x] deterministic connectivity-aware Cell-to-BEL reference placer
+- [x] directed, capacity-aware Wire/PIP reference router
 - [x] flow-level verification gates and CLI demo
 - [x] unit and integration tests
 
-The M0 grid is intentionally abstract: one coordinate represents both a site
-and a routing node. Its purpose is to validate APIs and invariants, not model
-ECP5 silicon.
+The M0 grid is intentionally abstract. It has separate BEL-pin and channel
+wires plus directed PIPs, but does not model real ECP5 tiles. Its purpose is to
+validate graph APIs and occupancy invariants before importing silicon data.
 
 ## M1 — Struo/Celox adapter
 

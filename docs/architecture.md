@@ -45,6 +45,34 @@ upgrade.
 copy mapped cells, nets, port directions, constants, clocks, and constraints
 into this model. No Struo or Celox type appears in the PnR API.
 
+## Unified problem graph
+
+Placement and routing operate on one heterogeneous graph:
+
+```text
+Cell --placement candidate--> BEL
+  |                            |
+CellPin --binding candidate--> BelPin --pin access--> Wire
+  |                                                      |
+ Net                                      Wire <--PIP--> Wire
+```
+
+Logical cells and nets are demand; BELs, wires, and PIPs are finite-capacity
+physical supply. A solution selects cell-to-BEL bindings and one connected
+wire/PIP tree for each net. This exposes placement legality, routing capacity,
+pin reachability, congestion, and eventually timing to the same optimizer.
+
+The graph is unified at the query and solver level, not stored as one boxed
+node array. Each kind has a typed stable ID (`CellId`, `BelId`, `WireId`, and so
+on) and a compact arena. `UnifiedGraph` returns logical, fixed physical, and
+programmable adjacency directly, while `Cell -> BEL` and `CellPin -> BelPin`
+candidate edges are generated lazily. This avoids storing the potentially huge
+Cartesian product of cells and compatible BELs.
+
+The M0 router already observes wire and PIP capacities and PIP direction. A
+production router will replace its breadth-first search with negotiated
+congestion without changing the graph contract.
+
 ## Verification policy
 
 Artifacts advance only when the evidence for the preceding stage exists. The
