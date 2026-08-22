@@ -15,14 +15,18 @@ validate graph APIs and occupancy invariants before importing silicon data.
 
 ## M1 — Struo/Celox adapter
 
-- Add a revision-pinned adapter crate for Struo's `Ecp5Netlist`.
-- Consume Celox from crates.io at the workspace-pinned exact version; do not
+- [x] Add a revision-pinned adapter crate for Struo's `Ecp5Netlist`.
+- [x] Consume Celox from crates.io at the workspace-pinned exact version; do not
   introduce a Celox Git dependency.
-- Preserve LUT4 equations, `TRELLIS_FF` controls, `DP16KD`, constants, ports,
-  clocks, and user constraints.
-- Run Celox post-map simulation before physical implementation.
-- Add committed mapped-netlist fixtures so PnR work does not require a frontend
-  rebuild on every test.
+- [x] Preserve LUT4 equations, `TRELLIS_FF` controls, `DP16KD`, constants, ports,
+  and clocks.
+- [ ] Import user constraints alongside the mapped object.
+- [x] Add programmatic mapped-netlist fixtures for LUT4, `TRELLIS_FF`, and
+  `DP16KD` import plus crates.io Celox artifact validation.
+- [ ] Run Celox post-map simulation automatically before physical
+  implementation.
+- [ ] Add a complete mapped blinky fixture so PnR work does not require a
+  frontend rebuild on every test.
 
 Exit criterion: a Struo blinky enters Texo without a JSON round trip and the
 same mapped design still passes Celox simulation.

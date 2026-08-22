@@ -28,6 +28,13 @@ release version; it must not be added as a Git dependency or overridden with a
 Git `[patch.crates-io]` entry. Both adapters require fixture tests before an
 upgrade.
 
+`texo-struo` implements that boundary. It consumes Struo's in-memory
+`Ecp5Netlist`, creates explicit logical pins for LUT4, TRELLIS_FF, DP16KD,
+constant networks, and every top-level port bit, then connects them through
+Texo nets without serializing JSON. ECP5 configuration metadata remains in the
+adapter beside the target-neutral graph. The same mapped object can be turned
+into a crates.io Celox `FrontendArtifact` for post-map verification.
+
 ## Boundaries
 
 ```text

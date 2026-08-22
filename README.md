@@ -23,6 +23,7 @@ architecture data is introduced; it is not yet a production FPGA router.
 | `texo-model` | Typed logical/physical arenas and their unified graph view |
 | `texo-pnr` | Cell-to-BEL placement and capacity-aware Wire/PIP routing |
 | `texo-flow` | End-to-end stage orchestration and verification gates |
+| `texo-struo` | Direct Struo ECP5 import and crates.io Celox verification boundary |
 | `texo-cli` | Command-line entry point |
 
 The PnR crates do not depend on Veryl, Struo, Celox, or a particular FPGA.
@@ -31,6 +32,10 @@ problem graph. Candidate binding edges are generated lazily, while the backing
 storage remains split into compact type-specific arenas. Adapters and target
 databases stay at the boundary so upstream API changes do not leak into the
 algorithms.
+
+`texo-struo` pins Struo to one exact Git revision because it is not published
+on crates.io. Celox is pinned to `=0.3.1` from crates.io and is never replaced
+with a Git dependency.
 
 ## Try it
 

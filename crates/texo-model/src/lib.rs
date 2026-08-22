@@ -64,10 +64,16 @@ impl Point {
 pub enum ResourceKind {
     /// General combinational or sequential logic.
     Logic,
+    /// Lookup table with the given physical input count.
+    Lut(u8),
+    /// Dedicated sequential register.
+    Register,
     /// Embedded memory.
     Memory,
     /// Package-facing input/output resource.
     Io,
+    /// Dedicated constant network source.
+    Constant,
 }
 
 /// Signal direction at a logical or physical pin.

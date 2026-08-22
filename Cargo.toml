@@ -4,6 +4,7 @@ members = [
     "crates/texo-flow",
     "crates/texo-model",
     "crates/texo-pnr",
+    "crates/texo-struo",
 ]
 default-members = ["crates/texo-cli"]
 resolver = "3"
@@ -16,6 +17,9 @@ authors = ["Texo contributors"]
 
 [workspace.dependencies]
 celox = { version = "=0.3.1", default-features = false }
+struo-celox = { git = "https://github.com/fabrica-eda/struo.git", rev = "fd994db45f792fb4a019d57575fbb1239eae21ae" }
+struo-ir = { git = "https://github.com/fabrica-eda/struo.git", rev = "fd994db45f792fb4a019d57575fbb1239eae21ae" }
+struo-target-ecp5 = { git = "https://github.com/fabrica-eda/struo.git", rev = "fd994db45f792fb4a019d57575fbb1239eae21ae" }
 texo-flow = { path = "crates/texo-flow" }
 texo-model = { path = "crates/texo-model" }
 texo-pnr = { path = "crates/texo-pnr" }
