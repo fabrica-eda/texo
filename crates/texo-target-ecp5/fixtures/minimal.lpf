@@ -1,0 +1,4 @@
+# Minimal parser and CLI fixture.
+LOCATE COMP "input" SITE "A10";
+IOBUF PORT "input" IO_TYPE=LVCMOS33 PULLMODE=UP;
+FREQUENCY PORT "input" 25 MHZ;

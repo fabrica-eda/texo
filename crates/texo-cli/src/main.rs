@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use texo_flow::{Evidence, implement};
 use texo_model::{Design, Device, PinDirection, ResourceKind};
-use texo_target_ecp5::read_architecture;
+use texo_target_ecp5::{parse_lpf, read_architecture};
 
 const USAGE: &str = "\
 Texo FPGA place and route
@@ -15,6 +15,7 @@ Texo FPGA place and route
 Usage:
   texo demo                         run the deterministic abstract-grid PnR demo
   texo target-info <architecture>   inspect an ECP5 architecture snapshot
+  texo lpf-info <constraints.lpf>   inspect ECP5 pin and IOBUF constraints
   texo help                         show this help
 ";
 
@@ -41,12 +42,46 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             target_info(&path)
         }
+        Some("lpf-info") => {
+            let path = args
+                .next()
+                .ok_or_else(|| format!("lpf-info requires an LPF path\n\n{USAGE}"))?;
+            if args.next().is_some() {
+                return Err(format!("lpf-info accepts one LPF path\n\n{USAGE}").into());
+            }
+            lpf_info(&path)
+        }
         None | Some("help" | "-h" | "--help") => {
             print!("{USAGE}");
             Ok(())
         }
         Some(command) => Err(format!("unknown command `{command}`\n\n{USAGE}").into()),
     }
+}
+
+fn lpf_info(path: &str) -> Result<(), Box<dyn Error>> {
+    let constraints = parse_lpf(File::open(path)?)?;
+    println!("locations: {}", constraints.locations().len());
+    for (port, pin) in constraints.locations() {
+        println!("  {port} -> {pin}");
+    }
+    println!("IOBUF ports: {}", constraints.io_attributes().len());
+    for (port, attributes) in constraints.io_attributes() {
+        let settings = attributes
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("  {port}: {settings}");
+    }
+    println!(
+        "unsupported commands: {}",
+        constraints.unsupported_commands().len()
+    );
+    for command in constraints.unsupported_commands() {
+        println!("  {command}");
+    }
+    Ok(())
 }
 
 fn target_info(path: &str) -> Result<(), Box<dyn Error>> {

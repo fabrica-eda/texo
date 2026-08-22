@@ -42,14 +42,14 @@ same mapped design still passes Celox simulation.
 - [x] Atomically place LUT-driven FFs in matching `TRELLIS_COMB(z)` /
   `TRELLIS_FF(z+1)` slots; bind unpaired FF data through the `M` input.
 - [x] Convert resolved package-pin bindings into fixed PIO placement groups.
+- [x] Parse LPF `LOCATE COMP` and `IOBUF PORT` constraints, resolve scalar and
+  vector Struo port cells, and retain unsupported commands for diagnostics.
 - [ ] Generate and characterize a complete production device snapshot using a
   locally built `pytrellis` and `prjtrellis-db` checkout.
 - [ ] Model clock networks and timing arcs beyond the routing-graph delay
   metadata already preserved by the importer.
 - [ ] Pack BRAMs and global clocks with explicit legality errors.
 - [ ] Absorb constant drivers and record the resulting primitive parameters.
-- [ ] Parse LPF constraints and resolve port bits into the package-pin binding
-  API.
 
 Exit criterion: every packed primitive has one legal BEL on the selected exact
 device/package and a checker can reconstruct all occupancy.

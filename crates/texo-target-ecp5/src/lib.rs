@@ -4,6 +4,13 @@
 //! `tools/export_ecp5.py` script snapshots that graph into the schema defined
 //! here. Runtime placement and routing then use only Rust and [`texo_model`].
 
+mod lpf;
+
+pub use lpf::{
+    LogicalPort, LpfConstraints, LpfError, ResolvedLpf, parse_lpf, resolve_lpf_port_cells,
+    resolve_lpf_ports,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -268,6 +275,8 @@ pub struct Ecp5Packing {
     constraints: PlacementConstraints,
     lut_ff_pairs: Vec<LutFfPair>,
     general_routing_ffs: Vec<CellId>,
+    io_attributes: BTreeMap<CellId, BTreeMap<String, String>>,
+    unsupported_lpf_commands: Vec<String>,
 }
 
 /// One logical IO cell constrained to a package ball or lead.
@@ -296,6 +305,67 @@ impl Ecp5Packing {
     #[must_use]
     pub fn general_routing_ffs(&self) -> &[CellId] {
         &self.general_routing_ffs
+    }
+
+    /// LPF `IOBUF` attributes resolved to logical IO cells.
+    #[must_use]
+    pub const fn io_attributes(&self) -> &BTreeMap<CellId, BTreeMap<String, String>> {
+        &self.io_attributes
+    }
+
+    /// LPF commands retained because this packing stage does not implement them.
+    #[must_use]
+    pub fn unsupported_lpf_commands(&self) -> &[String] {
+        &self.unsupported_lpf_commands
+    }
+
+    /// Applies resolved LPF locations and IO attributes atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns package-binding errors, invalid IO-cell references, or an
+    /// attribute conflict with a previously applied LPF set.
+    pub fn apply_resolved_lpf(
+        &mut self,
+        design: &Design,
+        architecture: &Ecp5Architecture,
+        package_name: &str,
+        resolved: &ResolvedLpf,
+    ) -> Result<(), PackingError> {
+        let mut io_attributes = self.io_attributes.clone();
+        for (&cell_id, attributes) in &resolved.io_attributes {
+            let Some(cell) = design.cells().get(cell_id.0) else {
+                return Err(PackingError::UnknownIoCell(cell_id));
+            };
+            if cell.kind != ResourceKind::Io {
+                return Err(PackingError::CellIsNotIo {
+                    cell: cell.name.clone(),
+                });
+            }
+            let target = io_attributes.entry(cell_id).or_default();
+            for (key, value) in attributes {
+                if let Some(previous) = target.get(key)
+                    && previous != value
+                {
+                    return Err(PackingError::ConflictingIoAttribute {
+                        cell: cell.name.clone(),
+                        key: key.clone(),
+                    });
+                }
+                target.insert(key.clone(), value.clone());
+            }
+        }
+
+        self.bind_package_pins(
+            design,
+            architecture,
+            package_name,
+            resolved.package_pins.clone(),
+        )?;
+        self.io_attributes = io_attributes;
+        self.unsupported_lpf_commands
+            .extend(resolved.unsupported_commands.iter().cloned());
+        Ok(())
     }
 
     /// Adds fixed IO BEL assignments for one exact package.
@@ -438,6 +508,8 @@ pub fn pack_lut_ffs(
         constraints,
         lut_ff_pairs,
         general_routing_ffs,
+        io_attributes: BTreeMap::new(),
+        unsupported_lpf_commands: Vec::new(),
     })
 }
 
@@ -531,6 +603,13 @@ pub enum PackingError {
         /// Pin name.
         pin: String,
     },
+    /// A later LPF application changed an existing IO attribute value.
+    ConflictingIoAttribute {
+        /// Logical IO cell name.
+        cell: String,
+        /// Attribute key.
+        key: String,
+    },
 }
 
 impl fmt::Display for PackingError {
@@ -562,6 +641,9 @@ impl fmt::Display for PackingError {
                 f,
                 "IO cell `{cell}` is incompatible with package `{package}` pin `{pin}`"
             ),
+            Self::ConflictingIoAttribute { cell, key } => {
+                write!(f, "IO cell `{cell}` has a conflicting `{key}` attribute")
+            }
         }
     }
 }
@@ -578,7 +660,8 @@ impl Error for PackingError {
             | Self::CellIsNotIo { .. }
             | Self::DuplicateIoCell { .. }
             | Self::DuplicatePackagePin(_)
-            | Self::IncompatiblePackagePin { .. } => None,
+            | Self::IncompatiblePackagePin { .. }
+            | Self::ConflictingIoAttribute { .. } => None,
         }
     }
 }
@@ -950,7 +1033,10 @@ mod tests {
     use texo_pnr::place_with_constraints;
     use texo_struo::import_ecp5;
 
-    use super::{PackagePinBinding, PipMetadata, pack_lut_ffs, read_architecture};
+    use super::{
+        LogicalPort, PackagePinBinding, PipMetadata, pack_lut_ffs, parse_lpf, read_architecture,
+        resolve_lpf_port_cells, resolve_lpf_ports,
+    };
 
     const FIXTURE: &str = include_str!("../fixtures/minimal-ecp5.json");
 
@@ -999,6 +1085,30 @@ mod tests {
                 assert_eq!(graph.placement_candidates(CellId(index)).unwrap().len(), 1);
             }
         }
+
+        let parsed = parse_lpf(b"LOCATE COMP lhs SITE A10;".as_slice()).unwrap();
+        let resolved = resolve_lpf_port_cells(
+            &parsed,
+            imported
+                .ports()
+                .iter()
+                .map(|port| (port.name.as_str(), port.bits.as_slice())),
+            true,
+        )
+        .unwrap();
+        let lhs_cell = imported
+            .ports()
+            .iter()
+            .find(|port| port.name == "lhs")
+            .unwrap()
+            .bits[0];
+        assert_eq!(resolved.package_pins[0].cell, lhs_cell);
+
+        let mut packing = pack_lut_ffs(imported.design(), &architecture).unwrap();
+        packing
+            .apply_resolved_lpf(imported.design(), &architecture, "CABGA381", &resolved)
+            .unwrap();
+        assert_eq!(packing.constraints().groups().len(), 1);
     }
 
     #[test]
@@ -1117,6 +1227,45 @@ mod tests {
                 .is_err()
         );
         assert!(packing.constraints().groups().is_empty());
+    }
+
+    #[test]
+    fn applies_resolved_lpf_location_and_iobuf_attributes() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let input = design.add_cell("input", ResourceKind::Io);
+        design.add_pin(input, "O", PinDirection::Output).unwrap();
+        let parsed = parse_lpf(
+            br#"
+                LOCATE COMP "input" SITE "A10";
+                IOBUF PORT "input" IO_TYPE=LVCMOS33 PULLMODE=UP;
+            "#
+            .as_slice(),
+        )
+        .unwrap();
+        let resolved = resolve_lpf_ports(
+            &parsed,
+            &[LogicalPort {
+                name: "input".into(),
+                bits: vec![input],
+            }],
+            false,
+        )
+        .unwrap();
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+
+        packing
+            .apply_resolved_lpf(&design, &architecture, "CABGA381", &resolved)
+            .unwrap();
+        let placement =
+            place_with_constraints(&design, architecture.device(), packing.constraints()).unwrap();
+
+        assert_eq!(
+            placement.bel(input),
+            architecture.packages()[0].pins.get("A10").copied()
+        );
+        assert_eq!(packing.io_attributes()[&input]["IO_TYPE"], "LVCMOS33");
+        assert_eq!(packing.io_attributes()[&input]["PULLMODE"], "UP");
     }
 
     fn add_ff(design: &mut Design, name: &str) -> CellId {

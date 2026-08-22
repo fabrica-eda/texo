@@ -43,6 +43,7 @@ with a Git dependency.
 ```sh
 cargo run -- demo
 cargo run -- target-info crates/texo-target-ecp5/fixtures/minimal-ecp5.json
+cargo run -- lpf-info crates/texo-target-ecp5/fixtures/minimal.lpf
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check

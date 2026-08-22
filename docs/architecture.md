@@ -93,6 +93,15 @@ the same mechanism as a one-cell group with one PIO BEL assignment.
 `texo-flow::implement_with_constraints` carries these packing decisions through
 placement and routing before recording physical-implementation evidence.
 
+The LPF boundary parses nextpnr-compatible `LOCATE COMP <port> SITE <pin>` and
+`IOBUF PORT <port> key=value...` commands. It supports quoted names, comments,
+multiline commands, scalar ports, and indexed vector bits. Resolution accepts a
+borrowed `(port name, &[CellId])` iterator, so Struo's `ImportedPort` remains in
+the adapter crate. Locations become fixed package/PIO groups; IOBUF attributes
+remain indexed by logical IO CellId for configuration generation. Unknown port
+names, duplicate sites/attributes, and unconstrained bits in strict mode are
+errors. Other LPF verbs are retained and shown by `texo lpf-info`.
+
 ## ECP5 architecture snapshots
 
 `texo-target-ecp5` expands a schema-versioned snapshot into the target-neutral
