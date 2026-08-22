@@ -1663,6 +1663,23 @@ pub fn pack_lut_ffs(
     design: &Design,
     architecture: &Ecp5Architecture,
 ) -> Result<Ecp5Packing, PackingError> {
+    pack_lut_ffs_excluding(design, architecture, [])
+}
+
+/// Packs LUT-driven FFs while keeping selected LUT outputs on general routing.
+///
+/// This is used for sources such as constant generators whose direct local FF
+/// path cannot provide enough minimum delay for hold repair.
+///
+/// # Errors
+///
+/// Returns the same errors as [`pack_lut_ffs`].
+pub fn pack_lut_ffs_excluding(
+    design: &Design,
+    architecture: &Ecp5Architecture,
+    excluded_luts: impl IntoIterator<Item = CellId>,
+) -> Result<Ecp5Packing, PackingError> {
+    let excluded_luts = excluded_luts.into_iter().collect::<BTreeSet<_>>();
     let mut constraints = PlacementConstraints::new();
     let mut paired_luts = BTreeSet::new();
     let mut paired_ffs = BTreeSet::new();
@@ -1697,7 +1714,7 @@ pub fn pack_lut_ffs(
         let Some(lut) = lut_driver(design, data_pin) else {
             continue;
         };
-        if is_carry_slice(design, lut) {
+        if is_carry_slice(design, lut) || excluded_luts.contains(&lut) {
             continue;
         }
         if paired_luts.contains(&lut) {
@@ -2898,8 +2915,8 @@ mod tests {
     use super::{
         ArchitectureFile, BlockRamRequirement, GlobalClockRequirement, ImportError, LogicalPort,
         PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, expand, find_bel_pin,
-        find_global_clock_requirements, pack_lut_ffs, parse_lpf, read_architecture,
-        read_architecture_cache, resolve_lpf_port_cells, resolve_lpf_ports,
+        find_global_clock_requirements, pack_lut_ffs, pack_lut_ffs_excluding, parse_lpf,
+        read_architecture, read_architecture_cache, resolve_lpf_port_cells, resolve_lpf_ports,
         write_architecture_cache,
     };
 
@@ -3048,6 +3065,36 @@ mod tests {
         assert_eq!(
             architecture.bel_metadata(lut_bel).z + 1,
             architecture.bel_metadata(ff_bel).z
+        );
+    }
+
+    #[test]
+    fn excluded_lut_keeps_its_ff_on_general_routing() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let lut = design.add_cell("constant_lut", ResourceKind::Lut(4));
+        for name in ["A", "B", "C", "D"] {
+            design.add_pin(lut, name, PinDirection::Input).unwrap();
+        }
+        let lut_output = design.add_pin(lut, "F", PinDirection::Output).unwrap();
+        let ff = add_ff(&mut design, "ff");
+        let ff_data = design.cells()[ff.0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == "DI")
+            .unwrap();
+        design
+            .add_net("constant_to_ff", lut_output, [ff_data])
+            .unwrap();
+
+        let packing = pack_lut_ffs_excluding(&design, &architecture, [lut]).unwrap();
+
+        assert!(packing.lut_ff_pairs().is_empty());
+        assert_eq!(packing.general_routing_ffs(), &[ff]);
+        assert_eq!(
+            packing.constraints().pin_name_bindings().get(&ff_data),
+            Some(&"M".to_owned())
         );
     }
 

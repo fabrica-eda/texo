@@ -16,7 +16,7 @@ use texo_struo::{ImportedEcp5Design, PrimitiveMetadata};
 use texo_target_ecp5::{
     BlockRamRequirement, DEFAULT_GLOBAL_CLOCK_FANOUT, DelayRangeRecord, Ecp5Architecture,
     Ecp5Packing, LpfConstraints, LpfError, PackingError, PipClassTimingRecord, SpeedGradeRecord,
-    find_global_clock_requirements, pack_lut_ffs, resolve_lpf_port_cells,
+    find_global_clock_requirements, pack_lut_ffs_excluding, resolve_lpf_port_cells,
 };
 use texo_timing::{
     DelayRange, PICOSECONDS_PER_SECOND, TimingConstraints, TimingError, TimingModel, TimingReport,
@@ -256,7 +256,10 @@ pub fn implement_struo_ecp5_with_progress(
         .ok_or_else(|| Ecp5FlowError::UnknownSpeedGrade(speed_grade_name.into()))?;
 
     let mut design = imported.design().clone();
-    let mut packing = pack_lut_ffs(&design, architecture)?;
+    let constant_luts = imported.metadata().iter().filter_map(|(&cell, metadata)| {
+        matches!(metadata, PrimitiveMetadata::Constant { .. }).then_some(cell)
+    });
+    let mut packing = pack_lut_ffs_excluding(&design, architecture, constant_luts)?;
     packing.pack_carry_pairs(
         &design,
         architecture,
@@ -373,7 +376,7 @@ impl TimingDrivenContext<'_> {
         if initial_timing.met_timing() {
             return Ok((initial_implementation, initial_timing));
         }
-        let placement_weights = timing_net_weights(&initial_timing, self.timing_constraints);
+        let placement_weights = timing_placement_weights(&initial_timing, self.timing_constraints);
         let placement = place_with_net_weights(
             self.design,
             self.architecture.device(),
@@ -390,6 +393,7 @@ impl TimingDrivenContext<'_> {
         let routing_weights = timing_net_weights(&timing, self.timing_constraints);
         let mut routing_costs =
             ecp5_routing_costs(self.architecture, self.speed_grade, routing_weights)?;
+        routing_costs.set_sink_min_delays_ps(hold_sink_min_delays(&timing));
         let (timing_implementation, timing_routed) = self.route_and_analyze(
             implementation.placement.clone(),
             &routing,
@@ -431,7 +435,7 @@ impl TimingDrivenContext<'_> {
         routing_costs: &mut RoutingCosts,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<(PnrResult, TimingReport), Ecp5FlowError> {
-        let refinement_weights = timing_net_weights(timing, self.timing_constraints);
+        let refinement_weights = timing_placement_weights(timing, self.timing_constraints);
         let refined_placement = refine_placement_with_net_weights(
             self.design,
             self.architecture.device(),
@@ -450,6 +454,7 @@ impl TimingDrivenContext<'_> {
             self.route_and_analyze(refined_placement, &refined_routing, None, progress)?;
         routing_costs
             .set_net_criticalities(timing_net_weights(&refined_timing, self.timing_constraints));
+        routing_costs.set_sink_min_delays_ps(hold_sink_min_delays(&refined_timing));
         let (refined_timing_implementation, refined_timing_routed) = self.route_and_analyze(
             refined_implementation.placement.clone(),
             &refined_routing,
@@ -503,7 +508,7 @@ impl TimingDrivenContext<'_> {
     }
 }
 
-const MAX_INCREMENTAL_REFINEMENTS: usize = 4;
+const MAX_INCREMENTAL_REFINEMENTS: usize = 8;
 
 fn ecp5_routing_costs(
     architecture: &Ecp5Architecture,
@@ -514,24 +519,29 @@ fn ecp5_routing_costs(
         .pip_classes
         .iter()
         .map(|(name, class)| {
-            let delay = pip_class_delay(class, 1)?.max_ps;
-            let delay = u32::try_from(delay).map_err(|_| Ecp5FlowError::TimingDelayOverflow)?;
-            Ok((name.as_str(), delay))
+            let delay = pip_class_delay(class, 1)?;
+            let minimum =
+                u32::try_from(delay.min_ps).map_err(|_| Ecp5FlowError::TimingDelayOverflow)?;
+            let maximum =
+                u32::try_from(delay.max_ps).map_err(|_| Ecp5FlowError::TimingDelayOverflow)?;
+            Ok((name.as_str(), (minimum, maximum)))
         })
         .collect::<Result<BTreeMap<_, _>, Ecp5FlowError>>()?;
-    let pip_delays_ps = architecture
-        .pip_metadata_iter()
-        .map(|(_, metadata)| {
-            class_delays
-                .get(metadata.timing_class)
-                .copied()
-                .ok_or_else(|| Ecp5FlowError::MissingPipTimingClass {
-                    speed_grade: speed_grade.name.clone(),
-                    timing_class: metadata.timing_class.to_owned(),
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(RoutingCosts::new(pip_delays_ps, net_criticalities))
+    let mut pip_min_delays_ps = Vec::with_capacity(architecture.device().pips().len());
+    let mut pip_delays_ps = Vec::with_capacity(architecture.device().pips().len());
+    for (_, metadata) in architecture.pip_metadata_iter() {
+        let &(minimum, maximum) = class_delays.get(metadata.timing_class).ok_or_else(|| {
+            Ecp5FlowError::MissingPipTimingClass {
+                speed_grade: speed_grade.name.clone(),
+                timing_class: metadata.timing_class.to_owned(),
+            }
+        })?;
+        pip_min_delays_ps.push(minimum);
+        pip_delays_ps.push(maximum);
+    }
+    let mut costs = RoutingCosts::new(pip_delays_ps, net_criticalities);
+    costs.set_pip_min_delays_ps(pip_min_delays_ps);
+    Ok(costs)
 }
 
 fn analyze_ecp5_implementation(
@@ -577,6 +587,69 @@ fn timing_net_weights(
     weights
 }
 
+fn timing_placement_weights(
+    timing: &TimingReport,
+    constraints: &TimingConstraints,
+) -> BTreeMap<NetId, u64> {
+    let Some(period_ps) = constraints.clock_periods_ps().values().copied().min() else {
+        return BTreeMap::new();
+    };
+    let delays =
+        timing
+            .net_delays
+            .iter()
+            .fold(BTreeMap::<NetId, u64>::new(), |mut delays, edge| {
+                delays
+                    .entry(edge.net)
+                    .and_modify(|known| *known = (*known).max(edge.delay.max_ps))
+                    .or_insert(edge.delay.max_ps);
+                delays
+            });
+    timing_net_weights(timing, constraints)
+        .into_iter()
+        .map(|(net, criticality)| {
+            let delay_ps = delays.get(&net).copied().unwrap_or(0);
+            (
+                net,
+                delay_weighted_criticality(criticality, delay_ps, period_ps),
+            )
+        })
+        .collect()
+}
+
+fn delay_weighted_criticality(criticality: u64, delay_ps: u64, period_ps: u64) -> u64 {
+    const ROUTING_SEGMENTS_PER_PERIOD: u64 = 4;
+    let period_ps = period_ps.max(1);
+    let delay_fraction = delay_ps
+        .saturating_mul(ROUTING_SEGMENTS_PER_PERIOD)
+        .min(period_ps);
+    1 + criticality.saturating_sub(1).saturating_mul(delay_fraction) / period_ps
+}
+
+fn hold_sink_min_delays(timing: &TimingReport) -> BTreeMap<(NetId, CellPinId), u64> {
+    let delays_by_sink = timing
+        .net_delays
+        .iter()
+        .map(|delay| (delay.sink, delay))
+        .collect::<BTreeMap<_, _>>();
+    let mut minimums = BTreeMap::<(NetId, CellPinId), u64>::new();
+    for check in &timing.hold_checks {
+        if check.slack_ps >= 0 {
+            continue;
+        }
+        let Some(delay) = delays_by_sink.get(&check.data_pin) else {
+            continue;
+        };
+        let deficit_ps = u64::try_from(check.slack_ps.unsigned_abs()).unwrap_or(u64::MAX);
+        let minimum_ps = delay.delay.min_ps.saturating_add(deficit_ps);
+        minimums
+            .entry((delay.net, delay.sink))
+            .and_modify(|known| *known = (*known).max(minimum_ps))
+            .or_insert(minimum_ps);
+    }
+    minimums
+}
+
 fn criticality_weight(urgency: i128, period_ps: i128) -> u64 {
     const SCALE: u64 = 1 << 10;
     const MAX_EXTRA_WEIGHT: u64 = 63;
@@ -587,11 +660,10 @@ fn criticality_weight(urgency: i128, period_ps: i128) -> u64 {
     1 + powered.saturating_mul(MAX_EXTRA_WEIGHT) / SCALE.pow(4)
 }
 
-fn timing_score(timing: &TimingReport) -> (i128, i128) {
-    (
-        timing.worst_slack_ps.unwrap_or(i128::MIN),
-        timing.worst_hold_slack_ps.unwrap_or(i128::MIN),
-    )
+fn timing_score(timing: &TimingReport) -> (i128, i128, i128) {
+    let setup = timing.worst_slack_ps.unwrap_or(i128::MIN);
+    let hold = timing.worst_hold_slack_ps.unwrap_or(i128::MIN);
+    (setup.min(hold), setup, hold)
 }
 
 fn ecp5_timing_constraints(
@@ -980,8 +1052,9 @@ mod tests {
 
     use super::{
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, criticality_weight,
-        ecp5_timing_constraints, ecp5_timing_model, find_cell_pin, implement, implement_struo_ecp5,
-        implement_with_constraints, pip_class_delay, verify_post_map_with_celox,
+        delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, find_cell_pin,
+        implement, implement_struo_ecp5, implement_with_constraints, pip_class_delay,
+        verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -992,6 +1065,14 @@ mod tests {
         assert_eq!(criticality_weight(2_000, 4_000), 4);
         assert_eq!(criticality_weight(3_000, 4_000), 20);
         assert_eq!(criticality_weight(4_000, 4_000), 64);
+    }
+
+    #[test]
+    fn placement_criticality_favors_delay_consuming_edges() {
+        assert_eq!(delay_weighted_criticality(64, 0, 4_000), 1);
+        assert_eq!(delay_weighted_criticality(64, 500, 4_000), 32);
+        assert_eq!(delay_weighted_criticality(64, 1_000, 4_000), 64);
+        assert_eq!(delay_weighted_criticality(64, 2_000, 4_000), 64);
     }
 
     #[test]
