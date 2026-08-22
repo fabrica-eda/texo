@@ -441,13 +441,23 @@ fn timing_net_weights(
     let mut weights = BTreeMap::<NetId, u64>::new();
     for edge in &timing.net_setup_slacks {
         let urgency = (critical_limit - edge.slack_ps).clamp(0, period_ps);
-        let weight = 1 + u64::try_from((urgency * 63) / period_ps).unwrap_or(63);
+        let weight = criticality_weight(urgency, period_ps);
         weights
             .entry(edge.net)
             .and_modify(|known| *known = (*known).max(weight))
             .or_insert(weight);
     }
     weights
+}
+
+fn criticality_weight(urgency: i128, period_ps: i128) -> u64 {
+    const SCALE: u64 = 1 << 10;
+    const MAX_EXTRA_WEIGHT: u64 = 63;
+    let scaled = u64::try_from((urgency * i128::from(SCALE)) / period_ps)
+        .unwrap_or(SCALE)
+        .min(SCALE);
+    let powered = scaled.pow(4);
+    1 + powered.saturating_mul(MAX_EXTRA_WEIGHT) / SCALE.pow(4)
 }
 
 fn timing_score(timing: &TimingReport) -> (i128, i128) {
@@ -842,12 +852,20 @@ mod tests {
     };
 
     use super::{
-        Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, ecp5_timing_constraints, ecp5_timing_model,
-        find_cell_pin, implement, implement_struo_ecp5, implement_with_constraints,
-        pip_class_delay, verify_post_map_with_celox,
+        Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, criticality_weight,
+        ecp5_timing_constraints, ecp5_timing_model, find_cell_pin, implement, implement_struo_ecp5,
+        implement_with_constraints, pip_class_delay, verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
+
+    #[test]
+    fn timing_criticality_emphasizes_the_worst_edges() {
+        assert_eq!(criticality_weight(0, 4_000), 1);
+        assert_eq!(criticality_weight(2_000, 4_000), 4);
+        assert_eq!(criticality_weight(3_000, 4_000), 20);
+        assert_eq!(criticality_weight(4_000, 4_000), 64);
+    }
 
     #[test]
     fn preserves_non_monotonic_pip_corners_for_sta() {
