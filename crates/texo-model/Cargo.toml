@@ -1,0 +1,10 @@
+[package]
+name = "texo-model"
+description = "Frontend-independent logical and physical models for Texo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+

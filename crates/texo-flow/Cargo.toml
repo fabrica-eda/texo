@@ -1,0 +1,14 @@
+[package]
+name = "texo-flow"
+description = "EDA flow orchestration and verification gates for Texo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+texo-model.workspace = true
+texo-pnr.workspace = true
+
+[lints]
+workspace = true
+

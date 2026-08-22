@@ -1,0 +1,13 @@
+[package]
+name = "texo-pnr"
+description = "Placement and routing algorithms for Texo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+texo-model.workspace = true
+
+[lints]
+workspace = true
+
