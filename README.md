@@ -22,7 +22,7 @@ architecture data is introduced; it is not yet a production FPGA router.
 |---|---|
 | `texo-model` | Typed logical/physical arenas and their unified graph view |
 | `texo-pnr` | Atomic-group Cell-to-BEL placement and capacity-aware Wire/PIP routing |
-| `texo-flow` | End-to-end stage orchestration and verification gates |
+| `texo-flow` | Verified Struo-to-ECP5 orchestration and release gates |
 | `texo-struo` | Direct Struo ECP5 import and crates.io Celox verification boundary |
 | `texo-target-ecp5` | Project Trellis import, LUT/FF, DP16KD and DCCA packing, package-to-PIO binding |
 | `texo-cli` | Command-line entry point |

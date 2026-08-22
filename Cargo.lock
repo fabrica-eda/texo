@@ -3201,8 +3201,13 @@ dependencies = [
 name = "texo-flow"
 version = "0.1.0"
 dependencies = [
+ "struo-celox",
+ "struo-ir",
+ "struo-target-ecp5",
  "texo-model",
  "texo-pnr",
+ "texo-struo",
+ "texo-target-ecp5",
 ]
 
 [[package]]

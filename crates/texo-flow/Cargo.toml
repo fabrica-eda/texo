@@ -8,7 +8,13 @@ rust-version.workspace = true
 [dependencies]
 texo-model.workspace = true
 texo-pnr.workspace = true
+texo-struo.workspace = true
+texo-target-ecp5.workspace = true
+
+[dev-dependencies]
+struo-celox.workspace = true
+struo-ir.workspace = true
+struo-target-ecp5.workspace = true
 
 [lints]
 workspace = true
-

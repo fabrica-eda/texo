@@ -37,6 +37,16 @@ Texo nets without serializing JSON. ECP5 configuration metadata remains in the
 adapter beside the target-neutral graph. The same mapped object can be turned
 into a crates.io Celox `FrontendArtifact` for post-map verification.
 
+`texo-flow::verify_post_map_with_celox` records simulation evidence only after
+a caller-provided Celox testbench succeeds. `implement_struo_ecp5` requires
+that evidence, clones the imported design, derives DP16KD requirements from
+Struo metadata, runs LUT/FF, BRAM, DCCA, and LPF packing, then invokes generic
+placement and routing. Failures commit neither new evidence nor a partially
+transformed design. The owned success result retains primitive metadata,
+absorbed configuration inputs, packing decisions, placement, and routes for
+later timing and bitstream stages; the original mapped object remains available
+for further Celox verification.
+
 ## Boundaries
 
 ```text
@@ -105,8 +115,8 @@ original net. The DCCA cell is then constrained to compatible physical DCCA
 BELs, so both sides are routed through the ordinary Wire/PIP graph. Unknown
 nets, duplicate requests, non-clock nets, and insufficient DCCA resources are
 transactional packing errors.
-`texo-flow::implement_with_constraints` carries these packing decisions through
-placement and routing before recording physical-implementation evidence.
+`texo-flow::implement_struo_ecp5` carries these packing decisions through
+placement and routing before recording mapped-netlist and physical evidence.
 
 The LPF boundary parses nextpnr-compatible `LOCATE COMP <port> SITE <pin>` and
 `IOBUF PORT <port> key=value...` commands. It supports quoted names, comments,

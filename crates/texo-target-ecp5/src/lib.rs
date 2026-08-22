@@ -1552,10 +1552,10 @@ mod tests {
         let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
 
         assert_eq!(architecture.device().name(), "LFE5UM5G-85F-test");
-        assert_eq!(architecture.device().bels().len(), 8);
-        assert_eq!(architecture.device().wires().len(), 41);
-        assert_eq!(architecture.device().pips().len(), 3);
-        assert_eq!(architecture.packages()[0].pins.len(), 1);
+        assert_eq!(architecture.device().bels().len(), 10);
+        assert_eq!(architecture.device().wires().len(), 47);
+        assert_eq!(architecture.device().pips().len(), 14);
+        assert_eq!(architecture.packages()[0].pins.len(), 3);
         assert_eq!(
             architecture.pip_metadata().values().next(),
             Some(&PipMetadata {
@@ -1589,7 +1589,7 @@ mod tests {
         assert_eq!(graph.placement_candidates(lut).unwrap().len(), 2);
         for (index, cell) in imported.design().cells().iter().enumerate() {
             if cell.kind == ResourceKind::Io {
-                assert_eq!(graph.placement_candidates(CellId(index)).unwrap().len(), 1);
+                assert_eq!(graph.placement_candidates(CellId(index)).unwrap().len(), 3);
             }
         }
 

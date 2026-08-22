@@ -130,6 +130,38 @@
           "tile_type": "EFB1_PICB1",
           "delay": 1,
           "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 6 },
+          "to": { "dx": 0, "dy": 0, "index": 5 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "delay": 1,
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 6 },
+          "to": { "dx": 0, "dy": 0, "index": 0 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "delay": 1,
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 6 },
+          "to": { "dx": 0, "dy": 0, "index": 1 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "delay": 1,
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 4 },
+          "to": { "dx": 1, "dy": 0, "index": 17 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "delay": 1,
+          "lutperm_flags": 0
         }
       ]
     },
@@ -147,7 +179,13 @@
         { "name": "LSR0_SLICE" },
         { "name": "CE0_SLICE" },
         { "name": "Q0_SLICE" },
-        { "name": "CLKA_EBR" }
+        { "name": "CLKA_EBR" },
+        { "name": "PADDI_B" },
+        { "name": "PADDO_B" },
+        { "name": "PADDT_B" },
+        { "name": "PADDI_C" },
+        { "name": "PADDO_C" },
+        { "name": "PADDT_C" }
       ],
       "bels": [
         {
@@ -182,9 +220,86 @@
           "pins": [
             { "name": "CLKA", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 12 } }
           ]
+        },
+        {
+          "name": "PIOB",
+          "bel_type": "PIO",
+          "z": 9,
+          "pins": [
+            { "name": "I", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 14 } },
+            { "name": "T", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 15 } },
+            { "name": "O", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 13 } }
+          ]
+        },
+        {
+          "name": "PIOC",
+          "bel_type": "PIO",
+          "z": 10,
+          "pins": [
+            { "name": "I", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 17 } },
+            { "name": "T", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 18 } },
+            { "name": "O", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 16 } }
+          ]
         }
       ],
-      "pips": []
+      "pips": [
+        {
+          "from": { "dx": 0, "dy": 0, "index": 5 },
+          "to": { "dx": 0, "dy": 0, "index": 0 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "delay": 1,
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 5 },
+          "to": { "dx": 0, "dy": 0, "index": 1 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "delay": 1,
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 13 },
+          "to": { "dx": 0, "dy": 0, "index": 0 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "delay": 1,
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 13 },
+          "to": { "dx": 0, "dy": 0, "index": 1 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "delay": 1,
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 4 },
+          "to": { "dx": 0, "dy": 0, "index": 17 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "delay": 1,
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 13 },
+          "to": { "dx": -1, "dy": 0, "index": 0 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "delay": 1,
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 13 },
+          "to": { "dx": -1, "dy": 0, "index": 1 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "delay": 1,
+          "lutperm_flags": 0
+        }
+      ]
     }
   ],
   "locations": [
@@ -195,7 +310,9 @@
     {
       "name": "CABGA381",
       "pins": [
-        { "name": "A10", "x": 0, "y": 0, "bel": 1 }
+        { "name": "A10", "x": 0, "y": 0, "bel": 1 },
+        { "name": "B10", "x": 1, "y": 0, "bel": 3 },
+        { "name": "C10", "x": 1, "y": 0, "bel": 4 }
       ]
     }
   ]

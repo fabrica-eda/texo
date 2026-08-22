@@ -23,8 +23,8 @@ validate graph APIs and occupancy invariants before importing silicon data.
 - [ ] Import user constraints alongside the mapped object.
 - [x] Add programmatic mapped-netlist fixtures for LUT4, `TRELLIS_FF`, and
   `DP16KD` import plus crates.io Celox artifact validation.
-- [ ] Run Celox post-map simulation automatically before physical
-  implementation.
+- [x] Run caller-provided Celox post-map testbenches transactionally and require
+  their evidence before ECP5 physical implementation.
 - [ ] Add a complete mapped blinky fixture so PnR work does not require a
   frontend rebuild on every test.
 
@@ -54,6 +54,8 @@ same mapped design still passes Celox simulation.
   16 global networks, and constrain them to compatible BELs transactionally.
 - [x] Fold LUT constants into INIT, absorb FF/BRAM constants into input-mux
   metadata, and synthesize shared constant LUTs only for residual nets.
+- [x] Orchestrate Struo metadata, optional LPF resolution, all target packing,
+  placement, routing, and verification evidence as one transactional API.
 
 Exit criterion: every packed primitive has one legal BEL on the selected exact
 device/package and a checker can reconstruct all occupancy.
