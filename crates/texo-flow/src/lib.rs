@@ -1,5 +1,6 @@
 //! Flow orchestration and explicit verification evidence.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -400,41 +401,44 @@ impl TimingDrivenContext<'_> {
             Some(&routing_costs),
             progress,
         )?;
-        let candidates = [
+        let candidates = vec![
             (initial_implementation, initial_timing),
             (implementation, timing),
             (timing_implementation, timing_routed),
         ];
-        let (mut best_implementation, mut best_timing) = candidates
+        let mut archive = select_timing_frontier(candidates);
+        let mut active = archive.clone();
+        for _ in 0..MAX_INCREMENTAL_REFINEMENTS {
+            if archive.iter().any(|(_, timing)| timing.met_timing()) {
+                break;
+            }
+            let mut children = Vec::with_capacity(active.len() * 2);
+            for (implementation, timing) in &active {
+                children.extend(self.refine_candidates(
+                    &implementation.placement,
+                    timing,
+                    &mut routing_costs,
+                    progress,
+                )?);
+            }
+            active = select_timing_beam(children);
+            let mut expanded_archive = archive;
+            expanded_archive.extend(active.iter().cloned());
+            archive = select_timing_frontier(expanded_archive);
+        }
+        Ok(archive
             .into_iter()
             .max_by_key(|(_, timing)| timing_score(timing))
-            .expect("three timing candidates are present");
-        for _ in 0..MAX_INCREMENTAL_REFINEMENTS {
-            if best_timing.met_timing() {
-                break;
-            }
-            let (candidate_implementation, candidate_timing) = self.refine_candidate(
-                &best_implementation.placement,
-                &best_timing,
-                &mut routing_costs,
-                progress,
-            )?;
-            if timing_score(&candidate_timing) <= timing_score(&best_timing) {
-                break;
-            }
-            best_implementation = candidate_implementation;
-            best_timing = candidate_timing;
-        }
-        Ok((best_implementation, best_timing))
+            .expect("the timing archive is non-empty"))
     }
 
-    fn refine_candidate(
+    fn refine_candidates(
         &self,
         placement: &Placement,
         timing: &TimingReport,
         routing_costs: &mut RoutingCosts,
         progress: &mut impl FnMut(Ecp5FlowStage),
-    ) -> Result<(PnrResult, TimingReport), Ecp5FlowError> {
+    ) -> Result<Vec<(PnrResult, TimingReport)>, Ecp5FlowError> {
         let refinement_weights = timing_placement_weights(timing, self.timing_constraints);
         let refined_placement = refine_placement_with_net_weights(
             self.design,
@@ -461,13 +465,10 @@ impl TimingDrivenContext<'_> {
             Some(routing_costs),
             progress,
         )?;
-        Ok([
+        Ok(vec![
             (refined_implementation, refined_timing),
             (refined_timing_implementation, refined_timing_routed),
-        ]
-        .into_iter()
-        .max_by_key(|(_, timing)| timing_score(timing))
-        .expect("two refinement candidates are present"))
+        ])
     }
 
     fn route_and_analyze(
@@ -509,6 +510,7 @@ impl TimingDrivenContext<'_> {
 }
 
 const MAX_INCREMENTAL_REFINEMENTS: usize = 8;
+const TIMING_FRONTIER_WIDTH: usize = 3;
 
 fn ecp5_routing_costs(
     architecture: &Ecp5Architecture,
@@ -664,6 +666,147 @@ fn timing_score(timing: &TimingReport) -> (i128, i128, i128) {
     let setup = timing.worst_slack_ps.unwrap_or(i128::MIN);
     let hold = timing.worst_hold_slack_ps.unwrap_or(i128::MIN);
     (setup.min(hold), setup, hold)
+}
+
+type TimingCandidate = (PnrResult, TimingReport);
+type TimingAxes = (i128, i128, usize);
+
+fn select_timing_frontier(candidates: Vec<TimingCandidate>) -> Vec<TimingCandidate> {
+    let axes = candidates
+        .iter()
+        .map(|(implementation, timing)| {
+            (
+                timing.worst_slack_ps.unwrap_or(i128::MIN),
+                timing.worst_hold_slack_ps.unwrap_or(i128::MIN),
+                implementation.total_pips,
+            )
+        })
+        .collect::<Vec<_>>();
+    let selected = pareto_axes_indices(&axes, TIMING_FRONTIER_WIDTH);
+    let mut candidates = candidates.into_iter().map(Some).collect::<Vec<_>>();
+    selected
+        .into_iter()
+        .map(|index| {
+            candidates[index]
+                .take()
+                .expect("a frontier index is unique")
+        })
+        .collect()
+}
+
+fn select_timing_beam(candidates: Vec<TimingCandidate>) -> Vec<TimingCandidate> {
+    let axes = candidates
+        .iter()
+        .map(|(implementation, timing)| {
+            (
+                timing.worst_slack_ps.unwrap_or(i128::MIN),
+                timing.worst_hold_slack_ps.unwrap_or(i128::MIN),
+                implementation.total_pips,
+            )
+        })
+        .collect::<Vec<_>>();
+    let selected = extreme_axes_indices(
+        &axes,
+        &(0..axes.len()).collect::<Vec<_>>(),
+        TIMING_FRONTIER_WIDTH,
+    );
+    let mut candidates = candidates.into_iter().map(Some).collect::<Vec<_>>();
+    selected
+        .into_iter()
+        .map(|index| candidates[index].take().expect("a beam index is unique"))
+        .collect()
+}
+
+fn pareto_axes_indices(axes: &[TimingAxes], width: usize) -> Vec<usize> {
+    let nondominated = (0..axes.len())
+        .filter(|&candidate| {
+            !(0..axes.len()).any(|other| {
+                other != candidate
+                    && timing_axes_dominate(axes[other], other, axes[candidate], candidate)
+            })
+        })
+        .collect::<Vec<_>>();
+    extreme_axes_indices(axes, &nondominated, width)
+}
+
+fn extreme_axes_indices(axes: &[TimingAxes], eligible: &[usize], width: usize) -> Vec<usize> {
+    let mut selected = BTreeSet::new();
+    for objective in [
+        TimingObjective::Balanced,
+        TimingObjective::Setup,
+        TimingObjective::Hold,
+    ] {
+        if let Some(best) = eligible
+            .iter()
+            .copied()
+            .max_by_key(|&index| timing_objective_rank(axes[index], index, objective))
+        {
+            selected.insert(best);
+        }
+        if selected.len() == width {
+            break;
+        }
+    }
+    let mut balanced = eligible.to_vec();
+    balanced.sort_by_key(|&index| {
+        Reverse(timing_objective_rank(
+            axes[index],
+            index,
+            TimingObjective::Balanced,
+        ))
+    });
+    for index in balanced {
+        if selected.len() == width {
+            break;
+        }
+        selected.insert(index);
+    }
+    let mut selected = selected.into_iter().collect::<Vec<_>>();
+    selected.sort_by_key(|&index| {
+        Reverse(timing_objective_rank(
+            axes[index],
+            index,
+            TimingObjective::Balanced,
+        ))
+    });
+    selected
+}
+
+fn timing_axes_dominate(
+    left: TimingAxes,
+    left_index: usize,
+    right: TimingAxes,
+    right_index: usize,
+) -> bool {
+    let (left_setup, left_hold, left_pips) = left;
+    let (right_setup, right_hold, right_pips) = right;
+    left_setup >= right_setup
+        && left_hold >= right_hold
+        && (left_setup > right_setup
+            || left_hold > right_hold
+            || left_pips < right_pips
+            || (left_pips == right_pips && left_index < right_index))
+}
+
+#[derive(Clone, Copy)]
+enum TimingObjective {
+    Balanced,
+    Setup,
+    Hold,
+}
+
+fn timing_objective_rank(
+    (setup, hold, pips): TimingAxes,
+    index: usize,
+    objective: TimingObjective,
+) -> (i128, i128, i128, Reverse<usize>, Reverse<usize>) {
+    let balanced = setup.min(hold);
+    let (first, second, third) = match objective {
+        TimingObjective::Balanced => (balanced, setup, hold),
+        TimingObjective::Setup => (setup, hold, balanced),
+        TimingObjective::Hold => (hold, setup, balanced),
+    };
+    (first, second, third, Reverse(pips), Reverse(index))
 }
 
 fn ecp5_timing_constraints(
@@ -1052,8 +1195,9 @@ mod tests {
 
     use super::{
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, criticality_weight,
-        delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, find_cell_pin,
-        implement, implement_struo_ecp5, implement_with_constraints, pip_class_delay,
+        delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model,
+        extreme_axes_indices, find_cell_pin, implement, implement_struo_ecp5,
+        implement_with_constraints, pareto_axes_indices, pip_class_delay,
         verify_post_map_with_celox,
     };
 
@@ -1073,6 +1217,31 @@ mod tests {
         assert_eq!(delay_weighted_criticality(64, 500, 4_000), 32);
         assert_eq!(delay_weighted_criticality(64, 1_000, 4_000), 64);
         assert_eq!(delay_weighted_criticality(64, 2_000, 4_000), 64);
+    }
+
+    #[test]
+    fn timing_frontier_keeps_balanced_setup_and_hold_extremes() {
+        let axes = [
+            (-100, -100, 100),
+            (10, -300, 90),
+            (-300, 20, 90),
+            (-200, -200, 80),
+            (-100, -100, 110),
+        ];
+
+        assert_eq!(pareto_axes_indices(&axes, 3), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn timing_beam_keeps_non_monotonic_search_trajectories() {
+        let axes = [
+            (-500, -500, 100),
+            (-400, -800, 90),
+            (-800, -300, 90),
+            (-900, -900, 80),
+        ];
+
+        assert_eq!(extreme_axes_indices(&axes, &[0, 1, 2, 3], 3), vec![0, 1, 2]);
     }
 
     #[test]
@@ -1342,6 +1511,7 @@ mod tests {
             &source,
             MappingOptions {
                 arithmetic: ArithmeticMapping::CarryChain,
+                ..MappingOptions::default()
             },
         )
         .unwrap();

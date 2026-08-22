@@ -3113,6 +3113,7 @@ mod tests {
             &source,
             MappingOptions {
                 arithmetic: ArithmeticMapping::CarryChain,
+                ..MappingOptions::default()
             },
         )
         .unwrap();
@@ -3165,6 +3166,7 @@ mod tests {
             &source,
             MappingOptions {
                 arithmetic: ArithmeticMapping::CarryChain,
+                ..MappingOptions::default()
             },
         )
         .unwrap();
