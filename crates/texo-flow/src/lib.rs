@@ -401,20 +401,42 @@ impl TimingDrivenContext<'_> {
             (implementation, timing),
             (timing_implementation, timing_routed),
         ];
-        let (best_implementation, best_timing) = candidates
+        let (mut best_implementation, mut best_timing) = candidates
             .into_iter()
             .max_by_key(|(_, timing)| timing_score(timing))
             .expect("three timing candidates are present");
-        if best_timing.met_timing() {
-            return Ok((best_implementation, best_timing));
+        for _ in 0..MAX_INCREMENTAL_REFINEMENTS {
+            if best_timing.met_timing() {
+                break;
+            }
+            let (candidate_implementation, candidate_timing) = self.refine_candidate(
+                &best_implementation.placement,
+                &best_timing,
+                &mut routing_costs,
+                progress,
+            )?;
+            if timing_score(&candidate_timing) <= timing_score(&best_timing) {
+                break;
+            }
+            best_implementation = candidate_implementation;
+            best_timing = candidate_timing;
         }
+        Ok((best_implementation, best_timing))
+    }
 
-        let refinement_weights = timing_net_weights(&best_timing, self.timing_constraints);
+    fn refine_candidate(
+        &self,
+        placement: &Placement,
+        timing: &TimingReport,
+        routing_costs: &mut RoutingCosts,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<(PnrResult, TimingReport), Ecp5FlowError> {
+        let refinement_weights = timing_net_weights(timing, self.timing_constraints);
         let refined_placement = refine_placement_with_net_weights(
             self.design,
             self.architecture.device(),
             self.packing.constraints(),
-            best_implementation.placement.clone(),
+            placement.clone(),
             &refinement_weights,
         )?;
         progress(Ecp5FlowStage::TimingDrivenPlaced);
@@ -431,17 +453,16 @@ impl TimingDrivenContext<'_> {
         let (refined_timing_implementation, refined_timing_routed) = self.route_and_analyze(
             refined_implementation.placement.clone(),
             &refined_routing,
-            Some(&routing_costs),
+            Some(routing_costs),
             progress,
         )?;
         Ok([
-            (best_implementation, best_timing),
             (refined_implementation, refined_timing),
             (refined_timing_implementation, refined_timing_routed),
         ]
         .into_iter()
         .max_by_key(|(_, timing)| timing_score(timing))
-        .expect("three refinement candidates are present"))
+        .expect("two refinement candidates are present"))
     }
 
     fn route_and_analyze(
@@ -481,6 +502,8 @@ impl TimingDrivenContext<'_> {
         Ok((implementation, timing))
     }
 }
+
+const MAX_INCREMENTAL_REFINEMENTS: usize = 4;
 
 fn ecp5_routing_costs(
     architecture: &Ecp5Architecture,
