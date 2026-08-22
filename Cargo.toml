@@ -5,6 +5,7 @@ members = [
     "crates/texo-model",
     "crates/texo-pnr",
     "crates/texo-struo",
+    "crates/texo-target-ecp5",
 ]
 default-members = ["crates/texo-cli"]
 resolver = "3"
@@ -17,12 +18,16 @@ authors = ["Texo contributors"]
 
 [workspace.dependencies]
 celox = { version = "=0.3.1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 struo-celox = { git = "https://github.com/fabrica-eda/struo.git", rev = "fd994db45f792fb4a019d57575fbb1239eae21ae" }
 struo-ir = { git = "https://github.com/fabrica-eda/struo.git", rev = "fd994db45f792fb4a019d57575fbb1239eae21ae" }
 struo-target-ecp5 = { git = "https://github.com/fabrica-eda/struo.git", rev = "fd994db45f792fb4a019d57575fbb1239eae21ae" }
 texo-flow = { path = "crates/texo-flow" }
 texo-model = { path = "crates/texo-model" }
 texo-pnr = { path = "crates/texo-pnr" }
+texo-struo = { path = "crates/texo-struo" }
+texo-target-ecp5 = { path = "crates/texo-target-ecp5" }
 
 [workspace.lints.rust]
 missing_docs = "warn"

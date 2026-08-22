@@ -3194,6 +3194,7 @@ version = "0.1.0"
 dependencies = [
  "texo-flow",
  "texo-model",
+ "texo-target-ecp5",
 ]
 
 [[package]]
@@ -3224,6 +3225,18 @@ dependencies = [
  "struo-ir",
  "struo-target-ecp5",
  "texo-model",
+]
+
+[[package]]
+name = "texo-target-ecp5"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "struo-ir",
+ "struo-target-ecp5",
+ "texo-model",
+ "texo-struo",
 ]
 
 [[package]]

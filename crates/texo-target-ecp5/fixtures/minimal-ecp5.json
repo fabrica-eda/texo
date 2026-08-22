@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "project_trellis_revision": "3afe7b52b30f4b4417ee98f03016767a502006e3",
+    "database_revision": "015e0330630d7c238c0e4f2cdd9c8157eb78c54a",
+    "include_lutperm_pips": true,
+    "split_slice_mode": true
+  },
+  "family": "ECP5",
+  "device": "LFE5UM5G-85F-test",
+  "width": 2,
+  "height": 1,
+  "location_types": [
+    {
+      "wires": [
+        { "name": "A0_SLICE" },
+        { "name": "B0_SLICE" },
+        { "name": "C0_SLICE" },
+        { "name": "D0_SLICE" },
+        { "name": "F0_SLICE" },
+        { "name": "H01E0001" },
+        { "name": "PADDI_A" },
+        { "name": "PADDO_A" },
+        { "name": "PADDT_A" }
+      ],
+      "bels": [
+        {
+          "name": "SLICEA.K0",
+          "bel_type": "TRELLIS_COMB",
+          "z": 0,
+          "pins": [
+            { "name": "A", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 0 } },
+            { "name": "B", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 1 } },
+            { "name": "C", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 2 } },
+            { "name": "D", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 3 } },
+            { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 4 } }
+          ]
+        },
+        {
+          "name": "PIOA",
+          "bel_type": "PIO",
+          "z": 8,
+          "pins": [
+            { "name": "I", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 7 } },
+            { "name": "T", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 8 } },
+            { "name": "O", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 6 } }
+          ]
+        }
+      ],
+      "pips": [
+        {
+          "from": { "dx": 0, "dy": 0, "index": 5 },
+          "to": { "dx": 1, "dy": 0, "index": 5 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "delay": 1,
+          "lutperm_flags": 0
+        }
+      ]
+    },
+    {
+      "wires": [
+        { "name": "A0_SLICE" },
+        { "name": "B0_SLICE" },
+        { "name": "C0_SLICE" },
+        { "name": "D0_SLICE" },
+        { "name": "F0_SLICE" },
+        { "name": "H01E0001" }
+      ],
+      "bels": [
+        {
+          "name": "SLICEA.K0",
+          "bel_type": "TRELLIS_COMB",
+          "z": 0,
+          "pins": [
+            { "name": "A", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 0 } },
+            { "name": "B", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 1 } },
+            { "name": "C", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 2 } },
+            { "name": "D", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 3 } },
+            { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 4 } }
+          ]
+        }
+      ],
+      "pips": []
+    }
+  ],
+  "locations": [
+    { "x": 0, "y": 0, "location_type": 0 },
+    { "x": 1, "y": 0, "location_type": 1 }
+  ],
+  "packages": [
+    {
+      "name": "CABGA381",
+      "pins": [
+        { "name": "A10", "x": 0, "y": 0, "bel": 1 }
+      ]
+    }
+  ]
+}

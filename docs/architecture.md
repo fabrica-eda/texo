@@ -21,6 +21,8 @@ The inspected upstream versions are:
 |---|---|---|
 | `fabrica-eda/struo` | `fd994db45f792fb4a019d57575fbb1239eae21ae` | `Ecp5Netlist`, `Ecp5Cell`, mapped ports, nextpnr-compatible JSON, verification policy |
 | `celox` | crates.io exact version `=0.3.1` | `FrontendArtifact` and native post-map simulation |
+| `YosysHQ/prjtrellis` | exporter inspected at `3afe7b52b30f4b4417ee98f03016767a502006e3` | deduplicated chip database, relative resource references, package IO database |
+| `prjtrellis-db` | snapshot records the exact revision; fixture uses `015e0330630d7c238c0e4f2cdd9c8157eb78c54a` | ECP5 routing and package data |
 
 Struo is not currently published on crates.io, so its first adapter will pin an
 exact Git revision. Celox must be consumed from crates.io and pinned to an exact
@@ -79,6 +81,37 @@ Cartesian product of cells and compatible BELs.
 The M0 router already observes wire and PIP capacities and PIP direction. A
 production router will replace its breadth-first search with negotiated
 congestion without changing the graph contract.
+
+## ECP5 architecture snapshots
+
+`texo-target-ecp5` expands a schema-versioned snapshot into the target-neutral
+`Device`. Project Trellis location types remain deduplicated on disk: each grid
+location names one type, while BEL pins and PIPs use relative location/resource
+references. Import occurs in three passes—wires, BELs/pins, then PIPs—so every
+relative reference is validated before it reaches the solver. Package records
+must resolve to an IO BEL. ECP5-only data such as BEL type/Z, fixed-arc status,
+tile type, delay, and LUT permutation flags remains in side metadata keyed by
+the same stable IDs.
+
+Generate a snapshot from local, revision-controlled Project Trellis source and
+database checkouts:
+
+```sh
+python3 tools/export_ecp5.py \
+  -L /path/to/prjtrellis/libtrellis/build/libtrellis \
+  --database /path/to/prjtrellis-db \
+  --device LFE5UM5G-85F \
+  --project-trellis-revision <source-commit> \
+  --database-revision <database-commit> \
+  --output artifacts/LFE5UM5G-85F.json
+
+cargo run -- target-info artifacts/LFE5UM5G-85F.json
+```
+
+The exporter deliberately enables Project Trellis's LUT-permutation PIPs and
+split-slice mode. The importer rejects snapshots that omit split-slice mode,
+use another schema/family, have incomplete provenance, or contain dangling
+relative/package references.
 
 ## Verification policy
 

@@ -33,8 +33,16 @@ same mapped design still passes Celox simulation.
 
 ## M2 — ECP5 architecture database and packing
 
-- Import Project Trellis chip database data into a versioned compact format.
-- Model tiles, BELs, wires, PIPs, packages, clock networks, and timing arcs.
+- [x] Define a provenance-bearing, versioned, deduplicated Project Trellis
+  snapshot format and Rust importer.
+- [x] Import BELs, BEL pins, wires, directed/fixed PIPs, package-to-PIO
+  bindings, and target-specific PIP metadata.
+- [x] Verify direct Struo LUT4 and IO compatibility against imported
+  `TRELLIS_COMB` and `PIO` BELs.
+- [ ] Generate and characterize a complete production device snapshot using a
+  locally built `pytrellis` and `prjtrellis-db` checkout.
+- [ ] Model clock networks and timing arcs beyond the routing-graph delay
+  metadata already preserved by the importer.
 - Pack LUT/FF pairs, IO buffers, BRAMs, and global clocks with explicit legality
   errors.
 - Parse LPF constraints and bind package pins.

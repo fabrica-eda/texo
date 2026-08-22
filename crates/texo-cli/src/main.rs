@@ -2,17 +2,20 @@
 
 use std::env;
 use std::error::Error;
+use std::fs::File;
 use std::process::ExitCode;
 
 use texo_flow::{Evidence, implement};
 use texo_model::{Design, Device, PinDirection, ResourceKind};
+use texo_target_ecp5::read_architecture;
 
 const USAGE: &str = "\
 Texo FPGA place and route
 
 Usage:
-  texo demo     run the deterministic abstract-grid PnR demo
-  texo help     show this help
+  texo demo                         run the deterministic abstract-grid PnR demo
+  texo target-info <architecture>   inspect an ECP5 architecture snapshot
+  texo help                         show this help
 ";
 
 fn main() -> ExitCode {
@@ -26,14 +29,57 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    match env::args().nth(1).as_deref() {
-        Some("demo") => demo(),
+    let mut args = env::args().skip(1);
+    match args.next().as_deref() {
+        Some("demo") if args.next().is_none() => demo(),
+        Some("target-info") => {
+            let path = args
+                .next()
+                .ok_or_else(|| format!("target-info requires an architecture path\n\n{USAGE}"))?;
+            if args.next().is_some() {
+                return Err(format!("target-info accepts one architecture path\n\n{USAGE}").into());
+            }
+            target_info(&path)
+        }
         None | Some("help" | "-h" | "--help") => {
             print!("{USAGE}");
             Ok(())
         }
         Some(command) => Err(format!("unknown command `{command}`\n\n{USAGE}").into()),
     }
+}
+
+fn target_info(path: &str) -> Result<(), Box<dyn Error>> {
+    let architecture = read_architecture(File::open(path)?)?;
+    let device = architecture.device();
+    let fixed_pips = architecture
+        .pip_metadata()
+        .values()
+        .filter(|pip| pip.fixed)
+        .count();
+
+    println!("device: {}", device.name());
+    println!("grid: {} x {}", device.width(), device.height());
+    println!("BELs: {}", device.bels().len());
+    println!("BEL pins: {}", device.bel_pins().len());
+    println!("wires: {}", device.wires().len());
+    println!("PIPs: {} ({fixed_pips} fixed)", device.pips().len());
+    let package_names = architecture
+        .packages()
+        .iter()
+        .map(|package| package.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("packages: {package_names}");
+    println!(
+        "Project Trellis revision: {}",
+        architecture.provenance().project_trellis_revision
+    );
+    println!(
+        "database revision: {}",
+        architecture.provenance().database_revision
+    );
+    Ok(())
 }
 
 fn demo() -> Result<(), Box<dyn Error>> {

@@ -1,0 +1,19 @@
+[package]
+name = "texo-target-ecp5"
+description = "Project Trellis architecture import for Texo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+texo-model.workspace = true
+
+[dev-dependencies]
+struo-ir.workspace = true
+struo-target-ecp5.workspace = true
+texo-struo.workspace = true
+
+[lints]
+workspace = true

@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 texo-flow.workspace = true
 texo-model.workspace = true
+texo-target-ecp5.workspace = true
 
 [lints]
 workspace = true
-

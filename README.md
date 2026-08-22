@@ -24,6 +24,7 @@ architecture data is introduced; it is not yet a production FPGA router.
 | `texo-pnr` | Cell-to-BEL placement and capacity-aware Wire/PIP routing |
 | `texo-flow` | End-to-end stage orchestration and verification gates |
 | `texo-struo` | Direct Struo ECP5 import and crates.io Celox verification boundary |
+| `texo-target-ecp5` | Versioned Project Trellis architecture import and ECP5 metadata |
 | `texo-cli` | Command-line entry point |
 
 The PnR crates do not depend on Veryl, Struo, Celox, or a particular FPGA.
@@ -41,10 +42,16 @@ with a Git dependency.
 
 ```sh
 cargo run -- demo
+cargo run -- target-info crates/texo-target-ecp5/fixtures/minimal-ecp5.json
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
+
+`tools/export_ecp5.py` generates a deduplicated architecture snapshot from a
+local Project Trellis build and database. Production device snapshots are
+generated artifacts; the repository keeps a small schema fixture for fast,
+deterministic tests.
 
 See [docs/architecture.md](docs/architecture.md) for the integration boundary
 and [docs/roadmap.md](docs/roadmap.md) for the implementation sequence.

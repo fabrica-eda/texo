@@ -267,10 +267,18 @@ impl Importer {
                     direction,
                 },
             );
-            let pin = self.design.add_pin(cell, "FABRIC", PinDirection::Inout)?;
             match direction {
-                PortDirection::Input => self.claim_driver(mapped_bit.into(), pin)?,
-                PortDirection::Output => self.add_sink(mapped_bit, pin),
+                // Project Trellis names PIO ports from the BEL's perspective:
+                // `O` carries pad input into fabric, while `I` carries fabric
+                // output toward the pad.
+                PortDirection::Input => {
+                    let pin = self.design.add_pin(cell, "O", PinDirection::Output)?;
+                    self.claim_driver(mapped_bit.into(), pin)?;
+                }
+                PortDirection::Output => {
+                    let pin = self.design.add_pin(cell, "I", PinDirection::Input)?;
+                    self.add_sink(mapped_bit, pin);
+                }
             }
             cells.push(cell);
         }
@@ -308,7 +316,9 @@ impl Importer {
         for (name, bit) in ["A", "B", "C", "D"].into_iter().zip(*inputs) {
             self.add_input(cell, name, bit)?;
         }
-        self.add_output(cell, "Z", *output)
+        // Struo exposes the pre-pack LUT4 port name `Z`. Project Trellis's
+        // split-slice BEL uses `F`, matching nextpnr's lut_to_comb packing.
+        self.add_output(cell, "F", *output)
     }
 
     fn add_flip_flop(&mut self, primitive: &Ecp5Cell) -> Result<(), AdapterError> {
