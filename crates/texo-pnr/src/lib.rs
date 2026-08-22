@@ -555,10 +555,15 @@ fn choose_assignment<'a>(
                 .iter()
                 .map(|bel| device.bels()[bel.0].point)
                 .collect::<Vec<_>>();
-            (cost, points, assignment)
+            let center = Point::new(device.width() / 2, device.height() / 2);
+            let center_distance = points
+                .iter()
+                .map(|point| point.manhattan(center))
+                .sum::<u64>();
+            (cost, center_distance, points, assignment)
         })
         .min()
-        .map(|(_, _, assignment)| assignment.to_vec())
+        .map(|(_, _, _, assignment)| assignment.to_vec())
 }
 
 const MAX_PLACEMENT_REFINEMENT_PASSES: usize = 2;
@@ -1804,6 +1809,20 @@ mod tests {
                 cell: "sink".into()
             })
         );
+    }
+
+    #[test]
+    fn seeds_an_unconnected_unit_at_the_device_center() {
+        let mut design = Design::new();
+        let cell = design.add_cell("cell", ResourceKind::Logic);
+        design.add_pin(cell, "out", PinDirection::Output).unwrap();
+        let device = Device::rectangular_logic(5, 1).unwrap();
+
+        let placement =
+            place_with_constraints(&design, &device, &PlacementConstraints::new()).unwrap();
+        let point = device.bels()[placement.bel(cell).unwrap().0].point;
+
+        assert_eq!(point, Point::new(2, 0));
     }
 
     #[test]

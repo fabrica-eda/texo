@@ -2891,7 +2891,7 @@ mod tests {
     use struo_target_ecp5::{
         ArithmeticMapping, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
     };
-    use texo_model::{CellId, Design, PinDirection, PipId, ResourceKind, UnifiedGraph};
+    use texo_model::{BelId, CellId, Design, PinDirection, PipId, ResourceKind, UnifiedGraph};
     use texo_pnr::{place_and_route_with_constraints, place_with_constraints};
     use texo_struo::{PrimitiveMetadata, import_ecp5};
 
@@ -3480,6 +3480,14 @@ mod tests {
             .unwrap();
         let source_net = design.add_net("clock", driver, [clock]).unwrap();
         let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+        let local_ff = architecture
+            .device()
+            .bels()
+            .iter()
+            .position(|bel| bel.kind == ResourceKind::Register && bel.point.x == 0)
+            .map(BelId)
+            .unwrap();
+        packing.constraints.add_group([ff], [vec![local_ff]]);
         packing
             .bind_package_pins(
                 &design,
