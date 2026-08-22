@@ -49,7 +49,8 @@ same mapped design still passes Celox simulation.
 - [ ] Model clock networks and timing arcs beyond the routing-graph delay
   metadata already preserved by the importer.
 - [ ] Pack BRAMs and global clocks with explicit legality errors.
-- [ ] Absorb constant drivers and record the resulting primitive parameters.
+- [x] Fold LUT constants into INIT, absorb FF/BRAM constants into input-mux
+  metadata, and synthesize shared constant LUTs only for residual nets.
 
 Exit criterion: every packed primitive has one legal BEL on the selected exact
 device/package and a checker can reconstruct all occupancy.

@@ -102,6 +102,16 @@ remain indexed by logical IO CellId for configuration generation. Unknown port
 names, duplicate sites/attributes, and unconstrained bits in strict mode are
 errors. Other LPF verbs are retained and shown by `texo lpf-info`.
 
+Constant handling occurs while the Struo mapped object is copied into the
+logical graph. Constant LUT inputs select and replicate the corresponding INIT
+truth-table plane, so those logical pins and nets disappear. Constant FF
+controls and DP16KD inputs that have configuration muxes are recorded in an
+`absorbed_inputs` table keyed by CellId and physical pin name. If a constant is
+still required by a routable terminal—such as a constant top-level output—the
+adapter lazily creates one shared LUT source for that value. Consequently no
+abstract `Constant` cell reaches ECP5 placement, while the original mapped
+object remains unchanged for Celox post-map verification.
+
 ## ECP5 architecture snapshots
 
 `texo-target-ecp5` expands a schema-versioned snapshot into the target-neutral

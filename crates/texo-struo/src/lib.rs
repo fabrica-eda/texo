@@ -154,6 +154,7 @@ pub struct ImportedEcp5Design {
     name: String,
     design: Design,
     metadata: BTreeMap<CellId, PrimitiveMetadata>,
+    absorbed_inputs: BTreeMap<CellId, BTreeMap<String, bool>>,
     ports: Vec<ImportedPort>,
 }
 
@@ -176,6 +177,12 @@ impl ImportedEcp5Design {
         &self.metadata
     }
 
+    /// Constant input values absorbed into primitive configuration.
+    #[must_use]
+    pub const fn absorbed_inputs(&self) -> &BTreeMap<CellId, BTreeMap<String, bool>> {
+        &self.absorbed_inputs
+    }
+
     /// Source-level vector port grouping.
     #[must_use]
     pub fn ports(&self) -> &[ImportedPort] {
@@ -191,16 +198,17 @@ impl ImportedEcp5Design {
 
 /// Imports the exact in-memory Struo mapped object into Texo.
 ///
-/// Every physical primitive pin is represented explicitly. Constant bits become
-/// dedicated constant cells, and top-level vector bits become individual I/O
-/// cells while their source grouping is retained in [`ImportedPort`].
+/// Routable physical primitive pins are represented explicitly. Constants are
+/// folded into LUT INIT or primitive input-mux configuration where legal;
+/// residual constant nets receive lazily created constant LUTs. Top-level
+/// vector bits become individual I/O cells while their source grouping is
+/// retained in [`ImportedPort`].
 ///
 /// # Errors
 ///
 /// Returns an error for inconsistent mapped wiring or an invalid Texo model.
 pub fn import_ecp5(netlist: &Ecp5Netlist) -> Result<ImportedEcp5Design, AdapterError> {
     let mut importer = Importer::new();
-    importer.add_constants()?;
     for port in netlist.ports() {
         importer.add_port(port)?;
     }
@@ -225,6 +233,7 @@ pub fn celox_frontend_artifact(
 struct Importer {
     design: Design,
     metadata: BTreeMap<CellId, PrimitiveMetadata>,
+    absorbed_inputs: BTreeMap<CellId, BTreeMap<String, bool>>,
     ports: Vec<ImportedPort>,
     drivers: BTreeMap<MappedSignal, CellPinId>,
     sinks: BTreeMap<MappedSignal, Vec<CellPinId>>,
@@ -233,22 +242,6 @@ struct Importer {
 impl Importer {
     fn new() -> Self {
         Self::default()
-    }
-
-    fn add_constants(&mut self) -> Result<(), AdapterError> {
-        for (signal, name, value) in [
-            (MappedSignal::Zero, "$false", false),
-            (MappedSignal::One, "$true", true),
-        ] {
-            let cell = self.add_cell(
-                name,
-                ResourceKind::Constant,
-                PrimitiveMetadata::Constant { value },
-            );
-            let output = self.design.add_pin(cell, "Y", PinDirection::Output)?;
-            self.claim_driver(signal, output)?;
-        }
-        Ok(())
     }
 
     fn add_port(&mut self, port: &struo_target_ecp5::MappedPort) -> Result<(), AdapterError> {
@@ -308,13 +301,23 @@ impl Importer {
         else {
             unreachable!("dispatch guarantees LUT4")
         };
+        let mut packed_init = *init;
+        for (index, bit) in inputs.iter().copied().enumerate() {
+            if let Some(value) = constant_value(bit) {
+                packed_init = fold_lut_input(packed_init, index, value);
+            }
+        }
         let cell = self.add_cell(
             name,
             ResourceKind::Lut(4),
-            PrimitiveMetadata::Lut4 { init: *init },
+            PrimitiveMetadata::Lut4 { init: packed_init },
         );
         for (name, bit) in ["A", "B", "C", "D"].into_iter().zip(*inputs) {
-            self.add_input(cell, name, bit)?;
+            if let Some(value) = constant_value(bit) {
+                self.record_absorbed_input(cell, name, value);
+            } else {
+                self.add_input(cell, name, bit)?;
+            }
         }
         // Struo exposes the pre-pack LUT4 port name `Z`. Project Trellis's
         // split-slice BEL uses `F`, matching nextpnr's lut_to_comb packing.
@@ -345,16 +348,24 @@ impl Importer {
         );
         self.add_input(cell, "DI", *data)?;
         self.add_input(cell, "CLK", *clock)?;
-        self.add_input(
+        self.add_absorbable_input(
             cell,
             "CE",
             enable.map_or(Bit::One, |control| control.signal),
         )?;
-        self.add_input(
-            cell,
-            "LSR",
-            reset.map_or(Bit::Zero, |control| control.signal),
-        )?;
+        let lsr = reset.map_or(Bit::Zero, |control| control.signal);
+        let lsr_is_inactive = constant_value(lsr).is_some_and(|value| {
+            reset.is_none_or(|control| value != matches!(control.active, StruoActiveLevel::High))
+        });
+        if lsr_is_inactive {
+            self.record_absorbed_input(
+                cell,
+                "LSR",
+                constant_value(lsr).expect("inactive check requires a constant"),
+            );
+        } else {
+            self.add_input(cell, "LSR", lsr)?;
+        }
         self.add_output(cell, "Q", *output)
     }
 
@@ -415,10 +426,10 @@ impl Importer {
         clock: Bit,
     ) -> Result<(), AdapterError> {
         for (index, bit) in write_address.iter().copied().enumerate() {
-            self.add_input(cell, format!("ADA{index}"), bit)?;
+            self.add_absorbable_input(cell, format!("ADA{index}"), bit)?;
         }
         for index in 0..18 {
-            self.add_input(
+            self.add_absorbable_input(
                 cell,
                 format!("DIA{index}"),
                 write_data.get(index).copied().unwrap_or(Bit::Zero),
@@ -431,16 +442,16 @@ impl Importer {
             ("WEA", write_enable.signal),
             ("RSTA", Bit::Zero),
         ] {
-            self.add_input(cell, name, bit)?;
+            self.add_absorbable_input(cell, name, bit)?;
         }
         for index in 0..3 {
-            self.add_input(cell, format!("CSA{index}"), Bit::Zero)?;
+            self.add_absorbable_input(cell, format!("CSA{index}"), Bit::Zero)?;
         }
         for (index, bit) in read_address.iter().copied().enumerate() {
-            self.add_input(cell, format!("ADB{index}"), bit)?;
+            self.add_absorbable_input(cell, format!("ADB{index}"), bit)?;
         }
         for index in 0..18 {
-            self.add_input(cell, format!("DIB{index}"), Bit::Zero)?;
+            self.add_absorbable_input(cell, format!("DIB{index}"), Bit::Zero)?;
         }
         for (name, bit) in [
             (
@@ -452,10 +463,10 @@ impl Importer {
             ("WEB", Bit::Zero),
             ("RSTB", Bit::Zero),
         ] {
-            self.add_input(cell, name, bit)?;
+            self.add_absorbable_input(cell, name, bit)?;
         }
         for index in 0..3 {
-            self.add_input(cell, format!("CSB{index}"), Bit::Zero)?;
+            self.add_absorbable_input(cell, format!("CSB{index}"), Bit::Zero)?;
         }
         Ok(())
     }
@@ -482,6 +493,47 @@ impl Importer {
         Ok(())
     }
 
+    fn add_absorbable_input(
+        &mut self,
+        cell: CellId,
+        name: impl Into<String>,
+        bit: Bit,
+    ) -> Result<(), AdapterError> {
+        let name = name.into();
+        if let Some(value) = constant_value(bit) {
+            self.record_absorbed_input(cell, name, value);
+            Ok(())
+        } else {
+            self.add_input(cell, name, bit)
+        }
+    }
+
+    fn record_absorbed_input(&mut self, cell: CellId, name: impl Into<String>, value: bool) {
+        self.absorbed_inputs
+            .entry(cell)
+            .or_default()
+            .insert(name.into(), value);
+    }
+
+    fn add_constant_driver(&mut self, value: bool) -> Result<CellPinId, AdapterError> {
+        let signal = if value {
+            MappedSignal::One
+        } else {
+            MappedSignal::Zero
+        };
+        if let Some(driver) = self.drivers.get(&signal) {
+            return Ok(*driver);
+        }
+        let cell = self.add_cell(
+            if value { "$PACKER_VCC" } else { "$PACKER_GND" },
+            ResourceKind::Lut(4),
+            PrimitiveMetadata::Constant { value },
+        );
+        let output = self.design.add_pin(cell, "F", PinDirection::Output)?;
+        self.claim_driver(signal, output)?;
+        Ok(output)
+    }
+
     fn add_output(
         &mut self,
         cell: CellId,
@@ -506,20 +558,44 @@ impl Importer {
 
     fn finish(mut self, name: &str) -> Result<ImportedEcp5Design, AdapterError> {
         for (signal, sinks) in std::mem::take(&mut self.sinks) {
-            let driver = self
-                .drivers
-                .get(&signal)
-                .copied()
-                .ok_or(AdapterError::MissingDriver(signal))?;
+            let driver = if let Some(driver) = self.drivers.get(&signal) {
+                *driver
+            } else {
+                match signal {
+                    MappedSignal::Zero => self.add_constant_driver(false)?,
+                    MappedSignal::One => self.add_constant_driver(true)?,
+                    MappedSignal::Wire(_) => return Err(AdapterError::MissingDriver(signal)),
+                }
+            };
             self.design.add_net(signal_name(signal), driver, sinks)?;
         }
         Ok(ImportedEcp5Design {
             name: name.into(),
             design: self.design,
             metadata: self.metadata,
+            absorbed_inputs: self.absorbed_inputs,
             ports: self.ports,
         })
     }
+}
+
+const fn constant_value(bit: Bit) -> Option<bool> {
+    match bit {
+        Bit::Zero => Some(false),
+        Bit::One => Some(true),
+        Bit::Wire(_) => None,
+    }
+}
+
+fn fold_lut_input(init: u16, input: usize, value: bool) -> u16 {
+    let mut folded = 0_u16;
+    for output_index in 0..16 {
+        let source_index = (output_index & !(1 << input)) | (usize::from(value) << input);
+        if init & (1 << source_index) != 0 {
+            folded |= 1 << output_index;
+        }
+    }
+    folded
 }
 
 fn reset_metadata(reset: Reset) -> ResetMetadata {
@@ -580,6 +656,8 @@ impl From<ModelError> for AdapterError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use struo_ir::{
         ActiveLevel as StruoActiveLevel, ClockEdge as StruoClockEdge, EnableControl, MemoryCell,
         Netlist, RegisterCell, ResetControl,
@@ -589,7 +667,7 @@ mod tests {
 
     use super::{
         ActiveLevel, ClockEdge, PrimitiveMetadata, ResetMetadata, celox_frontend_artifact,
-        import_ecp5,
+        fold_lut_input, import_ecp5,
     };
 
     fn mapped_xor() -> struo_target_ecp5::Ecp5Netlist {
@@ -602,25 +680,41 @@ mod tests {
     }
 
     #[test]
-    fn imports_ports_constants_lut_pins_and_nets_without_json() {
+    fn replicates_the_selected_lut_truth_table_plane() {
+        assert_eq!(fold_lut_input(0xaaaa, 0, false), 0x0000);
+        assert_eq!(fold_lut_input(0xaaaa, 0, true), 0xffff);
+        assert_eq!(fold_lut_input(0xcccc, 1, false), 0x0000);
+        assert_eq!(fold_lut_input(0xcccc, 1, true), 0xffff);
+    }
+
+    #[test]
+    fn folds_lut_constants_without_a_residual_constant_cell() {
         let mapped = mapped_xor();
 
         let imported = import_ecp5(&mapped).unwrap();
 
         assert_eq!(imported.name(), "logic");
         assert_eq!(imported.ports().len(), 3);
-        assert!(
-            imported
-                .design()
-                .cells()
-                .iter()
-                .any(|cell| cell.kind == ResourceKind::Lut(4))
+        let lut = imported
+            .design()
+            .cells()
+            .iter()
+            .position(|cell| cell.kind == ResourceKind::Lut(4))
+            .map(CellId)
+            .unwrap();
+        assert!(matches!(
+            imported.metadata().get(&lut),
+            Some(PrimitiveMetadata::Lut4 { .. })
+        ));
+        assert_eq!(
+            imported.absorbed_inputs()[&lut],
+            BTreeMap::from([("C".into(), false), ("D".into(), false)])
         );
         assert!(
-            imported
+            !imported
                 .metadata()
                 .values()
-                .any(|metadata| matches!(metadata, PrimitiveMetadata::Lut4 { .. }))
+                .any(|metadata| matches!(metadata, PrimitiveMetadata::Constant { .. }))
         );
         assert!(
             imported
@@ -698,6 +792,71 @@ mod tests {
     }
 
     #[test]
+    fn absorbs_default_flip_flop_controls() {
+        let mut source = Netlist::new("state");
+        let data = source.add_input("data");
+        let clock = source.add_input("clock");
+        let output = source.add_register_output("state");
+        source.add_register(RegisterCell::new(
+            "state",
+            output,
+            data,
+            clock,
+            StruoClockEdge::Rising,
+            None,
+            None,
+        ));
+        source.add_output("state", output);
+        let imported = import_ecp5(&map_to_ecp5(&source).unwrap()).unwrap();
+        let flip_flop = imported
+            .design()
+            .cells()
+            .iter()
+            .position(|cell| cell.kind == ResourceKind::Register)
+            .map(CellId)
+            .unwrap();
+        let pin_names = imported.design().cells()[flip_flop.0]
+            .pins()
+            .iter()
+            .map(|pin| imported.design().pins()[pin.0].name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(pin_names, ["DI", "CLK", "Q"]);
+        assert_eq!(
+            imported.absorbed_inputs()[&flip_flop],
+            BTreeMap::from([("CE".into(), true), ("LSR".into(), false)])
+        );
+    }
+
+    #[test]
+    fn lazily_creates_a_lut_for_a_residual_constant_net() {
+        let mut source = Netlist::new("constant");
+        let high = source.add_constant(true);
+        source.add_output("high", high);
+        let imported = import_ecp5(&map_to_ecp5(&source).unwrap()).unwrap();
+        let constant_cells = imported
+            .metadata()
+            .iter()
+            .filter(|(_, metadata)| matches!(metadata, PrimitiveMetadata::Constant { value: true }))
+            .collect::<Vec<_>>();
+
+        assert_eq!(constant_cells.len(), 1);
+        let cell = *constant_cells[0].0;
+        assert_eq!(imported.design().cells()[cell.0].kind, ResourceKind::Lut(4));
+        assert_eq!(
+            imported.design().pins()[imported.design().cells()[cell.0].pins()[0].0].name,
+            "F"
+        );
+        assert!(
+            !imported
+                .design()
+                .cells()
+                .iter()
+                .any(|cell| cell.kind == ResourceKind::Constant)
+        );
+    }
+
+    #[test]
     fn imports_complete_dp16kd_pin_surface() {
         let mut source = Netlist::new("memory");
         let clock = source.add_input("clock");
@@ -743,7 +902,10 @@ mod tests {
             .map(CellId)
             .unwrap();
 
-        assert_eq!(imported.design().cells()[block_ram.0].pins().len(), 82);
+        assert_eq!(imported.design().cells()[block_ram.0].pins().len(), 11);
+        assert_eq!(imported.absorbed_inputs()[&block_ram].len(), 71);
+        assert!(imported.absorbed_inputs()[&block_ram]["CEA"]);
+        assert!(!imported.absorbed_inputs()[&block_ram]["WEB"]);
         assert!(matches!(
             imported.metadata().get(&block_ram),
             Some(PrimitiveMetadata::BlockRam {
