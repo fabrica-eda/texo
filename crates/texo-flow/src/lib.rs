@@ -7,8 +7,9 @@ use std::fmt;
 use texo_model::{CellId, CellPinId, Design, Device, NetId, PinDirection, PipId, ResourceKind};
 pub use texo_pnr::RoutingProgress;
 use texo_pnr::{
-    PlacementConstraints, PnrError, PnrResult, RoutingCosts, place_and_route_with_constraints,
-    place_with_constraints, place_with_net_weights, route_with_placement_and_progress,
+    Placement, PlacementConstraints, PnrError, PnrResult, RoutingConstraints, RoutingCosts,
+    place_and_route_with_constraints, place_with_constraints, place_with_net_weights,
+    refine_placement_with_net_weights, route_with_placement_and_progress,
     route_with_timing_costs_and_progress,
 };
 use texo_struo::{ImportedEcp5Design, PrimitiveMetadata};
@@ -384,13 +385,90 @@ impl TimingDrivenContext<'_> {
             self.packing
                 .global_routing_constraints(self.design, self.architecture, &placement)?;
         progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
-        let implementation = route_with_placement_and_progress(
+        let (implementation, timing) =
+            self.route_and_analyze(placement, &routing, None, progress)?;
+        let routing_weights = timing_net_weights(&timing, self.timing_constraints);
+        let mut routing_costs =
+            ecp5_routing_costs(self.architecture, self.speed_grade, routing_weights)?;
+        let (timing_implementation, timing_routed) = self.route_and_analyze(
+            implementation.placement.clone(),
+            &routing,
+            Some(&routing_costs),
+            progress,
+        )?;
+        let candidates = [
+            (initial_implementation, initial_timing),
+            (implementation, timing),
+            (timing_implementation, timing_routed),
+        ];
+        let (best_implementation, best_timing) = candidates
+            .into_iter()
+            .max_by_key(|(_, timing)| timing_score(timing))
+            .expect("three timing candidates are present");
+        if best_timing.met_timing() {
+            return Ok((best_implementation, best_timing));
+        }
+
+        let refinement_weights = timing_net_weights(&best_timing, self.timing_constraints);
+        let refined_placement = refine_placement_with_net_weights(
             self.design,
             self.architecture.device(),
-            placement,
-            &routing,
-            |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
+            self.packing.constraints(),
+            best_implementation.placement.clone(),
+            &refinement_weights,
         )?;
+        progress(Ecp5FlowStage::TimingDrivenPlaced);
+        let refined_routing = self.packing.global_routing_constraints(
+            self.design,
+            self.architecture,
+            &refined_placement,
+        )?;
+        progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
+        let (refined_implementation, refined_timing) =
+            self.route_and_analyze(refined_placement, &refined_routing, None, progress)?;
+        routing_costs
+            .set_net_criticalities(timing_net_weights(&refined_timing, self.timing_constraints));
+        let (refined_timing_implementation, refined_timing_routed) = self.route_and_analyze(
+            refined_implementation.placement.clone(),
+            &refined_routing,
+            Some(&routing_costs),
+            progress,
+        )?;
+        Ok([
+            (best_implementation, best_timing),
+            (refined_implementation, refined_timing),
+            (refined_timing_implementation, refined_timing_routed),
+        ]
+        .into_iter()
+        .max_by_key(|(_, timing)| timing_score(timing))
+        .expect("three refinement candidates are present"))
+    }
+
+    fn route_and_analyze(
+        &self,
+        placement: Placement,
+        routing: &RoutingConstraints,
+        costs: Option<&RoutingCosts>,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<(PnrResult, TimingReport), Ecp5FlowError> {
+        let implementation = if let Some(costs) = costs {
+            route_with_timing_costs_and_progress(
+                self.design,
+                self.architecture.device(),
+                placement,
+                routing,
+                costs,
+                |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
+            )?
+        } else {
+            route_with_placement_and_progress(
+                self.design,
+                self.architecture.device(),
+                placement,
+                routing,
+                |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
+            )?
+        };
         progress(Ecp5FlowStage::TimingDrivenRouted);
         let timing = analyze_ecp5_implementation(
             self.design,
@@ -400,35 +478,7 @@ impl TimingDrivenContext<'_> {
             self.timing_model,
             self.timing_constraints,
         )?;
-        let routing_weights = timing_net_weights(&timing, self.timing_constraints);
-        let routing_costs =
-            ecp5_routing_costs(self.architecture, self.speed_grade, routing_weights)?;
-        let timing_implementation = route_with_timing_costs_and_progress(
-            self.design,
-            self.architecture.device(),
-            implementation.placement.clone(),
-            &routing,
-            &routing_costs,
-            |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
-        )?;
-        progress(Ecp5FlowStage::TimingDrivenRouted);
-        let timing_routed = analyze_ecp5_implementation(
-            self.design,
-            self.architecture,
-            self.speed_grade,
-            &timing_implementation,
-            self.timing_model,
-            self.timing_constraints,
-        )?;
-        let candidates = [
-            (initial_implementation, initial_timing),
-            (implementation, timing),
-            (timing_implementation, timing_routed),
-        ];
-        Ok(candidates
-            .into_iter()
-            .max_by_key(|(_, timing)| timing_score(timing))
-            .expect("three timing candidates are present"))
+        Ok((implementation, timing))
     }
 }
 

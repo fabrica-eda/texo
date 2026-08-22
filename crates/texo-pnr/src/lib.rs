@@ -74,6 +74,11 @@ impl RoutingCosts {
     pub const fn net_criticalities(&self) -> &BTreeMap<NetId, u64> {
         &self.net_criticalities
     }
+
+    /// Replaces logical-net criticalities while retaining the device delay table.
+    pub fn set_net_criticalities(&mut self, net_criticalities: BTreeMap<NetId, u64>) {
+        self.net_criticalities = net_criticalities;
+    }
 }
 
 impl RoutingConstraints {
@@ -406,6 +411,40 @@ pub fn place_with_net_weights(
     )
 }
 
+/// Refines an existing legal placement with deterministic per-net timing weights.
+///
+/// Unlike [`place_with_net_weights`], this preserves the current solution as
+/// the starting point and accepts only moves that reduce the weighted graph
+/// objective. Atomic placement groups remain intact.
+///
+/// # Errors
+///
+/// Returns a descriptive error when the supplied placement does not match the
+/// design, device, or placement constraints.
+pub fn refine_placement_with_net_weights(
+    design: &Design,
+    device: &Device,
+    constraints: &PlacementConstraints,
+    placement: Placement,
+    net_weights: &BTreeMap<NetId, u64>,
+) -> Result<Placement, PnrError> {
+    let graph = UnifiedGraph::new(design, device);
+    let (_, neighbors) = placement_neighbors(design, Some(net_weights));
+    let mut candidate_cache = BTreeMap::new();
+    let units = placement_units(&graph, constraints, &mut candidate_cache)?;
+    let mut placed = validate_refinement_start(&graph, &units, placement)?;
+    let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
+    refine_placement(
+        &graph,
+        constraints,
+        &units,
+        &neighbors,
+        &mut placed,
+        &mut occupied,
+    );
+    finish_placement(&graph, constraints, placed)
+}
+
 #[derive(Clone, Debug)]
 struct PlacementUnit {
     cells: Vec<CellId>,
@@ -437,6 +476,15 @@ impl PlacementChoices {
         match self {
             Self::Shared(assignments) => (0, Arc::as_ptr(assignments).cast::<()>() as usize),
             Self::SingleCell(candidates) => (1, Arc::as_ptr(candidates).cast::<()>() as usize),
+        }
+    }
+
+    fn contains(&self, assignment: &[BelId]) -> bool {
+        match self {
+            Self::Shared(assignments) => assignments.iter().any(|known| known == assignment),
+            Self::SingleCell(candidates) => {
+                assignment.len() == 1 && candidates.contains(&assignment[0])
+            }
         }
     }
 }
@@ -537,6 +585,15 @@ fn place(
         &mut occupied,
     );
 
+    finish_placement(graph, constraints, placed)
+}
+
+fn finish_placement(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    placed: Vec<Option<BelId>>,
+) -> Result<Placement, PnrError> {
+    let design = graph.design();
     let bindings = placed
         .into_iter()
         .map(|bel| bel.expect("every ordered cell was placed"))
@@ -565,6 +622,51 @@ fn place(
         bindings,
         pin_bindings,
     })
+}
+
+fn validate_refinement_start(
+    graph: &UnifiedGraph<'_>,
+    units: &[PlacementUnit],
+    placement: Placement,
+) -> Result<Vec<Option<BelId>>, PnrError> {
+    if placement.bindings.len() != graph.design().cells().len() {
+        return Err(PnrError::InvalidPlacement {
+            reason: format!(
+                "expected {} cell bindings, received {}",
+                graph.design().cells().len(),
+                placement.bindings.len()
+            ),
+        });
+    }
+    let mut occupied = BTreeSet::new();
+    for &bel in &placement.bindings {
+        if bel.0 >= graph.device().bels().len() {
+            return Err(PnrError::InvalidPlacement {
+                reason: format!("binding names unknown BEL {}", bel.0),
+            });
+        }
+        if !occupied.insert(bel) {
+            return Err(PnrError::InvalidPlacement {
+                reason: format!("BEL {} is assigned more than once", bel.0),
+            });
+        }
+    }
+    for unit in units {
+        let assignment = unit
+            .cells
+            .iter()
+            .map(|cell| placement.bindings[cell.0])
+            .collect::<Vec<_>>();
+        if !unit.choices.contains(&assignment) {
+            return Err(PnrError::InvalidPlacement {
+                reason: format!(
+                    "cell group beginning at {} has an incompatible assignment",
+                    unit.cells[0].0
+                ),
+            });
+        }
+    }
+    Ok(placement.bindings.into_iter().map(Some).collect())
 }
 
 fn placement_neighbors(
@@ -1875,6 +1977,11 @@ pub enum PnrError {
         /// Specific invariant that failed.
         reason: String,
     },
+    /// A supplied placement was incomplete, incompatible, or overlapping.
+    InvalidPlacement {
+        /// Specific invariant that failed.
+        reason: String,
+    },
     /// Internal or externally supplied placement omitted a cell.
     MissingPlacement {
         /// Missing cell ID.
@@ -1926,6 +2033,7 @@ impl fmt::Display for PnrError {
                 write!(f, "invalid routing constraint for net {}: {reason}", net.0)
             }
             Self::InvalidRoutingCosts { reason } => write!(f, "invalid routing costs: {reason}"),
+            Self::InvalidPlacement { reason } => write!(f, "invalid placement: {reason}"),
             Self::MissingPlacement { cell } => {
                 write!(f, "placement is missing cell ID {}", cell.0)
             }
@@ -1955,6 +2063,7 @@ impl Error for PnrError {
             | Self::InvalidPinNameBinding { .. }
             | Self::InvalidRoutingConstraint { .. }
             | Self::InvalidRoutingCosts { .. }
+            | Self::InvalidPlacement { .. }
             | Self::MissingPlacement { .. }
             | Self::Unroutable { .. }
             | Self::CongestionNotResolved { .. } => None,
@@ -1978,8 +2087,9 @@ mod tests {
     };
 
     use super::{
-        PlacementConstraints, PlacementNeighbor, PnrError, RouteSearch, RoutingConstraints,
-        RoutingCosts, place_and_route, place_with_constraints, refinement_edge_cost,
+        Placement, PlacementConstraints, PlacementNeighbor, PnrError, RouteSearch,
+        RoutingConstraints, RoutingCosts, place_and_route, place_with_constraints,
+        refine_placement_with_net_weights, refinement_edge_cost,
         route_with_timing_costs_and_progress, routing_step_cost, timing_tree_cost,
     };
 
@@ -2053,6 +2163,29 @@ mod tests {
 
         assert_eq!(refinement_edge_cost(ordinary, 3), 6);
         assert_eq!(refinement_edge_cost(critical, 3), 18);
+    }
+
+    #[test]
+    fn incremental_refinement_starts_from_the_supplied_placement() {
+        let design = two_cell_design();
+        let device = Device::rectangular_logic(5, 1).unwrap();
+        let initial = Placement {
+            bindings: vec![BelId(0), BelId(4)],
+            pin_bindings: BTreeMap::new(),
+        };
+
+        let refined = refine_placement_with_net_weights(
+            &design,
+            &device,
+            &PlacementConstraints::new(),
+            initial,
+            &BTreeMap::from([(NetId(0), 64)]),
+        )
+        .unwrap();
+        let source = refined.point(CellId(0), &device).unwrap();
+        let sink = refined.point(CellId(1), &device).unwrap();
+
+        assert!(source.manhattan(sink) < 4);
     }
 
     #[test]
