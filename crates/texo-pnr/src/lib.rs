@@ -402,6 +402,22 @@ struct PlacementCandidateKey {
     pins: Vec<(String, texo_model::PinDirection)>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PlacementNeighbor {
+    cell: CellId,
+    weight: u64,
+    timing_driven: bool,
+}
+
+fn refinement_edge_cost(edge: PlacementNeighbor, distance: u64) -> u64 {
+    let distance = if edge.timing_driven {
+        distance.saturating_mul(distance)
+    } else {
+        distance
+    };
+    edge.weight.saturating_mul(distance)
+}
+
 fn place(
     graph: &UnifiedGraph<'_>,
     constraints: &PlacementConstraints,
@@ -493,21 +509,20 @@ fn place(
 fn placement_neighbors(
     design: &Design,
     net_weights: Option<&BTreeMap<NetId, u64>>,
-) -> (Vec<usize>, Vec<Vec<(CellId, u64)>>) {
+) -> (Vec<usize>, Vec<Vec<PlacementNeighbor>>) {
     let mut degree = vec![0_usize; design.cells().len()];
     let mut neighbors = vec![Vec::new(); design.cells().len()];
     for (net_index, net) in design.nets().iter().enumerate() {
         let driver = design.pins()[net.driver.0].cell;
+        let timing_weight = net_weights
+            .and_then(|weights| weights.get(&NetId(net_index)))
+            .copied()
+            .unwrap_or(1);
         let edge_weight = if design.cells()[driver.0].kind == texo_model::ResourceKind::Clock {
             0
         } else {
             let fanout_weight = (64_u64 / net.sinks.len().max(1) as u64).max(1);
-            fanout_weight.saturating_mul(
-                net_weights
-                    .and_then(|weights| weights.get(&NetId(net_index)))
-                    .copied()
-                    .unwrap_or(1),
-            )
+            fanout_weight.saturating_mul(timing_weight)
         };
         for sink in &net.sinks {
             let sink = design.pins()[sink.0].cell;
@@ -515,8 +530,16 @@ fn placement_neighbors(
                 degree[driver.0] += 1;
                 degree[sink.0] += 1;
                 if edge_weight != 0 {
-                    neighbors[driver.0].push((sink, edge_weight));
-                    neighbors[sink.0].push((driver, edge_weight));
+                    neighbors[driver.0].push(PlacementNeighbor {
+                        cell: sink,
+                        weight: edge_weight,
+                        timing_driven: timing_weight > 1,
+                    });
+                    neighbors[sink.0].push(PlacementNeighbor {
+                        cell: driver,
+                        weight: edge_weight,
+                        timing_driven: timing_weight > 1,
+                    });
                 }
             }
         }
@@ -528,7 +551,7 @@ fn choose_assignment<'a>(
     cells: &[CellId],
     assignments: impl Iterator<Item = &'a [BelId]>,
     device: &Device,
-    neighbors: &[Vec<(CellId, u64)>],
+    neighbors: &[Vec<PlacementNeighbor>],
     placed: &[Option<BelId>],
     occupied: &BTreeSet<BelId>,
 ) -> Option<Vec<BelId>> {
@@ -542,8 +565,8 @@ fn choose_assignment<'a>(
                     let point = device.bels()[bel.0].point;
                     neighbors[cell.0]
                         .iter()
-                        .filter_map(|&(neighbor, weight)| {
-                            placed[neighbor.0].map(|neighbor_bel| (neighbor_bel, weight))
+                        .filter_map(|&edge| {
+                            placed[edge.cell.0].map(|neighbor_bel| (neighbor_bel, edge.weight))
                         })
                         .map(|(neighbor_bel, weight)| {
                             weight * point.manhattan(device.bels()[neighbor_bel.0].point)
@@ -566,7 +589,7 @@ fn choose_assignment<'a>(
         .map(|(_, _, _, assignment)| assignment.to_vec())
 }
 
-const MAX_PLACEMENT_REFINEMENT_PASSES: usize = 2;
+const MAX_PLACEMENT_REFINEMENT_PASSES: usize = 4;
 const PLACEMENT_REFINEMENT_CANDIDATES: usize = 64;
 
 #[allow(clippy::too_many_lines)]
@@ -574,7 +597,7 @@ fn refine_placement(
     graph: &UnifiedGraph<'_>,
     constraints: &PlacementConstraints,
     units: &[PlacementUnit],
-    neighbors: &[Vec<(CellId, u64)>],
+    neighbors: &[Vec<PlacementNeighbor>],
     placed: &mut [Option<BelId>],
     occupied: &mut BTreeSet<BelId>,
 ) {
@@ -604,7 +627,7 @@ fn refine_placement(
                 unit.cells
                     .iter()
                     .flat_map(|cell| &neighbors[cell.0])
-                    .map(|(_, weight)| *weight)
+                    .map(|edge| edge.weight)
                     .sum::<u64>(),
             ),
             unit.cells[0],
@@ -702,24 +725,24 @@ fn refine_placement(
 fn refinement_target(
     unit: &PlacementUnit,
     device: &Device,
-    neighbors: &[Vec<(CellId, u64)>],
+    neighbors: &[Vec<PlacementNeighbor>],
     placed: &[Option<BelId>],
 ) -> Option<Point> {
     let mut weighted_x = 0_u64;
     let mut weighted_y = 0_u64;
     let mut total_weight = 0_u64;
     for &cell in &unit.cells {
-        for &(neighbor, weight) in &neighbors[cell.0] {
-            if unit.cells.contains(&neighbor) {
+        for &edge in &neighbors[cell.0] {
+            if unit.cells.contains(&edge.cell) {
                 continue;
             }
-            let Some(neighbor_bel) = placed[neighbor.0] else {
+            let Some(neighbor_bel) = placed[edge.cell.0] else {
                 continue;
             };
             let point = device.bels()[neighbor_bel.0].point;
-            weighted_x = weighted_x.saturating_add(u64::from(point.x) * weight);
-            weighted_y = weighted_y.saturating_add(u64::from(point.y) * weight);
-            total_weight = total_weight.saturating_add(weight);
+            weighted_x = weighted_x.saturating_add(u64::from(point.x) * edge.weight);
+            weighted_y = weighted_y.saturating_add(u64::from(point.y) * edge.weight);
+            total_weight = total_weight.saturating_add(edge.weight);
         }
     }
     (total_weight != 0).then(|| {
@@ -736,7 +759,7 @@ fn choose_refined_assignment(
     spatial_index: &SpatialChoiceIndex,
     graph: &UnifiedGraph<'_>,
     constraints: &PlacementConstraints,
-    neighbors: &[Vec<(CellId, u64)>],
+    neighbors: &[Vec<PlacementNeighbor>],
     placed: &[Option<BelId>],
     occupied: &BTreeSet<BelId>,
     pin_usage: &HashMap<WireId, HashMap<NetId, usize>>,
@@ -913,7 +936,7 @@ fn assignment_wirelength(
     cells: &[CellId],
     assignment: &[BelId],
     device: &Device,
-    neighbors: &[Vec<(CellId, u64)>],
+    neighbors: &[Vec<PlacementNeighbor>],
     placed: &[Option<BelId>],
 ) -> u64 {
     cells
@@ -923,10 +946,13 @@ fn assignment_wirelength(
             let point = device.bels()[bel.0].point;
             neighbors[cell.0]
                 .iter()
-                .filter(|(neighbor, _)| !cells.contains(neighbor))
-                .filter_map(|&(neighbor, weight)| {
-                    placed[neighbor.0].map(|neighbor_bel| {
-                        weight * point.manhattan(device.bels()[neighbor_bel.0].point)
+                .filter(|edge| !cells.contains(&edge.cell))
+                .filter_map(|&edge| {
+                    placed[edge.cell.0].map(|neighbor_bel| {
+                        refinement_edge_cost(
+                            edge,
+                            point.manhattan(device.bels()[neighbor_bel.0].point),
+                        )
                     })
                 })
                 .sum::<u64>()
@@ -1767,7 +1793,10 @@ impl From<ModelError> for PnrError {
 mod tests {
     use texo_model::{BelId, CellId, Design, Device, PinDirection, Point, ResourceKind};
 
-    use super::{PlacementConstraints, PnrError, place_and_route, place_with_constraints};
+    use super::{
+        PlacementConstraints, PlacementNeighbor, PnrError, place_and_route, place_with_constraints,
+        refinement_edge_cost,
+    };
 
     fn two_cell_design() -> Design {
         let mut design = Design::new();
@@ -1823,6 +1852,22 @@ mod tests {
         let point = device.bels()[placement.bel(cell).unwrap().0].point;
 
         assert_eq!(point, Point::new(2, 0));
+    }
+
+    #[test]
+    fn timing_driven_refinement_penalizes_long_edges_quadratically() {
+        let ordinary = PlacementNeighbor {
+            cell: CellId(0),
+            weight: 2,
+            timing_driven: false,
+        };
+        let critical = PlacementNeighbor {
+            timing_driven: true,
+            ..ordinary
+        };
+
+        assert_eq!(refinement_edge_cost(ordinary, 3), 6);
+        assert_eq!(refinement_edge_cost(critical, 3), 18);
     }
 
     #[test]
