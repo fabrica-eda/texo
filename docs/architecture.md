@@ -82,6 +82,17 @@ The M0 router already observes wire and PIP capacities and PIP direction. A
 production router will replace its breadth-first search with negotiated
 congestion without changing the graph contract.
 
+Target packing emits atomic placement groups rather than replacing the unified
+graph. A group lists its logical cells and every legal BEL tuple; the generic
+placer selects a tuple as one indivisible unit. Candidate-specific CellPin to
+BelPin overrides handle physical port selection without mutating the logical
+netlist. For ECP5, a LUT-driven FF is grouped with `TRELLIS_COMB(z)` and
+`TRELLIS_FF(z+1)` and keeps the dedicated `DI` path. An unpaired FF maps its
+logical `DI` terminal to the general-routing `M` pin. Package constraints use
+the same mechanism as a one-cell group with one PIO BEL assignment.
+`texo-flow::implement_with_constraints` carries these packing decisions through
+placement and routing before recording physical-implementation evidence.
+
 ## ECP5 architecture snapshots
 
 `texo-target-ecp5` expands a schema-versioned snapshot into the target-neutral

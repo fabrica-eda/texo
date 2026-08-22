@@ -4,13 +4,17 @@
 //! `tools/export_ecp5.py` script snapshots that graph into the schema defined
 //! here. Runtime placement and routing then use only Rust and [`texo_model`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::io::Read;
 
 use serde::{Deserialize, Serialize};
-use texo_model::{BelId, Device, ModelError, PinDirection, PipId, Point, ResourceKind, WireId};
+use texo_model::{
+    BelId, BelPinId, CellId, CellPinId, Design, Device, ModelError, PinDirection, PipId, Point,
+    ResourceKind, UnifiedGraph, WireId,
+};
+use texo_pnr::PlacementConstraints;
 
 /// Current on-disk architecture schema version.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -246,6 +250,342 @@ impl Ecp5Architecture {
     #[must_use]
     pub fn packages(&self) -> &[Package] {
         &self.packages
+    }
+}
+
+/// One LUT and FF selected for the ECP5 dedicated `F → DI` path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LutFfPair {
+    /// Driving LUT4 cell.
+    pub lut: CellId,
+    /// Driven register cell.
+    pub ff: CellId,
+}
+
+/// Target packing decisions consumed by grouped placement and configuration.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Ecp5Packing {
+    constraints: PlacementConstraints,
+    lut_ff_pairs: Vec<LutFfPair>,
+    general_routing_ffs: Vec<CellId>,
+}
+
+/// One logical IO cell constrained to a package ball or lead.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackagePinBinding {
+    /// Logical IO cell.
+    pub cell: CellId,
+    /// Package ball or lead name.
+    pub pin: String,
+}
+
+impl Ecp5Packing {
+    /// Atomic placement groups and candidate-specific pin bindings.
+    #[must_use]
+    pub const fn constraints(&self) -> &PlacementConstraints {
+        &self.constraints
+    }
+
+    /// LUT/FF pairs using the dedicated data path (`SD=1`).
+    #[must_use]
+    pub fn lut_ff_pairs(&self) -> &[LutFfPair] {
+        &self.lut_ff_pairs
+    }
+
+    /// FFs rebound from logical `DI` to the general-routing `M` pin (`SD=0`).
+    #[must_use]
+    pub fn general_routing_ffs(&self) -> &[CellId] {
+        &self.general_routing_ffs
+    }
+
+    /// Adds fixed IO BEL assignments for one exact package.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown package/pin, a non-IO logical cell,
+    /// duplicate cell or package-pin bindings, or an incompatible PIO BEL.
+    pub fn bind_package_pins(
+        &mut self,
+        design: &Design,
+        architecture: &Ecp5Architecture,
+        package_name: &str,
+        bindings: impl IntoIterator<Item = PackagePinBinding>,
+    ) -> Result<(), PackingError> {
+        let package = architecture
+            .packages()
+            .iter()
+            .find(|package| package.name == package_name)
+            .ok_or_else(|| PackingError::UnknownPackage(package_name.into()))?;
+        let graph = UnifiedGraph::new(design, architecture.device());
+        let mut cells = BTreeSet::new();
+        let mut pins = BTreeSet::new();
+        let mut fixed_groups = Vec::new();
+        for binding in bindings {
+            let Some(cell) = design.cells().get(binding.cell.0) else {
+                return Err(PackingError::UnknownIoCell(binding.cell));
+            };
+            if cell.kind != ResourceKind::Io {
+                return Err(PackingError::CellIsNotIo {
+                    cell: cell.name.clone(),
+                });
+            }
+            if !cells.insert(binding.cell) {
+                return Err(PackingError::DuplicateIoCell {
+                    cell: cell.name.clone(),
+                });
+            }
+            if !pins.insert(binding.pin.clone()) {
+                return Err(PackingError::DuplicatePackagePin(binding.pin));
+            }
+            let bel = package.pins.get(&binding.pin).copied().ok_or_else(|| {
+                PackingError::UnknownPackagePin {
+                    package: package_name.into(),
+                    pin: binding.pin.clone(),
+                }
+            })?;
+            if !graph.placement_candidates(binding.cell)?.contains(&bel) {
+                return Err(PackingError::IncompatiblePackagePin {
+                    cell: cell.name.clone(),
+                    package: package_name.into(),
+                    pin: binding.pin,
+                });
+            }
+            fixed_groups.push((binding.cell, bel));
+        }
+        for (cell, bel) in fixed_groups {
+            self.constraints.add_group([cell], [vec![bel]]);
+        }
+        Ok(())
+    }
+}
+
+/// Packs LUT-driven FFs into matching ECP5 logic-cell BEL pairs.
+///
+/// For each LUT, the first FF whose `DI` net is driven by that LUT's `F` pin
+/// receives an atomic `TRELLIS_COMB(z)` / `TRELLIS_FF(z + 1)` placement group.
+/// Other FFs are rebound to the physical `M` pin for ordinary routing.
+///
+/// # Errors
+///
+/// Returns an error when the logical FF surface or physical general-routing
+/// pin surface is incomplete, or graph candidate generation fails.
+pub fn pack_lut_ffs(
+    design: &Design,
+    architecture: &Ecp5Architecture,
+) -> Result<Ecp5Packing, PackingError> {
+    let graph = UnifiedGraph::new(design, architecture.device());
+    let mut constraints = PlacementConstraints::new();
+    let mut paired_luts = BTreeSet::new();
+    let mut paired_ffs = BTreeSet::new();
+    let mut lut_ff_pairs = Vec::new();
+    let mut ff_data_pins = BTreeMap::new();
+
+    for (index, cell) in design.cells().iter().enumerate() {
+        if cell.kind != ResourceKind::Register {
+            continue;
+        }
+        let ff = CellId(index);
+        let data_pin = cell
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == "DI")
+            .ok_or_else(|| PackingError::MissingFfDataPin {
+                cell: cell.name.clone(),
+            })?;
+        ff_data_pins.insert(ff, data_pin);
+
+        let Some(lut) = lut_driver(design, data_pin) else {
+            continue;
+        };
+        if paired_luts.contains(&lut) {
+            continue;
+        }
+        let assignments = lut_ff_assignments(&graph, architecture, lut, ff)?;
+        if assignments.is_empty() {
+            continue;
+        }
+        constraints.add_group([lut, ff], assignments);
+        paired_luts.insert(lut);
+        paired_ffs.insert(ff);
+        lut_ff_pairs.push(LutFfPair { lut, ff });
+    }
+
+    let mut general_routing_ffs = Vec::new();
+    for (ff, data_pin) in ff_data_pins {
+        if paired_ffs.contains(&ff) {
+            continue;
+        }
+        let mut bound = false;
+        for bel in graph.placement_candidates(ff)? {
+            if architecture.bel_metadata()[&bel].bel_type != "TRELLIS_FF" {
+                continue;
+            }
+            if let Some(m_pin) = find_bel_pin(architecture.device(), bel, "M") {
+                constraints.bind_pin(data_pin, bel, m_pin);
+                bound = true;
+            }
+        }
+        if !bound {
+            return Err(PackingError::MissingGeneralDataPin {
+                cell: design.cells()[ff.0].name.clone(),
+            });
+        }
+        general_routing_ffs.push(ff);
+    }
+
+    Ok(Ecp5Packing {
+        constraints,
+        lut_ff_pairs,
+        general_routing_ffs,
+    })
+}
+
+fn lut_driver(design: &Design, data_pin: CellPinId) -> Option<CellId> {
+    let net = &design.nets()[design.pins()[data_pin.0].net()?.0];
+    let driver = &design.pins()[net.driver.0];
+    (driver.name == "F" && design.cells()[driver.cell.0].kind == ResourceKind::Lut(4))
+        .then_some(driver.cell)
+}
+
+fn lut_ff_assignments(
+    graph: &UnifiedGraph<'_>,
+    architecture: &Ecp5Architecture,
+    lut: CellId,
+    ff: CellId,
+) -> Result<Vec<Vec<BelId>>, ModelError> {
+    let lut_bels = graph.placement_candidates(lut)?;
+    let ff_bels = graph.placement_candidates(ff)?;
+    let mut assignments = Vec::new();
+    for lut_bel in lut_bels {
+        let lut_metadata = &architecture.bel_metadata()[&lut_bel];
+        if lut_metadata.bel_type != "TRELLIS_COMB" {
+            continue;
+        }
+        for &ff_bel in &ff_bels {
+            let ff_metadata = &architecture.bel_metadata()[&ff_bel];
+            if ff_metadata.bel_type == "TRELLIS_FF"
+                && architecture.device().bels()[lut_bel.0].point
+                    == architecture.device().bels()[ff_bel.0].point
+                && lut_metadata.z.checked_add(1) == Some(ff_metadata.z)
+            {
+                assignments.push(vec![lut_bel, ff_bel]);
+            }
+        }
+    }
+    Ok(assignments)
+}
+
+fn find_bel_pin(device: &Device, bel: BelId, name: &str) -> Option<BelPinId> {
+    device.bels()[bel.0]
+        .pins()
+        .iter()
+        .copied()
+        .find(|pin| device.bel_pins()[pin.0].name == name)
+}
+
+/// ECP5 logic packing failed before placement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PackingError {
+    /// Unified graph candidate generation failed.
+    Model(ModelError),
+    /// A register did not expose the expected logical `DI` pin.
+    MissingFfDataPin {
+        /// Register cell name.
+        cell: String,
+    },
+    /// No compatible physical FF exposed the general-routing `M` pin.
+    MissingGeneralDataPin {
+        /// Register cell name.
+        cell: String,
+    },
+    /// Selected package is not present in the architecture snapshot.
+    UnknownPackage(String),
+    /// Package pin is not present in the selected package.
+    UnknownPackagePin {
+        /// Package name.
+        package: String,
+        /// Pin name.
+        pin: String,
+    },
+    /// A binding referenced an unknown logical cell.
+    UnknownIoCell(CellId),
+    /// A package binding referenced a non-IO logical cell.
+    CellIsNotIo {
+        /// Logical cell name.
+        cell: String,
+    },
+    /// One logical IO cell was constrained more than once in one call.
+    DuplicateIoCell {
+        /// Logical cell name.
+        cell: String,
+    },
+    /// One package pin was assigned more than once in one call.
+    DuplicatePackagePin(String),
+    /// Logical IO pin surface is incompatible with the package's PIO BEL.
+    IncompatiblePackagePin {
+        /// Logical cell name.
+        cell: String,
+        /// Package name.
+        package: String,
+        /// Pin name.
+        pin: String,
+    },
+}
+
+impl fmt::Display for PackingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Model(error) => write!(f, "invalid packing graph: {error}"),
+            Self::MissingFfDataPin { cell } => {
+                write!(f, "register `{cell}` has no logical DI pin")
+            }
+            Self::MissingGeneralDataPin { cell } => {
+                write!(
+                    f,
+                    "register `{cell}` has no compatible general-routing M pin"
+                )
+            }
+            Self::UnknownPackage(package) => write!(f, "unknown ECP5 package `{package}`"),
+            Self::UnknownPackagePin { package, pin } => {
+                write!(f, "package `{package}` has no pin `{pin}`")
+            }
+            Self::UnknownIoCell(cell) => write!(f, "unknown IO cell ID {}", cell.0),
+            Self::CellIsNotIo { cell } => write!(f, "cell `{cell}` is not an IO cell"),
+            Self::DuplicateIoCell { cell } => {
+                write!(f, "IO cell `{cell}` has more than one package pin")
+            }
+            Self::DuplicatePackagePin(pin) => {
+                write!(f, "package pin `{pin}` is assigned more than once")
+            }
+            Self::IncompatiblePackagePin { cell, package, pin } => write!(
+                f,
+                "IO cell `{cell}` is incompatible with package `{package}` pin `{pin}`"
+            ),
+        }
+    }
+}
+
+impl Error for PackingError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Model(error) => Some(error),
+            Self::MissingFfDataPin { .. }
+            | Self::MissingGeneralDataPin { .. }
+            | Self::UnknownPackage(_)
+            | Self::UnknownPackagePin { .. }
+            | Self::UnknownIoCell(_)
+            | Self::CellIsNotIo { .. }
+            | Self::DuplicateIoCell { .. }
+            | Self::DuplicatePackagePin(_)
+            | Self::IncompatiblePackagePin { .. } => None,
+        }
+    }
+}
+
+impl From<ModelError> for PackingError {
+    fn from(value: ModelError) -> Self {
+        Self::Model(value)
     }
 }
 
@@ -606,10 +946,11 @@ impl From<ModelError> for ImportError {
 mod tests {
     use struo_ir::Netlist;
     use struo_target_ecp5::map_to_ecp5;
-    use texo_model::{CellId, ResourceKind, UnifiedGraph};
+    use texo_model::{CellId, Design, PinDirection, ResourceKind, UnifiedGraph};
+    use texo_pnr::place_with_constraints;
     use texo_struo::import_ecp5;
 
-    use super::{PipMetadata, read_architecture};
+    use super::{PackagePinBinding, PipMetadata, pack_lut_ffs, read_architecture};
 
     const FIXTURE: &str = include_str!("../fixtures/minimal-ecp5.json");
 
@@ -618,8 +959,8 @@ mod tests {
         let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
 
         assert_eq!(architecture.device().name(), "LFE5UM5G-85F-test");
-        assert_eq!(architecture.device().bels().len(), 3);
-        assert_eq!(architecture.device().wires().len(), 15);
+        assert_eq!(architecture.device().bels().len(), 5);
+        assert_eq!(architecture.device().wires().len(), 27);
         assert_eq!(architecture.device().pips().len(), 1);
         assert_eq!(architecture.packages()[0].pins.len(), 1);
         assert_eq!(
@@ -658,5 +999,132 @@ mod tests {
                 assert_eq!(graph.placement_candidates(CellId(index)).unwrap().len(), 1);
             }
         }
+    }
+
+    #[test]
+    fn packs_a_lut_driven_ff_into_matching_z_slots() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let lut = design.add_cell("lut", ResourceKind::Lut(4));
+        for name in ["A", "B", "C", "D"] {
+            design.add_pin(lut, name, PinDirection::Input).unwrap();
+        }
+        let lut_output = design.add_pin(lut, "F", PinDirection::Output).unwrap();
+        let ff = add_ff(&mut design, "ff");
+        let ff_data = design.cells()[ff.0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == "DI")
+            .unwrap();
+        design.add_net("lut_to_ff", lut_output, [ff_data]).unwrap();
+
+        let packing = pack_lut_ffs(&design, &architecture).unwrap();
+        let placement =
+            place_with_constraints(&design, architecture.device(), packing.constraints()).unwrap();
+        let lut_bel = placement.bel(lut).unwrap();
+        let ff_bel = placement.bel(ff).unwrap();
+
+        assert_eq!(packing.lut_ff_pairs().len(), 1);
+        assert!(packing.general_routing_ffs().is_empty());
+        assert_eq!(
+            architecture.device().bels()[lut_bel.0].point,
+            architecture.device().bels()[ff_bel.0].point
+        );
+        assert_eq!(
+            architecture.bel_metadata()[&lut_bel].z + 1,
+            architecture.bel_metadata()[&ff_bel].z
+        );
+    }
+
+    #[test]
+    fn binds_an_unpaired_ff_to_the_general_routing_input() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let ff = add_ff(&mut design, "standalone_ff");
+        let data_pin = design.cells()[ff.0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == "DI")
+            .unwrap();
+
+        let packing = pack_lut_ffs(&design, &architecture).unwrap();
+        let placement =
+            place_with_constraints(&design, architecture.device(), packing.constraints()).unwrap();
+        let physical_pin = placement.pin_binding(data_pin).unwrap();
+
+        assert!(packing.lut_ff_pairs().is_empty());
+        assert_eq!(packing.general_routing_ffs(), &[ff]);
+        assert_eq!(architecture.device().bel_pins()[physical_pin.0].name, "M");
+    }
+
+    #[test]
+    fn fixes_an_io_cell_to_its_package_pin_bel() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let io = design.add_cell("input", ResourceKind::Io);
+        design.add_pin(io, "O", PinDirection::Output).unwrap();
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+        packing
+            .bind_package_pins(
+                &design,
+                &architecture,
+                "CABGA381",
+                [PackagePinBinding {
+                    cell: io,
+                    pin: "A10".into(),
+                }],
+            )
+            .unwrap();
+
+        let placement =
+            place_with_constraints(&design, architecture.device(), packing.constraints()).unwrap();
+
+        assert_eq!(
+            placement.bel(io),
+            architecture.packages()[0].pins.get("A10").copied()
+        );
+    }
+
+    #[test]
+    fn package_binding_failure_is_transactional() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let first = design.add_cell("first", ResourceKind::Io);
+        design.add_pin(first, "O", PinDirection::Output).unwrap();
+        let second = design.add_cell("second", ResourceKind::Io);
+        design.add_pin(second, "O", PinDirection::Output).unwrap();
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+
+        assert!(
+            packing
+                .bind_package_pins(
+                    &design,
+                    &architecture,
+                    "CABGA381",
+                    [
+                        PackagePinBinding {
+                            cell: first,
+                            pin: "A10".into(),
+                        },
+                        PackagePinBinding {
+                            cell: second,
+                            pin: "missing".into(),
+                        },
+                    ],
+                )
+                .is_err()
+        );
+        assert!(packing.constraints().groups().is_empty());
+    }
+
+    fn add_ff(design: &mut Design, name: &str) -> CellId {
+        let ff = design.add_cell(name, ResourceKind::Register);
+        for pin in ["DI", "CLK", "LSR", "CE"] {
+            design.add_pin(ff, pin, PinDirection::Input).unwrap();
+        }
+        design.add_pin(ff, "Q", PinDirection::Output).unwrap();
+        ff
     }
 }

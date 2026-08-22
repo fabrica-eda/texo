@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 
 use texo_model::{Design, Device};
-use texo_pnr::{PnrError, PnrResult, place_and_route};
+use texo_pnr::{PlacementConstraints, PnrError, PnrResult, place_and_route_with_constraints};
 
 /// Evidence required before a programmable artifact may be released.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -87,7 +87,22 @@ pub fn implement(
     device: &Device,
     evidence: &mut Evidence,
 ) -> Result<PnrResult, PnrError> {
-    let result = place_and_route(design, device)?;
+    implement_with_constraints(design, device, &PlacementConstraints::new(), evidence)
+}
+
+/// Runs physical implementation with target packing/placement constraints.
+///
+/// # Errors
+///
+/// Propagates constraint, placement, or routing failures without recording the
+/// physical implementation gate.
+pub fn implement_with_constraints(
+    design: &Design,
+    device: &Device,
+    constraints: &PlacementConstraints,
+    evidence: &mut Evidence,
+) -> Result<PnrResult, PnrError> {
+    let result = place_and_route_with_constraints(design, device, constraints)?;
     evidence.record(Gate::PhysicalImplementation);
     Ok(result)
 }
@@ -116,9 +131,10 @@ impl Error for MissingEvidence {}
 
 #[cfg(test)]
 mod tests {
-    use texo_model::{Design, Device, PinDirection, ResourceKind};
+    use texo_model::{BelId, Design, Device, PinDirection, ResourceKind};
+    use texo_pnr::PlacementConstraints;
 
-    use super::{Evidence, Gate, implement};
+    use super::{Evidence, Gate, implement, implement_with_constraints};
 
     #[test]
     fn implementation_records_only_its_own_gate() {
@@ -136,5 +152,21 @@ mod tests {
         assert!(evidence.contains(Gate::PhysicalImplementation));
         assert!(!evidence.contains(Gate::TimingClosure));
         assert!(evidence.authorize_bitstream().is_err());
+    }
+
+    #[test]
+    fn rejected_packing_constraints_do_not_record_evidence() {
+        let mut design = Design::new();
+        let a = design.add_cell("a", ResourceKind::Logic);
+        design.add_pin(a, "out", PinDirection::Output).unwrap();
+        let b = design.add_cell("b", ResourceKind::Logic);
+        design.add_pin(b, "in", PinDirection::Input).unwrap();
+        let device = Device::rectangular_logic(2, 1).unwrap();
+        let mut constraints = PlacementConstraints::new();
+        constraints.add_group([a, b], [vec![BelId(0), BelId(0)]]);
+        let mut evidence = Evidence::new();
+
+        assert!(implement_with_constraints(&design, &device, &constraints, &mut evidence).is_err());
+        assert!(!evidence.contains(Gate::PhysicalImplementation));
     }
 }

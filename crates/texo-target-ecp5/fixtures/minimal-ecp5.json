@@ -21,7 +21,13 @@
         { "name": "H01E0001" },
         { "name": "PADDI_A" },
         { "name": "PADDO_A" },
-        { "name": "PADDT_A" }
+        { "name": "PADDT_A" },
+        { "name": "DI0_SLICE" },
+        { "name": "M0_SLICE" },
+        { "name": "CLK0_SLICE" },
+        { "name": "LSR0_SLICE" },
+        { "name": "CE0_SLICE" },
+        { "name": "Q0_SLICE" }
       ],
       "bels": [
         {
@@ -45,6 +51,19 @@
             { "name": "T", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 8 } },
             { "name": "O", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 6 } }
           ]
+        },
+        {
+          "name": "SLICEA.FF0",
+          "bel_type": "TRELLIS_FF",
+          "z": 1,
+          "pins": [
+            { "name": "DI", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 9 } },
+            { "name": "M", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 10 } },
+            { "name": "CLK", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 11 } },
+            { "name": "LSR", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 12 } },
+            { "name": "CE", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 13 } },
+            { "name": "Q", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 14 } }
+          ]
         }
       ],
       "pips": [
@@ -65,7 +84,13 @@
         { "name": "C0_SLICE" },
         { "name": "D0_SLICE" },
         { "name": "F0_SLICE" },
-        { "name": "H01E0001" }
+        { "name": "H01E0001" },
+        { "name": "DI0_SLICE" },
+        { "name": "M0_SLICE" },
+        { "name": "CLK0_SLICE" },
+        { "name": "LSR0_SLICE" },
+        { "name": "CE0_SLICE" },
+        { "name": "Q0_SLICE" }
       ],
       "bels": [
         {
@@ -78,6 +103,19 @@
             { "name": "C", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 2 } },
             { "name": "D", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 3 } },
             { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 4 } }
+          ]
+        },
+        {
+          "name": "SLICEA.FF0",
+          "bel_type": "TRELLIS_FF",
+          "z": 1,
+          "pins": [
+            { "name": "DI", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 6 } },
+            { "name": "M", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 7 } },
+            { "name": "CLK", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 8 } },
+            { "name": "LSR", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 9 } },
+            { "name": "CE", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 10 } },
+            { "name": "Q", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 11 } }
           ]
         }
       ],

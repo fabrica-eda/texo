@@ -3236,6 +3236,7 @@ dependencies = [
  "struo-ir",
  "struo-target-ecp5",
  "texo-model",
+ "texo-pnr",
  "texo-struo",
 ]
 

@@ -5,13 +5,76 @@ use std::error::Error;
 use std::fmt;
 
 use texo_model::{
-    BelId, CellId, Design, Device, ModelError, NetId, PipId, Point, UnifiedGraph, WireId,
+    BelId, BelPinId, CellId, CellPinId, Design, Device, ModelError, NetId, PipId, Point,
+    UnifiedGraph, WireId,
 };
 
 /// Cell-to-BEL bindings indexed by stable cell ID.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Placement {
     bindings: Vec<BelId>,
+    pin_bindings: BTreeMap<CellPinId, BelPinId>,
+}
+
+/// One atomically placed group and its legal BEL assignments.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlacementGroup {
+    /// Cells assigned together, in assignment-column order.
+    pub cells: Vec<CellId>,
+    /// Legal assignments; every row must have one BEL per cell.
+    pub assignments: Vec<Vec<BelId>>,
+}
+
+/// Optional grouped/fixed placement rules supplied by a target packer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PlacementConstraints {
+    groups: Vec<PlacementGroup>,
+    pin_bindings: BTreeMap<(CellPinId, BelId), BelPinId>,
+}
+
+impl PlacementConstraints {
+    /// Creates an unconstrained placement problem.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            groups: Vec::new(),
+            pin_bindings: BTreeMap::new(),
+        }
+    }
+
+    /// Adds one atomic group. Structural and compatibility checks run before
+    /// placement because they require the complete design and device.
+    pub fn add_group(
+        &mut self,
+        cells: impl IntoIterator<Item = CellId>,
+        assignments: impl IntoIterator<Item = Vec<BelId>>,
+    ) {
+        self.groups.push(PlacementGroup {
+            cells: cells.into_iter().collect(),
+            assignments: assignments.into_iter().collect(),
+        });
+    }
+
+    /// Target-supplied atomic groups in insertion order.
+    #[must_use]
+    pub fn groups(&self) -> &[PlacementGroup] {
+        &self.groups
+    }
+
+    /// Overrides one logical pin's physical pin for a particular BEL choice.
+    ///
+    /// This models target packing transformations such as an ECP5 FF data
+    /// input using `DI` when paired with a LUT and `M` when independently
+    /// routed. Validation occurs before placement.
+    pub fn bind_pin(&mut self, pin: CellPinId, bel: BelId, bel_pin: BelPinId) {
+        self.pin_bindings.insert((pin, bel), bel_pin);
+    }
+
+    /// Candidate-specific pin binding overrides.
+    #[must_use]
+    pub const fn pin_bindings(&self) -> &BTreeMap<(CellPinId, BelId), BelPinId> {
+        &self.pin_bindings
+    }
 }
 
 impl Placement {
@@ -25,6 +88,13 @@ impl Placement {
     #[must_use]
     pub fn bindings(&self) -> &[BelId] {
         &self.bindings
+    }
+
+    /// Target-selected physical pin override, when packing changed the
+    /// logical-to-physical port name.
+    #[must_use]
+    pub fn pin_binding(&self, pin: CellPinId) -> Option<BelPinId> {
+        self.pin_bindings.get(&pin).copied()
     }
 
     /// Physical point assigned to a cell.
@@ -69,8 +139,21 @@ pub struct PnrResult {
 ///
 /// Returns a descriptive model, legality, or routability error.
 pub fn place_and_route(design: &Design, device: &Device) -> Result<PnrResult, PnrError> {
+    place_and_route_with_constraints(design, device, &PlacementConstraints::new())
+}
+
+/// Places and routes with target-supplied atomic placement groups.
+///
+/// # Errors
+///
+/// Returns a descriptive constraint, model, legality, or routability error.
+pub fn place_and_route_with_constraints(
+    design: &Design,
+    device: &Device,
+    constraints: &PlacementConstraints,
+) -> Result<PnrResult, PnrError> {
     let graph = UnifiedGraph::new(design, device);
-    let placement = place(&graph)?;
+    let placement = place(&graph, constraints)?;
     let routes = route(&graph, &placement)?;
     let total_pips = routes.iter().map(|route| route.pips.len()).sum();
     Ok(PnrResult {
@@ -80,7 +163,29 @@ pub fn place_and_route(design: &Design, device: &Device) -> Result<PnrResult, Pn
     })
 }
 
-fn place(graph: &UnifiedGraph<'_>) -> Result<Placement, PnrError> {
+/// Places a design without routing it.
+///
+/// # Errors
+///
+/// Returns a descriptive constraint, model, or BEL-exhaustion error.
+pub fn place_with_constraints(
+    design: &Design,
+    device: &Device,
+    constraints: &PlacementConstraints,
+) -> Result<Placement, PnrError> {
+    place(&UnifiedGraph::new(design, device), constraints)
+}
+
+#[derive(Clone, Debug)]
+struct PlacementUnit {
+    cells: Vec<CellId>,
+    assignments: Vec<Vec<BelId>>,
+}
+
+fn place(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+) -> Result<Placement, PnrError> {
     let design = graph.design();
     let device = graph.device();
     let mut degree = vec![0_usize; design.cells().len()];
@@ -98,40 +203,224 @@ fn place(graph: &UnifiedGraph<'_>) -> Result<Placement, PnrError> {
         }
     }
 
-    let mut order: Vec<_> = (0..design.cells().len()).map(CellId).collect();
-    order.sort_by_key(|id| (std::cmp::Reverse(degree[id.0]), *id));
+    let mut units = placement_units(graph, constraints)?;
+    units.sort_by_key(|unit| {
+        (
+            std::cmp::Reverse(unit.cells.iter().map(|cell| degree[cell.0]).sum::<usize>()),
+            unit.cells[0],
+        )
+    });
 
     let mut placed = vec![None; design.cells().len()];
     let mut occupied = BTreeSet::new();
-    for cell_id in order {
-        let cell = &design.cells()[cell_id.0];
-        let choice = graph
-            .placement_candidates(cell_id)?
+    for unit in units {
+        let choice = unit
+            .assignments
             .into_iter()
-            .filter(|bel| !occupied.contains(bel))
-            .map(|bel| {
-                let point = device.bels()[bel.0].point;
-                let cost: u64 = neighbors[cell_id.0]
+            .filter(|assignment| assignment.iter().all(|bel| !occupied.contains(bel)))
+            .map(|assignment| {
+                let cost = unit
+                    .cells
                     .iter()
-                    .filter_map(|neighbor| placed[neighbor.0])
-                    .map(|neighbor_bel: BelId| point.manhattan(device.bels()[neighbor_bel.0].point))
-                    .sum();
-                (cost, point, bel)
+                    .zip(&assignment)
+                    .map(|(cell, bel)| {
+                        let point = device.bels()[bel.0].point;
+                        neighbors[cell.0]
+                            .iter()
+                            .filter_map(|neighbor| placed[neighbor.0])
+                            .map(|neighbor_bel: BelId| {
+                                point.manhattan(device.bels()[neighbor_bel.0].point)
+                            })
+                            .sum::<u64>()
+                    })
+                    .sum::<u64>();
+                let points = assignment
+                    .iter()
+                    .map(|bel| device.bels()[bel.0].point)
+                    .collect::<Vec<_>>();
+                (cost, points, assignment)
             })
             .min();
-        let (_, _, bel) = choice.ok_or_else(|| PnrError::NoBel {
-            cell: cell.name.clone(),
+        let (_, _, assignment) = choice.ok_or_else(|| PnrError::NoBel {
+            cell: design.cells()[unit.cells[0].0].name.clone(),
         })?;
-        occupied.insert(bel);
-        placed[cell_id.0] = Some(bel);
+        for (cell, bel) in unit.cells.into_iter().zip(assignment) {
+            occupied.insert(bel);
+            placed[cell.0] = Some(bel);
+        }
     }
 
+    let bindings = placed
+        .into_iter()
+        .map(|bel| bel.expect("every ordered cell was placed"))
+        .collect::<Vec<_>>();
+    let pin_bindings = constraints
+        .pin_bindings
+        .iter()
+        .filter(|((pin, bel), _)| bindings[design.pins()[pin.0].cell.0] == *bel)
+        .map(|((pin, _), bel_pin)| (*pin, *bel_pin))
+        .collect();
     Ok(Placement {
-        bindings: placed
-            .into_iter()
-            .map(|bel| bel.expect("every ordered cell was placed"))
-            .collect(),
+        bindings,
+        pin_bindings,
     })
+}
+
+fn placement_units(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+) -> Result<Vec<PlacementUnit>, PnrError> {
+    validate_pin_bindings(graph, constraints)?;
+    let mut constrained = BTreeSet::new();
+    let mut units = Vec::new();
+    for (group_index, group) in constraints.groups.iter().enumerate() {
+        if group.cells.is_empty() || group.assignments.is_empty() {
+            return Err(PnrError::InvalidPlacementConstraint {
+                group: group_index,
+                reason: "group and assignment set must be non-empty".into(),
+            });
+        }
+        for &cell in &group.cells {
+            if cell.0 >= graph.design().cells().len() {
+                return Err(PnrError::InvalidPlacementConstraint {
+                    group: group_index,
+                    reason: format!("unknown cell ID {}", cell.0),
+                });
+            }
+            if !constrained.insert(cell) {
+                return Err(PnrError::InvalidPlacementConstraint {
+                    group: group_index,
+                    reason: format!("cell ID {} occurs in more than one group", cell.0),
+                });
+            }
+        }
+        for assignment in &group.assignments {
+            if assignment.len() != group.cells.len() {
+                return Err(PnrError::InvalidPlacementConstraint {
+                    group: group_index,
+                    reason: "assignment width does not match group width".into(),
+                });
+            }
+            let mut unique_bels = BTreeSet::new();
+            for (&cell, &bel) in group.cells.iter().zip(assignment) {
+                if !unique_bels.insert(bel) {
+                    return Err(PnrError::InvalidPlacementConstraint {
+                        group: group_index,
+                        reason: format!("BEL ID {} is assigned more than once", bel.0),
+                    });
+                }
+                if !placement_candidates(graph, constraints, cell)?.contains(&bel) {
+                    return Err(PnrError::InvalidPlacementConstraint {
+                        group: group_index,
+                        reason: format!("BEL ID {} is incompatible with cell ID {}", bel.0, cell.0),
+                    });
+                }
+            }
+        }
+        units.push(PlacementUnit {
+            cells: group.cells.clone(),
+            assignments: group.assignments.clone(),
+        });
+    }
+    for index in 0..graph.design().cells().len() {
+        let cell = CellId(index);
+        if !constrained.contains(&cell) {
+            units.push(PlacementUnit {
+                cells: vec![cell],
+                assignments: placement_candidates(graph, constraints, cell)?
+                    .into_iter()
+                    .map(|bel| vec![bel])
+                    .collect(),
+            });
+        }
+    }
+    Ok(units)
+}
+
+fn validate_pin_bindings(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+) -> Result<(), PnrError> {
+    for (&(pin, bel), &bel_pin) in &constraints.pin_bindings {
+        let Some(logical) = graph.design().pins().get(pin.0) else {
+            return Err(PnrError::InvalidPinBinding {
+                pin,
+                bel,
+                reason: "unknown logical pin".into(),
+            });
+        };
+        let Some(physical_bel) = graph.device().bels().get(bel.0) else {
+            return Err(PnrError::InvalidPinBinding {
+                pin,
+                bel,
+                reason: "unknown BEL".into(),
+            });
+        };
+        let Some(physical_pin) = graph.device().bel_pins().get(bel_pin.0) else {
+            return Err(PnrError::InvalidPinBinding {
+                pin,
+                bel,
+                reason: "unknown BEL pin".into(),
+            });
+        };
+        if physical_pin.bel != bel {
+            return Err(PnrError::InvalidPinBinding {
+                pin,
+                bel,
+                reason: "physical pin belongs to another BEL".into(),
+            });
+        }
+        if graph.design().cells()[logical.cell.0].kind != physical_bel.kind {
+            return Err(PnrError::InvalidPinBinding {
+                pin,
+                bel,
+                reason: "cell and BEL resource classes differ".into(),
+            });
+        }
+        if logical.direction != physical_pin.direction {
+            return Err(PnrError::InvalidPinBinding {
+                pin,
+                bel,
+                reason: "logical and physical pin directions differ".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn placement_candidates(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    cell: CellId,
+) -> Result<Vec<BelId>, PnrError> {
+    let Some(logical_cell) = graph.design().cells().get(cell.0) else {
+        return Err(PnrError::Model(ModelError::UnknownCell(cell)));
+    };
+    Ok(graph
+        .device()
+        .bels()
+        .iter()
+        .enumerate()
+        .filter(|(index, physical_bel)| {
+            if physical_bel.kind != logical_cell.kind {
+                return false;
+            }
+            let bel = BelId(*index);
+            logical_cell.pins().iter().all(|logical_pin| {
+                let logical = &graph.design().pins()[logical_pin.0];
+                if let Some(physical_pin) = constraints.pin_bindings.get(&(*logical_pin, bel)) {
+                    let physical = &graph.device().bel_pins()[physical_pin.0];
+                    physical.bel == bel && physical.direction == logical.direction
+                } else {
+                    physical_bel.pins().iter().any(|physical_pin| {
+                        let physical = &graph.device().bel_pins()[physical_pin.0];
+                        physical.name == logical.name && physical.direction == logical.direction
+                    })
+                }
+            })
+        })
+        .map(|(index, _)| BelId(index))
+        .collect())
 }
 
 fn route(graph: &UnifiedGraph<'_>, placement: &Placement) -> Result<Vec<NetRoute>, PnrError> {
@@ -147,7 +436,7 @@ fn route(graph: &UnifiedGraph<'_>, placement: &Placement) -> Result<Vec<NetRoute
         let driver_bel = placement
             .bel(driver_cell)
             .ok_or(PnrError::MissingPlacement { cell: driver_cell })?;
-        let driver_wire = graph.bound_wire(net.driver, driver_bel)?;
+        let driver_wire = bound_wire(graph, placement, net.driver, driver_bel)?;
         let mut tree_wires = BTreeSet::from([driver_wire]);
         let mut tree_pips = BTreeSet::new();
 
@@ -156,7 +445,7 @@ fn route(graph: &UnifiedGraph<'_>, placement: &Placement) -> Result<Vec<NetRoute
             let sink_bel = placement
                 .bel(sink_cell)
                 .ok_or(PnrError::MissingPlacement { cell: sink_cell })?;
-            let sink_wire = graph.bound_wire(*sink_pin, sink_bel)?;
+            let sink_wire = bound_wire(graph, placement, *sink_pin, sink_bel)?;
             if tree_wires.contains(&sink_wire) {
                 continue;
             }
@@ -188,6 +477,19 @@ fn route(graph: &UnifiedGraph<'_>, placement: &Placement) -> Result<Vec<NetRoute
         });
     }
     Ok(routes)
+}
+
+fn bound_wire(
+    graph: &UnifiedGraph<'_>,
+    placement: &Placement,
+    cell_pin: CellPinId,
+    bel: BelId,
+) -> Result<WireId, PnrError> {
+    if let Some(bel_pin) = placement.pin_binding(cell_pin) {
+        Ok(graph.device().bel_pins()[bel_pin.0].wire)
+    } else {
+        Ok(graph.bound_wire(cell_pin, bel)?)
+    }
 }
 
 fn shortest_path(
@@ -245,6 +547,22 @@ pub enum PnrError {
         /// Cell that could not be placed.
         cell: String,
     },
+    /// A target packer supplied a malformed or incompatible atomic group.
+    InvalidPlacementConstraint {
+        /// Group index in [`PlacementConstraints`].
+        group: usize,
+        /// Specific invariant that failed.
+        reason: String,
+    },
+    /// A target packer supplied an invalid candidate-specific pin binding.
+    InvalidPinBinding {
+        /// Logical pin being overridden.
+        pin: CellPinId,
+        /// BEL choice for which the override applies.
+        bel: BelId,
+        /// Specific invariant that failed.
+        reason: String,
+    },
     /// Internal or externally supplied placement omitted a cell.
     MissingPlacement {
         /// Missing cell ID.
@@ -262,6 +580,16 @@ impl fmt::Display for PnrError {
         match self {
             Self::Model(error) => write!(f, "invalid problem graph: {error}"),
             Self::NoBel { cell } => write!(f, "no compatible free BEL for cell `{cell}`"),
+            Self::InvalidPlacementConstraint { group, reason } => {
+                write!(f, "invalid placement constraint group {group}: {reason}")
+            }
+            Self::InvalidPinBinding { pin, bel, reason } => {
+                write!(
+                    f,
+                    "invalid physical pin binding for pin {} on BEL {}: {reason}",
+                    pin.0, bel.0
+                )
+            }
             Self::MissingPlacement { cell } => {
                 write!(f, "placement is missing cell ID {}", cell.0)
             }
@@ -274,7 +602,11 @@ impl Error for PnrError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Model(error) => Some(error),
-            Self::NoBel { .. } | Self::MissingPlacement { .. } | Self::Unroutable { .. } => None,
+            Self::NoBel { .. }
+            | Self::InvalidPlacementConstraint { .. }
+            | Self::InvalidPinBinding { .. }
+            | Self::MissingPlacement { .. }
+            | Self::Unroutable { .. } => None,
         }
     }
 }
@@ -287,9 +619,9 @@ impl From<ModelError> for PnrError {
 
 #[cfg(test)]
 mod tests {
-    use texo_model::{Design, Device, PinDirection, Point, ResourceKind};
+    use texo_model::{BelId, CellId, Design, Device, PinDirection, Point, ResourceKind};
 
-    use super::{PnrError, place_and_route};
+    use super::{PlacementConstraints, PnrError, place_and_route, place_with_constraints};
 
     fn two_cell_design() -> Design {
         let mut design = Design::new();
@@ -331,6 +663,55 @@ mod tests {
                 cell: "sink".into()
             })
         );
+    }
+
+    #[test]
+    fn places_a_target_group_atomically() {
+        let design = two_cell_design();
+        let device = Device::rectangular_logic(2, 1).unwrap();
+        let mut constraints = PlacementConstraints::new();
+        constraints.add_group([CellId(0), CellId(1)], [vec![BelId(1), BelId(0)]]);
+
+        let placement = place_with_constraints(&design, &device, &constraints).unwrap();
+
+        assert_eq!(placement.bindings(), &[BelId(1), BelId(0)]);
+    }
+
+    #[test]
+    fn rejects_a_group_that_reuses_one_bel() {
+        let design = two_cell_design();
+        let device = Device::rectangular_logic(2, 1).unwrap();
+        let mut constraints = PlacementConstraints::new();
+        constraints.add_group([CellId(0), CellId(1)], [vec![BelId(0), BelId(0)]]);
+
+        assert!(matches!(
+            place_with_constraints(&design, &device, &constraints),
+            Err(PnrError::InvalidPlacementConstraint { .. })
+        ));
+    }
+
+    #[test]
+    fn target_pin_override_participates_in_candidate_generation() {
+        let mut design = Design::new();
+        let cell = design.add_cell("cell", ResourceKind::Logic);
+        let logical_pin = design
+            .add_pin(cell, "logical", PinDirection::Output)
+            .unwrap();
+        let mut device = Device::new("renamed-pin", 1, 1).unwrap();
+        let wire = device.add_wire("wire", Point::new(0, 0), 1).unwrap();
+        let bel = device
+            .add_bel("bel", ResourceKind::Logic, Point::new(0, 0))
+            .unwrap();
+        let physical_pin = device
+            .add_bel_pin(bel, "physical", PinDirection::Output, wire)
+            .unwrap();
+        let mut constraints = PlacementConstraints::new();
+        constraints.bind_pin(logical_pin, bel, physical_pin);
+
+        let placement = place_with_constraints(&design, &device, &constraints).unwrap();
+
+        assert_eq!(placement.bel(cell), Some(bel));
+        assert_eq!(placement.pin_binding(logical_pin), Some(physical_pin));
     }
 
     #[test]
