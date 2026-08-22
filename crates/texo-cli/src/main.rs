@@ -3,7 +3,7 @@
 use std::env;
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -34,6 +34,7 @@ Usage:
                                     run a verified Struo/Celox ECP5 XOR flow
   texo axi4-pnr <architecture> <package> <speed-grade> <constraints.lpf> [checkpoint.json]
                                     run the Struo AXI4 self-test through native Texo PnR
+  texo axi4-json <design.json>      export the same mapped AXI4 design for nextpnr
   texo target-info <architecture>   inspect an ECP5 architecture snapshot
   texo cache-architecture <architecture.json> <architecture.txdb>
                                     cache the expanded routing graph for fast reuse
@@ -105,6 +106,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 checkpoint.as_deref(),
             )
         }
+        Some("axi4-json") => parse_axi4_json(args),
         Some("target-info") => {
             let path = args
                 .next()
@@ -144,6 +146,30 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some(command) => Err(format!("unknown command `{command}`\n\n{USAGE}").into()),
     }
+}
+
+fn parse_axi4_json(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let path = args
+        .next()
+        .ok_or_else(|| format!("axi4-json requires an output path\n\n{USAGE}"))?;
+    if args.next().is_some() {
+        return Err(format!("axi4-json accepts one argument\n\n{USAGE}").into());
+    }
+    axi4_json(&path)
+}
+
+fn axi4_json(path: &str) -> Result<(), Box<dyn Error>> {
+    let rtl = axi4_crossbar_self_test()?;
+    let synthesized = synthesize(&rtl)?;
+    let mapped = map_to_ecp5(&synthesized.netlist)?;
+    let mut output = BufWriter::new(File::create(path)?);
+    output.write_all(mapped.to_nextpnr_json()?.as_bytes())?;
+    output.flush()?;
+    println!(
+        "nextpnr JSON: {path} ({} mapped cells)",
+        mapped.cells().len()
+    );
+    Ok(())
 }
 
 fn lpf_info(path: &str) -> Result<(), Box<dyn Error>> {
@@ -415,6 +441,18 @@ fn axi4_pnr(
 }
 
 fn report_flow_stage(stage: Ecp5FlowStage, started: &mut Instant) {
+    if let Ecp5FlowStage::TimingSnapshot {
+        worst_setup_ps,
+        worst_hold_ps,
+    } = stage
+    {
+        println!(
+            "timing candidate: setup {} ps, hold {} ps",
+            worst_setup_ps.map_or_else(|| "n/a".into(), |value| value.to_string()),
+            worst_hold_ps.map_or_else(|| "n/a".into(), |value| value.to_string()),
+        );
+        return;
+    }
     if let Ecp5FlowStage::Routing(event) | Ecp5FlowStage::TimingDrivenRouting(event) = stage {
         let label = match stage {
             Ecp5FlowStage::Routing(_) => "routing",
@@ -454,6 +492,9 @@ fn report_flow_stage(stage: Ecp5FlowStage, started: &mut Instant) {
             unreachable!("routing progress returned above")
         }
         Ecp5FlowStage::TimingDrivenRouted => "timing-driven negotiated routing",
+        Ecp5FlowStage::TimingSnapshot { .. } => {
+            unreachable!("timing snapshot returned above")
+        }
         Ecp5FlowStage::Timed => "timing analysis",
     };
     println!("{name} completed in {:.2?}", started.elapsed());

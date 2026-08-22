@@ -8,10 +8,10 @@ use std::fmt;
 use texo_model::{CellId, CellPinId, Design, Device, NetId, PinDirection, PipId, ResourceKind};
 pub use texo_pnr::RoutingProgress;
 use texo_pnr::{
-    NetRoute, Placement, PlacementConstraints, PnrError, PnrResult, RoutingConstraints,
-    RoutingCosts, place_and_route_with_constraints, place_with_constraints,
-    place_with_net_sink_weights, refine_placement_with_net_sink_weights_limited,
-    route_with_placement_and_progress, route_with_timing_costs_and_progress,
+    NetRoute, Placement, PlacementConstraints, PlacementRefiner, PnrError, PnrResult,
+    RoutingConstraints, RoutingCosts, place_analytically_with_net_sink_weights,
+    place_and_route_with_constraints, route_with_placement_and_progress,
+    route_with_timing_costs_and_progress,
 };
 use texo_struo::{ImportedEcp5Design, PrimitiveMetadata};
 use texo_target_ecp5::{
@@ -208,6 +208,13 @@ pub enum Ecp5FlowStage {
     TimingDrivenRouting(RoutingProgress),
     /// Timing-driven negotiated routing is complete.
     TimingDrivenRouted,
+    /// One routed candidate has been evaluated by static timing analysis.
+    TimingSnapshot {
+        /// Smallest setup slack, when a setup endpoint is constrained.
+        worst_setup_ps: Option<i128>,
+        /// Smallest hold slack, when a hold endpoint is constrained.
+        worst_hold_ps: Option<i128>,
+    },
     /// Post-route static timing analysis is complete.
     Timed,
 }
@@ -288,7 +295,12 @@ pub fn implement_struo_ecp5_with_progress(
 
     let mut staged_evidence = evidence.clone();
     staged_evidence.record(Gate::MappedNetlistComplete);
-    let placement = place_with_constraints(&design, architecture.device(), packing.constraints())?;
+    let placement = place_analytically_with_net_sink_weights(
+        &design,
+        architecture.device(),
+        packing.constraints(),
+        &BTreeMap::new(),
+    )?;
     progress(Ecp5FlowStage::Placed);
     let mut global_routing_cache = architecture.global_routing_cache();
     let routing = packing.global_routing_constraints_cached(
@@ -316,6 +328,10 @@ pub fn implement_struo_ecp5_with_progress(
         &timing_model,
         &timing_constraints,
     )?;
+    progress(Ecp5FlowStage::TimingSnapshot {
+        worst_setup_ps: initial_timing.worst_slack_ps,
+        worst_hold_ps: initial_timing.worst_hold_slack_ps,
+    });
 
     let (implementation, timing) = TimingDrivenContext {
         design: &design,
@@ -387,7 +403,7 @@ impl TimingDrivenContext<'_> {
             return Ok((initial_implementation, initial_timing));
         }
         let placement_weights = timing_placement_weights(&initial_timing, self.timing_constraints);
-        let placement = place_with_net_sink_weights(
+        let placement = place_analytically_with_net_sink_weights(
             self.design,
             self.architecture.device(),
             self.packing.constraints(),
@@ -406,20 +422,17 @@ impl TimingDrivenContext<'_> {
         let routing_weights = timing_net_weights(&timing, self.timing_constraints);
         let mut routing_costs =
             ecp5_routing_costs(self.architecture, self.speed_grade, routing_weights)?;
-        routing_costs.set_sink_min_delays_ps(hold_sink_min_delays(&timing));
-        let (timing_implementation, timing_routed) = self.route_and_analyze(
-            implementation.placement.clone(),
-            &routing,
-            Some(&routing_costs),
-            progress,
-        )?;
         let candidates = vec![
             (initial_implementation, initial_timing),
             (implementation, timing),
-            (timing_implementation, timing_routed),
         ];
         let mut archive = select_timing_frontier(candidates);
         let mut active = archive.clone();
+        let placement_refiner = PlacementRefiner::new(
+            self.design,
+            self.architecture.device(),
+            self.packing.constraints(),
+        )?;
         for _ in 0..MAX_INCREMENTAL_REFINEMENTS {
             if archive.iter().any(|(_, timing)| timing.met_timing()) {
                 break;
@@ -429,6 +442,7 @@ impl TimingDrivenContext<'_> {
                 children.extend(self.refine_candidates(
                     implementation,
                     timing,
+                    &placement_refiner,
                     &mut routing_costs,
                     progress,
                 )?);
@@ -494,14 +508,12 @@ impl TimingDrivenContext<'_> {
         &mut self,
         implementation: &PnrResult,
         timing: &TimingReport,
+        placement_refiner: &PlacementRefiner<'_>,
         routing_costs: &mut RoutingCosts,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<Vec<(PnrResult, TimingReport)>, Ecp5FlowError> {
         let refinement_weights = timing_placement_weights(timing, self.timing_constraints);
-        let refined_placement = refine_placement_with_net_sink_weights_limited(
-            self.design,
-            self.architecture.device(),
-            self.packing.constraints(),
+        let refined_placement = placement_refiner.refine_with_net_sink_weights_limited(
             implementation.placement.clone(),
             &refinement_weights,
             MAX_REFINED_PLACEMENT_UNITS,
@@ -515,17 +527,7 @@ impl TimingDrivenContext<'_> {
         )?;
         progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
         let criticalities = timing_net_weights(timing, self.timing_constraints);
-        let mut ranked_critical_nets = criticalities
-            .iter()
-            .filter_map(|(&net, &weight)| (weight > 1).then_some((Reverse(weight), net)))
-            .collect::<Vec<_>>();
-        ranked_critical_nets.sort_unstable();
-        let mut released = ranked_critical_nets
-            .into_iter()
-            .take(MAX_RELEASED_CRITICAL_NETS)
-            .map(|(_, net)| net)
-            .collect::<BTreeSet<_>>();
-        released.extend(hold_sink_min_delays(timing).keys().map(|(net, _)| *net));
+        let released = released_timing_nets(timing, self.timing_constraints);
         let incremental_routing = freeze_unchanged_routes(
             self.design,
             implementation,
@@ -534,7 +536,7 @@ impl TimingDrivenContext<'_> {
             &released,
         );
         routing_costs.set_net_criticalities(criticalities);
-        routing_costs.set_sink_min_delays_ps(hold_sink_min_delays(timing));
+        routing_costs.set_sink_min_delays_ps(BTreeMap::new());
         let refined = self.route_and_analyze(
             refined_placement,
             &incremental_routing,
@@ -578,14 +580,18 @@ impl TimingDrivenContext<'_> {
             self.timing_model,
             self.timing_constraints,
         )?;
+        progress(Ecp5FlowStage::TimingSnapshot {
+            worst_setup_ps: timing.worst_slack_ps,
+            worst_hold_ps: timing.worst_hold_slack_ps,
+        });
         Ok((implementation, timing))
     }
 }
 
-const MAX_INCREMENTAL_REFINEMENTS: usize = 4;
+const MAX_INCREMENTAL_REFINEMENTS: usize = 8;
 const TIMING_FRONTIER_WIDTH: usize = 3;
 const SETUP_FOCUSED_BEAM_WIDTH: usize = 2;
-const MAX_REFINED_PLACEMENT_UNITS: usize = 32;
+const MAX_REFINED_PLACEMENT_UNITS: usize = 256;
 const MAX_RELEASED_CRITICAL_NETS: usize = 64;
 
 fn ecp5_routing_costs(
@@ -739,6 +745,19 @@ fn freeze_routes_except(routes: &[NetRoute], released: &BTreeSet<NetId>) -> Rout
         }
     }
     frozen
+}
+
+fn released_timing_nets(timing: &TimingReport, constraints: &TimingConstraints) -> BTreeSet<NetId> {
+    let mut ranked = timing_net_weights(timing, constraints)
+        .into_iter()
+        .filter_map(|(net, weight)| (weight > 1).then_some((Reverse(weight), net)))
+        .collect::<Vec<_>>();
+    ranked.sort_unstable();
+    ranked
+        .into_iter()
+        .take(MAX_RELEASED_CRITICAL_NETS)
+        .map(|(_, net)| net)
+        .collect()
 }
 
 fn freeze_unchanged_routes(
@@ -1129,6 +1148,12 @@ fn ecp5_timing_model(
             }
         }
         for check in &record.setup_holds {
+            // ECP5 LSR is an asynchronous set/reset input. Its characterized
+            // recovery/removal values must not become synchronous data
+            // setup/hold checks or constrain the register-to-register Fmax.
+            if check.signal_pin == "LSR" {
+                continue;
+            }
             let using_general_routing = general_routing_ffs.contains(&cell_id);
             if (check.signal_pin == "DI" && using_general_routing)
                 || (check.signal_pin == "M" && !using_general_routing)
@@ -1356,7 +1381,7 @@ mod tests {
     use std::num::NonZeroU32;
 
     use struo_celox::ecp5_simulator;
-    use struo_ir::{ArithmeticOp, ClockEdge, Netlist, RegisterCell};
+    use struo_ir::{ActiveLevel, ArithmeticOp, ClockEdge, Netlist, RegisterCell, ResetControl};
     use struo_target_ecp5::{
         ArithmeticMapping, Ecp5Netlist, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
     };
@@ -1619,6 +1644,7 @@ mod tests {
         let mut source = Netlist::new("registered");
         let data = source.add_input("data");
         let clock = source.add_input("clock");
+        let reset = source.add_input("reset");
         let state = source.add_register_output("state");
         source.add_register(RegisterCell::new(
             "state",
@@ -1627,7 +1653,12 @@ mod tests {
             clock,
             ClockEdge::Rising,
             None,
-            None,
+            Some(ResetControl {
+                signal: reset,
+                active: ActiveLevel::High,
+                asynchronous: true,
+                value: false,
+            }),
         ));
         let mapped = map_to_ecp5(&source).unwrap();
         let imported = import_ecp5(&mapped).unwrap();
@@ -1669,6 +1700,7 @@ mod tests {
             .map(CellId)
             .unwrap();
         let ff_data = find_cell_pin(&design, ff, "DI").unwrap();
+        let ff_lsr = find_cell_pin(&design, ff, "LSR").unwrap();
         let ff_q = find_cell_pin(&design, ff, "Q").unwrap();
 
         assert_eq!(packing.clock_frequencies_hz().len(), 1);
@@ -1676,6 +1708,7 @@ mod tests {
         assert_eq!(constraints.clock_periods_ps()[&global_net], 40_000);
         assert_eq!(timing_model.clock_to_q(ff_q).unwrap().1.max_ps, 525);
         assert_eq!(timing_model.setup_hold(ff_data).unwrap().2.min_ps, 233);
+        assert!(timing_model.setup_hold(ff_lsr).is_none());
     }
 
     #[test]

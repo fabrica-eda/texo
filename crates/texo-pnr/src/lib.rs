@@ -464,6 +464,29 @@ pub fn place_with_net_sink_weights(
     )
 }
 
+/// Places a design by solving a sparse quadratic connectivity objective and
+/// deterministically legalizing placement units onto compatible BELs.
+///
+/// Fixed units act as boundary conditions. Per-sink timing weights strengthen
+/// only the corresponding logical edge. The solve is deterministic and does
+/// not use random seeds.
+///
+/// # Errors
+///
+/// Returns a descriptive constraint, model, or BEL-exhaustion error.
+pub fn place_analytically_with_net_sink_weights(
+    design: &Design,
+    device: &Device,
+    constraints: &PlacementConstraints,
+    sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
+) -> Result<Placement, PnrError> {
+    analytical_place(
+        &UnifiedGraph::new(design, device),
+        constraints,
+        sink_weights,
+    )
+}
+
 /// Refines an existing legal placement with deterministic per-net timing weights.
 ///
 /// Unlike [`place_with_net_weights`], this preserves the current solution as
@@ -552,22 +575,71 @@ pub fn refine_placement_with_net_sink_weights_limited(
     sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
     max_moved_units: usize,
 ) -> Result<Placement, PnrError> {
-    let graph = UnifiedGraph::new(design, device);
-    let (_, neighbors) = placement_neighbors(design, None, Some(sink_weights));
-    let mut candidate_cache = BTreeMap::new();
-    let units = placement_units(&graph, constraints, &mut candidate_cache)?;
-    let mut placed = validate_refinement_start(&graph, &units, placement)?;
-    let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
-    refine_placement(
-        &graph,
-        constraints,
-        &units,
-        &neighbors,
-        &mut placed,
-        &mut occupied,
-        Some(max_moved_units),
-    );
-    finish_placement(&graph, constraints, placed)
+    PlacementRefiner::new(design, device, constraints)?.refine_with_net_sink_weights_limited(
+        placement,
+        sink_weights,
+        max_moved_units,
+    )
+}
+
+/// Reusable legal-placement problem for iterative timing refinement.
+///
+/// Compatible BEL assignments are independent of timing weights and are
+/// expensive to enumerate on large devices. This object builds them once and
+/// reuses them across deterministic STA/refinement generations.
+pub struct PlacementRefiner<'a> {
+    graph: UnifiedGraph<'a>,
+    constraints: &'a PlacementConstraints,
+    units: Vec<PlacementUnit>,
+}
+
+impl<'a> PlacementRefiner<'a> {
+    /// Builds and caches all legal placement-unit assignments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a placement group or candidate binding is invalid.
+    pub fn new(
+        design: &'a Design,
+        device: &'a Device,
+        constraints: &'a PlacementConstraints,
+    ) -> Result<Self, PnrError> {
+        let graph = UnifiedGraph::new(design, device);
+        let mut candidate_cache = BTreeMap::new();
+        let units = placement_units(&graph, constraints, &mut candidate_cache)?;
+        Ok(Self {
+            graph,
+            constraints,
+            units,
+        })
+    }
+
+    /// Refines a legal placement while moving at most the requested units.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the starting placement is incompatible with the
+    /// cached problem.
+    pub fn refine_with_net_sink_weights_limited(
+        &self,
+        placement: Placement,
+        sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
+        max_moved_units: usize,
+    ) -> Result<Placement, PnrError> {
+        let (_, neighbors) = placement_neighbors(self.graph.design(), None, Some(sink_weights));
+        let mut placed = validate_refinement_start(&self.graph, &self.units, placement)?;
+        let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
+        refine_placement(
+            &self.graph,
+            self.constraints,
+            &self.units,
+            &neighbors,
+            &mut placed,
+            &mut occupied,
+            Some(max_moved_units),
+        );
+        finish_placement(&self.graph, self.constraints, placed)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -715,6 +787,325 @@ fn place(
     finish_placement(graph, constraints, placed)
 }
 
+#[allow(clippy::too_many_lines)]
+fn analytical_place(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
+) -> Result<Placement, PnrError> {
+    const CENTER_WEIGHT: f64 = 0.01;
+    let design = graph.design();
+    let device = graph.device();
+    let (_, neighbors) = placement_neighbors(design, None, Some(sink_weights));
+    let mut candidate_cache = BTreeMap::new();
+    let units = placement_units(graph, constraints, &mut candidate_cache)?;
+    let mut unit_by_cell = vec![usize::MAX; design.cells().len()];
+    for (unit_index, unit) in units.iter().enumerate() {
+        for &cell in &unit.cells {
+            unit_by_cell[cell.0] = unit_index;
+        }
+    }
+
+    let fixed = units
+        .iter()
+        .map(|unit| {
+            (unit.choices.len() == 1).then(|| device.bels()[unit.choices.assignment(0)[0].0].point)
+        })
+        .collect::<Vec<_>>();
+    let mut edge_weights = BTreeMap::<(usize, usize), f64>::new();
+    for (cell_index, edges) in neighbors.iter().enumerate() {
+        let unit = unit_by_cell[cell_index];
+        for edge in edges {
+            let other = unit_by_cell[edge.cell.0];
+            if unit >= other {
+                continue;
+            }
+            let weight = u32::try_from(edge.weight).expect("placement edge weight fits u32");
+            *edge_weights.entry((unit, other)).or_default() += f64::from(weight);
+        }
+    }
+
+    let center = Point::new(device.width() / 2, device.height() / 2);
+    let mut diagonal = vec![CENTER_WEIGHT; units.len()];
+    let mut rhs_x = vec![CENTER_WEIGHT * f64::from(center.x); units.len()];
+    let mut rhs_y = vec![CENTER_WEIGHT * f64::from(center.y); units.len()];
+    let mut adjacency = vec![Vec::<(usize, f64)>::new(); units.len()];
+    for ((left, right), weight) in edge_weights {
+        match (fixed[left], fixed[right]) {
+            (Some(_), Some(_)) => {}
+            (Some(point), None) => {
+                diagonal[right] += weight;
+                rhs_x[right] += weight * f64::from(point.x);
+                rhs_y[right] += weight * f64::from(point.y);
+            }
+            (None, Some(point)) => {
+                diagonal[left] += weight;
+                rhs_x[left] += weight * f64::from(point.x);
+                rhs_y[left] += weight * f64::from(point.y);
+            }
+            (None, None) => {
+                diagonal[left] += weight;
+                diagonal[right] += weight;
+                adjacency[left].push((right, weight));
+                adjacency[right].push((left, weight));
+            }
+        }
+    }
+    let initial_x = vec![f64::from(center.x); units.len()];
+    let initial_y = vec![f64::from(center.y); units.len()];
+    let mut solved_x = solve_quadratic(&diagonal, &adjacency, &rhs_x, initial_x);
+    let mut solved_y = solve_quadratic(&diagonal, &adjacency, &rhs_y, initial_y);
+    for density_weight in [0.05, 0.10, 0.20, 0.40] {
+        let (target_x, target_y) =
+            analytic_spread_targets(&units, &fixed, device, solved_x.clone(), solved_y.clone());
+        let mut spread_diagonal = diagonal.clone();
+        let mut spread_rhs_x = rhs_x.clone();
+        let mut spread_rhs_y = rhs_y.clone();
+        for index in 0..units.len() {
+            if fixed[index].is_some() {
+                continue;
+            }
+            let anchor_weight = diagonal[index].max(1.0) * density_weight;
+            spread_diagonal[index] += anchor_weight;
+            spread_rhs_x[index] += anchor_weight * target_x[index];
+            spread_rhs_y[index] += anchor_weight * target_y[index];
+        }
+        solved_x = solve_quadratic(&spread_diagonal, &adjacency, &spread_rhs_x, solved_x);
+        solved_y = solve_quadratic(&spread_diagonal, &adjacency, &spread_rhs_y, solved_y);
+    }
+
+    let mut placed = vec![None; design.cells().len()];
+    let mut occupied = BTreeSet::new();
+    let mut pin_usage = HashMap::new();
+    let mut point_usage = vec![0_usize; (device.width() * device.height()) as usize];
+    for unit in units.iter().filter(|unit| unit.choices.len() == 1) {
+        let assignment = unit.choices.assignment(0);
+        if assignment.iter().any(|bel| occupied.contains(bel))
+            || !assignment_pin_wires_are_legal(
+                graph,
+                constraints,
+                &unit.cells,
+                assignment,
+                &pin_usage,
+            )
+        {
+            return Err(PnrError::InvalidPlacement {
+                reason: format!(
+                    "fixed unit beginning at cell {} is not legal",
+                    unit.cells[0].0
+                ),
+            });
+        }
+        install_assignment(
+            graph,
+            constraints,
+            unit,
+            assignment,
+            &mut placed,
+            &mut occupied,
+            &mut pin_usage,
+        );
+        update_point_usage(device, assignment, &mut point_usage);
+    }
+
+    let mut order = units
+        .iter()
+        .enumerate()
+        .filter(|(_, unit)| unit.choices.len() > 1)
+        .map(|(index, unit)| {
+            let criticality = unit
+                .cells
+                .iter()
+                .flat_map(|cell| &neighbors[cell.0])
+                .map(|edge| edge.weight)
+                .sum::<u64>();
+            (index, Reverse(criticality), unit.cells[0])
+        })
+        .collect::<Vec<_>>();
+    order.sort_by_key(|&(_, criticality, cell)| (criticality, cell));
+    let mut spatial_indexes = BTreeMap::new();
+    for (index, _, _) in order {
+        let unit = &units[index];
+        let target = Point::new(
+            rounded_coordinate(solved_x[index], device.width()),
+            rounded_coordinate(solved_y[index], device.height()),
+        );
+        let spatial_index = spatial_indexes
+            .entry(unit.choices.cache_key())
+            .or_insert_with(|| SpatialChoiceIndex::new(&unit.choices, device));
+        let assignment_index = nearest_legal_assignments_with_density(
+            unit,
+            spatial_index,
+            graph,
+            constraints,
+            target,
+            &occupied,
+            &pin_usage,
+            &point_usage,
+        )
+        .into_iter()
+        .min_by_key(|&choice| {
+            let point = device.bels()[unit.choices.assignment(choice)[0].0].point;
+            (point.manhattan(target), point, choice)
+        })
+        .ok_or_else(|| PnrError::NoBel {
+            cell: design.cells()[unit.cells[0].0].name.clone(),
+        })?;
+        let assignment = unit.choices.assignment(assignment_index);
+        install_assignment(
+            graph,
+            constraints,
+            unit,
+            assignment,
+            &mut placed,
+            &mut occupied,
+            &mut pin_usage,
+        );
+        update_point_usage(device, assignment, &mut point_usage);
+    }
+    finish_placement(graph, constraints, placed)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn rounded_coordinate(value: f64, extent: u32) -> u32 {
+    value.round().clamp(0.0, f64::from(extent - 1)) as u32
+}
+
+fn analytic_spread_targets(
+    units: &[PlacementUnit],
+    fixed: &[Option<Point>],
+    device: &Device,
+    mut x: Vec<f64>,
+    mut y: Vec<f64>,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut movable = units
+        .iter()
+        .enumerate()
+        .filter_map(|(index, _)| fixed[index].is_none().then_some(index))
+        .collect::<Vec<_>>();
+    if movable.is_empty() {
+        return (x, y);
+    }
+    let count = u32::try_from(movable.len()).expect("placement unit count fits u32");
+    let aspect = f64::from(device.width()) / f64::from(device.height());
+    let columns = ceil_coordinate((f64::from(count) * aspect).sqrt()).clamp(1, device.width());
+    let rows = count.div_ceil(columns).clamp(1, device.height());
+    let mean_x = movable.iter().map(|&index| x[index]).sum::<f64>() / f64::from(count);
+    let mean_y = movable.iter().map(|&index| y[index]).sum::<f64>() / f64::from(count);
+    let start_x = rounded_coordinate(mean_x - f64::from(columns) / 2.0, device.width())
+        .min(device.width() - columns);
+    let start_y = rounded_coordinate(mean_y - f64::from(rows) / 2.0, device.height())
+        .min(device.height() - rows);
+    movable.sort_by(|&left, &right| {
+        x[left]
+            .total_cmp(&x[right])
+            .then_with(|| y[left].total_cmp(&y[right]))
+            .then_with(|| units[left].cells[0].cmp(&units[right].cells[0]))
+    });
+    for (column, chunk) in movable.chunks_mut(rows as usize).enumerate() {
+        chunk.sort_by(|&left, &right| {
+            y[left]
+                .total_cmp(&y[right])
+                .then_with(|| x[left].total_cmp(&x[right]))
+                .then_with(|| units[left].cells[0].cmp(&units[right].cells[0]))
+        });
+        for (row, &index) in chunk.iter().enumerate() {
+            let column = u32::try_from(column).expect("spread column fits u32");
+            let row = u32::try_from(row).expect("spread row fits u32");
+            x[index] = f64::from(start_x + column);
+            y[index] = f64::from(start_y + row);
+        }
+    }
+    (x, y)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn ceil_coordinate(value: f64) -> u32 {
+    value.ceil() as u32
+}
+
+fn install_assignment(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    unit: &PlacementUnit,
+    assignment: &[BelId],
+    placed: &mut [Option<BelId>],
+    occupied: &mut BTreeSet<BelId>,
+    pin_usage: &mut HashMap<WireId, HashMap<NetId, usize>>,
+) {
+    for (&cell, &bel) in unit.cells.iter().zip(assignment) {
+        occupied.insert(bel);
+        placed[cell.0] = Some(bel);
+    }
+    update_pin_usage(graph, constraints, &unit.cells, assignment, pin_usage, true);
+}
+
+fn solve_quadratic(
+    diagonal: &[f64],
+    adjacency: &[Vec<(usize, f64)>],
+    rhs: &[f64],
+    mut solution: Vec<f64>,
+) -> Vec<f64> {
+    const MAX_ITERATIONS: usize = 100;
+    const RELATIVE_TOLERANCE: f64 = 1e-8;
+    let multiply = |values: &[f64]| {
+        diagonal
+            .iter()
+            .zip(adjacency)
+            .enumerate()
+            .map(|(index, (&diagonal, edges))| {
+                edges
+                    .iter()
+                    .fold(diagonal * values[index], |sum, &(other, weight)| {
+                        sum - weight * values[other]
+                    })
+            })
+            .collect::<Vec<_>>()
+    };
+    let product = multiply(&solution);
+    let mut residual = rhs
+        .iter()
+        .zip(product)
+        .map(|(&rhs, product)| rhs - product)
+        .collect::<Vec<_>>();
+    let mut direction = residual.clone();
+    let mut residual_norm = dot(&residual, &residual);
+    let initial_norm = residual_norm.max(f64::EPSILON);
+    for _ in 0..MAX_ITERATIONS {
+        if residual_norm <= initial_norm * RELATIVE_TOLERANCE {
+            break;
+        }
+        let product = multiply(&direction);
+        let denominator = dot(&direction, &product);
+        if denominator <= f64::EPSILON {
+            break;
+        }
+        let alpha = residual_norm / denominator;
+        for ((solution, residual), (&direction, product)) in solution
+            .iter_mut()
+            .zip(&mut residual)
+            .zip(direction.iter().zip(product))
+        {
+            *solution += alpha * direction;
+            *residual -= alpha * product;
+        }
+        let next_norm = dot(&residual, &residual);
+        let beta = next_norm / residual_norm;
+        for (direction, &residual) in direction.iter_mut().zip(&residual) {
+            *direction = residual + beta * *direction;
+        }
+        residual_norm = next_norm;
+    }
+    solution
+}
+
+fn dot(left: &[f64], right: &[f64]) -> f64 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum()
+}
+
 fn finish_placement(
     graph: &UnifiedGraph<'_>,
     constraints: &PlacementConstraints,
@@ -815,7 +1206,9 @@ fn placement_neighbors(
                 .and_then(|weights| weights.get(&(NetId(net_index), sink_pin)))
                 .copied()
                 .unwrap_or(net_timing_weight);
-            let edge_weight = if design.cells()[driver.0].kind == texo_model::ResourceKind::Clock {
+            let edge_weight = if design.cells()[driver.0].kind == texo_model::ResourceKind::Clock
+                || net.sinks.len() > MAX_PLACEMENT_FANOUT
+            {
                 0
             } else {
                 fanout_weight.saturating_mul(timing_weight)
@@ -841,6 +1234,8 @@ fn placement_neighbors(
     }
     (degree, neighbors)
 }
+
+const MAX_PLACEMENT_FANOUT: usize = 256;
 
 fn choose_assignment<'a>(
     cells: &[CellId],
@@ -918,14 +1313,22 @@ fn refine_placement(
     let mut order = (0..units.len()).collect::<Vec<_>>();
     order.sort_by_key(|&index| {
         let unit = &units[index];
+        let maximum_weight = unit
+            .cells
+            .iter()
+            .flat_map(|cell| &neighbors[cell.0])
+            .map(|edge| edge.weight)
+            .max()
+            .unwrap_or(0);
+        let total_weight = unit
+            .cells
+            .iter()
+            .flat_map(|cell| &neighbors[cell.0])
+            .map(|edge| edge.weight)
+            .sum::<u64>();
         (
-            Reverse(
-                unit.cells
-                    .iter()
-                    .flat_map(|cell| &neighbors[cell.0])
-                    .map(|edge| edge.weight)
-                    .sum::<u64>(),
-            ),
+            Reverse(maximum_weight),
+            Reverse(total_weight),
             unit.cells[0],
         )
     });
@@ -1096,6 +1499,52 @@ fn nearest_legal_assignments(
     occupied: &BTreeSet<BelId>,
     pin_usage: &HashMap<WireId, HashMap<NetId, usize>>,
 ) -> Vec<usize> {
+    nearest_legal_assignments_impl(
+        unit,
+        spatial_index,
+        graph,
+        constraints,
+        target,
+        occupied,
+        pin_usage,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nearest_legal_assignments_with_density(
+    unit: &PlacementUnit,
+    spatial_index: &SpatialChoiceIndex,
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    target: Point,
+    occupied: &BTreeSet<BelId>,
+    pin_usage: &HashMap<WireId, HashMap<NetId, usize>>,
+    point_usage: &[usize],
+) -> Vec<usize> {
+    nearest_legal_assignments_impl(
+        unit,
+        spatial_index,
+        graph,
+        constraints,
+        target,
+        occupied,
+        pin_usage,
+        Some(point_usage),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nearest_legal_assignments_impl(
+    unit: &PlacementUnit,
+    spatial_index: &SpatialChoiceIndex,
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    target: Point,
+    occupied: &BTreeSet<BelId>,
+    pin_usage: &HashMap<WireId, HashMap<NetId, usize>>,
+    point_usage: Option<&[usize]>,
+) -> Vec<usize> {
     let device = graph.device();
     let mut nearest = Vec::new();
     let max_radius = device.width() + device.height();
@@ -1118,6 +1567,9 @@ fn nearest_legal_assignments(
                 for &index in bucket {
                     let assignment = unit.choices.assignment(index);
                     if assignment.iter().all(|bel| !occupied.contains(bel))
+                        && point_usage.is_none_or(|usage| {
+                            density_allows_assignment(graph, unit, assignment, usage)
+                        })
                         && assignment_pin_wires_are_legal(
                             graph,
                             constraints,
@@ -1138,6 +1590,39 @@ fn nearest_legal_assignments(
         }
     }
     nearest
+}
+
+const MAX_LOGIC_CELLS_PER_POINT: usize = 2;
+
+fn density_allows_assignment(
+    graph: &UnifiedGraph<'_>,
+    unit: &PlacementUnit,
+    assignment: &[BelId],
+    point_usage: &[usize],
+) -> bool {
+    if unit
+        .cells
+        .iter()
+        .any(|cell| graph.design().cells()[cell.0].kind != texo_model::ResourceKind::Logic)
+    {
+        return true;
+    }
+    let device = graph.device();
+    let mut added = BTreeMap::<Point, usize>::new();
+    for &bel in assignment {
+        *added.entry(device.bels()[bel.0].point).or_default() += 1;
+    }
+    added.into_iter().all(|(point, count)| {
+        let index = (point.y * device.width() + point.x) as usize;
+        point_usage[index] + count <= MAX_LOGIC_CELLS_PER_POINT
+    })
+}
+
+fn update_point_usage(device: &Device, assignment: &[BelId], point_usage: &mut [usize]) {
+    for &bel in assignment {
+        let point = device.bels()[bel.0].point;
+        point_usage[(point.y * device.width() + point.x) as usize] += 1;
+    }
 }
 
 fn assignment_pin_wires_are_legal(
@@ -2026,7 +2511,7 @@ impl RouteSearch {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn shortest_path(
         &mut self,
         graph: &UnifiedGraph<'_>,
@@ -2066,6 +2551,14 @@ impl RouteSearch {
         let epoch = self.epoch;
         let device = graph.device();
         let goal_point = device.wires()[goal.0].point;
+        let corridor = (criticality > 1).then(|| {
+            let start_point = starts
+                .iter()
+                .map(|start| device.wires()[start.0].point)
+                .min_by_key(|point| (point.manhattan(goal_point), *point))
+                .expect("a route tree always contains its driver");
+            routing_corridor(start_point, goal_point, device, TIMING_ROUTE_MARGIN)
+        });
         let mut queue = BinaryHeap::new();
         for &start in starts {
             let arrival_ps = tree_delays_ps.get(&start).copied().unwrap_or(0);
@@ -2102,6 +2595,11 @@ impl RouteSearch {
             }
 
             for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
+                if corridor.is_some_and(|corridor| {
+                    !point_inside_corridor(device.wires()[neighbor.0].point, corridor)
+                }) {
+                    continue;
+                }
                 let congestion = congestion_cost(
                     wire_occupancy[neighbor.0],
                     device.wires()[neighbor.0].capacity,
@@ -2141,8 +2639,50 @@ impl RouteSearch {
                 )));
             }
         }
+        if corridor.is_some() {
+            return self.shortest_path(
+                graph,
+                starts,
+                goal,
+                wire_occupancy,
+                pip_occupancy,
+                wire_history,
+                pip_history,
+                present_factor,
+                None,
+                0,
+                tree_delays_ps,
+                minimum_arrival_ps,
+            );
+        }
         None
     }
+}
+
+type RoutingCorridor = (u32, u32, u32, u32);
+
+const TIMING_ROUTE_MARGIN: u32 = 12;
+
+fn routing_corridor(start: Point, goal: Point, device: &Device, margin: u32) -> RoutingCorridor {
+    (
+        start.x.min(goal.x).saturating_sub(margin),
+        start
+            .x
+            .max(goal.x)
+            .saturating_add(margin)
+            .min(device.width() - 1),
+        start.y.min(goal.y).saturating_sub(margin),
+        start
+            .y
+            .max(goal.y)
+            .saturating_add(margin)
+            .min(device.height() - 1),
+    )
+}
+
+fn point_inside_corridor(point: Point, corridor: RoutingCorridor) -> bool {
+    let (minimum_x, maximum_x, minimum_y, maximum_y) = corridor;
+    (minimum_x..=maximum_x).contains(&point.x) && (minimum_y..=maximum_y).contains(&point.y)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2456,10 +2996,12 @@ mod tests {
 
     use super::{
         Placement, PlacementConstraints, PlacementNeighbor, PnrError, RouteSearch,
-        RoutingConstraints, RoutingCosts, place_and_route, place_with_constraints,
-        placement_neighbors, refine_placement_with_net_sink_weights_limited,
-        refine_placement_with_net_weights, refinement_edge_cost, route_with_placement_and_progress,
-        route_with_timing_costs_and_progress, routing_step_cost, timing_tree_cost,
+        RoutingConstraints, RoutingCosts, place_analytically_with_net_sink_weights,
+        place_and_route, place_with_constraints, placement_neighbors,
+        refine_placement_with_net_sink_weights_limited, refine_placement_with_net_weights,
+        refinement_edge_cost, route_with_placement_and_progress,
+        route_with_timing_costs_and_progress, routing_corridor, routing_step_cost,
+        timing_tree_cost,
     };
 
     fn two_cell_design() -> Design {
@@ -2489,6 +3031,41 @@ mod tests {
         assert!(!result.routes[0].wires.is_empty());
         assert!(!result.routes[0].pips.is_empty());
         assert_eq!(result.total_pips, result.routes[0].pips.len());
+    }
+
+    #[test]
+    fn analytical_placement_is_deterministic_and_legal() {
+        let design = two_cell_design();
+        let device = Device::rectangular_logic(4, 4).unwrap();
+        let constraints = PlacementConstraints::new();
+
+        let first = place_analytically_with_net_sink_weights(
+            &design,
+            &device,
+            &constraints,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let second = place_analytically_with_net_sink_weights(
+            &design,
+            &device,
+            &constraints,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert_ne!(first.bindings()[0], first.bindings()[1]);
+    }
+
+    #[test]
+    fn timing_routing_corridor_is_clipped_to_the_device() {
+        let device = Device::rectangular_logic(8, 6).unwrap();
+
+        assert_eq!(
+            routing_corridor(Point::new(1, 1), Point::new(6, 4), &device, 3),
+            (0, 7, 0, 5),
+        );
     }
 
     #[test]
