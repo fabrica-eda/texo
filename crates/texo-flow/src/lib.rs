@@ -4,6 +4,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::time::Instant;
 
 use texo_model::{
     BelId, CellId, CellPinId, Design, Device, NetId, PinDirection, PipId, ResourceKind,
@@ -1187,6 +1188,8 @@ impl TimingDrivenContext<'_> {
         costs: Option<&RoutingCosts>,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<(PnrResult, TimingReport), Ecp5FlowError> {
+        let profile = metrics_enabled();
+        let started = Instant::now();
         let implementation = if let Some(costs) = costs {
             route_with_timing_costs_and_progress(
                 self.design,
@@ -1205,7 +1208,9 @@ impl TimingDrivenContext<'_> {
                 |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
             )?
         };
+        let routed = started.elapsed();
         progress(Ecp5FlowStage::TimingDrivenRouted);
+        let analysis_started = Instant::now();
         let timing = analyze_ecp5_implementation(
             self.design,
             self.architecture,
@@ -1214,6 +1219,13 @@ impl TimingDrivenContext<'_> {
             self.timing_model,
             self.timing_constraints,
         )?;
+        if profile {
+            eprintln!(
+                "[metrics] route_and_analyze route={routed:?} analyze={:?} pips={}",
+                analysis_started.elapsed(),
+                implementation.total_pips
+            );
+        }
         progress(timing_snapshot(&timing));
         Ok((implementation, timing))
     }
@@ -1245,7 +1257,10 @@ const MAX_LOCAL_CONNECTION_REFINEMENTS: usize = 4;
 const MAX_LOCAL_CONNECTION_CANDIDATES: usize = 8;
 const TIMING_FRONTIER_WIDTH: usize = 1;
 const REFINED_PLACEMENT_UNIT_LIMITS: [usize; 4] = [256, 128, 64, 32];
-const DETAILED_ROUTING_QUANTA_PS: [u64; 2] = [10, 1];
+const DETAILED_ROUTING_QUANTA_PS: [u64; 1] = [10];
+// The second 1 ps quantum measured as a pure extra full renegotiation on the
+// AXI4 self-test: final WNS and placement were bit-identical without it while
+// each multiresolution round paid one more ~30 s global ripup.
 const MAX_CRITICAL_PATH_CELLS: usize = 6;
 const MAX_CRITICAL_PATH_CELL_CANDIDATES: usize = 4;
 const MAX_CRITICAL_CLOSURE_ROUNDS: usize = 4;

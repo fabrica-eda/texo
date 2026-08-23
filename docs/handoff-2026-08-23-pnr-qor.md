@@ -50,7 +50,7 @@ Gotchas learned the hard way:
 At the 250 MHz target Texo closes (+7/+9 ps) in about 112 s, down from
 160 s at session start.
 
-## Session update (2026-08-24, uncommitted)
+## Session update (2026-08-24)
 
 | Config | WNS @300 | Runtime |
 |---|---|---|
@@ -58,17 +58,27 @@ At the 250 MHz target Texo closes (+7/+9 ps) in about 112 s, down from
 | drop second analytical seed + stalled-ripup memo | −352 ps | 269 s |
 | budget-excess scoring for local vertex moves | −342 ps | 243 s |
 | + single-connection endpoint cells join vertex moves | −287 ps | 344 s |
-| + margin-gated route prescreening (**kept**, commit 357fd71 + this) | **−277 ps** | ~310 s |
+| + margin-gated route prescreening (commit 49efc28) | −277 ps | ~310 s |
+| + incremental congestion tracking, single ripup quantum (**kept**) | **−277 ps** | **245 s** |
 
-Fmax ≈ 276.6 MHz with the kept configuration.
+Fmax ≈ 276.6 MHz. Runtime profile that drove the last two changes:
+98% of the flow is route trials; per-trial breakdown showed `route_net` A*
+dominating (~1.3 s even for 14-net releases), full-scan congestion history
+~130 ms per trial, and five successful global data-route ripups at 26–38 s
+each. The tracker keeps overuse sets incrementally (identical history values,
+verified bit-identical final placement), and collapsing
+`DETAILED_ROUTING_QUANTA_PS` to `[10]` removed one full renegotiation per
+multiresolution round with a bit-identical result — the 1 ps pass contributed
+nothing on this design.
 
-Runtime profile at −287 ps: 337 of 344 s inside routing stages (191 trials ×
-1.6 s avg), 87 trials (45%) rejected by the real gate. The prescreen
-(`estimate_edge_delay` in texo-timing: Manhattan×250 ps + 300 ps overhead per
-renegotiated net edge, criticality-weighted) skips a proposal's route trial
-only when its estimate is >25% worse; unguarded (reject on any non-improve)
-it cut runtime to 101 s but lost 388 ps of WNS — the linear model cannot see
-long-line shortcuts, so mildly negative estimates must stay eligible.
+Remaining known costs, in priority order for future sessions:
+1. Unbounded A* for criticality-1 nets (no corridor) — the long tail of
+   0.7–1.6 s small trials.
+2. Detailed-quantum transition searches turn arrival into part of the A*
+   state, multiplying visited states for the released critical nets.
+3. Global ripups renegotiate all 2350 nets when only the failing region
+   contends; targeted ripup would trade QoR risk for most of the remaining
+   ~110 s.
 
 ## Commits (oldest first)
 

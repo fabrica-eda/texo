@@ -2890,6 +2890,7 @@ fn route_reaches_all_sinks(
     Ok(true)
 }
 
+#[allow(clippy::too_many_lines)]
 fn route(
     graph: &UnifiedGraph<'_>,
     placement: &Placement,
@@ -2903,10 +2904,28 @@ fn route(
     let mut pip_occupancy = vec![0_u16; device.pips().len()];
     let mut wire_history = vec![0_u32; device.wires().len()];
     let mut pip_history = vec![0_u32; device.pips().len()];
+    let mut overuse = OveruseTracker::default();
     let mut routes = vec![None; design.nets().len()];
     for (&net, route) in constraints.routes() {
         routes[net.0] = Some(route.clone());
-        add_route(route, &mut wire_occupancy, &mut pip_occupancy);
+        for &wire in &route.wires {
+            wire_occupancy[wire.0] += 1;
+            track_entry(
+                &mut overuse.wires,
+                wire_occupancy[wire.0],
+                device.wires()[wire.0].capacity,
+                wire.0,
+            );
+        }
+        for &pip in &route.pips {
+            pip_occupancy[pip.0] += 1;
+            track_entry(
+                &mut overuse.pips,
+                pip_occupancy[pip.0],
+                device.pips()[pip.0].capacity,
+                pip.0,
+            );
+        }
     }
     let pin_wires = PinWireCache::build(graph, placement);
     let mut routing_order = routing_order(design, constraints, costs);
@@ -2934,7 +2953,24 @@ fn route(
         });
         for &index in &dirty {
             if let Some(previous) = routes[index].take() {
-                remove_route(&previous, &mut wire_occupancy, &mut pip_occupancy);
+                for &wire in &previous.wires {
+                    wire_occupancy[wire.0] -= 1;
+                    track_entry(
+                        &mut overuse.wires,
+                        wire_occupancy[wire.0],
+                        device.wires()[wire.0].capacity,
+                        wire.0,
+                    );
+                }
+                for &pip in &previous.pips {
+                    pip_occupancy[pip.0] -= 1;
+                    track_entry(
+                        &mut overuse.pips,
+                        pip_occupancy[pip.0],
+                        device.pips()[pip.0].capacity,
+                        pip.0,
+                    );
+                }
             }
         }
         let mut ordinal = 0;
@@ -2965,20 +3001,40 @@ fn route(
                 &mut search,
                 &mut tree_arrival_ps,
             )?;
-            add_route(&route, &mut wire_occupancy, &mut pip_occupancy);
+            for &wire in &route.wires {
+                wire_occupancy[wire.0] += 1;
+                track_entry(
+                    &mut overuse.wires,
+                    wire_occupancy[wire.0],
+                    device.wires()[wire.0].capacity,
+                    wire.0,
+                );
+            }
+            for &pip in &route.pips {
+                pip_occupancy[pip.0] += 1;
+                track_entry(
+                    &mut overuse.pips,
+                    pip_occupancy[pip.0],
+                    device.pips()[pip.0].capacity,
+                    pip.0,
+                );
+            }
             routes[index] = Some(route);
         }
 
-        let overused_wires = update_congestion_history(
-            &wire_occupancy,
-            device.wires().iter().map(|wire| wire.capacity),
-            &mut wire_history,
-        );
-        let overused_pips = update_congestion_history(
-            &pip_occupancy,
-            device.pips().iter().map(|pip| pip.capacity),
-            &mut pip_history,
-        );
+        // History grows once per iteration for exactly the resources that are
+        // currently overused; the trackers make that O(conflicts) instead of
+        // a full device rescan, with identical resulting history values.
+        for &index in &overuse.wires {
+            let excess = wire_occupancy[index] - device.wires()[index].capacity;
+            wire_history[index] = wire_history[index].saturating_add(u32::from(excess));
+        }
+        for &index in &overuse.pips {
+            let excess = pip_occupancy[index] - device.pips()[index].capacity;
+            pip_history[index] = pip_history[index].saturating_add(u32::from(excess));
+        }
+        let overused_wires = overuse.wires.len();
+        let overused_pips = overuse.pips.len();
         if overused_wires == 0 && overused_pips == 0 {
             return Ok(routes
                 .into_iter()
@@ -2988,16 +3044,10 @@ fn route(
         dirty = congested_routes(device, &routes, &wire_occupancy, &pip_occupancy);
     }
 
-    let overused_wires = count_overused(
-        &wire_occupancy,
-        device.wires().iter().map(|wire| wire.capacity),
-    );
-    let overused_pips =
-        count_overused(&pip_occupancy, device.pips().iter().map(|pip| pip.capacity));
     Err(PnrError::CongestionNotResolved {
         iterations: MAX_ROUTING_ITERATIONS,
-        overused_wires,
-        overused_pips,
+        overused_wires: overuse.wires.len(),
+        overused_pips: overuse.pips.len(),
     })
 }
 
@@ -3245,45 +3295,24 @@ fn routed_tree_pip_delay(costs: &RoutingCosts, pip: PipId, minimum_arrival_ps: u
     }
 }
 
-fn add_route(route: &NetRoute, wire_occupancy: &mut [u16], pip_occupancy: &mut [u16]) {
-    for wire in &route.wires {
-        wire_occupancy[wire.0] += 1;
-    }
-    for pip in &route.pips {
-        pip_occupancy[pip.0] += 1;
-    }
+/// Indices whose occupancy currently exceeds capacity.
+///
+/// Maintained incrementally by [`track_entry`] so the per-iteration history
+/// update touches only conflicting resources instead of rescanning every wire
+/// and PIP on the device; resulting history values are identical to a full
+/// rescan because entries are independent.
+#[derive(Default)]
+struct OveruseTracker {
+    wires: BTreeSet<usize>,
+    pips: BTreeSet<usize>,
 }
 
-fn remove_route(route: &NetRoute, wire_occupancy: &mut [u16], pip_occupancy: &mut [u16]) {
-    for wire in &route.wires {
-        wire_occupancy[wire.0] -= 1;
+fn track_entry(tracker: &mut BTreeSet<usize>, used: u16, capacity: u16, index: usize) {
+    if used > capacity {
+        tracker.insert(index);
+    } else {
+        tracker.remove(&index);
     }
-    for pip in &route.pips {
-        pip_occupancy[pip.0] -= 1;
-    }
-}
-
-fn count_overused(occupancy: &[u16], capacities: impl Iterator<Item = u16>) -> usize {
-    occupancy
-        .iter()
-        .zip(capacities)
-        .filter(|(used, capacity)| **used > *capacity)
-        .count()
-}
-
-fn update_congestion_history(
-    occupancy: &[u16],
-    capacities: impl Iterator<Item = u16>,
-    history: &mut [u32],
-) -> usize {
-    let mut overused = 0;
-    for ((&used, capacity), history) in occupancy.iter().zip(capacities).zip(history) {
-        if used > capacity {
-            overused += 1;
-            *history = history.saturating_add(u32::from(used - capacity));
-        }
-    }
-    overused
 }
 
 fn bound_wire(
