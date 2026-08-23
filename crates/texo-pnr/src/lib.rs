@@ -279,6 +279,116 @@ pub struct PnrResult {
     pub total_pips: usize,
 }
 
+/// Retains only the branches needed to reach `sinks` from a routed net's
+/// driver. The returned partial tree can be supplied as a routing constraint;
+/// the router will preserve its shared trunk and grow the missing sink arcs.
+///
+/// # Errors
+///
+/// Returns an invalid-routing-constraint or placement error when the supplied
+/// route is not a driver-rooted tree for the current placement.
+pub fn retain_route_for_sinks(
+    design: &Design,
+    device: &Device,
+    placement: &Placement,
+    route: &NetRoute,
+    sinks: &BTreeSet<CellPinId>,
+) -> Result<Option<NetRoute>, PnrError> {
+    if sinks.is_empty() {
+        return Ok(None);
+    }
+    let graph = UnifiedGraph::new(design, device);
+    let net = design
+        .nets()
+        .get(route.net.0)
+        .ok_or_else(|| PnrError::InvalidRoutingConstraint {
+            net: route.net,
+            reason: "net ID is outside the design".into(),
+        })?;
+    if let Some(&sink) = sinks.iter().find(|sink| !net.sinks.contains(sink)) {
+        return Err(PnrError::InvalidRoutingConstraint {
+            net: route.net,
+            reason: format!("pin {} is not a sink of the routed net", sink.0),
+        });
+    }
+    let driver_cell = design.pins()[net.driver.0].cell;
+    let driver_bel = placement
+        .bel(driver_cell)
+        .ok_or(PnrError::MissingPlacement { cell: driver_cell })?;
+    let driver_wire = bound_wire(&graph, placement, net.driver, driver_bel)?;
+    let route_wires = route.wires.iter().copied().collect::<BTreeSet<_>>();
+    if !route_wires.contains(&driver_wire) {
+        return Err(PnrError::InvalidRoutingConstraint {
+            net: route.net,
+            reason: "route does not contain its placed driver wire".into(),
+        });
+    }
+
+    let mut adjacent = BTreeMap::<WireId, Vec<(WireId, PipId)>>::new();
+    for &pip_id in &route.pips {
+        let pip =
+            device
+                .pips()
+                .get(pip_id.0)
+                .ok_or_else(|| PnrError::InvalidRoutingConstraint {
+                    net: route.net,
+                    reason: format!("unknown PIP {pip_id:?}"),
+                })?;
+        adjacent.entry(pip.from).or_default().push((pip.to, pip_id));
+        adjacent.entry(pip.to).or_default().push((pip.from, pip_id));
+    }
+    let mut parent = BTreeMap::<WireId, (WireId, PipId)>::new();
+    let mut visited = BTreeSet::from([driver_wire]);
+    let mut pending = vec![driver_wire];
+    while let Some(wire) = pending.pop() {
+        for &(next, pip) in adjacent.get(&wire).map_or(&[][..], Vec::as_slice) {
+            if visited.insert(next) {
+                parent.insert(next, (wire, pip));
+                pending.push(next);
+            }
+        }
+    }
+    if visited != route_wires || route.pips.len().saturating_add(1) != route.wires.len() {
+        return Err(PnrError::InvalidRoutingConstraint {
+            net: route.net,
+            reason: "route is not one connected tree rooted at its driver".into(),
+        });
+    }
+
+    let mut retained_wires = BTreeSet::from([driver_wire]);
+    let mut retained_pips = BTreeSet::new();
+    for &sink in sinks {
+        let sink_cell = design.pins()[sink.0].cell;
+        let sink_bel = placement
+            .bel(sink_cell)
+            .ok_or(PnrError::MissingPlacement { cell: sink_cell })?;
+        let mut wire = bound_wire(&graph, placement, sink, sink_bel)?;
+        if !route_wires.contains(&wire) {
+            return Err(PnrError::InvalidRoutingConstraint {
+                net: route.net,
+                reason: format!("route does not reach retained sink pin {}", sink.0),
+            });
+        }
+        while wire != driver_wire {
+            let &(previous, pip) =
+                parent
+                    .get(&wire)
+                    .ok_or_else(|| PnrError::InvalidRoutingConstraint {
+                        net: route.net,
+                        reason: format!("retained sink pin {} is disconnected", sink.0),
+                    })?;
+            retained_wires.insert(wire);
+            retained_pips.insert(pip);
+            wire = previous;
+        }
+    }
+    Ok(Some(NetRoute {
+        net: route.net,
+        wires: retained_wires.into_iter().collect(),
+        pips: retained_pips.into_iter().collect(),
+    }))
+}
+
 /// Deterministic progress event from negotiated routing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RoutingProgress {
@@ -2678,6 +2788,25 @@ fn validate_routing_costs(
     Ok(())
 }
 
+fn route_reaches_all_sinks(
+    graph: &UnifiedGraph<'_>,
+    placement: &Placement,
+    route: &NetRoute,
+) -> Result<bool, PnrError> {
+    let net = &graph.design().nets()[route.net.0];
+    let wires = route.wires.iter().copied().collect::<BTreeSet<_>>();
+    for &sink in &net.sinks {
+        let cell = graph.design().pins()[sink.0].cell;
+        let bel = placement
+            .bel(cell)
+            .ok_or(PnrError::MissingPlacement { cell })?;
+        if !wires.contains(&bound_wire(graph, placement, sink, bel)?) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn route(
     graph: &UnifiedGraph<'_>,
     placement: &Placement,
@@ -2698,9 +2827,17 @@ fn route(
     }
     let mut routing_order = (0..design.nets().len()).collect::<Vec<_>>();
     routing_order.sort_by_key(|&index| routing_order_key(design, constraints, costs, index));
-    let mut dirty = (0..design.nets().len())
-        .filter(|index| !constraints.routes().contains_key(&NetId(*index)))
-        .collect::<BTreeSet<_>>();
+    let mut dirty = BTreeSet::new();
+    for index in 0..design.nets().len() {
+        let complete = if let Some(route) = constraints.routes().get(&NetId(index)) {
+            route_reaches_all_sinks(graph, placement, route)?
+        } else {
+            false
+        };
+        if !complete {
+            dirty.insert(index);
+        }
+    }
     let mut search = RouteSearch::new(device.wires().len());
     for iteration in 0..MAX_ROUTING_ITERATIONS {
         let present_factor = 1_u32 << iteration.min(12);
@@ -3609,9 +3746,9 @@ mod tests {
         RoutingConstraints, RoutingCosts, place_analytically_with_net_sink_weights,
         place_and_route, place_with_constraints, placement_neighbors,
         refine_placement_with_net_sink_weights_limited, refine_placement_with_net_weights,
-        refinement_edge_cost, route_with_placement_and_progress,
-        route_with_timing_costs_and_progress, routing_corridor, routing_step_cost,
-        routing_transition_cost, timing_tree_cost,
+        refinement_edge_cost, retain_route_for_sinks, route_reaches_all_sinks,
+        route_with_placement_and_progress, route_with_timing_costs_and_progress, routing_corridor,
+        routing_step_cost, routing_transition_cost, timing_tree_cost,
     };
 
     fn two_cell_design() -> Design {
@@ -3800,6 +3937,75 @@ mod tests {
         .unwrap();
 
         assert_eq!(iterations, vec![0]);
+    }
+
+    #[test]
+    fn partial_route_preserves_shared_tree_and_routes_only_missing_sink_arc() {
+        let mut design = Design::new();
+        let source = design.add_cell("source", ResourceKind::Logic);
+        let source_out = design.add_pin(source, "out", PinDirection::Output).unwrap();
+        let near = design.add_cell("near", ResourceKind::Logic);
+        let near_in = design.add_pin(near, "in", PinDirection::Input).unwrap();
+        let far = design.add_cell("far", ResourceKind::Logic);
+        let far_in = design.add_pin(far, "in", PinDirection::Input).unwrap();
+        design
+            .add_net("fanout", source_out, [near_in, far_in])
+            .unwrap();
+        let device = Device::rectangular_logic(3, 1).unwrap();
+        let placement = Placement {
+            bindings: vec![BelId(0), BelId(1), BelId(2)],
+            pin_bindings: BTreeMap::new(),
+        };
+        let full = route_with_placement_and_progress(
+            &design,
+            &device,
+            placement.clone(),
+            &RoutingConstraints::new(),
+            |_| {},
+        )
+        .unwrap();
+        let partial = retain_route_for_sinks(
+            &design,
+            &device,
+            &placement,
+            &full.routes[0],
+            &BTreeSet::from([near_in]),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(partial.pips.len() < full.routes[0].pips.len());
+
+        let mut constraints = RoutingConstraints::new();
+        constraints.add_route(partial.clone());
+        let mut iterations = Vec::new();
+        let rerouted = route_with_placement_and_progress(
+            &design,
+            &device,
+            placement.clone(),
+            &constraints,
+            |event| {
+                if let super::RoutingProgress::Iteration { nets, .. } = event {
+                    iterations.push(nets);
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(iterations, vec![1]);
+        assert!(
+            partial
+                .pips
+                .iter()
+                .all(|pip| rerouted.routes[0].pips.contains(pip))
+        );
+        assert!(
+            route_reaches_all_sinks(
+                &UnifiedGraph::new(&design, &device),
+                &placement,
+                &rerouted.routes[0]
+            )
+            .unwrap()
+        );
     }
 
     #[test]

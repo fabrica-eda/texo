@@ -12,7 +12,7 @@ pub use texo_pnr::RoutingProgress;
 use texo_pnr::{
     NetRoute, Placement, PlacementConstraints, PlacementRefiner, PnrError, PnrResult,
     RoutingConstraints, RoutingCosts, place_analytically_with_net_sink_weights,
-    place_and_route_with_constraints, route_with_placement_and_progress,
+    place_and_route_with_constraints, retain_route_for_sinks, route_with_placement_and_progress,
     route_with_timing_costs_and_progress,
 };
 use texo_struo::{ImportedEcp5Design, PrimitiveMetadata};
@@ -634,16 +634,28 @@ impl TimingDrivenContext<'_> {
             let Some(worst_slack_ps) = seed.1.worst_slack_ps else {
                 break;
             };
-            let detailed_nets = seed
+            let detailed_sinks = seed
                 .1
                 .net_setup_slacks
                 .iter()
-                .filter_map(|edge| (edge.slack_ps == worst_slack_ps).then_some(edge.net))
+                .filter_map(|edge| {
+                    (edge.slack_ps == worst_slack_ps).then_some((edge.net, edge.sink))
+                })
                 .collect::<BTreeSet<_>>();
-            if detailed_nets.is_empty() {
+            if detailed_sinks.is_empty() {
                 break;
             }
-            let frozen = freeze_routes_except(&seed.0.routes, &detailed_nets);
+            let detailed_nets = detailed_sinks
+                .iter()
+                .map(|(net, _)| *net)
+                .collect::<BTreeSet<_>>();
+            let frozen = freeze_route_sinks_except(
+                self.design,
+                self.architecture.device(),
+                &seed.0.placement,
+                &seed.0.routes,
+                &detailed_sinks,
+            )?;
             routing_costs
                 .set_net_criticalities(timing_net_weights(&seed.1, self.timing_constraints));
             routing_costs.set_sink_min_delays_ps(BTreeMap::new());
@@ -683,11 +695,14 @@ impl TimingDrivenContext<'_> {
         if minimums.is_empty() {
             return Ok(None);
         }
-        let repair_nets = minimums
-            .keys()
-            .map(|(net, _)| *net)
-            .collect::<BTreeSet<_>>();
-        let frozen = freeze_routes_except(&implementation.routes, &repair_nets);
+        let repair_sinks = minimums.keys().copied().collect::<BTreeSet<_>>();
+        let frozen = freeze_route_sinks_except(
+            self.design,
+            self.architecture.device(),
+            &implementation.placement,
+            &implementation.routes,
+            &repair_sinks,
+        )?;
         routing_costs.set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
         routing_costs.set_sink_min_delays_ps(minimums);
         match self.route_and_analyze(
@@ -726,7 +741,7 @@ impl TimingDrivenContext<'_> {
         )?;
         progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
         let criticalities = timing_net_weights(timing, self.timing_constraints);
-        let released = released_timing_nets(timing, self.timing_constraints);
+        let released = released_timing_sinks(timing, self.timing_constraints);
         let incremental_routing = freeze_unchanged_routes(
             self.design,
             implementation,
@@ -797,13 +812,9 @@ impl TimingDrivenContext<'_> {
                 self.global_routing_cache,
             )?;
             progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
-            let frozen = freeze_unchanged_routes(
-                self.design,
-                implementation,
-                &placement,
-                &base,
-                &BTreeSet::from([net]),
-            );
+            let released = BTreeSet::from([(net, sink)]);
+            let frozen =
+                freeze_unchanged_routes(self.design, implementation, &placement, &base, &released);
             routing_costs
                 .set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
             routing_costs.set_sink_min_delays_ps(BTreeMap::new());
@@ -819,6 +830,7 @@ impl TimingDrivenContext<'_> {
         Ok(candidates)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn refine_critical_path_cells(
         &mut self,
         implementation: &PnrResult,
@@ -854,10 +866,11 @@ impl TimingDrivenContext<'_> {
             .filter(|(_, (_, connections))| connections.len() >= 2)
             .collect::<Vec<_>>();
         cells.sort_unstable_by_key(|(cell, (delay, _))| (Reverse(*delay), *cell));
-        let released = worst_connections
+        let critical_sinks = worst_connections
             .iter()
-            .map(|(net, _, _)| *net)
+            .map(|(net, _, sink)| (*net, *sink))
             .collect::<BTreeSet<_>>();
+        let released = release_entire_nets(self.design, &critical_sinks);
         let mut placement = implementation.placement.clone();
         let mut candidates = Vec::new();
         for (cell, (_, connections)) in cells.into_iter().take(MAX_CRITICAL_PATH_CELLS) {
@@ -898,7 +911,7 @@ impl TimingDrivenContext<'_> {
                 routing_costs
                     .set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
                 routing_costs.set_sink_min_delays_ps(BTreeMap::new());
-                routing_costs.set_detailed_timing_nets(released.clone());
+                routing_costs.set_detailed_timing_nets(released_net_ids(&released));
                 routing_costs.set_detailed_delay_quantum_ps(10);
                 let trial = self.route_and_analyze(refined, &frozen, Some(routing_costs), progress);
                 routing_costs.set_detailed_timing_nets(BTreeSet::new());
@@ -1145,26 +1158,84 @@ fn hold_sink_min_delays(timing: &TimingReport) -> BTreeMap<(NetId, CellPinId), u
     minimums
 }
 
-fn freeze_routes_except(routes: &[NetRoute], released: &BTreeSet<NetId>) -> RoutingConstraints {
+fn freeze_route_sinks_except(
+    design: &Design,
+    device: &Device,
+    placement: &Placement,
+    routes: &[NetRoute],
+    released: &BTreeSet<(NetId, CellPinId)>,
+) -> Result<RoutingConstraints, PnrError> {
     let mut frozen = RoutingConstraints::new();
     for route in routes {
-        if !released.contains(&route.net) {
+        let net = &design.nets()[route.net.0];
+        let retained = net
+            .sinks
+            .iter()
+            .copied()
+            .filter(|sink| !released.contains(&(route.net, *sink)))
+            .collect::<BTreeSet<_>>();
+        if retained.len() == net.sinks.len() {
             frozen.add_route(route.clone());
+        } else if let Some(partial) =
+            retain_route_for_sinks(design, device, placement, route, &retained)?
+        {
+            frozen.add_route(partial);
         }
     }
-    frozen
+    Ok(frozen)
 }
 
-fn released_timing_nets(timing: &TimingReport, constraints: &TimingConstraints) -> BTreeSet<NetId> {
+fn released_timing_sinks(
+    timing: &TimingReport,
+    constraints: &TimingConstraints,
+) -> BTreeSet<(NetId, CellPinId)> {
     let mut ranked = timing_net_weights(timing, constraints)
         .into_iter()
         .filter_map(|(net, weight)| (weight > 1).then_some((Reverse(weight), net)))
         .collect::<Vec<_>>();
     ranked.sort_unstable();
-    ranked
+    let released = ranked
         .into_iter()
         .take(MAX_RELEASED_CRITICAL_NETS)
-        .map(|(_, net)| net)
+        .flat_map(|(_, net)| {
+            timing
+                .net_setup_slacks
+                .iter()
+                .filter_map(move |edge| (edge.net == net).then_some((net, edge.sink)))
+        })
+        .collect::<BTreeSet<_>>();
+    release_entire_nets_from_timing(timing, &released)
+}
+
+fn release_entire_nets_from_timing(
+    timing: &TimingReport,
+    released: &BTreeSet<(NetId, CellPinId)>,
+) -> BTreeSet<(NetId, CellPinId)> {
+    let nets = released_net_ids(released);
+    timing
+        .net_delays
+        .iter()
+        .filter_map(|edge| nets.contains(&edge.net).then_some((edge.net, edge.sink)))
+        .collect()
+}
+
+fn released_net_ids(released: &BTreeSet<(NetId, CellPinId)>) -> BTreeSet<NetId> {
+    released.iter().map(|(net, _)| *net).collect()
+}
+
+fn release_entire_nets(
+    design: &Design,
+    released: &BTreeSet<(NetId, CellPinId)>,
+) -> BTreeSet<(NetId, CellPinId)> {
+    released_net_ids(released)
+        .into_iter()
+        .flat_map(|net| {
+            design.nets()[net.0]
+                .sinks
+                .iter()
+                .copied()
+                .map(move |sink| (net, sink))
+        })
         .collect()
 }
 
@@ -1173,7 +1244,7 @@ fn freeze_unchanged_routes(
     implementation: &PnrResult,
     placement: &Placement,
     base: &RoutingConstraints,
-    released: &BTreeSet<NetId>,
+    released: &BTreeSet<(NetId, CellPinId)>,
 ) -> RoutingConstraints {
     let moved = implementation
         .placement
@@ -1185,7 +1256,9 @@ fn freeze_unchanged_routes(
         .collect::<BTreeSet<_>>();
     let mut frozen = base.clone();
     for route in &implementation.routes {
-        if base.routes().contains_key(&route.net) || released.contains(&route.net) {
+        if base.routes().contains_key(&route.net)
+            || released.iter().any(|(net, _)| *net == route.net)
+        {
             continue;
         }
         let net = &design.nets()[route.net.0];
@@ -1693,6 +1766,7 @@ impl Error for MissingEvidence {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::num::NonZeroU32;
 
     use struo_celox::ecp5_simulator;
@@ -1701,7 +1775,7 @@ mod tests {
         ArithmeticMapping, Ecp5Netlist, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
     };
     use texo_model::{BelId, CellId, Design, Device, NetId, PinDirection, ResourceKind};
-    use texo_pnr::{NetRoute, PlacementConstraints};
+    use texo_pnr::{PlacementConstraints, place_and_route};
     use texo_struo::import_ecp5;
     use texo_target_ecp5::{
         PipClassTimingRecord, TimingCornersRecord, find_global_clock_requirements, pack_lut_ffs,
@@ -1711,7 +1785,7 @@ mod tests {
     use super::{
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, criticality_weight,
         delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, find_cell_pin,
-        freeze_routes_except, implement, implement_struo_ecp5, implement_with_constraints,
+        freeze_route_sinks_except, implement, implement_struo_ecp5, implement_with_constraints,
         pip_class_delay, slack_violations, staged_timing_score, verify_post_map_with_celox,
     };
 
@@ -1774,21 +1848,37 @@ mod tests {
     }
 
     #[test]
-    fn local_hold_repair_releases_only_violating_nets() {
-        let routes = [
-            NetRoute {
-                net: NetId(0),
-                wires: Vec::new(),
-                pips: Vec::new(),
-            },
-            NetRoute {
-                net: NetId(1),
-                wires: Vec::new(),
-                pips: Vec::new(),
-            },
-        ];
+    fn local_hold_repair_releases_only_violating_sink_arcs() {
+        let mut design = Design::new();
+        let first_driver = design.add_cell("source_a", ResourceKind::Logic);
+        let first_output = design
+            .add_pin(first_driver, "out", PinDirection::Output)
+            .unwrap();
+        let first_receiver = design.add_cell("sink_a", ResourceKind::Logic);
+        let first_input = design
+            .add_pin(first_receiver, "in", PinDirection::Input)
+            .unwrap();
+        let second_driver = design.add_cell("source_b", ResourceKind::Logic);
+        let second_output = design
+            .add_pin(second_driver, "out", PinDirection::Output)
+            .unwrap();
+        let second_receiver = design.add_cell("sink_b", ResourceKind::Logic);
+        let second_input = design
+            .add_pin(second_receiver, "in", PinDirection::Input)
+            .unwrap();
+        design.add_net("a", first_output, [first_input]).unwrap();
+        design.add_net("b", second_output, [second_input]).unwrap();
+        let device = Device::rectangular_logic(4, 4).unwrap();
+        let implementation = place_and_route(&design, &device).unwrap();
 
-        let frozen = freeze_routes_except(&routes, &std::collections::BTreeSet::from([NetId(1)]));
+        let frozen = freeze_route_sinks_except(
+            &design,
+            &device,
+            &implementation.placement,
+            &implementation.routes,
+            &BTreeSet::from([(NetId(1), second_input)]),
+        )
+        .unwrap();
 
         assert!(frozen.routes().contains_key(&NetId(0)));
         assert!(!frozen.routes().contains_key(&NetId(1)));
