@@ -484,6 +484,17 @@ impl TimingDrivenContext<'_> {
         }
         archive =
             self.close_setup_critically(archive, &placement_refiner, &mut routing_costs, progress)?;
+        if !archive
+            .iter()
+            .any(|(_, timing)| timing.worst_slack_ps.is_some_and(|slack| slack >= 0))
+        {
+            archive = self.escape_placement_basin(
+                archive,
+                &placement_refiner,
+                &mut routing_costs,
+                progress,
+            )?;
+        }
         let mut hold_repairs = Vec::new();
         for (implementation, timing) in &archive {
             if timing.worst_slack_ps.is_none_or(|slack| slack < 0) {
@@ -574,7 +585,6 @@ impl TimingDrivenContext<'_> {
         }
         Ok(archive)
     }
-
     fn refine_critical_path_vertices(
         &mut self,
         mut archive: Vec<TimingCandidate>,
@@ -680,6 +690,85 @@ impl TimingDrivenContext<'_> {
             }
             archive.push(trial);
             archive = select_timing_frontier(archive);
+        }
+        Ok(archive)
+    }
+
+    /// Deterministic basin escape for designs that stall with negative setup
+    /// slack. Each round re-solves the analytical placement from the
+    /// incumbent's per-sink criticality weights raised to a fixed power, which
+    /// sharpens the contrast around critical paths and lands in a different
+    /// placement basin without randomness. The kicked candidate is kept only
+    /// when a full route-and-analysis beats the archive's best; the greedy
+    /// refinement then descends again from the new basin.
+    #[allow(clippy::too_many_lines)]
+    fn escape_placement_basin(
+        &mut self,
+        mut archive: Vec<TimingCandidate>,
+        placement_refiner: &PlacementRefiner<'_>,
+        routing_costs: &mut RoutingCosts,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
+        for _ in 0..MAX_BASIN_ESCAPE_ROUNDS {
+            let best_score = archive
+                .iter()
+                .map(|(_, timing)| timing_score(timing))
+                .max()
+                .expect("the timing archive is non-empty");
+            if archive
+                .iter()
+                .any(|(_, timing)| timing.worst_slack_ps.is_some_and(|slack| slack >= 0))
+            {
+                break;
+            }
+            let seed = archive
+                .iter()
+                .max_by_key(|(implementation, timing)| {
+                    (timing_score(timing), Reverse(implementation.total_pips))
+                })
+                .expect("the timing archive is non-empty")
+                .clone();
+            let weights = timing_placement_weights(&seed.1, self.timing_constraints);
+            let amplified = weights
+                .into_iter()
+                .map(|(sink, weight)| (sink, weight.saturating_pow(BASIN_ESCAPE_WEIGHT_EXPONENT)))
+                .collect::<BTreeMap<_, _>>();
+            let kicked = place_analytically_with_net_sink_weights(
+                self.design,
+                self.architecture.device(),
+                self.packing.constraints(),
+                &amplified,
+            )?;
+            progress(Ecp5FlowStage::TimingDrivenPlaced);
+            let routing = self.packing.global_routing_constraints_cached(
+                self.design,
+                self.architecture,
+                &kicked,
+                self.global_routing_cache,
+            )?;
+            progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
+            routing_costs
+                .set_net_criticalities(timing_net_weights(&seed.1, self.timing_constraints));
+            routing_costs.set_sink_min_delays_ps(BTreeMap::new());
+            let trial =
+                match self.route_and_analyze(kicked, &routing, Some(routing_costs), progress) {
+                    Ok(trial) => trial,
+                    Err(Ecp5FlowError::Pnr(_)) => break,
+                    Err(error) => return Err(error),
+                };
+            let improves_objective = timing_score(&trial.1) > best_score;
+            progress(Ecp5FlowStage::TimingTrialDecision { improves_objective });
+            if !improves_objective {
+                break;
+            }
+            archive.push(trial);
+            archive = select_timing_frontier(archive);
+            archive = self.refine_setup_monotonically(
+                archive,
+                placement_refiner,
+                routing_costs,
+                progress,
+            )?;
         }
         Ok(archive)
     }
@@ -1008,6 +1097,12 @@ const MAX_CRITICAL_PATH_CELLS: usize = 6;
 const MAX_CRITICAL_PATH_CELL_CANDIDATES: usize = 4;
 const MAX_CRITICAL_CLOSURE_ROUNDS: usize = 4;
 const MAX_CRITICAL_PATH_VERTEX_REFINEMENTS: usize = 4;
+// Basin-escape budget for designs that stall with negative setup slack after
+// every refinement phase. Kicks re-solve the analytical placement with the
+// incumbent's criticality weights amplified by a fixed power, which lands in a
+// different deterministic basin; no randomness or recorded seed is involved.
+const MAX_BASIN_ESCAPE_ROUNDS: usize = 2;
+const BASIN_ESCAPE_WEIGHT_EXPONENT: u32 = 4;
 // Start with cheap local legalization, then let only an internal vertex of the
 // actual worst path escape a bad placement basin.  The broad pass is still a
 // deterministic exhaustive choice over that one unit's legal BEL assignments;
