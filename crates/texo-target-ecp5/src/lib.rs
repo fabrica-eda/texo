@@ -3215,7 +3215,7 @@ mod tests {
             .pack_carry_pairs(
                 imported.design(),
                 &architecture,
-                imported.carry_pairs().iter().copied(),
+                imported.carry_pairs().iter().take(1).copied(),
             )
             .unwrap();
         assert_eq!(packing.carry_pairs(), &[pair]);
@@ -3267,14 +3267,15 @@ mod tests {
             .pack_carry_pairs(
                 imported.design(),
                 &architecture,
-                imported.carry_pairs().iter().copied(),
+                imported.carry_pairs().iter().take(2).copied(),
             )
             .unwrap();
 
-        assert_eq!(imported.carry_pairs().len(), 2);
+        assert_eq!(imported.carry_pairs().len(), 3);
         let cells = imported
             .carry_pairs()
             .iter()
+            .take(2)
             .flatten()
             .copied()
             .collect::<Vec<_>>();

@@ -343,7 +343,7 @@ impl Importer {
                 self.add_absorbable_input(cell, pin_name, bit)?;
             }
             if slice == 0 {
-                self.add_absorbable_input(cell, "FCI", *carry_in)?;
+                self.add_input(cell, "FCI", *carry_in)?;
             } else {
                 self.add_signal_input(cell, "FCI", internal_carry)?;
             }
@@ -730,6 +730,65 @@ impl Importer {
         Ok(())
     }
 
+    fn insert_carry_feedins(&mut self) -> Result<(), AdapterError> {
+        let mut feedin_sinks = [MappedSignal::Zero, MappedSignal::One]
+            .into_iter()
+            .flat_map(|signal| {
+                self.sinks
+                    .get(&signal)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|sink| self.design.pins()[sink.0].name == "FCI")
+                    .map(move |sink| (signal, sink))
+            })
+            .collect::<Vec<_>>();
+        feedin_sinks.sort_by_key(|(_, sink)| self.design.pins()[sink.0].cell.0);
+
+        for (feedin_index, (constant, original_sink)) in feedin_sinks.into_iter().enumerate() {
+            if let Some(sinks) = self.sinks.get_mut(&constant) {
+                sinks.retain(|sink| *sink != original_sink);
+            }
+            let internal_carry = self.fresh_synthetic_signal();
+            let continued_carry = self.fresh_synthetic_signal();
+            let name = format!("$carry_feedin{feedin_index}");
+
+            let first = self.add_cell(
+                format!("{name}$slice0"),
+                ResourceKind::Lut(4),
+                PrimitiveMetadata::CarrySlice {
+                    init: 0x000a,
+                    inject: false,
+                    slice: 0,
+                },
+            );
+            self.record_absorbed_input(first, "A", constant == MappedSignal::One);
+            for pin in ["B", "C", "D"] {
+                self.record_absorbed_input(first, pin, false);
+            }
+            self.add_signal_output(first, "FCO", internal_carry)?;
+
+            let second = self.add_cell(
+                format!("{name}$slice1"),
+                ResourceKind::Lut(4),
+                PrimitiveMetadata::CarrySlice {
+                    init: 0xffff,
+                    inject: true,
+                    slice: 1,
+                },
+            );
+            for pin in ["A", "B", "C", "D"] {
+                self.record_absorbed_input(second, pin, false);
+            }
+            self.add_signal_input(second, "FCI", internal_carry)?;
+            self.add_signal_output(second, "FCO", continued_carry)?;
+            self.sinks.insert(continued_carry, vec![original_sink]);
+            self.carry_pairs.push([first, second]);
+        }
+        self.sinks.retain(|_, sinks| !sinks.is_empty());
+        Ok(())
+    }
+
     fn fresh_synthetic_signal(&mut self) -> MappedSignal {
         let signal = MappedSignal::Synthetic(self.next_synthetic_signal);
         self.next_synthetic_signal += 1;
@@ -737,6 +796,7 @@ impl Importer {
     }
 
     fn finish(mut self, name: &str) -> Result<ImportedEcp5Design, AdapterError> {
+        self.insert_carry_feedins()?;
         self.insert_carry_feedouts()?;
         for (signal, sinks) in std::mem::take(&mut self.sinks) {
             let driver = if let Some(driver) = self.drivers.get(&signal) {
@@ -934,8 +994,8 @@ mod tests {
 
         let imported = import_ecp5(&map_to_ecp5(&source).unwrap()).unwrap();
 
-        assert_eq!(imported.carry_pairs().len(), 4);
-        for pair in imported.carry_pairs() {
+        assert_eq!(imported.carry_pairs().len(), 5);
+        for pair in &imported.carry_pairs()[..4] {
             for (slice, &cell) in pair.iter().enumerate() {
                 assert!(matches!(
                     imported.metadata()[&cell],
@@ -959,6 +1019,27 @@ mod tests {
             assert!(first_pins.contains(&"FCO"));
             assert!(second_pins.contains(&"FCI"));
         }
+        let feedin = imported.carry_pairs().last().unwrap();
+        assert_eq!(
+            imported.design().cells()[feedin[0].0].name,
+            "$carry_feedin0$slice0"
+        );
+        assert!(matches!(
+            imported.metadata()[&feedin[0]],
+            PrimitiveMetadata::CarrySlice {
+                init: 0x000a,
+                inject: false,
+                slice: 0,
+            }
+        ));
+        assert!(matches!(
+            imported.metadata()[&feedin[1]],
+            PrimitiveMetadata::CarrySlice {
+                init: 0xffff,
+                inject: true,
+                slice: 1,
+            }
+        ));
     }
 
     #[test]
@@ -975,7 +1056,7 @@ mod tests {
         let imported = import_ecp5(&map_to_ecp5(&source).unwrap()).unwrap();
         let feedout = imported.carry_pairs().last().unwrap();
 
-        assert_eq!(imported.carry_pairs().len(), 5);
+        assert_eq!(imported.carry_pairs().len(), 6);
         assert!(matches!(
             imported.metadata()[&feedout[0]],
             PrimitiveMetadata::CarrySlice {

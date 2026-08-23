@@ -418,6 +418,15 @@ fn finish_routing(
         routing_costs,
         progress,
     )?;
+    for route in &routes {
+        if route.pips.len().saturating_add(1) != route.wires.len() {
+            return Err(PnrError::RouteIsNotTree {
+                net: route.net,
+                wires: route.wires.len(),
+                pips: route.pips.len(),
+            });
+        }
+    }
     let total_pips = routes.iter().map(|route| route.pips.len()).sum();
     Ok(PnrResult {
         placement,
@@ -3130,6 +3139,9 @@ impl RouteSearch {
             }
 
             for &(neighbor, pip) in graph.routing_neighbors(wire).ok()? {
+                if starts.contains(&neighbor) {
+                    continue;
+                }
                 if corridor.is_some_and(|corridor| {
                     !point_inside_corridor(device.wires()[neighbor.0].point, corridor)
                 }) {
@@ -3273,12 +3285,18 @@ fn shortest_hold_path(
         }
         if wire == goal {
             if arrival_ps >= minimum_arrival_ps {
-                return Some(reconstruct_hold_path(state, &visits));
+                let path = reconstruct_hold_path(state, &visits);
+                if path.0.iter().copied().collect::<BTreeSet<_>>().len() == path.0.len() {
+                    return Some(path);
+                }
             }
             continue;
         }
 
         for &(neighbor, pip) in graph.routing_neighbors(wire).ok()? {
+            if starts.contains(&neighbor) {
+                continue;
+            }
             let congestion = congestion_cost(
                 wire_occupancy[neighbor.0],
                 device.wires()[neighbor.0].capacity,
@@ -3490,6 +3508,15 @@ pub enum PnrError {
         /// PIPs still over capacity.
         overused_pips: usize,
     },
+    /// A completed route contained a cycle or disconnected component.
+    RouteIsNotTree {
+        /// Logical net whose physical route was malformed.
+        net: NetId,
+        /// Unique wires in the route.
+        wires: usize,
+        /// Unique PIPs in the route.
+        pips: usize,
+    },
 }
 
 impl fmt::Display for PnrError {
@@ -3534,6 +3561,11 @@ impl fmt::Display for PnrError {
                 "routing congestion remains after {iterations} iterations: \
                  {overused_wires} overused wires, {overused_pips} overused PIPs"
             ),
+            Self::RouteIsNotTree { net, wires, pips } => write!(
+                f,
+                "route for net {} is not a tree: {wires} wires, {pips} PIPs",
+                net.0
+            ),
         }
     }
 }
@@ -3551,7 +3583,8 @@ impl Error for PnrError {
             | Self::InvalidPlacement { .. }
             | Self::MissingPlacement { .. }
             | Self::Unroutable { .. }
-            | Self::CongestionNotResolved { .. } => None,
+            | Self::CongestionNotResolved { .. }
+            | Self::RouteIsNotTree { .. } => None,
         }
     }
 }

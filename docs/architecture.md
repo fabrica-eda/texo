@@ -54,7 +54,12 @@ and records architecture/database provenance, verification evidence, mapped
 primitive configuration, absorbed inputs, target packing, final Cell-to-BEL
 bindings, selected speed grade, every routed Wire/PIP ID and name, and min/max
 timing checks. It is an implementation checkpoint for later configuration
-stages, not yet a bitstream.
+stages. The AXI4 release flow additionally records each net's driver wire and
+fixed/bidirectional edge attributes. `tools/axi4_bitstream.py` locks those
+placements and routes into nextpnr's packed ECP5 context, writes a Project
+Trellis configuration, invokes `ecppack`, and verifies an
+`ecpunpack`/`ecppack` byte-identical round trip. nextpnr does not place or route
+in this path.
 
 ## Boundaries
 

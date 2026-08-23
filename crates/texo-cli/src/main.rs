@@ -1,5 +1,6 @@
 //! Texo command-line entry point.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fs::File;
@@ -8,12 +9,13 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use celox::SimulatorBuilder;
 use serde_json::{Value, json};
 use struo_celox::ecp5_simulator;
-use struo_example_axi4_smartconnect::axi4_crossbar_self_test;
+use struo_example_axi4_smartconnect::{AXI4_CROSSBAR_SOURCE, axi4_crossbar_self_test};
 use struo_ir::Netlist;
 use struo_synth::synthesize;
-use struo_target_ecp5::map_to_ecp5;
+use struo_target_ecp5::{Ecp5Cell, Ecp5Netlist, map_to_ecp5};
 use texo_flow::{
     Ecp5FlowOptions, Ecp5FlowResult, Ecp5FlowStage, Evidence, Gate, RoutingProgress, implement,
     implement_struo_ecp5_with_progress, verify_post_map_with_celox,
@@ -163,13 +165,93 @@ fn axi4_json(path: &str) -> Result<(), Box<dyn Error>> {
     let synthesized = synthesize(&rtl)?;
     let mapped = map_to_ecp5(&synthesized.netlist)?;
     let mut output = BufWriter::new(File::create(path)?);
-    output.write_all(mapped.to_nextpnr_json()?.as_bytes())?;
+    output.write_all(lossless_nextpnr_json(&mapped)?.as_bytes())?;
     output.flush()?;
     println!(
         "nextpnr JSON: {path} ({} mapped cells)",
         mapped.cells().len()
     );
     Ok(())
+}
+
+fn lossless_nextpnr_json(mapped: &Ecp5Netlist) -> Result<String, Box<dyn Error>> {
+    let mut document: Value = serde_json::from_str(&mapped.to_nextpnr_json()?)?;
+    let mut totals = BTreeMap::<&str, usize>::new();
+    for cell in mapped.cells() {
+        *totals.entry(ecp5_cell_name(cell)).or_default() += 1;
+    }
+
+    let module = document["modules"]
+        .get_mut(mapped.name())
+        .and_then(Value::as_object_mut)
+        .ok_or("Struo nextpnr JSON omitted its top module")?;
+    let cells = module
+        .get_mut("cells")
+        .and_then(Value::as_object_mut)
+        .ok_or("Struo nextpnr JSON omitted its cell map")?;
+    let mut occurrences = BTreeMap::<&str, usize>::new();
+    for cell in mapped.cells() {
+        let name = ecp5_cell_name(cell);
+        let total = totals[name];
+        let occurrence = occurrences.entry(name).or_default();
+        if total > 1 && *occurrence + 1 < total {
+            let unique_name = format!("{name}$texo_duplicate{occurrence}");
+            if cells
+                .insert(unique_name.clone(), duplicate_nextpnr_cell(cell)?)
+                .is_some()
+            {
+                return Err(format!("duplicate repair name `{unique_name}` already exists").into());
+            }
+        }
+        *occurrence += 1;
+    }
+    if cells.len() != mapped.cells().len() {
+        return Err(format!(
+            "lossless nextpnr export contains {} cells, expected {}",
+            cells.len(),
+            mapped.cells().len()
+        )
+        .into());
+    }
+    Ok(serde_json::to_string_pretty(&document)?)
+}
+
+fn duplicate_nextpnr_cell(cell: &Ecp5Cell) -> Result<Value, Box<dyn Error>> {
+    let Ecp5Cell::Lut4 {
+        inputs,
+        output,
+        init,
+        ..
+    } = cell
+    else {
+        return Err(format!(
+            "lossless nextpnr export does not yet support duplicate non-LUT cell `{}`",
+            ecp5_cell_name(cell)
+        )
+        .into());
+    };
+    Ok(json!({
+        "hide_name": 0,
+        "type": "LUT4",
+        "parameters": { "INIT": format!("{init:016b}") },
+        "attributes": {},
+        "port_directions": {
+            "A": "input", "B": "input", "C": "input", "D": "input", "Z": "output"
+        },
+        "connections": {
+            "A": [inputs[0]], "B": [inputs[1]], "C": [inputs[2]], "D": [inputs[3]],
+            "Z": [output]
+        }
+    }))
+}
+
+fn ecp5_cell_name(cell: &Ecp5Cell) -> &str {
+    match cell {
+        Ecp5Cell::Lut4 { name, .. }
+        | Ecp5Cell::Ccu2c { name, .. }
+        | Ecp5Cell::FlipFlop { name, .. }
+        | Ecp5Cell::BlockRam { name, .. } => name,
+    }
 }
 
 fn lpf_info(path: &str) -> Result<(), Box<dyn Error>> {
@@ -358,8 +440,16 @@ fn axi4_pnr(
     checkpoint_path: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let rtl = axi4_crossbar_self_test()?;
+    let mut evidence = Evidence::new();
+    verify_axi4_rtl(&mut evidence)?;
+
     let synthesized = synthesize(&rtl)?;
     let mapped = map_to_ecp5(&synthesized.netlist)?;
+    if !mapped.retiming().equivalence_signed_off {
+        return Err("Struo mapping/retiming equivalence sign-off failed".into());
+    }
+    evidence.record(Gate::SynthesisEquivalence);
+    println!("Struo synthesis/mapping equivalence sign-off: passed");
     let imported = import_ecp5(&mapped)?;
     println!(
         "Struo AXI4 self-test: {} Boolean nodes, {} registers, {} mapped cells",
@@ -368,7 +458,6 @@ fn axi4_pnr(
         mapped.cells().len()
     );
 
-    let mut evidence = Evidence::new();
     verify_post_map_with_celox(&mut evidence, || -> Result<(), Box<dyn Error>> {
         let mut simulator = ecp5_simulator(&mapped)?.build_native()?;
         let clock = simulator.event("clk");
@@ -438,6 +527,31 @@ fn axi4_pnr(
         serde_json::to_writer_pretty(File::create(path)?, &checkpoint)?;
         println!("checkpoint: {path}");
     }
+    Ok(())
+}
+
+fn verify_axi4_rtl(evidence: &mut Evidence) -> Result<(), Box<dyn Error>> {
+    let mut rtl_simulator =
+        SimulatorBuilder::new(AXI4_CROSSBAR_SOURCE, "Axi4CrossbarSelfTest").build_native()?;
+    let rtl_clock = rtl_simulator.event("clk");
+    let rtl_reset = rtl_simulator.signal("rst_n");
+    let rtl_passed = rtl_simulator.signal("passed");
+    let rtl_failed = rtl_simulator.signal("failed");
+    rtl_simulator.modify(|io| io.set(rtl_reset, 0_u8))?;
+    rtl_simulator.tick(rtl_clock)?;
+    rtl_simulator.modify(|io| io.set(rtl_reset, 1_u8))?;
+    for _ in 0..24 {
+        if rtl_simulator.get(rtl_passed) == 1_u8.into() {
+            break;
+        }
+        rtl_simulator.tick(rtl_clock)?;
+    }
+    if rtl_simulator.get(rtl_passed) != 1_u8.into() || rtl_simulator.get(rtl_failed) != 0_u8.into()
+    {
+        return Err("Celox RTL AXI4 self-test did not pass".into());
+    }
+    evidence.record(Gate::RtlSimulation);
+    println!("Celox RTL AXI4 self-test: passed");
     Ok(())
 }
 
@@ -658,6 +772,26 @@ fn checkpoint_routes(result: &Ecp5FlowResult, architecture: &Ecp5Architecture) -
         .routes
         .iter()
         .map(|route| {
+            let net = &result.design.nets()[route.net.0];
+            let driver_pin = &result.design.pins()[net.driver.0];
+            let driver_bel = result.implementation.placement.bindings()[driver_pin.cell.0];
+            let driver_bel_pin = result
+                .implementation
+                .placement
+                .pin_binding(net.driver)
+                .or_else(|| {
+                    device.bels()[driver_bel.0]
+                        .pins()
+                        .iter()
+                        .copied()
+                        .find(|bel_pin| {
+                            let physical = &device.bel_pins()[bel_pin.0];
+                            physical.name == driver_pin.name
+                                && physical.direction == driver_pin.direction
+                        })
+                })
+                .expect("a routed net driver has a physical BEL pin");
+            let driver_wire = device.bel_pins()[driver_bel_pin.0].wire;
             let wires = route
                 .wires
                 .iter()
@@ -674,12 +808,16 @@ fn checkpoint_routes(result: &Ecp5FlowResult, architecture: &Ecp5Architecture) -
                         "from": device.wires()[pip.from.0].name,
                         "to_wire_id": pip.to.0,
                         "to": device.wires()[pip.to.0].name,
+                        "bidirectional": pip.bidirectional,
+                        "fixed": architecture.pip_metadata(*pip_id).fixed,
                     })
                 })
                 .collect::<Vec<_>>();
             json!({
                 "net_id": route.net.0,
-                "net": result.design.nets()[route.net.0].name,
+                "net": net.name,
+                "driver_wire_id": driver_wire.0,
+                "driver_wire": device.wires()[driver_wire.0].name,
                 "wires": wires,
                 "pips": pips,
             })
@@ -1004,11 +1142,15 @@ fn demo() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
 
     use serde_json::Value;
+    use struo_example_axi4_smartconnect::axi4_crossbar_self_test;
+    use struo_synth::synthesize;
+    use struo_target_ecp5::map_to_ecp5;
 
-    use super::ecp5_demo;
+    use super::{ecp5_cell_name, ecp5_demo, lossless_nextpnr_json};
 
     const ARCHITECTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1066,5 +1208,26 @@ mod tests {
 
         fs::remove_file(first).unwrap();
         fs::remove_file(second).unwrap();
+    }
+
+    #[test]
+    fn axi4_nextpnr_export_preserves_duplicate_named_cells() {
+        let rtl = axi4_crossbar_self_test().unwrap();
+        let synthesized = synthesize(&rtl).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let unique_names = mapped
+            .cells()
+            .iter()
+            .map(ecp5_cell_name)
+            .collect::<BTreeSet<_>>();
+        assert!(unique_names.len() < mapped.cells().len());
+
+        let document: Value =
+            serde_json::from_str(&lossless_nextpnr_json(&mapped).unwrap()).unwrap();
+        let cells = document["modules"][mapped.name()]["cells"]
+            .as_object()
+            .unwrap();
+        assert_eq!(cells.len(), mapped.cells().len());
+        assert!(cells.keys().any(|name| name.contains("$texo_duplicate")));
     }
 }

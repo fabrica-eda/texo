@@ -10,6 +10,7 @@ name = "texo"
 path = "src/main.rs"
 
 [dependencies]
+celox.workspace = true
 serde_json.workspace = true
 struo-celox.workspace = true
 struo-example-axi4-smartconnect.workspace = true

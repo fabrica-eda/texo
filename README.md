@@ -71,5 +71,34 @@ contains provenance, evidence, primitive configuration, absorbed constants,
 packing decisions, IO/clock constraints, placement, Wire/PIP routes, and the
 post-route timing report.
 
+The AXI4 self-test has a gated path from Struo through a Texo-owned placement
+and route to an ECP5 bitstream. Cache a production architecture snapshot, export
+the lossless mapped netlist, run PnR, and emit the bitstream as follows:
+
+```sh
+cargo run --release -- cache-architecture \
+  artifacts/LFE5UM5G-85F.json artifacts/LFE5UM5G-85F.txdb
+cargo run --release -- axi4-json artifacts/axi4.json
+cargo run --release -- axi4-pnr \
+  artifacts/LFE5UM5G-85F.txdb CABGA381 8 \
+  examples/axi4-self-test/lfe5um5g-85f-evn-250mhz.lpf \
+  artifacts/axi4.checkpoint.json
+tools/axi4_bitstream.py \
+  --checkpoint artifacts/axi4.checkpoint.json \
+  --mapped-json artifacts/axi4.json \
+  --lpf examples/axi4-self-test/lfe5um5g-85f-evn-250mhz.lpf \
+  --config artifacts/axi4.config \
+  --bit artifacts/axi4.bit
+```
+
+`axi4_bitstream.py` uses nextpnr only for ECP5 packing and configuration
+writing: it locks every Texo placement and route edge and does not invoke the
+nextpnr placer or router. It refuses checkpoints without all six functional,
+physical, and timing evidence gates, without nonnegative setup and hold slack,
+or with a route that is not a tree. It then requires every checkpoint edge to
+be represented in the configuration and byte-compares an `ecpunpack`/`ecppack`
+round trip. The command requires `nextpnr-ecp5`, `ecppack`, and `ecpunpack` on
+`PATH`.
+
 See [docs/architecture.md](docs/architecture.md) for the integration boundary
 and [docs/roadmap.md](docs/roadmap.md) for the implementation sequence.
