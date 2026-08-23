@@ -185,6 +185,23 @@ router2's per-round real-delay feedback; those act on an already-good
 placement instead of replacing its seed. Any further work should target that
 layer, not the analytical solve.
 
+### Experiment 8 (detail-layer turnover): negative, reverted
+
+Tried exactly that detail layer: rank each cell's vertex proposals by the
+criticality-weighted geometric estimate and route only the top-N (N=2/3,
+candidates widened 4→8), plus first-improvement early exit in local-
+connection refinement. Result: WNS −293 ps (−16 ps vs baseline), runtime
+roughly unchanged under load; disabling either half still gave −293. The
+geometric estimate does not reliably identify which proposal wins after full
+routing — consistent with every other estimate-based result on this design.
+The committed 25%-margin prescreen remains the right amount of estimation:
+it only removes clearly-hopeless trials and never reorders or substitutes.
+
+Conclusion for future sessions: on the AXI4 self-test, estimates can veto but
+not rank. A real turnover gain needs a faster *routed* trial (router-level
+work: bounded search for criticality-1 nets, targeted ripup), not smarter
+pre-route scoring.
+
 ## Failed experiments (patches kept, not merged)
 
 - Bound2bound reweighting alone: `/tmp/opencode/b2b-experiment.patch`
