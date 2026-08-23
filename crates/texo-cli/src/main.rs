@@ -426,6 +426,7 @@ fn axi4_pnr(
             }
         );
     }
+    report_critical_setup_edges(&result, imported.design(), architecture.device());
     if let Some(path) = checkpoint_path {
         let checkpoint = ecp5_checkpoint(
             "axi4-crossbar-self-test",
@@ -440,14 +441,72 @@ fn axi4_pnr(
     Ok(())
 }
 
+fn report_critical_setup_edges(result: &Ecp5FlowResult, design: &Design, device: &Device) {
+    let Some(worst_slack_ps) = result.timing.worst_slack_ps else {
+        return;
+    };
+    for edge in result
+        .timing
+        .net_setup_slacks
+        .iter()
+        .filter(|edge| edge.slack_ps == worst_slack_ps)
+    {
+        let net = &design.nets()[edge.net.0];
+        let driver_pin = &design.pins()[net.driver.0];
+        let sink_pin = &design.pins()[edge.sink.0];
+        let driver_cell = &design.cells()[driver_pin.cell.0];
+        let sink_cell = &design.cells()[sink_pin.cell.0];
+        let driver_bel = result.implementation.placement.bindings()[driver_pin.cell.0];
+        let sink_bel = result.implementation.placement.bindings()[sink_pin.cell.0];
+        let delay_ps = result
+            .timing
+            .net_delays
+            .iter()
+            .find(|delay| delay.net == edge.net && delay.sink == edge.sink)
+            .map_or(0, |delay| delay.delay.max_ps);
+        println!(
+            "critical setup edge: net {} {}.{} @ {} -> {}.{} @ {}, delay {delay_ps} ps",
+            net.name,
+            driver_cell.name,
+            driver_pin.name,
+            device.bels()[driver_bel.0].name,
+            sink_cell.name,
+            sink_pin.name,
+            device.bels()[sink_bel.0].name,
+        );
+    }
+}
+
 fn report_flow_stage(stage: Ecp5FlowStage, started: &mut Instant) {
+    if let Ecp5FlowStage::CriticalPathMove { cell, from, to } = stage {
+        println!(
+            "critical-path placement trial: cell {}, BEL {} -> {}",
+            cell.0, from.0, to.0
+        );
+        return;
+    }
+    if let Ecp5FlowStage::TimingTrialDecision { improves_objective } = stage {
+        println!(
+            "timing trial: {}",
+            if improves_objective {
+                "improves incumbent"
+            } else {
+                "rejected"
+            }
+        );
+        return;
+    }
     if let Ecp5FlowStage::TimingSnapshot {
         worst_setup_ps,
+        setup_tns_ps,
+        setup_violations,
         worst_hold_ps,
+        hold_ths_ps,
+        hold_violations,
     } = stage
     {
         println!(
-            "timing candidate: setup {} ps, hold {} ps",
+            "timing trial: WNS {} ps, TNS {setup_tns_ps} ps ({setup_violations} violations), WHS {} ps, THS {hold_ths_ps} ps ({hold_violations} violations)",
             worst_setup_ps.map_or_else(|| "n/a".into(), |value| value.to_string()),
             worst_hold_ps.map_or_else(|| "n/a".into(), |value| value.to_string()),
         );
@@ -487,6 +546,9 @@ fn report_flow_stage(stage: Ecp5FlowStage, started: &mut Instant) {
         Ecp5FlowStage::Routing(_) => unreachable!("routing progress returned above"),
         Ecp5FlowStage::Routed => "negotiated routing",
         Ecp5FlowStage::TimingDrivenPlaced => "timing-driven placement",
+        Ecp5FlowStage::CriticalPathMove { .. } => {
+            unreachable!("critical-path move returned above")
+        }
         Ecp5FlowStage::TimingDrivenGlobalClocksRouted => "timing-driven global clock routing",
         Ecp5FlowStage::TimingDrivenRouting(_) => {
             unreachable!("routing progress returned above")
@@ -494,6 +556,9 @@ fn report_flow_stage(stage: Ecp5FlowStage, started: &mut Instant) {
         Ecp5FlowStage::TimingDrivenRouted => "timing-driven negotiated routing",
         Ecp5FlowStage::TimingSnapshot { .. } => {
             unreachable!("timing snapshot returned above")
+        }
+        Ecp5FlowStage::TimingTrialDecision { .. } => {
+            unreachable!("timing decision returned above")
         }
         Ecp5FlowStage::Timed => "timing analysis",
     };

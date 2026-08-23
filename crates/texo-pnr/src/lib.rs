@@ -53,6 +53,8 @@ pub struct RoutingCosts {
     pip_min_delays_ps: Vec<u32>,
     net_criticalities: BTreeMap<NetId, u64>,
     sink_min_delays_ps: BTreeMap<(NetId, CellPinId), u64>,
+    detailed_timing_nets: BTreeSet<NetId>,
+    detailed_delay_quantum_ps: u64,
 }
 
 impl RoutingCosts {
@@ -64,6 +66,8 @@ impl RoutingCosts {
             pip_delays_ps,
             net_criticalities,
             sink_min_delays_ps: BTreeMap::new(),
+            detailed_timing_nets: BTreeSet::new(),
+            detailed_delay_quantum_ps: 1,
         }
     }
 
@@ -107,6 +111,22 @@ impl RoutingCosts {
     #[must_use]
     pub const fn sink_min_delays_ps(&self) -> &BTreeMap<(NetId, CellPinId), u64> {
         &self.sink_min_delays_ps
+    }
+
+    /// Replaces the nets routed with exact picosecond delay resolution.
+    pub fn set_detailed_timing_nets(&mut self, detailed_timing_nets: BTreeSet<NetId>) {
+        self.detailed_timing_nets = detailed_timing_nets;
+    }
+
+    /// Nets routed with exact picosecond delay resolution.
+    #[must_use]
+    pub const fn detailed_timing_nets(&self) -> &BTreeSet<NetId> {
+        &self.detailed_timing_nets
+    }
+
+    /// Sets the positive delay quantum used only for detailed timing nets.
+    pub fn set_detailed_delay_quantum_ps(&mut self, detailed_delay_quantum_ps: u64) {
+        self.detailed_delay_quantum_ps = detailed_delay_quantum_ps;
     }
 }
 
@@ -640,6 +660,495 @@ impl<'a> PlacementRefiner<'a> {
         );
         finish_placement(&self.graph, self.constraints, placed)
     }
+
+    /// Moves one endpoint placement unit to an unoccupied nearby assignment
+    /// only when the characterized unloaded connection gets shorter.
+    ///
+    /// This is a deterministic detailed-placement primitive. The caller must
+    /// reroute and run STA before accepting the proposal because congestion
+    /// and other connections of the moved unit are deliberately excluded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the starting placement or timing table is invalid.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an internally validated placement-unit table is
+    /// inconsistent with the design.
+    #[allow(clippy::too_many_lines)]
+    pub fn refine_connection_delay(
+        &self,
+        placement: Placement,
+        driver_pin: CellPinId,
+        sink_pin: CellPinId,
+        move_driver: bool,
+        pip_delays_ps: &[u32],
+        max_move_distance: u64,
+    ) -> Result<Option<Placement>, PnrError> {
+        if pip_delays_ps.len() != self.graph.device().pips().len() {
+            return Err(PnrError::InvalidRoutingCosts {
+                reason: format!(
+                    "expected {} PIP delays, received {}",
+                    self.graph.device().pips().len(),
+                    pip_delays_ps.len()
+                ),
+            });
+        }
+        let design = self.graph.design();
+        let device = self.graph.device();
+        let driver_cell = design
+            .pins()
+            .get(driver_pin.0)
+            .ok_or_else(|| PnrError::InvalidPlacement {
+                reason: format!("connection driver pin {} does not exist", driver_pin.0),
+            })?
+            .cell;
+        let sink_cell = design
+            .pins()
+            .get(sink_pin.0)
+            .ok_or_else(|| PnrError::InvalidPlacement {
+                reason: format!("connection sink pin {} does not exist", sink_pin.0),
+            })?
+            .cell;
+        let (moving_cell, moving_pin, fixed_cell, fixed_pin) = if move_driver {
+            (driver_cell, driver_pin, sink_cell, sink_pin)
+        } else {
+            (sink_cell, sink_pin, driver_cell, driver_pin)
+        };
+        let Some(unit) = self
+            .units
+            .iter()
+            .find(|unit| unit.cells.contains(&moving_cell))
+        else {
+            return Ok(None);
+        };
+        if unit.cells.contains(&fixed_cell) || unit.choices.len() <= 1 {
+            return Ok(None);
+        }
+        let mut placed = validate_refinement_start(&self.graph, &self.units, placement)?;
+        let current = unit
+            .cells
+            .iter()
+            .map(|cell| placed[cell.0].expect("validated placement is complete"))
+            .collect::<Vec<_>>();
+        let moving_column = unit
+            .cells
+            .iter()
+            .position(|&cell| cell == moving_cell)
+            .expect("the selected unit contains its moving endpoint");
+        let fixed_bel = placed[fixed_cell.0].expect("validated placement is complete");
+        let fixed_wire = candidate_pin_wire(&self.graph, self.constraints, fixed_pin, fixed_bel)
+            .ok_or_else(|| PnrError::InvalidPlacement {
+                reason: format!("fixed pin {} has no physical wire", fixed_pin.0),
+            })?;
+        let current_moving_wire = candidate_pin_wire(
+            &self.graph,
+            self.constraints,
+            moving_pin,
+            current[moving_column],
+        )
+        .ok_or_else(|| PnrError::InvalidPlacement {
+            reason: format!("moving pin {} has no physical wire", moving_pin.0),
+        })?;
+        let (current_start, current_goal) = if move_driver {
+            (current_moving_wire, fixed_wire)
+        } else {
+            (fixed_wire, current_moving_wire)
+        };
+        let Some(current_delay) =
+            local_connection_delay(&self.graph, current_start, current_goal, pip_delays_ps)
+        else {
+            return Ok(None);
+        };
+
+        let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
+        let mut pin_usage = HashMap::new();
+        for known in &self.units {
+            let assignment = known
+                .cells
+                .iter()
+                .map(|cell| placed[cell.0].expect("validated placement is complete"))
+                .collect::<Vec<_>>();
+            update_pin_usage(
+                &self.graph,
+                self.constraints,
+                &known.cells,
+                &assignment,
+                &mut pin_usage,
+                true,
+            );
+        }
+        for &bel in &current {
+            occupied.remove(&bel);
+        }
+        for &cell in &unit.cells {
+            placed[cell.0] = None;
+        }
+        update_pin_usage(
+            &self.graph,
+            self.constraints,
+            &unit.cells,
+            &current,
+            &mut pin_usage,
+            false,
+        );
+        let current_point = device.bels()[current[moving_column].0].point;
+        let mut best: Option<(u64, Vec<BelId>)> = None;
+        for choice in 0..unit.choices.len() {
+            let assignment = unit.choices.assignment(choice);
+            if assignment == current
+                || assignment.iter().any(|bel| occupied.contains(bel))
+                || device.bels()[assignment[moving_column].0]
+                    .point
+                    .manhattan(current_point)
+                    > max_move_distance
+                || !assignment_pin_wires_are_legal(
+                    &self.graph,
+                    self.constraints,
+                    &unit.cells,
+                    assignment,
+                    &pin_usage,
+                )
+            {
+                continue;
+            }
+            let Some(moving_wire) = candidate_pin_wire(
+                &self.graph,
+                self.constraints,
+                moving_pin,
+                assignment[moving_column],
+            ) else {
+                continue;
+            };
+            let (start, goal) = if move_driver {
+                (moving_wire, fixed_wire)
+            } else {
+                (fixed_wire, moving_wire)
+            };
+            let Some(delay) = local_connection_delay(&self.graph, start, goal, pip_delays_ps)
+            else {
+                continue;
+            };
+            if delay < current_delay
+                && best.as_ref().is_none_or(|(best_delay, best_assignment)| {
+                    (delay, assignment) < (*best_delay, best_assignment.as_slice())
+                })
+            {
+                best = Some((delay, assignment.to_vec()));
+            }
+        }
+        let Some((_, selected)) = best else {
+            return Ok(None);
+        };
+        for (&cell, &bel) in unit.cells.iter().zip(&selected) {
+            placed[cell.0] = Some(bel);
+        }
+        Ok(Some(finish_placement(
+            &self.graph,
+            self.constraints,
+            placed,
+        )?))
+    }
+
+    /// Proposes placements for one cell's unit that reduce incident connection
+    /// delay locally or physical path span during a broad critical-path move.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the starting placement or timing table is invalid.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an internally validated placement-unit table is
+    /// inconsistent with the design.
+    #[allow(clippy::too_many_lines)]
+    pub fn refine_cell_connection_delays(
+        &self,
+        placement: Placement,
+        moving_cell: CellId,
+        connections: &[(CellPinId, CellPinId)],
+        pip_delays_ps: &[u32],
+        max_move_distance: u64,
+        max_candidates: usize,
+    ) -> Result<Vec<Placement>, PnrError> {
+        if pip_delays_ps.len() != self.graph.device().pips().len() {
+            return Err(PnrError::InvalidRoutingCosts {
+                reason: format!(
+                    "expected {} PIP delays, received {}",
+                    self.graph.device().pips().len(),
+                    pip_delays_ps.len()
+                ),
+            });
+        }
+        let device = self.graph.device();
+        let Some(unit) = self
+            .units
+            .iter()
+            .find(|unit| unit.cells.contains(&moving_cell))
+        else {
+            return Ok(Vec::new());
+        };
+        if unit.choices.len() <= 1 || connections.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placed = validate_refinement_start(&self.graph, &self.units, placement)?;
+        let current = unit
+            .cells
+            .iter()
+            .map(|cell| placed[cell.0].expect("validated placement is complete"))
+            .collect::<Vec<_>>();
+        let moving_column = unit
+            .cells
+            .iter()
+            .position(|&cell| cell == moving_cell)
+            .expect("the selected unit contains its moving cell");
+        let broad_path_move = max_move_distance > 2;
+        let current_delay = if broad_path_move {
+            None
+        } else {
+            assignment_connection_delay(
+                &self.graph,
+                self.constraints,
+                unit,
+                &current,
+                moving_cell,
+                connections,
+                &placed,
+                pip_delays_ps,
+            )
+        };
+        let Some(current_span) = assignment_connection_span(
+            &self.graph,
+            unit,
+            &current,
+            moving_cell,
+            connections,
+            &placed,
+        ) else {
+            return Ok(Vec::new());
+        };
+        if !broad_path_move && current_delay.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
+        let mut pin_usage = HashMap::new();
+        for known in &self.units {
+            let assignment = known
+                .cells
+                .iter()
+                .map(|cell| placed[cell.0].expect("validated placement is complete"))
+                .collect::<Vec<_>>();
+            update_pin_usage(
+                &self.graph,
+                self.constraints,
+                &known.cells,
+                &assignment,
+                &mut pin_usage,
+                true,
+            );
+        }
+        for &bel in &current {
+            occupied.remove(&bel);
+        }
+        update_pin_usage(
+            &self.graph,
+            self.constraints,
+            &unit.cells,
+            &current,
+            &mut pin_usage,
+            false,
+        );
+        let current_point = device.bels()[current[moving_column].0].point;
+        let mut best = Vec::<(u64, u64, Vec<BelId>)>::new();
+        for choice in 0..unit.choices.len() {
+            let assignment = unit.choices.assignment(choice);
+            if assignment == current
+                || assignment.iter().any(|bel| occupied.contains(bel))
+                || device.bels()[assignment[moving_column].0]
+                    .point
+                    .manhattan(current_point)
+                    > max_move_distance
+                || !assignment_pin_wires_are_legal(
+                    &self.graph,
+                    self.constraints,
+                    &unit.cells,
+                    assignment,
+                    &pin_usage,
+                )
+            {
+                continue;
+            }
+            let Some(span) = assignment_connection_span(
+                &self.graph,
+                unit,
+                assignment,
+                moving_cell,
+                connections,
+                &placed,
+            ) else {
+                continue;
+            };
+            let score = if broad_path_move {
+                if span >= current_span {
+                    continue;
+                }
+                (span, 0)
+            } else {
+                let Some(delay) = assignment_connection_delay(
+                    &self.graph,
+                    self.constraints,
+                    unit,
+                    assignment,
+                    moving_cell,
+                    connections,
+                    &placed,
+                    pip_delays_ps,
+                ) else {
+                    continue;
+                };
+                let current_delay = current_delay.expect("local moves require a current delay");
+                if delay >= current_delay {
+                    continue;
+                }
+                (delay, span)
+            };
+            best.push((score.0, score.1, assignment.to_vec()));
+        }
+        best.sort_unstable_by(|left, right| {
+            (left.0, left.1, left.2.as_slice()).cmp(&(right.0, right.1, right.2.as_slice()))
+        });
+        best.dedup_by(|left, right| left.2 == right.2);
+        best.truncate(max_candidates.max(1));
+        let mut proposals = Vec::with_capacity(best.len());
+        for (_, _, selected) in best {
+            let mut proposed = placed.clone();
+            for (&cell, &bel) in unit.cells.iter().zip(&selected) {
+                proposed[cell.0] = Some(bel);
+            }
+            proposals.push(finish_placement(&self.graph, self.constraints, proposed)?);
+        }
+        Ok(proposals)
+    }
+}
+
+fn assignment_connection_span(
+    graph: &UnifiedGraph<'_>,
+    unit: &PlacementUnit,
+    assignment: &[BelId],
+    moving_cell: CellId,
+    connections: &[(CellPinId, CellPinId)],
+    placed: &[Option<BelId>],
+) -> Option<u64> {
+    let design = graph.design();
+    let device = graph.device();
+    let mut span = 0_u64;
+    for &(driver_pin, sink_pin) in connections {
+        let driver_cell = design.pins().get(driver_pin.0)?.cell;
+        let sink_cell = design.pins().get(sink_pin.0)?.cell;
+        if driver_cell != moving_cell && sink_cell != moving_cell {
+            return None;
+        }
+        let driver_bel = assignment_bel(unit, assignment, driver_cell, placed)?;
+        let sink_bel = assignment_bel(unit, assignment, sink_cell, placed)?;
+        let driver_point = device.bels().get(driver_bel.0)?.point;
+        let sink_point = device.bels().get(sink_bel.0)?.point;
+        span = span.saturating_add(driver_point.manhattan(sink_point));
+    }
+    Some(span)
+}
+
+fn assignment_bel(
+    unit: &PlacementUnit,
+    assignment: &[BelId],
+    cell: CellId,
+    placed: &[Option<BelId>],
+) -> Option<BelId> {
+    unit.cells
+        .iter()
+        .position(|&member| member == cell)
+        .map_or_else(
+            || placed.get(cell.0).copied().flatten(),
+            |column| assignment.get(column).copied(),
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assignment_connection_delay(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    unit: &PlacementUnit,
+    assignment: &[BelId],
+    moving_cell: CellId,
+    connections: &[(CellPinId, CellPinId)],
+    placed: &[Option<BelId>],
+    pip_delays_ps: &[u32],
+) -> Option<u64> {
+    let design = graph.design();
+    let mut total = 0_u64;
+    for &(driver_pin, sink_pin) in connections {
+        let driver_cell = design.pins().get(driver_pin.0)?.cell;
+        let sink_cell = design.pins().get(sink_pin.0)?.cell;
+        if driver_cell != moving_cell && sink_cell != moving_cell {
+            return None;
+        }
+        let driver_bel = assignment_bel(unit, assignment, driver_cell, placed)?;
+        let sink_bel = assignment_bel(unit, assignment, sink_cell, placed)?;
+        let driver_wire = candidate_pin_wire(graph, constraints, driver_pin, driver_bel)?;
+        let sink_wire = candidate_pin_wire(graph, constraints, sink_pin, sink_bel)?;
+        total = total.saturating_add(local_connection_delay(
+            graph,
+            driver_wire,
+            sink_wire,
+            pip_delays_ps,
+        )?);
+    }
+    Some(total)
+}
+
+fn local_connection_delay(
+    graph: &UnifiedGraph<'_>,
+    start: WireId,
+    goal: WireId,
+    pip_delays_ps: &[u32],
+) -> Option<u64> {
+    // Long-line entry/exit PIPs can put even a modest tile displacement over
+    // eight graph edges.  A too-small bound made a badly displaced critical
+    // vertex impossible to score, so the detailed placer could never move it
+    // back toward its path.  The one-tile corridor keeps this search local.
+    const MAX_LOCAL_HOPS: u8 = 16;
+    const LOCAL_MARGIN: u32 = 1;
+    let device = graph.device();
+    let corridor = routing_corridor(
+        device.wires()[start.0].point,
+        device.wires()[goal.0].point,
+        device,
+        LOCAL_MARGIN,
+    );
+    let mut queue = BinaryHeap::from([Reverse((0_u64, 0_u8, start))]);
+    let mut best = HashMap::from([((start, 0_u8), 0_u64)]);
+    while let Some(Reverse((delay, hops, wire))) = queue.pop() {
+        if wire == goal {
+            return Some(delay);
+        }
+        if hops == MAX_LOCAL_HOPS || best.get(&(wire, hops)).is_some_and(|known| *known < delay) {
+            continue;
+        }
+        for &(neighbor, pip) in graph.routing_neighbors(wire).ok()? {
+            if !point_inside_corridor(device.wires()[neighbor.0].point, corridor) {
+                continue;
+            }
+            let next_hops = hops + 1;
+            let next_delay = delay.saturating_add(u64::from(pip_delays_ps[pip.0]));
+            let key = (neighbor, next_hops);
+            if best.get(&key).is_none_or(|known| next_delay < *known) {
+                best.insert(key, next_delay);
+                queue.push(Reverse((next_delay, next_hops, neighbor)));
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -2123,6 +2632,23 @@ fn validate_routing_costs(
             });
         }
     }
+    for &net in &costs.detailed_timing_nets {
+        if net.0 >= graph.design().nets().len() {
+            return Err(PnrError::InvalidRoutingCosts {
+                reason: format!("detailed timing names unknown net {}", net.0),
+            });
+        }
+    }
+    if costs.detailed_delay_quantum_ps == 0
+        || costs.detailed_delay_quantum_ps > ROUTING_DELAY_QUANTUM_PS
+    {
+        return Err(PnrError::InvalidRoutingCosts {
+            reason: format!(
+                "detailed delay quantum {} ps is outside 1..={ROUTING_DELAY_QUANTUM_PS}",
+                costs.detailed_delay_quantum_ps
+            ),
+        });
+    }
     for (&(net, sink), &minimum_ps) in &costs.sink_min_delays_ps {
         let Some(net_data) = graph.design().nets().get(net.0) else {
             return Err(PnrError::InvalidRoutingCosts {
@@ -2292,7 +2818,7 @@ fn congested_routes(
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn route_net(
     graph: &UnifiedGraph<'_>,
     placement: &Placement,
@@ -2320,6 +2846,13 @@ fn route_net(
     let mut tree_pips =
         fixed.map_or_else(BTreeSet::new, |route| route.pips.iter().copied().collect());
     let criticality = routing_criticality(costs, net_id);
+    let delay_quantum_ps = costs.map_or(ROUTING_DELAY_QUANTUM_PS, |costs| {
+        if costs.detailed_timing_nets.contains(&net_id) {
+            costs.detailed_delay_quantum_ps
+        } else {
+            ROUTING_DELAY_QUANTUM_PS
+        }
+    });
     let mut tree_delays_ps = tree_wires
         .iter()
         .copied()
@@ -2365,6 +2898,7 @@ fn route_net(
                 present_factor,
                 costs,
                 criticality,
+                delay_quantum_ps,
                 &tree_delays_ps,
                 minimum_arrival_ps,
             )
@@ -2524,6 +3058,7 @@ impl RouteSearch {
         present_factor: u32,
         costs: Option<&RoutingCosts>,
         criticality: u64,
+        delay_quantum_ps: u64,
         tree_delays_ps: &BTreeMap<WireId, u64>,
         minimum_arrival_ps: u64,
     ) -> Option<(Vec<WireId>, Vec<PipId>)> {
@@ -2562,7 +3097,7 @@ impl RouteSearch {
         let mut queue = BinaryHeap::new();
         for &start in starts {
             let arrival_ps = tree_delays_ps.get(&start).copied().unwrap_or(0);
-            let distance = timing_tree_cost(arrival_ps, criticality);
+            let distance = timing_tree_cost(arrival_ps, criticality, delay_quantum_ps);
             self.seen[start.0] = epoch;
             self.distance[start.0] = distance;
             self.arrival_ps[start.0] = arrival_ps;
@@ -2612,9 +3147,19 @@ impl RouteSearch {
                     present_factor,
                 );
                 let pip_delay_ps = costs.map_or(0, |costs| costs.pip_delays_ps[pip.0]);
-                let step = routing_step_cost(pip_delay_ps, criticality, congestion);
-                let next_distance = distance.saturating_add(step);
                 let next_arrival_ps = arrival_ps.saturating_add(u64::from(pip_delay_ps));
+                let step = if delay_quantum_ps == ROUTING_DELAY_QUANTUM_PS {
+                    routing_step_cost(pip_delay_ps, criticality, congestion, delay_quantum_ps)
+                } else {
+                    routing_transition_cost(
+                        arrival_ps,
+                        next_arrival_ps,
+                        criticality,
+                        congestion,
+                        delay_quantum_ps,
+                    )
+                };
+                let next_distance = distance.saturating_add(step);
                 if neighbor == goal && next_arrival_ps < minimum_arrival_ps {
                     continue;
                 }
@@ -2651,6 +3196,7 @@ impl RouteSearch {
                 present_factor,
                 None,
                 0,
+                ROUTING_DELAY_QUANTUM_PS,
                 tree_delays_ps,
                 minimum_arrival_ps,
             );
@@ -2707,7 +3253,7 @@ fn shortest_hold_path(
     for &start in starts {
         let arrival_ps = tree_delays_ps.get(&start).copied().unwrap_or(0);
         let state = (start, hold_delay_bucket(arrival_ps, minimum_arrival_ps));
-        let distance = timing_tree_cost(arrival_ps, criticality);
+        let distance = timing_tree_cost(arrival_ps, criticality, ROUTING_DELAY_QUANTUM_PS);
         visits.insert(state, (distance, arrival_ps, None));
         queue.push(Reverse((
             distance.saturating_add(device.wires()[start.0].point.manhattan(goal_point)),
@@ -2745,8 +3291,12 @@ fn shortest_hold_path(
                 present_factor,
             );
             let pip_delay_ps = costs.pip_min_delays_ps[pip.0];
-            let next_distance =
-                distance.saturating_add(routing_step_cost(pip_delay_ps, criticality, congestion));
+            let next_distance = distance.saturating_add(routing_step_cost(
+                pip_delay_ps,
+                criticality,
+                congestion,
+                ROUTING_DELAY_QUANTUM_PS,
+            ));
             let next_arrival_ps = arrival_ps.saturating_add(u64::from(pip_delay_ps));
             let next_state = (
                 neighbor,
@@ -2810,15 +3360,21 @@ fn reconstruct_hold_path(
 const ROUTING_CRITICALITY_SCALE: u64 = 64;
 const ROUTING_DELAY_QUANTUM_PS: u64 = 50;
 
-fn timing_tree_cost(arrival_ps: u64, criticality: u64) -> u64 {
+fn timing_tree_cost(arrival_ps: u64, criticality: u64, delay_quantum_ps: u64) -> u64 {
     arrival_ps
         .saturating_mul(criticality)
-        .div_ceil(ROUTING_CRITICALITY_SCALE * ROUTING_DELAY_QUANTUM_PS)
+        .div_ceil(ROUTING_CRITICALITY_SCALE * delay_quantum_ps)
 }
 
-fn routing_step_cost(pip_delay_ps: u32, criticality: u64, congestion: u64) -> u64 {
+fn routing_step_cost(
+    pip_delay_ps: u32,
+    criticality: u64,
+    congestion: u64,
+    delay_quantum_ps: u64,
+) -> u64 {
+    let congestion_scale = ROUTING_DELAY_QUANTUM_PS.div_ceil(delay_quantum_ps);
     if criticality == 0 {
-        return 1_u64.saturating_add(congestion);
+        return 1_u64.saturating_add(congestion.saturating_mul(congestion_scale));
     }
     let delay_ps = u64::from(pip_delay_ps);
     let blended_ps = criticality
@@ -2828,9 +3384,30 @@ fn routing_step_cost(pip_delay_ps: u32, criticality: u64, congestion: u64) -> u6
         )
         .div_ceil(ROUTING_CRITICALITY_SCALE);
     blended_ps
-        .div_ceil(ROUTING_DELAY_QUANTUM_PS)
+        .div_ceil(delay_quantum_ps)
         .max(1)
-        .saturating_add(congestion)
+        .saturating_add(congestion.saturating_mul(congestion_scale))
+}
+
+fn routing_transition_cost(
+    arrival_ps: u64,
+    next_arrival_ps: u64,
+    criticality: u64,
+    congestion: u64,
+    delay_quantum_ps: u64,
+) -> u64 {
+    let congestion_scale = ROUTING_DELAY_QUANTUM_PS.div_ceil(delay_quantum_ps);
+    if criticality == 0 {
+        return 1_u64.saturating_add(congestion.saturating_mul(congestion_scale));
+    }
+    let timing_increment = timing_tree_cost(next_arrival_ps, criticality, delay_quantum_ps)
+        .saturating_sub(timing_tree_cost(arrival_ps, criticality, delay_quantum_ps));
+    let hop_bias = (ROUTING_CRITICALITY_SCALE - criticality)
+        .saturating_mul(ROUTING_DELAY_QUANTUM_PS)
+        .div_ceil(ROUTING_CRITICALITY_SCALE * delay_quantum_ps);
+    timing_increment
+        .saturating_add(hop_bias)
+        .saturating_add(congestion.saturating_mul(congestion_scale))
 }
 
 fn congestion_cost(occupancy: u16, capacity: u16, history: u32, present: u32) -> u64 {
@@ -3001,7 +3578,7 @@ mod tests {
         refine_placement_with_net_sink_weights_limited, refine_placement_with_net_weights,
         refinement_edge_cost, route_with_placement_and_progress,
         route_with_timing_costs_and_progress, routing_corridor, routing_step_cost,
-        timing_tree_cost,
+        routing_transition_cost, timing_tree_cost,
     };
 
     fn two_cell_design() -> Design {
@@ -3222,11 +3799,19 @@ mod tests {
 
     #[test]
     fn timing_routing_blends_delay_with_congestion() {
-        assert_eq!(routing_step_cost(1_000, 0, 2), 3);
-        assert_eq!(routing_step_cost(200, 64, 0), 4);
-        assert_eq!(routing_step_cost(200, 32, 0), 3);
-        assert_eq!(routing_step_cost(200, 64, 2), 6);
-        assert_eq!(timing_tree_cost(200, 64), 4);
+        assert_eq!(routing_step_cost(1_000, 0, 2, 50), 3);
+        assert_eq!(routing_step_cost(200, 64, 0, 50), 4);
+        assert_eq!(routing_step_cost(200, 32, 0, 50), 3);
+        assert_eq!(routing_step_cost(200, 64, 2, 50), 6);
+        assert_eq!(timing_tree_cost(200, 64, 50), 4);
+    }
+
+    #[test]
+    fn cumulative_quantization_does_not_round_every_pip() {
+        assert_eq!(routing_transition_cost(0, 24, 64, 0, 50), 1);
+        assert_eq!(routing_transition_cost(24, 48, 64, 0, 50), 0);
+        assert_eq!(routing_transition_cost(48, 72, 64, 0, 10), 3);
+        assert_eq!(routing_transition_cost(48, 72, 64, 0, 1), 24);
     }
 
     #[test]
@@ -3256,6 +3841,7 @@ mod tests {
                 1,
                 Some(&costs),
                 64,
+                50,
                 &tree_delays,
                 0,
             )
@@ -3293,6 +3879,7 @@ mod tests {
                 1,
                 Some(&costs),
                 0,
+                50,
                 &BTreeMap::from([(start, 0)]),
                 500,
             )

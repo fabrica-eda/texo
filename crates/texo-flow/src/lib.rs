@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use texo_model::{CellId, CellPinId, Design, Device, NetId, PinDirection, PipId, ResourceKind};
+use texo_model::{
+    BelId, CellId, CellPinId, Design, Device, NetId, PinDirection, PipId, ResourceKind,
+};
 pub use texo_pnr::RoutingProgress;
 use texo_pnr::{
     NetRoute, Placement, PlacementConstraints, PlacementRefiner, PnrError, PnrResult,
@@ -202,6 +204,15 @@ pub enum Ecp5FlowStage {
     Routed,
     /// STA-weighted deterministic replacement is complete.
     TimingDrivenPlaced,
+    /// A concrete worst-path cell proposal is about to be routed and timed.
+    CriticalPathMove {
+        /// Cell whose placement unit is being moved.
+        cell: CellId,
+        /// Current BEL of the selected cell.
+        from: BelId,
+        /// Proposed BEL of the selected cell.
+        to: BelId,
+    },
     /// Dedicated primary-clock trees for the timing-driven placement are locked.
     TimingDrivenGlobalClocksRouted,
     /// Progress within timing-driven negotiated routing.
@@ -212,8 +223,21 @@ pub enum Ecp5FlowStage {
     TimingSnapshot {
         /// Smallest setup slack, when a setup endpoint is constrained.
         worst_setup_ps: Option<i128>,
+        /// Sum of negative setup slacks; zero means no setup violation.
+        setup_tns_ps: i128,
+        /// Number of setup endpoints with negative slack.
+        setup_violations: usize,
         /// Smallest hold slack, when a hold endpoint is constrained.
         worst_hold_ps: Option<i128>,
+        /// Sum of negative hold slacks; zero means no hold violation.
+        hold_ths_ps: i128,
+        /// Number of hold endpoints with negative slack.
+        hold_violations: usize,
+    },
+    /// Whether the immediately preceding timing trial improves the incumbent objective.
+    TimingTrialDecision {
+        /// `true` when the trial is eligible to replace the incumbent.
+        improves_objective: bool,
     },
     /// Post-route static timing analysis is complete.
     Timed,
@@ -328,10 +352,7 @@ pub fn implement_struo_ecp5_with_progress(
         &timing_model,
         &timing_constraints,
     )?;
-    progress(Ecp5FlowStage::TimingSnapshot {
-        worst_setup_ps: initial_timing.worst_slack_ps,
-        worst_hold_ps: initial_timing.worst_hold_slack_ps,
-    });
+    progress(timing_snapshot(&initial_timing));
 
     let (implementation, timing) = TimingDrivenContext {
         design: &design,
@@ -427,41 +448,51 @@ impl TimingDrivenContext<'_> {
             (implementation, timing),
         ];
         let mut archive = select_timing_frontier(candidates);
-        let mut active = archive.clone();
         let placement_refiner = PlacementRefiner::new(
             self.design,
             self.architecture.device(),
             self.packing.constraints(),
         )?;
-        for _ in 0..MAX_INCREMENTAL_REFINEMENTS {
-            if archive.iter().any(|(_, timing)| timing.met_timing()) {
-                break;
-            }
-            let mut children = Vec::with_capacity(active.len());
-            for (implementation, timing) in &active {
-                children.extend(self.refine_candidates(
-                    implementation,
-                    timing,
-                    &placement_refiner,
-                    &mut routing_costs,
-                    progress,
-                )?);
-            }
-            let setup_focused = archive
+        archive = self.refine_setup_monotonically(
+            archive,
+            &placement_refiner,
+            &mut routing_costs,
+            progress,
+        )?;
+        for _ in 0..MAX_LOCAL_CONNECTION_REFINEMENTS {
+            let seed = archive
                 .iter()
-                .any(|(_, timing)| timing.worst_hold_slack_ps.is_some_and(|slack| slack >= 0))
-                || children
-                    .iter()
-                    .any(|(_, timing)| timing.worst_hold_slack_ps.is_some_and(|slack| slack >= 0));
-            active = select_timing_beam(children, setup_focused);
-            let mut expanded_archive = archive;
-            expanded_archive.extend(active.iter().cloned());
-            archive = select_timing_frontier(expanded_archive);
+                .max_by_key(|(_, timing)| timing_score(timing))
+                .expect("the timing archive is non-empty")
+                .clone();
+            let refinements = self.refine_local_connections(
+                &seed.0,
+                &seed.1,
+                &placement_refiner,
+                &mut routing_costs,
+                progress,
+            )?;
+            let Some(improved) = refinements
+                .into_iter()
+                .max_by_key(|(_, timing)| timing_score(timing))
+                .filter(|(_, timing)| timing_score(timing) > timing_score(&seed.1))
+            else {
+                break;
+            };
+            archive.push(improved);
+            archive = select_timing_frontier(archive);
         }
+        archive =
+            self.close_setup_critically(archive, &placement_refiner, &mut routing_costs, progress)?;
         let mut hold_repairs = Vec::new();
         for (implementation, timing) in &archive {
+            if timing.worst_slack_ps.is_none_or(|slack| slack < 0) {
+                continue;
+            }
             if let Some(repaired) =
                 self.repair_hold_locally(implementation, timing, &mut routing_costs, progress)?
+                && repaired.1.worst_slack_ps.is_some_and(|slack| slack >= 0)
+                && timing_score(&repaired.1) > timing_score(timing)
             {
                 hold_repairs.push(repaired);
             }
@@ -472,6 +503,167 @@ impl TimingDrivenContext<'_> {
             .into_iter()
             .max_by_key(|(_, timing)| timing_score(timing))
             .expect("the timing archive is non-empty"))
+    }
+
+    fn close_setup_critically(
+        &mut self,
+        mut archive: Vec<TimingCandidate>,
+        placement_refiner: &PlacementRefiner<'_>,
+        routing_costs: &mut RoutingCosts,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
+        for _ in 0..MAX_CRITICAL_CLOSURE_ROUNDS {
+            archive = self.refine_critical_path_vertices(
+                archive,
+                placement_refiner,
+                routing_costs,
+                progress,
+            )?;
+            archive =
+                self.refine_critical_routes_multiresolution(archive, routing_costs, progress)?;
+            let setup_closed = archive
+                .iter()
+                .any(|(_, timing)| timing.worst_slack_ps.is_some_and(|slack| slack >= 0));
+            if setup_closed {
+                break;
+            }
+        }
+        Ok(archive)
+    }
+
+    fn refine_setup_monotonically(
+        &mut self,
+        mut archive: Vec<TimingCandidate>,
+        placement_refiner: &PlacementRefiner<'_>,
+        routing_costs: &mut RoutingCosts,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
+        for _ in 0..MAX_INCREMENTAL_REFINEMENTS {
+            if archive.iter().any(|(_, timing)| timing.met_timing()) {
+                break;
+            }
+            let seed = archive
+                .iter()
+                .max_by_key(|(implementation, timing)| {
+                    (timing_score(timing), Reverse(implementation.total_pips))
+                })
+                .expect("the timing archive is non-empty")
+                .clone();
+            let mut improved = None;
+            for max_units in REFINED_PLACEMENT_UNIT_LIMITS {
+                let child = self.refine_candidate(
+                    &seed.0,
+                    &seed.1,
+                    placement_refiner,
+                    routing_costs,
+                    max_units,
+                    progress,
+                )?;
+                let improves_objective = timing_score(&child.1) > timing_score(&seed.1);
+                progress(Ecp5FlowStage::TimingTrialDecision { improves_objective });
+                if improves_objective {
+                    improved = Some(child);
+                    break;
+                }
+            }
+            let Some(improved) = improved else {
+                break;
+            };
+            archive.push(improved);
+            archive = select_timing_frontier(archive);
+        }
+        Ok(archive)
+    }
+
+    fn refine_critical_path_vertices(
+        &mut self,
+        mut archive: Vec<TimingCandidate>,
+        placement_refiner: &PlacementRefiner<'_>,
+        routing_costs: &mut RoutingCosts,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
+        for move_distance in CRITICAL_PATH_MOVE_DISTANCES {
+            for _ in 0..MAX_CRITICAL_PATH_VERTEX_REFINEMENTS {
+                let seed = archive
+                    .iter()
+                    .max_by_key(|(_, timing)| timing_score(timing))
+                    .expect("the timing archive is non-empty")
+                    .clone();
+                let Some(improved) = self
+                    .refine_critical_path_cells(
+                        &seed.0,
+                        &seed.1,
+                        placement_refiner,
+                        routing_costs,
+                        move_distance,
+                        progress,
+                    )?
+                    .into_iter()
+                    .max_by_key(|(_, timing)| timing_score(timing))
+                    .filter(|(_, timing)| timing_score(timing) > timing_score(&seed.1))
+                else {
+                    break;
+                };
+                archive.push(improved);
+                archive = select_timing_frontier(archive);
+            }
+        }
+        Ok(archive)
+    }
+
+    fn refine_critical_routes_multiresolution(
+        &self,
+        mut archive: Vec<TimingCandidate>,
+        routing_costs: &mut RoutingCosts,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
+        for delay_quantum_ps in DETAILED_ROUTING_QUANTA_PS {
+            let seed = archive
+                .iter()
+                .max_by_key(|(implementation, timing)| {
+                    (timing_score(timing), Reverse(implementation.total_pips))
+                })
+                .expect("the timing archive is non-empty")
+                .clone();
+            let Some(worst_slack_ps) = seed.1.worst_slack_ps else {
+                break;
+            };
+            let detailed_nets = seed
+                .1
+                .net_setup_slacks
+                .iter()
+                .filter_map(|edge| (edge.slack_ps == worst_slack_ps).then_some(edge.net))
+                .collect::<BTreeSet<_>>();
+            if detailed_nets.is_empty() {
+                break;
+            }
+            let frozen = freeze_routes_except(&seed.0.routes, &detailed_nets);
+            routing_costs
+                .set_net_criticalities(timing_net_weights(&seed.1, self.timing_constraints));
+            routing_costs.set_sink_min_delays_ps(BTreeMap::new());
+            routing_costs.set_detailed_timing_nets(detailed_nets);
+            routing_costs.set_detailed_delay_quantum_ps(delay_quantum_ps);
+            let trial = self.route_and_analyze(
+                seed.0.placement.clone(),
+                &frozen,
+                Some(routing_costs),
+                progress,
+            );
+            routing_costs.set_detailed_timing_nets(BTreeSet::new());
+            let trial = match trial {
+                Ok(trial) => trial,
+                Err(Ecp5FlowError::Pnr(_)) => break,
+                Err(error) => return Err(error),
+            };
+            let improves_objective = timing_score(&trial.1) > timing_score(&seed.1);
+            progress(Ecp5FlowStage::TimingTrialDecision { improves_objective });
+            if !improves_objective {
+                break;
+            }
+            archive.push(trial);
+            archive = select_timing_frontier(archive);
+        }
+        Ok(archive)
     }
 
     fn repair_hold_locally(
@@ -504,19 +696,20 @@ impl TimingDrivenContext<'_> {
         }
     }
 
-    fn refine_candidates(
+    fn refine_candidate(
         &mut self,
         implementation: &PnrResult,
         timing: &TimingReport,
         placement_refiner: &PlacementRefiner<'_>,
         routing_costs: &mut RoutingCosts,
+        max_refined_units: usize,
         progress: &mut impl FnMut(Ecp5FlowStage),
-    ) -> Result<Vec<(PnrResult, TimingReport)>, Ecp5FlowError> {
+    ) -> Result<TimingCandidate, Ecp5FlowError> {
         let refinement_weights = timing_placement_weights(timing, self.timing_constraints);
         let refined_placement = placement_refiner.refine_with_net_sink_weights_limited(
             implementation.placement.clone(),
             &refinement_weights,
-            MAX_REFINED_PLACEMENT_UNITS,
+            max_refined_units,
         )?;
         progress(Ecp5FlowStage::TimingDrivenPlaced);
         let refined_routing = self.packing.global_routing_constraints_cached(
@@ -543,7 +736,192 @@ impl TimingDrivenContext<'_> {
             Some(routing_costs),
             progress,
         )?;
-        Ok(vec![refined])
+        Ok(refined)
+    }
+
+    fn refine_local_connections(
+        &mut self,
+        implementation: &PnrResult,
+        timing: &TimingReport,
+        placement_refiner: &PlacementRefiner<'_>,
+        routing_costs: &mut RoutingCosts,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
+        let Some(worst_slack) = timing.worst_slack_ps else {
+            return Ok(Vec::new());
+        };
+        let delays = timing
+            .net_delays
+            .iter()
+            .map(|edge| ((edge.net, edge.sink), edge.delay.max_ps))
+            .collect::<BTreeMap<_, _>>();
+        let mut edges = timing
+            .net_setup_slacks
+            .iter()
+            .filter(|edge| edge.slack_ps == worst_slack)
+            .map(|edge| {
+                (
+                    Reverse(delays.get(&(edge.net, edge.sink)).copied().unwrap_or(0)),
+                    edge.net,
+                    edge.sink,
+                )
+            })
+            .collect::<Vec<_>>();
+        edges.sort_unstable();
+        edges.truncate(MAX_LOCAL_CONNECTION_CANDIDATES);
+        let mut candidates = Vec::new();
+        for (_, net, sink) in edges {
+            let driver = self.design.nets()[net.0].driver;
+            let Some(placement) = placement_refiner.refine_connection_delay(
+                implementation.placement.clone(),
+                driver,
+                sink,
+                false,
+                routing_costs.pip_delays_ps(),
+                1,
+            )?
+            else {
+                continue;
+            };
+            progress(Ecp5FlowStage::TimingDrivenPlaced);
+            let base = self.packing.global_routing_constraints_cached(
+                self.design,
+                self.architecture,
+                &placement,
+                self.global_routing_cache,
+            )?;
+            progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
+            let frozen = freeze_unchanged_routes(
+                self.design,
+                implementation,
+                &placement,
+                &base,
+                &BTreeSet::from([net]),
+            );
+            routing_costs
+                .set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
+            routing_costs.set_sink_min_delays_ps(BTreeMap::new());
+            if let Ok(candidate) =
+                self.route_and_analyze(placement, &frozen, Some(routing_costs), progress)
+            {
+                progress(Ecp5FlowStage::TimingTrialDecision {
+                    improves_objective: timing_score(&candidate.1) > timing_score(timing),
+                });
+                candidates.push(candidate);
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn refine_critical_path_cells(
+        &mut self,
+        implementation: &PnrResult,
+        timing: &TimingReport,
+        placement_refiner: &PlacementRefiner<'_>,
+        routing_costs: &mut RoutingCosts,
+        max_move_distance: u64,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
+        let Some(worst_slack_ps) = timing.worst_slack_ps else {
+            return Ok(Vec::new());
+        };
+        let worst_connections = timing
+            .net_setup_slacks
+            .iter()
+            .filter(|edge| edge.slack_ps == worst_slack_ps)
+            .map(|edge| {
+                let driver = self.design.nets()[edge.net.0].driver;
+                (edge.net, driver, edge.sink)
+            })
+            .collect::<Vec<_>>();
+        let connection_delays = timing
+            .net_delays
+            .iter()
+            .map(|delay| ((delay.net, delay.sink), delay.delay.max_ps))
+            .collect::<BTreeMap<_, _>>();
+        let mut by_cell = BTreeMap::<CellId, (u64, Vec<(CellPinId, CellPinId)>)>::new();
+        for &(net, driver, sink) in &worst_connections {
+            let driver_cell = self.design.pins()[driver.0].cell;
+            let sink_cell = self.design.pins()[sink.0].cell;
+            let delay = connection_delays.get(&(net, sink)).copied().unwrap_or(0);
+            let driver_entry = by_cell.entry(driver_cell).or_default();
+            driver_entry.0 = driver_entry.0.saturating_add(delay);
+            driver_entry.1.push((driver, sink));
+            let sink_entry = by_cell.entry(sink_cell).or_default();
+            sink_entry.0 = sink_entry.0.saturating_add(delay);
+            sink_entry.1.push((driver, sink));
+        }
+        let mut cells = by_cell
+            .into_iter()
+            .filter(|(_, (_, connections))| connections.len() >= 2)
+            .collect::<Vec<_>>();
+        cells.sort_unstable_by_key(|(cell, (delay, _))| (Reverse(*delay), *cell));
+        let released = worst_connections
+            .iter()
+            .map(|(net, _, _)| *net)
+            .collect::<BTreeSet<_>>();
+        let mut placement = implementation.placement.clone();
+        let mut candidates = Vec::new();
+        for (cell, (_, connections)) in cells.into_iter().take(MAX_CRITICAL_PATH_CELLS) {
+            let proposals = placement_refiner.refine_cell_connection_delays(
+                placement.clone(),
+                cell,
+                &connections,
+                routing_costs.pip_delays_ps(),
+                max_move_distance,
+                if max_move_distance > 2 {
+                    MAX_CRITICAL_PATH_CELL_CANDIDATES
+                } else {
+                    1
+                },
+            )?;
+            if proposals.is_empty() {
+                continue;
+            }
+            let from = placement.bindings()[cell.0];
+            let mut best_for_cell = None;
+            for refined in proposals {
+                let to = refined.bindings()[cell.0];
+                progress(Ecp5FlowStage::CriticalPathMove { cell, from, to });
+                let base = self.packing.global_routing_constraints_cached(
+                    self.design,
+                    self.architecture,
+                    &refined,
+                    self.global_routing_cache,
+                )?;
+                progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
+                let frozen = freeze_unchanged_routes(
+                    self.design,
+                    implementation,
+                    &refined,
+                    &base,
+                    &released,
+                );
+                routing_costs
+                    .set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
+                routing_costs.set_sink_min_delays_ps(BTreeMap::new());
+                routing_costs.set_detailed_timing_nets(released.clone());
+                routing_costs.set_detailed_delay_quantum_ps(10);
+                let trial = self.route_and_analyze(refined, &frozen, Some(routing_costs), progress);
+                routing_costs.set_detailed_timing_nets(BTreeSet::new());
+                if let Ok(candidate) = trial {
+                    let improves_objective = timing_score(&candidate.1) > timing_score(timing);
+                    progress(Ecp5FlowStage::TimingTrialDecision { improves_objective });
+                    if best_for_cell.as_ref().is_none_or(|(_, best_timing)| {
+                        timing_score(&candidate.1) > timing_score(best_timing)
+                    }) {
+                        best_for_cell = Some(candidate.clone());
+                    }
+                    candidates.push(candidate);
+                }
+            }
+            if let Some((best_implementation, best_timing)) = best_for_cell
+                && timing_score(&best_timing) > timing_score(timing)
+            {
+                placement = best_implementation.placement;
+            }
+        }
+        Ok(candidates)
     }
 
     fn route_and_analyze(
@@ -580,18 +958,26 @@ impl TimingDrivenContext<'_> {
             self.timing_model,
             self.timing_constraints,
         )?;
-        progress(Ecp5FlowStage::TimingSnapshot {
-            worst_setup_ps: timing.worst_slack_ps,
-            worst_hold_ps: timing.worst_hold_slack_ps,
-        });
+        progress(timing_snapshot(&timing));
         Ok((implementation, timing))
     }
 }
 
 const MAX_INCREMENTAL_REFINEMENTS: usize = 8;
-const TIMING_FRONTIER_WIDTH: usize = 3;
-const SETUP_FOCUSED_BEAM_WIDTH: usize = 2;
-const MAX_REFINED_PLACEMENT_UNITS: usize = 256;
+const MAX_LOCAL_CONNECTION_REFINEMENTS: usize = 4;
+const MAX_LOCAL_CONNECTION_CANDIDATES: usize = 8;
+const TIMING_FRONTIER_WIDTH: usize = 1;
+const REFINED_PLACEMENT_UNIT_LIMITS: [usize; 4] = [256, 128, 64, 32];
+const DETAILED_ROUTING_QUANTA_PS: [u64; 2] = [10, 1];
+const MAX_CRITICAL_PATH_CELLS: usize = 6;
+const MAX_CRITICAL_PATH_CELL_CANDIDATES: usize = 4;
+const MAX_CRITICAL_CLOSURE_ROUNDS: usize = 4;
+const MAX_CRITICAL_PATH_VERTEX_REFINEMENTS: usize = 4;
+// Start with cheap local legalization, then let only an internal vertex of the
+// actual worst path escape a bad placement basin.  The broad pass is still a
+// deterministic exhaustive choice over that one unit's legal BEL assignments;
+// it is not a random restart or a whole-design perturbation.
+const CRITICAL_PATH_MOVE_DISTANCES: [u64; 3] = [1, 2, 16];
 const MAX_RELEASED_CRITICAL_NETS: usize = 64;
 
 fn ecp5_routing_costs(
@@ -801,206 +1187,113 @@ fn criticality_weight(urgency: i128, period_ps: i128) -> u64 {
     1 + powered.saturating_mul(MAX_EXTRA_WEIGHT) / SCALE.pow(4)
 }
 
-fn timing_score(timing: &TimingReport) -> (i128, i128, i128) {
-    let setup = timing.worst_slack_ps.unwrap_or(i128::MIN);
-    let hold = timing.worst_hold_slack_ps.unwrap_or(i128::MIN);
-    (setup.min(hold), setup, hold)
+type ViolationScore = (Reverse<u128>, Reverse<u128>, Reverse<u128>, Reverse<usize>);
+type TimingScore = (bool, ViolationScore, i128, i128);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SlackViolations {
+    maximum_deficit_ps: u128,
+    squared_penalty_ps2: u128,
+    total_deficit_ps: u128,
+    endpoints: usize,
+}
+
+impl SlackViolations {
+    fn score(self) -> ViolationScore {
+        let worst_penalty = self
+            .maximum_deficit_ps
+            .saturating_mul(self.maximum_deficit_ps);
+        let objective_penalty = self.squared_penalty_ps2.saturating_add(worst_penalty);
+        (
+            Reverse(objective_penalty),
+            Reverse(self.maximum_deficit_ps),
+            Reverse(self.total_deficit_ps),
+            Reverse(self.endpoints),
+        )
+    }
+
+    fn total_negative_slack_ps(self) -> i128 {
+        -i128::try_from(self.total_deficit_ps).unwrap_or(i128::MAX)
+    }
+}
+
+fn timing_snapshot(timing: &TimingReport) -> Ecp5FlowStage {
+    let setup = slack_violations(timing.setup_checks.iter().map(|check| check.slack_ps));
+    let hold = slack_violations(timing.hold_checks.iter().map(|check| check.slack_ps));
+    Ecp5FlowStage::TimingSnapshot {
+        worst_setup_ps: timing.worst_slack_ps,
+        setup_tns_ps: setup.total_negative_slack_ps(),
+        setup_violations: setup.endpoints,
+        worst_hold_ps: timing.worst_hold_slack_ps,
+        hold_ths_ps: hold.total_negative_slack_ps(),
+        hold_violations: hold.endpoints,
+    }
+}
+
+fn timing_score(timing: &TimingReport) -> TimingScore {
+    let setup_score =
+        slack_violations(timing.setup_checks.iter().map(|check| check.slack_ps)).score();
+    let hold_score =
+        slack_violations(timing.hold_checks.iter().map(|check| check.slack_ps)).score();
+    let setup_slack = timing.worst_slack_ps.unwrap_or(i128::MIN);
+    let hold_slack = timing.worst_hold_slack_ps.unwrap_or(i128::MIN);
+    staged_timing_score(setup_score, hold_score, setup_slack, hold_slack)
+}
+
+fn staged_timing_score(
+    setup_score: ViolationScore,
+    hold_score: ViolationScore,
+    setup_slack: i128,
+    hold_slack: i128,
+) -> TimingScore {
+    if setup_slack < 0 {
+        (false, setup_score, setup_slack, hold_slack)
+    } else {
+        (true, hold_score, setup_slack, hold_slack)
+    }
+}
+
+fn slack_violations(slacks: impl Iterator<Item = i128>) -> SlackViolations {
+    let mut violations = SlackViolations::default();
+    for slack in slacks {
+        if slack >= 0 {
+            continue;
+        }
+        let deficit = slack.unsigned_abs();
+        violations.squared_penalty_ps2 = violations
+            .squared_penalty_ps2
+            .saturating_add(deficit.saturating_mul(deficit));
+        violations.maximum_deficit_ps = violations.maximum_deficit_ps.max(deficit);
+        violations.total_deficit_ps = violations.total_deficit_ps.saturating_add(deficit);
+        violations.endpoints += 1;
+    }
+    violations
 }
 
 type TimingCandidate = (PnrResult, TimingReport);
-type TimingAxes = (i128, i128, usize);
 
 fn select_timing_frontier(candidates: Vec<TimingCandidate>) -> Vec<TimingCandidate> {
-    let axes = candidates
-        .iter()
-        .map(|(implementation, timing)| {
-            (
-                timing.worst_slack_ps.unwrap_or(i128::MIN),
-                timing.worst_hold_slack_ps.unwrap_or(i128::MIN),
-                implementation.total_pips,
-            )
-        })
-        .collect::<Vec<_>>();
-    let selected = pareto_axes_indices(&axes, TIMING_FRONTIER_WIDTH);
-    let mut candidates = candidates.into_iter().map(Some).collect::<Vec<_>>();
-    selected
-        .into_iter()
-        .map(|index| {
-            candidates[index]
-                .take()
-                .expect("a frontier index is unique")
-        })
-        .collect()
+    select_timing_candidates(candidates, TIMING_FRONTIER_WIDTH)
 }
 
-fn select_timing_beam(
-    candidates: Vec<TimingCandidate>,
-    setup_focused: bool,
+fn select_timing_candidates(
+    mut candidates: Vec<TimingCandidate>,
+    width: usize,
 ) -> Vec<TimingCandidate> {
-    let axes = candidates
-        .iter()
-        .map(|(implementation, timing)| {
+    candidates.sort_by(
+        |(left_implementation, left_timing), (right_implementation, right_timing)| {
             (
-                timing.worst_slack_ps.unwrap_or(i128::MIN),
-                timing.worst_hold_slack_ps.unwrap_or(i128::MIN),
-                implementation.total_pips,
+                timing_score(right_timing),
+                Reverse(right_implementation.total_pips),
             )
-        })
-        .collect::<Vec<_>>();
-    let eligible = (0..axes.len()).collect::<Vec<_>>();
-    let selected = if setup_focused {
-        setup_focused_axes_indices(&axes, &eligible, SETUP_FOCUSED_BEAM_WIDTH)
-    } else {
-        extreme_axes_indices(&axes, &eligible, TIMING_FRONTIER_WIDTH)
-    };
-    let mut candidates = candidates.into_iter().map(Some).collect::<Vec<_>>();
-    selected
-        .into_iter()
-        .map(|index| candidates[index].take().expect("a beam index is unique"))
-        .collect()
-}
-
-fn setup_focused_axes_indices(axes: &[TimingAxes], eligible: &[usize], width: usize) -> Vec<usize> {
-    let mut selected = BTreeSet::new();
-    if let Some(balanced) = eligible
-        .iter()
-        .copied()
-        .max_by_key(|&index| timing_objective_rank(axes[index], index, TimingObjective::Balanced))
-    {
-        selected.insert(balanced);
-    }
-    let hold_clean = eligible
-        .iter()
-        .copied()
-        .filter(|&index| axes[index].1 >= 0)
-        .collect::<Vec<_>>();
-    let setup_pool = if hold_clean.is_empty() {
-        eligible
-    } else {
-        &hold_clean
-    };
-    if let Some(setup) = setup_pool
-        .iter()
-        .copied()
-        .max_by_key(|&index| timing_objective_rank(axes[index], index, TimingObjective::Setup))
-    {
-        selected.insert(setup);
-    }
-    let mut balanced = eligible.to_vec();
-    balanced.sort_by_key(|&index| {
-        Reverse(timing_objective_rank(
-            axes[index],
-            index,
-            TimingObjective::Balanced,
-        ))
-    });
-    for index in balanced {
-        if selected.len() == width {
-            break;
-        }
-        selected.insert(index);
-    }
-    let mut selected = selected.into_iter().collect::<Vec<_>>();
-    selected.sort_by_key(|&index| {
-        Reverse(timing_objective_rank(
-            axes[index],
-            index,
-            TimingObjective::Balanced,
-        ))
-    });
-    selected
-}
-
-fn pareto_axes_indices(axes: &[TimingAxes], width: usize) -> Vec<usize> {
-    let nondominated = (0..axes.len())
-        .filter(|&candidate| {
-            !(0..axes.len()).any(|other| {
-                other != candidate
-                    && timing_axes_dominate(axes[other], other, axes[candidate], candidate)
-            })
-        })
-        .collect::<Vec<_>>();
-    extreme_axes_indices(axes, &nondominated, width)
-}
-
-fn extreme_axes_indices(axes: &[TimingAxes], eligible: &[usize], width: usize) -> Vec<usize> {
-    let mut selected = BTreeSet::new();
-    for objective in [
-        TimingObjective::Balanced,
-        TimingObjective::Setup,
-        TimingObjective::Hold,
-    ] {
-        if let Some(best) = eligible
-            .iter()
-            .copied()
-            .max_by_key(|&index| timing_objective_rank(axes[index], index, objective))
-        {
-            selected.insert(best);
-        }
-        if selected.len() == width {
-            break;
-        }
-    }
-    let mut balanced = eligible.to_vec();
-    balanced.sort_by_key(|&index| {
-        Reverse(timing_objective_rank(
-            axes[index],
-            index,
-            TimingObjective::Balanced,
-        ))
-    });
-    for index in balanced {
-        if selected.len() == width {
-            break;
-        }
-        selected.insert(index);
-    }
-    let mut selected = selected.into_iter().collect::<Vec<_>>();
-    selected.sort_by_key(|&index| {
-        Reverse(timing_objective_rank(
-            axes[index],
-            index,
-            TimingObjective::Balanced,
-        ))
-    });
-    selected
-}
-
-fn timing_axes_dominate(
-    left: TimingAxes,
-    left_index: usize,
-    right: TimingAxes,
-    right_index: usize,
-) -> bool {
-    let (left_setup, left_hold, left_pips) = left;
-    let (right_setup, right_hold, right_pips) = right;
-    left_setup >= right_setup
-        && left_hold >= right_hold
-        && (left_setup > right_setup
-            || left_hold > right_hold
-            || left_pips < right_pips
-            || (left_pips == right_pips && left_index < right_index))
-}
-
-#[derive(Clone, Copy)]
-enum TimingObjective {
-    Balanced,
-    Setup,
-    Hold,
-}
-
-fn timing_objective_rank(
-    (setup, hold, pips): TimingAxes,
-    index: usize,
-    objective: TimingObjective,
-) -> (i128, i128, i128, Reverse<usize>, Reverse<usize>) {
-    let balanced = setup.min(hold);
-    let (first, second, third) = match objective {
-        TimingObjective::Balanced => (balanced, setup, hold),
-        TimingObjective::Setup => (setup, hold, balanced),
-        TimingObjective::Hold => (hold, setup, balanced),
-    };
-    (first, second, third, Reverse(pips), Reverse(index))
+                .cmp(&(
+                    timing_score(left_timing),
+                    Reverse(left_implementation.total_pips),
+                ))
+        },
+    );
+    candidates.truncate(width);
+    candidates
 }
 
 fn ecp5_timing_constraints(
@@ -1395,16 +1688,15 @@ mod tests {
 
     use super::{
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, criticality_weight,
-        delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model,
-        extreme_axes_indices, find_cell_pin, freeze_routes_except, implement, implement_struo_ecp5,
-        implement_with_constraints, pareto_axes_indices, pip_class_delay,
-        setup_focused_axes_indices, verify_post_map_with_celox,
+        delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, find_cell_pin,
+        freeze_routes_except, implement, implement_struo_ecp5, implement_with_constraints,
+        pip_class_delay, slack_violations, staged_timing_score, verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
 
     #[test]
-    fn timing_criticality_emphasizes_the_worst_edges() {
+    fn timing_criticality_concentrates_on_the_worst_paths() {
         assert_eq!(criticality_weight(0, 4_000), 1);
         assert_eq!(criticality_weight(2_000, 4_000), 4);
         assert_eq!(criticality_weight(3_000, 4_000), 20);
@@ -1420,42 +1712,42 @@ mod tests {
     }
 
     #[test]
-    fn timing_frontier_keeps_balanced_setup_and_hold_extremes() {
-        let axes = [
-            (-100, -100, 100),
-            (10, -300, 90),
-            (-300, 20, 90),
-            (-200, -200, 80),
-            (-100, -100, 110),
-        ];
-
-        assert_eq!(pareto_axes_indices(&axes, 3), vec![0, 1, 2]);
+    fn timing_objective_is_zero_exactly_at_closure() {
+        assert!(
+            slack_violations([0, 10, 20].into_iter()).score()
+                > slack_violations([-1, 10].into_iter()).score()
+        );
+        assert!(
+            slack_violations([-10, -10].into_iter()).score()
+                > slack_violations([-20, 0].into_iter()).score()
+        );
+        let violations = slack_violations([-20, 0, -5, 10].into_iter());
+        assert_eq!(violations.total_negative_slack_ps(), -25);
+        assert_eq!(violations.endpoints, 2);
     }
 
     #[test]
-    fn timing_beam_keeps_non_monotonic_search_trajectories() {
-        let axes = [
-            (-500, -500, 100),
-            (-400, -800, 90),
-            (-800, -300, 90),
-            (-900, -900, 80),
-        ];
+    fn timing_objective_rejects_small_wns_gains_that_destroy_tns() {
+        let narrow = slack_violations([-100, 0].into_iter()).score();
+        let widespread = slack_violations(std::iter::repeat_n(-99, 100)).score();
 
-        assert_eq!(extreme_axes_indices(&axes, &[0, 1, 2, 3], 3), vec![0, 1, 2]);
+        assert!(narrow > widespread);
     }
 
     #[test]
-    fn setup_focused_beam_protects_a_hold_clean_candidate() {
-        let axes = [
-            (-100, -10, 100),
-            (-200, 20, 90),
-            (-300, 50, 80),
-            (-50, -500, 70),
-        ];
+    fn timing_objective_closes_setup_before_hold_eco() {
+        let closed = slack_violations([0].into_iter()).score();
+        let setup_near = slack_violations([-10].into_iter()).score();
+        let setup_far = slack_violations([-20].into_iter()).score();
+        let hold_bad = slack_violations([-1_000].into_iter()).score();
 
-        assert_eq!(
-            setup_focused_axes_indices(&axes, &[0, 1, 2, 3], 2),
-            vec![0, 1]
+        assert!(
+            staged_timing_score(setup_near, hold_bad, -10, -1_000)
+                > staged_timing_score(setup_far, closed, -20, 10)
+        );
+        assert!(
+            staged_timing_score(closed, hold_bad, 0, -1_000)
+                > staged_timing_score(setup_near, closed, -10, 10)
         );
     }
 

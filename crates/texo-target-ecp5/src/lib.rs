@@ -390,8 +390,11 @@ pub struct Ecp5GlobalRoutingCache<'a> {
     wire_lookup: HashMap<(Point, &'a str), WireId>,
     unique_wires: HashMap<&'a str, Option<WireId>>,
     forward_routes: HashMap<(WireId, WireId), (Vec<WireId>, Vec<PipId>)>,
+    reverse_routes: HashMap<(usize, WireId), GlobalClockBranch>,
     reverse_search: GlobalReverseSearch,
 }
+
+type GlobalClockBranch = (WireId, Vec<WireId>, Vec<PipId>);
 
 #[derive(Deserialize, Serialize)]
 struct ArchitectureCache {
@@ -1116,7 +1119,7 @@ impl Ecp5Packing {
                     continue;
                 }
                 let (join, branch_wires, branch_pips) = cache
-                    .reverse_route(device, sink_wire, &wires, &tile_name)
+                    .reverse_route(device, network, sink_wire, &wires, &tile_name)
                     .ok_or_else(|| {
                         global_route_error(
                             net,
@@ -1173,6 +1176,7 @@ impl Ecp5Architecture {
             wire_lookup,
             unique_wires,
             forward_routes: HashMap::new(),
+            reverse_routes: HashMap::new(),
             reverse_search: GlobalReverseSearch::new(device.wires().len()),
         }
     }
@@ -1200,12 +1204,22 @@ impl Ecp5GlobalRoutingCache<'_> {
     fn reverse_route(
         &mut self,
         device: &Device,
+        network: usize,
         sink: WireId,
         tree: &BTreeSet<WireId>,
         target_name: &str,
     ) -> Option<(WireId, Vec<WireId>, Vec<PipId>)> {
-        self.reverse_search
-            .route(device, &self.incoming, sink, tree, target_name)
+        let key = (network, sink);
+        if let Some((join, wires, pips)) = self.reverse_routes.get(&key)
+            && (tree.contains(join) || wire_basename(&device.wires()[join.0].name) == target_name)
+        {
+            return Some((*join, wires.clone(), pips.clone()));
+        }
+        let route = self
+            .reverse_search
+            .route(device, &self.incoming, sink, tree, target_name)?;
+        self.reverse_routes.insert(key, route.clone());
+        Some(route)
     }
 }
 
