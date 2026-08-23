@@ -3680,7 +3680,13 @@ fn reconstruct_hold_path(
 }
 
 const ROUTING_CRITICALITY_SCALE: u64 = 64;
-const ROUTING_DELAY_QUANTUM_PS: u64 = 50;
+/// Default routing delay quantum in picoseconds.
+///
+/// Detailed timing nets may pass a finer quantum, but measuring the AXI4
+/// self-test showed the finest setting bought nothing: the final placement
+/// and WNS were unchanged while small-trial routing slowed by ~27% from the
+/// arrival-dimension state growth in [`routing_transition_cost`] searches.
+pub const ROUTING_DELAY_QUANTUM_PS: u64 = 50;
 
 fn timing_tree_cost(arrival_ps: u64, criticality: u64, delay_quantum_ps: u64) -> u64 {
     arrival_ps

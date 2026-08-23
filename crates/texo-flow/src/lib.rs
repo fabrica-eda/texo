@@ -1147,7 +1147,13 @@ impl TimingDrivenContext<'_> {
                     .set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
                 routing_costs.set_sink_min_delays_ps(BTreeMap::new());
                 routing_costs.set_detailed_timing_nets(released_net_ids(&released));
-                routing_costs.set_detailed_delay_quantum_ps(10);
+                // Measured: the finest quantum left WNS and hold untouched while slowing
+            // small-trial routing by ~27%, so detailed searches here run at the
+            // default granularity and only the multiresolution ripup keeps a
+            // fine quantum.
+            routing_costs.set_detailed_delay_quantum_ps(
+                texo_pnr::ROUTING_DELAY_QUANTUM_PS,
+            );
                 let trial = self.route_and_analyze(refined, &frozen, Some(routing_costs), progress);
                 routing_costs.set_detailed_timing_nets(BTreeSet::new());
                 if let Ok(candidate) = trial {
