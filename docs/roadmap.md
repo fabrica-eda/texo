@@ -66,8 +66,13 @@ device/package and a checker can reconstruct all occupancy.
 
 ## M3 — placement
 
-- [ ] Add timing/congestion cost models and incremental bounding-box updates.
-- [ ] Implement simulated annealing first; evaluate analytical placement later.
+- [x] Add timing cost models: routed-delay budgets drive bounded refinement
+  moves, and stalled flows escape placement basins deterministically.
+- [ ] Blend criticality into the single analytical solve (two competing seeds
+  measured: the timing-driven replacement never wins archive selection).
+- [ ] Evaluate simulated annealing; deterministic descent plus basin escape
+  is the current baseline and threshold acceptance inside descent measured
+  worse on the AXI4 self-test.
 - [ ] Extend the existing DCCA, fixed IO, and DP16KD placement groups as new target
   rules require.
 - [x] Emit schema-versioned deterministic JSON implementation checkpoints and
@@ -79,8 +84,10 @@ quality measured against nextpnr.
 ## M4 — routing
 
 - Separate global routing estimates from detailed routing resources.
-- Implement negotiated-congestion routing (PathFinder-style), timing criticality,
-  rip-up/reroute, and dedicated-resource handling.
+- [x] Implement negotiated-congestion routing (PathFinder-style) with timing
+  criticality, plus global data-route ripup under exact picosecond costs for
+  failing connections when closing critical paths.
+- [ ] Tune ripup cost (gate rounds that regress; single delay quantum).
 - Verify shorts, opens, illegal PIPs, and directionality independently of the
   router.
 
