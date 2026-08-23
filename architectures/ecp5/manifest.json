@@ -1,0 +1,28 @@
+{
+  "manifest_version": 1,
+  "architecture_schema_version": 4,
+  "cache_format_version": 2,
+  "source": {
+    "distribution": "Ubuntu 24.04 (noble, amd64)",
+    "database_root": "/usr/share/trellis/database",
+    "packages": {
+      "fpga-trellis-database": "1.4-2build4",
+      "python3-pytrellis": "1.4-2build4"
+    },
+    "project_trellis_revision": "project-trellis/1.4+ubuntu/1.4-2build4",
+    "database_revision": "fpga-trellis-database/1.4-2build4",
+    "python_libdirs": [
+      "/usr/lib/x86_64-linux-gnu/trellis",
+      "/usr/share/trellis/timing/util",
+      "/usr/share/trellis/util/common"
+    ]
+  },
+  "devices": [
+    {
+      "device": "LFE5UM5G-85F",
+      "artifact_stem": "texo-LFE5UM5G-85F-schema4-cache2",
+      "expected_txdb_bytes": 748942228,
+      "expected_txdb_sha256": "95b56be25b3a68588878cb1ac056639e46d2d10e18092db20418865eb8c2c351"
+    }
+  ]
+}

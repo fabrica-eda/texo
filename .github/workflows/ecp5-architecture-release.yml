@@ -1,0 +1,55 @@
+name: ECP5 architecture database
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "txdb-ecp5-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup override set 1.97.1
+          db_version=$(/usr/bin/python3 -c 'import json; print(json.load(open("architectures/ecp5/manifest.json"))["source"]["packages"]["fpga-trellis-database"])')
+          pytrellis_version=$(/usr/bin/python3 -c 'import json; print(json.load(open("architectures/ecp5/manifest.json"))["source"]["packages"]["python3-pytrellis"])')
+          sudo apt-get update
+          sudo apt-get install --yes \
+            "fpga-trellis-database=${db_version}" \
+            "python3-pytrellis=${pytrellis_version}" \
+            zstd
+
+      - name: Build release assets
+        run: |
+          cargo build --release --locked -p texo-cli
+          /usr/bin/python3 tools/build_ecp5_txdb.py
+
+      - name: Preserve workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: texo-ecp5-architecture-databases
+          if-no-files-found: error
+          path: |
+            artifacts/architecture/*.txdb.zst
+            artifacts/architecture/*.release.json
+            artifacts/architecture/*.SHA256SUMS
+
+      - name: Publish non-overwriting tagged release
+        if: startsWith(github.ref, 'refs/tags/txdb-ecp5-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --generate-notes \
+            artifacts/architecture/*.txdb.zst \
+            artifacts/architecture/*.release.json \
+            artifacts/architecture/*.SHA256SUMS

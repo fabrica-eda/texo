@@ -23,10 +23,10 @@ def parse_args():
     parser.add_argument(
         "--project-trellis-revision",
         required=True,
-        help="Project Trellis source Git revision",
+        help="Project Trellis source revision identifier",
     )
     parser.add_argument(
-        "--database-revision", required=True, help="prjtrellis-db Git revision"
+        "--database-revision", required=True, help="prjtrellis-db revision identifier"
     )
     parser.add_argument(
         "-L",

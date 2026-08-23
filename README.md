@@ -58,11 +58,18 @@ cargo fmt --all -- --check
 ```
 
 `tools/export_ecp5.py` generates a deduplicated architecture snapshot from a
-local Project Trellis build and database. Schema v3 includes PIP timing classes
+local Project Trellis build and database. Schema v4 includes PIP timing classes
 with their independently fitted `min/typ/max` corners and the `6/7/8/8_5G`
 speed-grade cell/interconnect tables. Production device
 snapshots are generated artifacts; the repository keeps a small schema fixture
 for fast, deterministic tests.
+
+Production `.txdb` inputs are reproducible release artifacts. The tracked
+architecture manifest pins their Project Trellis environment, schema, cache
+format, device set, and artifact names; the builder emits compressed caches,
+provenance, and SHA-256 checksums. See
+[`docs/architecture-databases.md`](docs/architecture-databases.md) for the
+build, release, download, and verification procedure.
 
 `ecp5-demo` builds an XOR through Struo, verifies its complete truth table with
 crates.io Celox, applies the selected package, speed grade, and LPF, runs the
@@ -76,11 +83,11 @@ and route to an ECP5 bitstream. Cache a production architecture snapshot, export
 the lossless mapped netlist, run PnR, and emit the bitstream as follows:
 
 ```sh
-cargo run --release -- cache-architecture \
-  artifacts/LFE5UM5G-85F.json artifacts/LFE5UM5G-85F.txdb
+cargo build --release --locked -p texo-cli
+/usr/bin/python3 tools/build_ecp5_txdb.py --device LFE5UM5G-85F
 cargo run --release -- axi4-json artifacts/axi4.json
 cargo run --release -- axi4-pnr \
-  artifacts/LFE5UM5G-85F.txdb CABGA381 8 \
+  artifacts/architecture/texo-LFE5UM5G-85F-schema4-cache2.txdb CABGA381 8 \
   examples/axi4-self-test/lfe5um5g-85f-evn-250mhz.lpf \
   artifacts/axi4.checkpoint.json
 tools/axi4_bitstream.py \
