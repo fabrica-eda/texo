@@ -115,6 +115,14 @@ cluster → LUT → retimed FF (~650+390 ps).
 - Static moderate weights on carry-adjacent nets in the initial analytical
   solve: WNS −509 ps / 337 s. Confirms finding 3 a third time: keep the
   initial solve connectivity-only at this utilization.
+- Replace-style iterative timed re-solves before refinement (weights from the
+  routed incumbent, contrast capped at 8, iterate while routed WNS improves,
+  up to 4 rounds): WNS −329 ps / 391 s. The phase-0 gate compares against the
+  *unrefined* initial candidate, so a mediocre early improvement replaces the
+  good basin that plain-seed refinement would have descended from. Every
+  weighting-based seed variant has now lost to the connectivity-only descent;
+  the structural difference vs nextpnr is its unified placer applying timing
+  weight continuously during spread/legalization, not a solve we can bolt on.
 
 ## Next steps (priority order)
 
