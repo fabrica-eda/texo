@@ -974,8 +974,9 @@ impl<'a> PlacementRefiner<'a> {
         )?))
     }
 
-    /// Proposes placements for one cell's unit that reduce incident connection
-    /// delay locally or physical path span during a broad critical-path move.
+    /// Proposes placements for one cell's unit that reduce the incident
+    /// connections' delay excess over their allowance targets locally, or the
+    /// physical path span during a broad critical-path move.
     ///
     /// # Errors
     ///
@@ -985,12 +986,13 @@ impl<'a> PlacementRefiner<'a> {
     ///
     /// Panics only if an internally validated placement-unit table is
     /// inconsistent with the design.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub fn refine_cell_connection_delays(
         &self,
         placement: Placement,
         moving_cell: CellId,
         connections: &[(CellPinId, CellPinId)],
+        targets_ps: &[u64],
         pip_delays_ps: &[u32],
         max_move_distance: u64,
         max_candidates: usize,
@@ -999,8 +1001,17 @@ impl<'a> PlacementRefiner<'a> {
             return Err(PnrError::InvalidRoutingCosts {
                 reason: format!(
                     "expected {} PIP delays, received {}",
-                    self.graph.device().pips().len(),
-                    pip_delays_ps.len()
+                    pip_delays_ps.len(),
+                    self.graph.device().pips().len()
+                ),
+            });
+        }
+        if targets_ps.len() != connections.len() {
+            return Err(PnrError::InvalidPlacement {
+                reason: format!(
+                    "expected {} connection targets, received {}",
+                    connections.len(),
+                    targets_ps.len()
                 ),
             });
         }
@@ -1027,19 +1038,27 @@ impl<'a> PlacementRefiner<'a> {
             .position(|&cell| cell == moving_cell)
             .expect("the selected unit contains its moving cell");
         let broad_path_move = max_move_distance > 2;
-        let current_delay = if broad_path_move {
+        // Local moves score by the routed-delay excess over the per-connection
+        // allowance targets so already-satisfied connections stop absorbing
+        // moves. Broad path moves stay span-ranked: measuring excess on every
+        // distant candidate cost ~30 s per run without moving WNS, because
+        // span already orders long-haul proposals well enough before the full
+        // route trial decides.
+        let current_excess = if broad_path_move {
             None
         } else {
-            assignment_connection_delay(
+            assignment_connection_excess(
                 &self.graph,
                 self.constraints,
                 unit,
                 &current,
                 moving_cell,
                 connections,
+                targets_ps,
                 &placed,
                 pip_delays_ps,
             )
+            .map(|(excess, _)| excess)
         };
         let Some(current_span) = assignment_connection_span(
             &self.graph,
@@ -1051,7 +1070,7 @@ impl<'a> PlacementRefiner<'a> {
         ) else {
             return Ok(Vec::new());
         };
-        if !broad_path_move && current_delay.is_none() {
+        if !broad_path_move && current_excess.is_none() {
             return Ok(Vec::new());
         }
 
@@ -1113,31 +1132,31 @@ impl<'a> PlacementRefiner<'a> {
             ) else {
                 continue;
             };
-            let score = if broad_path_move {
+            if broad_path_move {
                 if span >= current_span {
                     continue;
                 }
-                (span, 0)
+                best.push((span, 0, assignment.to_vec()));
             } else {
-                let Some(delay) = assignment_connection_delay(
+                let Some((excess, _)) = assignment_connection_excess(
                     &self.graph,
                     self.constraints,
                     unit,
                     assignment,
                     moving_cell,
                     connections,
+                    targets_ps,
                     &placed,
                     pip_delays_ps,
                 ) else {
                     continue;
                 };
-                let current_delay = current_delay.expect("local moves require a current delay");
-                if delay >= current_delay {
+                let current_excess = current_excess.expect("local moves require a current excess");
+                if excess >= current_excess {
                     continue;
                 }
-                (delay, span)
-            };
-            best.push((score.0, score.1, assignment.to_vec()));
+                best.push((excess, span, assignment.to_vec()));
+            }
         }
         best.sort_unstable_by(|left, right| {
             (left.0, left.1, left.2.as_slice()).cmp(&(right.0, right.1, right.2.as_slice()))
@@ -1197,20 +1216,27 @@ fn assignment_bel(
         )
 }
 
+/// Sums per-connection routing delay and its excess over the allowance target.
+///
+/// The excess objective lets a move that already satisfies some connections
+/// concentrate on the ones still blowing their budget instead of chasing the
+/// largest absolute delays.
 #[allow(clippy::too_many_arguments)]
-fn assignment_connection_delay(
+fn assignment_connection_excess(
     graph: &UnifiedGraph<'_>,
     constraints: &PlacementConstraints,
     unit: &PlacementUnit,
     assignment: &[BelId],
     moving_cell: CellId,
     connections: &[(CellPinId, CellPinId)],
+    targets_ps: &[u64],
     placed: &[Option<BelId>],
     pip_delays_ps: &[u32],
-) -> Option<u64> {
+) -> Option<(u64, u64)> {
     let design = graph.design();
     let mut total = 0_u64;
-    for &(driver_pin, sink_pin) in connections {
+    let mut excess = 0_u64;
+    for (&(driver_pin, sink_pin), &target_ps) in connections.iter().zip(targets_ps) {
         let driver_cell = design.pins().get(driver_pin.0)?.cell;
         let sink_cell = design.pins().get(sink_pin.0)?.cell;
         if driver_cell != moving_cell && sink_cell != moving_cell {
@@ -1220,14 +1246,11 @@ fn assignment_connection_delay(
         let sink_bel = assignment_bel(unit, assignment, sink_cell, placed)?;
         let driver_wire = candidate_pin_wire(graph, constraints, driver_pin, driver_bel)?;
         let sink_wire = candidate_pin_wire(graph, constraints, sink_pin, sink_bel)?;
-        total = total.saturating_add(local_connection_delay(
-            graph,
-            driver_wire,
-            sink_wire,
-            pip_delays_ps,
-        )?);
+        let delay = local_connection_delay(graph, driver_wire, sink_wire, pip_delays_ps)?;
+        total = total.saturating_add(delay);
+        excess = excess.saturating_add(delay.saturating_sub(target_ps));
     }
-    Some(total)
+    Some((excess, total))
 }
 
 fn local_connection_delay(

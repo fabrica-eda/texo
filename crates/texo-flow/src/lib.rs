@@ -365,7 +365,7 @@ pub fn implement_struo_ecp5_with_progress(
         speed_grade,
         timing_model: &timing_model,
         timing_constraints: &timing_constraints,
-        placement_weight_exponent: options.placement_weight_exponent,
+        stalled_ripup_seed: None,
     }
     .optimize(initial_implementation, initial_timing, &mut progress)?;
     progress(Ecp5FlowStage::Timed);
@@ -416,7 +416,11 @@ struct TimingDrivenContext<'a> {
     speed_grade: &'a SpeedGradeRecord,
     timing_model: &'a TimingModel,
     timing_constraints: &'a TimingConstraints,
-    placement_weight_exponent: u32,
+    /// Signature `(total_pips, timing_score)` of the archive seed whose global
+    /// ripup last failed to improve the objective. A full data-route ripup
+    /// costs ~100 s, so later closure rounds skip it while the best candidate
+    /// is unchanged.
+    stalled_ripup_seed: Option<(usize, TimingScore)>,
 }
 
 impl TimingDrivenContext<'_> {
@@ -429,26 +433,14 @@ impl TimingDrivenContext<'_> {
         if initial_timing.met_timing() {
             return Ok((initial_implementation, initial_timing));
         }
-        let placement = self.timing_driven_placement(&initial_timing)?;
-        progress(Ecp5FlowStage::TimingDrivenPlaced);
-        let routing = self.packing.global_routing_constraints_cached(
-            self.design,
-            self.architecture,
-            &placement,
-            self.global_routing_cache,
-        )?;
-        progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
-        let (implementation, timing) =
-            self.route_and_analyze(placement, &routing, None, progress)?;
-        let routing_weights = timing_net_weights(&timing, self.timing_constraints);
+        // The separate timing-driven analytical seed never won archive
+        // selection on the measured designs (the connectivity-only solve wins
+        // after routing), so refinement descends directly from the initial
+        // implementation and the second solve's route-and-analyze is skipped.
+        let routing_weights = timing_net_weights(&initial_timing, self.timing_constraints);
         let mut routing_costs =
             ecp5_routing_costs(self.architecture, self.speed_grade, routing_weights)?;
-        let candidates = vec![
-            (initial_implementation, initial_timing),
-            (implementation, timing),
-        ];
-        report_seed_selection(&candidates);
-        let mut archive = select_timing_frontier(candidates);
+        let mut archive = vec![(initial_implementation, initial_timing)];
         let placement_refiner = PlacementRefiner::new(
             self.design,
             self.architecture.device(),
@@ -523,37 +515,6 @@ impl TimingDrivenContext<'_> {
             Some(&final_timing),
         );
         Ok((final_implementation, final_timing))
-    }
-
-    /// Solves the timing-driven analytical placement that seeds refinement.
-    ///
-    /// The configured `placement_weight_exponent` sharpens the sink
-    /// criticality weights before the solve.
-    fn timing_driven_placement(
-        &self,
-        initial_timing: &TimingReport,
-    ) -> Result<Placement, Ecp5FlowError> {
-        let exponent = self.placement_weight_exponent;
-        let mut weights = timing_placement_weights(initial_timing, self.timing_constraints);
-        if exponent > 1 {
-            for weight in weights.values_mut() {
-                *weight = clamp_placement_sink_weight(weight.saturating_pow(exponent));
-            }
-        }
-        let placement = place_analytically_with_net_sink_weights(
-            self.design,
-            self.architecture.device(),
-            self.packing.constraints(),
-            &weights,
-        )?;
-        emit_placement_metric(
-            "timing_driven_place",
-            self.design,
-            self.architecture.device(),
-            &placement,
-            None,
-        );
-        Ok(placement)
     }
 
     fn close_setup_critically(
@@ -684,6 +645,13 @@ impl TimingDrivenContext<'_> {
             if seed.1.worst_slack_ps.is_none() {
                 break;
             }
+            let seed_signature = (seed.0.total_pips, timing_score(&seed.1));
+            if self.stalled_ripup_seed == Some(seed_signature) {
+                // The same incumbent already lost a full ripup round and no
+                // refinement moved it since; renegotiating every data route
+                // again would only burn ~100 s per quantum.
+                break;
+            }
             // Timing-driven ripup: lift every data-net route so the whole
             // design renegotiates while the failing connections pull toward
             // fast resources with exact picosecond costs. Freezing satisfied
@@ -728,6 +696,7 @@ impl TimingDrivenContext<'_> {
             let improves_objective = timing_score(&trial.1) > timing_score(&seed.1);
             progress(Ecp5FlowStage::TimingTrialDecision { improves_objective });
             if !improves_objective {
+                self.stalled_ripup_seed = Some(seed_signature);
                 break;
             }
             archive.push(trial);
@@ -987,23 +956,32 @@ impl TimingDrivenContext<'_> {
             .iter()
             .map(|delay| ((delay.net, delay.sink), delay.delay.max_ps))
             .collect::<BTreeMap<_, _>>();
-        let mut by_cell = BTreeMap::<CellId, (u64, Vec<(CellPinId, CellPinId)>)>::new();
+        // Per-connection delay targets mirror the routed-delay budgets: a
+        // failing connection must shed its whole slack deficit, but never more
+        // than half of its realized delay, so vertex moves score proposals by
+        // the budget they still exceed rather than raw delay alone.
+        let deficit_ps = u64::try_from(worst_slack_ps.unsigned_abs()).unwrap_or(u64::MAX);
+        let mut by_cell = BTreeMap::<CellId, (u64, Vec<(CellPinId, CellPinId)>, Vec<u64>)>::new();
         for &(net, driver, sink) in &worst_connections {
             let driver_cell = self.design.pins()[driver.0].cell;
             let sink_cell = self.design.pins()[sink.0].cell;
             let delay = connection_delays.get(&(net, sink)).copied().unwrap_or(0);
+            let target = delay.saturating_sub(deficit_ps).max(delay / 2).max(1);
             let driver_entry = by_cell.entry(driver_cell).or_default();
             driver_entry.0 = driver_entry.0.saturating_add(delay);
             driver_entry.1.push((driver, sink));
+            driver_entry.2.push(target);
             let sink_entry = by_cell.entry(sink_cell).or_default();
             sink_entry.0 = sink_entry.0.saturating_add(delay);
             sink_entry.1.push((driver, sink));
+            sink_entry.2.push(target);
         }
-        let mut cells = by_cell
-            .into_iter()
-            .filter(|(_, (_, connections))| connections.len() >= 2)
-            .collect::<Vec<_>>();
-        cells.sort_unstable_by_key(|(cell, (delay, _))| (Reverse(*delay), *cell));
+        // Endpoint cells with a single critical connection must move too:
+        // excluding them froze the driving FF of the worst carry-cluster feed
+        // and the sink FF behind it in place, leaving their general-routing
+        // hops permanently over budget.
+        let mut cells = by_cell.into_iter().collect::<Vec<_>>();
+        cells.sort_unstable_by_key(|(cell, (delay, _, _))| (Reverse(*delay), *cell));
         let critical_sinks = worst_connections
             .iter()
             .map(|(net, _, sink)| (*net, *sink))
@@ -1011,11 +989,12 @@ impl TimingDrivenContext<'_> {
         let released = release_entire_nets(self.design, &critical_sinks);
         let mut placement = implementation.placement.clone();
         let mut candidates = Vec::new();
-        for (cell, (_, connections)) in cells.into_iter().take(MAX_CRITICAL_PATH_CELLS) {
+        for (cell, (_, connections, targets)) in cells.into_iter().take(MAX_CRITICAL_PATH_CELLS) {
             let proposals = placement_refiner.refine_cell_connection_delays(
                 placement.clone(),
                 cell,
                 &connections,
+                &targets,
                 routing_costs.pip_delays_ps(),
                 max_move_distance,
                 if max_move_distance > 2 {
@@ -1258,12 +1237,6 @@ fn emit_placement_metric(
     }
 }
 
-/// Caps an amplified sink weight so fanout multiplication downstream still
-/// fits the placer's `u32` edge weights.
-fn clamp_placement_sink_weight(weight: u64) -> u64 {
-    weight.min(1024)
-}
-
 /// Derives per-connection free-distance allowances from routed delays and
 /// setup slack.
 ///
@@ -1312,25 +1285,6 @@ fn placement_sink_budgets(
         );
     }
     budgets
-}
-
-/// Reports which placement seed survives archive selection when
-/// `TEXO_METRICS` is set. The AXI4 self-test consistently keeps the
-/// connectivity-only seed, which motivated blending criticality into a
-/// single solve rather than tuning the replacement.
-fn report_seed_selection(candidates: &[(PnrResult, TimingReport)]) {
-    if !metrics_enabled() || candidates.len() < 2 {
-        return;
-    }
-    let winner = if timing_score(&candidates[0].1) > timing_score(&candidates[1].1) {
-        "initial"
-    } else {
-        "timing_driven"
-    };
-    eprintln!(
-        "[metrics] seed={winner} initial_wns={:?} timed_wns={:?}",
-        candidates[0].1.worst_slack_ps, candidates[1].1.worst_slack_ps
-    );
 }
 
 fn timing_net_weights(
@@ -1578,6 +1532,11 @@ impl SlackViolations {
 }
 
 /// Solves the connectivity-only analytical placement that starts the flow.
+///
+/// Measured: adding static moderate weights on nets touching packed carry
+/// slices pulled feeding logic toward the clusters globally but landed the
+/// whole design in a worse basin (WNS −509 vs −287 ps), matching the earlier
+/// finding that wirelength-dominant solves win at 1.6% utilization.
 fn initial_analytical_placement(
     design: &Design,
     architecture: &Ecp5Architecture,

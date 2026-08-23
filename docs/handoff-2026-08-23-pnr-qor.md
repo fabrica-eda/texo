@@ -50,6 +50,19 @@ Gotchas learned the hard way:
 At the 250 MHz target Texo closes (+7/+9 ps) in about 112 s, down from
 160 s at session start.
 
+## Session update (2026-08-24, uncommitted)
+
+| Config | WNS @300 | Runtime |
+|---|---|---|
+| baseline (handoff) | −352 ps | ~290 s |
+| drop second analytical seed + stalled-ripup memo | −352 ps | 269 s |
+| budget-excess scoring for local vertex moves | −342 ps | 243 s |
+| + single-connection endpoint cells join vertex moves (**kept**) | **−287 ps** | 344 s |
+
+Fmax ≈ 276 MHz with the kept configuration. Remaining critical path:
+decoder FF → carry cluster feed (~890 ps over 3–4 tiles), carry hops free,
+cluster → LUT → retimed FF (~650+390 ps).
+
 ## Commits (oldest first)
 
 | Commit | Content |
@@ -91,6 +104,17 @@ At the 250 MHz target Texo closes (+7/+9 ps) in about 112 s, down from
 - Threshold acceptance inside descent loops: reverted same-day; accepting
   regressions derailed the greedy trajectory (−15 ps / 287 s). Kept instead:
   gated basin escape after all phases stall.
+- Budget-excess scoring for *broad* (distance-16) vertex moves: unbounded A*
+  per candidate blew past 15 min; two-stage span-pre-ranking variant ran at
+  −342 ps / 276 s — no QoR over span-only, +33 s. Reverted.
+- `MAX_CRITICAL_PATH_CELLS` 6→12: same WNS (−287 ps), 436 s. The extra cells'
+  route trials are rejected; coverage is not the limiter.
+- Batched endpoint pulls (`refine_connection_delay` per worst edge, one route
+  trial for the batch): same WNS (−287 ps), 445 s; greedy estimated-delay
+  acceptance moves cells whose full-route outcome regresses TNS elsewhere.
+- Static moderate weights on carry-adjacent nets in the initial analytical
+  solve: WNS −509 ps / 337 s. Confirms finding 3 a third time: keep the
+  initial solve connectivity-only at this utilization.
 
 ## Next steps (priority order)
 
