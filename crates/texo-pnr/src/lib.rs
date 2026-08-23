@@ -2177,36 +2177,27 @@ fn nearest_legal_assignments_impl(
     let mut nearest = Vec::new();
     let max_radius = device.width() + device.height();
     for radius in 0..max_radius {
-        for y in 0..device.height() {
-            let dy = y.abs_diff(target.y);
-            if dy > radius {
-                continue;
-            }
+        for dy in 0..=radius {
             let dx = radius - dy;
-            for (side, x) in [target.x.checked_sub(dx), target.x.checked_add(dx)]
-                .into_iter()
-                .flatten()
-                .enumerate()
-            {
-                if x >= device.width() || (dx == 0 && side == 1) {
-                    continue;
-                }
-                let bucket = &spatial_index.by_point[(y * device.width() + x) as usize];
-                for &index in bucket {
-                    let assignment = unit.choices.assignment(index);
-                    if assignment.iter().all(|bel| !occupied.contains(bel))
-                        && point_usage.is_none_or(|usage| {
-                            density_allows_assignment(graph, unit, assignment, usage)
-                        })
-                        && assignment_pin_wires_are_legal(
-                            graph,
-                            constraints,
-                            &unit.cells,
-                            assignment,
-                            pin_usage,
-                        )
-                    {
-                        nearest.push(index);
+            for y in ring_coordinates(target.y, dy, device.height()) {
+                for x in ring_coordinates(target.x, dx, device.width()) {
+                    let bucket = &spatial_index.by_point[(y * device.width() + x) as usize];
+                    for &index in bucket {
+                        let assignment = unit.choices.assignment(index);
+                        if assignment.iter().all(|bel| !occupied.contains(bel))
+                            && point_usage.is_none_or(|usage| {
+                                density_allows_assignment(graph, unit, assignment, usage)
+                            })
+                            && assignment_pin_wires_are_legal(
+                                graph,
+                                constraints,
+                                &unit.cells,
+                                assignment,
+                                pin_usage,
+                            )
+                        {
+                            nearest.push(index);
+                        }
                     }
                 }
             }
@@ -2218,6 +2209,19 @@ fn nearest_legal_assignments_impl(
         }
     }
     nearest
+}
+
+/// Coordinates exactly `offset` away from `center`, clipped to `extent`.
+///
+/// The zero offset yields only the center so ring enumeration never visits a
+/// coordinate twice.
+fn ring_coordinates(center: u32, offset: u32, extent: u32) -> impl IntoIterator<Item = u32> {
+    let minus = center.checked_sub(offset);
+    let plus = (offset != 0).then(|| center.checked_add(offset)).flatten();
+    [minus, plus]
+        .into_iter()
+        .flatten()
+        .filter(move |&value| value < extent)
 }
 
 const MAX_LOGIC_CELLS_PER_POINT: usize = 2;
@@ -2788,9 +2792,48 @@ fn validate_routing_costs(
     Ok(())
 }
 
+/// Pin-to-wire resolutions for one fixed placement, computed once.
+///
+/// Resolving a logical pin scans its BEL's pins with name comparisons, and
+/// negotiated routing resolves the same pins on every net and iteration, so
+/// this cache performs each scan once per placement instead of once per use.
+#[derive(Clone, Debug)]
+struct PinWireCache {
+    wires: Vec<Option<WireId>>,
+}
+
+impl PinWireCache {
+    fn build(graph: &UnifiedGraph<'_>, placement: &Placement) -> Self {
+        let design = graph.design();
+        let mut wires = Vec::with_capacity(design.pins().len());
+        for index in 0..design.pins().len() {
+            let pin = CellPinId(index);
+            let cell = design.pins()[pin.0].cell;
+            let wire = placement
+                .bel(cell)
+                .and_then(|bel| bound_wire(graph, placement, pin, bel).ok());
+            wires.push(wire);
+        }
+        Self { wires }
+    }
+
+    /// Resolves a logical pin, falling back to the error-producing scan when
+    /// the cached resolution failed during construction.
+    fn resolve(
+        &self,
+        graph: &UnifiedGraph<'_>,
+        placement: &Placement,
+        cell_pin: CellPinId,
+        bel: BelId,
+    ) -> Result<WireId, PnrError> {
+        self.wires[cell_pin.0].map_or_else(|| bound_wire(graph, placement, cell_pin, bel), Ok)
+    }
+}
+
 fn route_reaches_all_sinks(
     graph: &UnifiedGraph<'_>,
     placement: &Placement,
+    pin_wires: &PinWireCache,
     route: &NetRoute,
 ) -> Result<bool, PnrError> {
     let net = &graph.design().nets()[route.net.0];
@@ -2800,7 +2843,7 @@ fn route_reaches_all_sinks(
         let bel = placement
             .bel(cell)
             .ok_or(PnrError::MissingPlacement { cell })?;
-        if !wires.contains(&bound_wire(graph, placement, sink, bel)?) {
+        if !wires.contains(&pin_wires.resolve(graph, placement, sink, bel)?) {
             return Ok(false);
         }
     }
@@ -2825,12 +2868,13 @@ fn route(
         routes[net.0] = Some(route.clone());
         add_route(route, &mut wire_occupancy, &mut pip_occupancy);
     }
-    let mut routing_order = (0..design.nets().len()).collect::<Vec<_>>();
-    routing_order.sort_by_key(|&index| routing_order_key(design, constraints, costs, index));
+    let pin_wires = PinWireCache::build(graph, placement);
+    let mut routing_order = routing_order(design, constraints, costs);
+    routing_order.sort_unstable();
     let mut dirty = BTreeSet::new();
     for index in 0..design.nets().len() {
         let complete = if let Some(route) = constraints.routes().get(&NetId(index)) {
-            route_reaches_all_sinks(graph, placement, route)?
+            route_reaches_all_sinks(graph, placement, &pin_wires, route)?
         } else {
             false
         };
@@ -2839,6 +2883,9 @@ fn route(
         }
     }
     let mut search = RouteSearch::new(device.wires().len());
+    // One shared per-net tree-arrival scratch buffer, sized once for the
+    // device. route_net seeds and cleans only the wires it touches.
+    let mut tree_arrival_ps = vec![UNROUTED_ARRIVAL_PS; device.wires().len()];
     for iteration in 0..MAX_ROUTING_ITERATIONS {
         let present_factor = 1_u32 << iteration.min(12);
         progress(RoutingProgress::Iteration {
@@ -2851,7 +2898,7 @@ fn route(
             }
         }
         let mut ordinal = 0;
-        for &index in &routing_order {
+        for &(_, index) in &routing_order {
             if !dirty.contains(&index) {
                 continue;
             }
@@ -2866,6 +2913,7 @@ fn route(
             let route = route_net(
                 graph,
                 placement,
+                &pin_wires,
                 constraints.routes().get(&net_id),
                 net_id,
                 &wire_occupancy,
@@ -2875,6 +2923,7 @@ fn route(
                 present_factor,
                 costs,
                 &mut search,
+                &mut tree_arrival_ps,
             )?;
             add_route(&route, &mut wire_occupancy, &mut pip_occupancy);
             routes[index] = Some(route);
@@ -2912,10 +2961,42 @@ fn route(
     })
 }
 
+/// Deterministic net routing order: locked trees first, then criticality,
+/// hold constraints, fanout, and stable ID.
+type RoutingOrderEntry = (
+    (bool, Reverse<u64>, Reverse<bool>, Reverse<usize>, usize),
+    usize,
+);
+
+fn routing_order(
+    design: &Design,
+    constraints: &RoutingConstraints,
+    costs: Option<&RoutingCosts>,
+) -> Vec<RoutingOrderEntry> {
+    let hold_constrained_nets = costs
+        .map(|costs| {
+            costs
+                .sink_min_delays_ps
+                .keys()
+                .map(|(net, _)| *net)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    (0..design.nets().len())
+        .map(|index| {
+            (
+                routing_order_key(design, constraints, costs, &hold_constrained_nets, index),
+                index,
+            )
+        })
+        .collect()
+}
+
 fn routing_order_key(
     design: &Design,
     constraints: &RoutingConstraints,
     costs: Option<&RoutingCosts>,
+    hold_constrained_nets: &BTreeSet<NetId>,
     index: usize,
 ) -> (bool, Reverse<u64>, Reverse<bool>, Reverse<usize>, usize) {
     let net = NetId(index);
@@ -2923,12 +3004,7 @@ fn routing_order_key(
         .and_then(|costs| costs.net_criticalities.get(&net))
         .copied()
         .unwrap_or(0);
-    let hold_constrained = costs.is_some_and(|costs| {
-        costs
-            .sink_min_delays_ps
-            .keys()
-            .any(|(candidate, _)| *candidate == net)
-    });
+    let hold_constrained = hold_constrained_nets.contains(&net);
     (
         !constraints.routes().contains_key(&net),
         Reverse(criticality),
@@ -2968,6 +3044,7 @@ fn congested_routes(
 fn route_net(
     graph: &UnifiedGraph<'_>,
     placement: &Placement,
+    pin_wires: &PinWireCache,
     fixed: Option<&NetRoute>,
     net_id: NetId,
     wire_occupancy: &[u16],
@@ -2977,6 +3054,7 @@ fn route_net(
     present_factor: u32,
     costs: Option<&RoutingCosts>,
     search: &mut RouteSearch,
+    tree_arrival_ps: &mut [u64],
 ) -> Result<NetRoute, PnrError> {
     let design = graph.design();
     let device = graph.device();
@@ -2985,7 +3063,7 @@ fn route_net(
     let driver_bel = placement
         .bel(driver_cell)
         .ok_or(PnrError::MissingPlacement { cell: driver_cell })?;
-    let driver_wire = bound_wire(graph, placement, net.driver, driver_bel)?;
+    let driver_wire = pin_wires.resolve(graph, placement, net.driver, driver_bel)?;
     let mut tree_wires =
         fixed.map_or_else(BTreeSet::new, |route| route.wires.iter().copied().collect());
     tree_wires.insert(driver_wire);
@@ -2999,24 +3077,27 @@ fn route_net(
             ROUTING_DELAY_QUANTUM_PS
         }
     });
-    let mut tree_delays_ps = tree_wires
-        .iter()
-        .copied()
-        .map(|wire| (wire, 0_u64))
-        .collect::<BTreeMap<_, _>>();
+    // `tree_arrival_ps` is a caller-owned scratch buffer reused across nets.
+    // The sentinel means "wire is outside the routed tree". Tree wires always
+    // carry a real nonnegative arrival, matching the previous map-based
+    // representation where absent entries were only ever written by insertion
+    // rather than merged with a zero seed.
+    for &wire in &tree_wires {
+        tree_arrival_ps[wire.0] = 0;
+    }
     let sinks = ordered_sinks(net_id, &net.sinks, costs);
     for sink_pin in &sinks {
         let sink_cell = design.pins()[sink_pin.0].cell;
         let sink_bel = placement
             .bel(sink_cell)
             .ok_or(PnrError::MissingPlacement { cell: sink_cell })?;
-        let sink_wire = bound_wire(graph, placement, *sink_pin, sink_bel)?;
+        let sink_wire = pin_wires.resolve(graph, placement, *sink_pin, sink_bel)?;
         let minimum_arrival_ps = costs
             .and_then(|costs| costs.sink_min_delays_ps.get(&(net_id, *sink_pin)))
             .copied()
             .unwrap_or(0);
         if tree_wires.contains(&sink_wire) {
-            if tree_delays_ps.get(&sink_wire).copied().unwrap_or(0) >= minimum_arrival_ps {
+            if tree_arrival_ps[sink_wire.0] >= minimum_arrival_ps {
                 continue;
             }
             return Err(PnrError::Unroutable {
@@ -3045,7 +3126,7 @@ fn route_net(
                 costs,
                 criticality,
                 delay_quantum_ps,
-                &tree_delays_ps,
+                tree_arrival_ps,
                 minimum_arrival_ps,
             )
             .ok_or_else(|| PnrError::Unroutable {
@@ -3064,20 +3145,28 @@ fn route_net(
                 ),
             })?;
         if let Some(costs) = costs {
-            let mut arrival_ps = tree_delays_ps[path_wires
+            let mut arrival_ps = tree_arrival_ps[path_wires
                 .last()
-                .expect("a routed path includes its tree start")];
+                .expect("a routed path includes its tree start")
+                .0];
             for (&wire, &pip) in path_wires.iter().rev().skip(1).zip(path_pips.iter().rev()) {
                 let delay_ps = routed_tree_pip_delay(costs, pip, minimum_arrival_ps);
                 arrival_ps = arrival_ps.saturating_add(u64::from(delay_ps));
-                tree_delays_ps
-                    .entry(wire)
-                    .and_modify(|known| *known = (*known).min(arrival_ps))
-                    .or_insert(arrival_ps);
+                tree_arrival_ps[wire.0] = match tree_arrival_ps[wire.0] {
+                    UNROUTED_ARRIVAL_PS => arrival_ps,
+                    known => known.min(arrival_ps),
+                };
+            }
+        } else {
+            for &wire in &path_wires {
+                tree_arrival_ps[wire.0] = 0;
             }
         }
         tree_wires.extend(path_wires);
         tree_pips.extend(path_pips);
+    }
+    for &wire in &tree_wires {
+        tree_arrival_ps[wire.0] = UNROUTED_ARRIVAL_PS;
     }
     Ok(NetRoute {
         net: net_id,
@@ -3085,6 +3174,9 @@ fn route_net(
         pips: tree_pips.into_iter().collect(),
     })
 }
+
+/// Arrival sentinel for wires outside the routed tree under optimization.
+const UNROUTED_ARRIVAL_PS: u64 = u64::MAX;
 
 fn ordered_sinks(net: NetId, sinks: &[CellPinId], costs: Option<&RoutingCosts>) -> Vec<CellPinId> {
     let mut ordered = sinks.to_vec();
@@ -3170,6 +3262,9 @@ fn bound_wire(
 struct RouteSearch {
     epoch: u32,
     seen: Vec<u32>,
+    /// Epoch-stamped members of the currently growing tree. Replaces
+    /// `starts.contains` on every edge relaxation with one array load.
+    start_mark: Vec<u32>,
     distance: Vec<u64>,
     arrival_ps: Vec<u64>,
     previous_wire: Vec<usize>,
@@ -3184,6 +3279,7 @@ impl RouteSearch {
         Self {
             epoch: 0,
             seen: vec![0; wire_count],
+            start_mark: vec![0; wire_count],
             distance: vec![0; wire_count],
             arrival_ps: vec![0; wire_count],
             previous_wire: vec![usize::MAX; wire_count],
@@ -3205,7 +3301,7 @@ impl RouteSearch {
         costs: Option<&RoutingCosts>,
         criticality: u64,
         delay_quantum_ps: u64,
-        tree_delays_ps: &BTreeMap<WireId, u64>,
+        tree_delays_ps: &[u64],
         minimum_arrival_ps: u64,
     ) -> Option<(Vec<WireId>, Vec<PipId>)> {
         if minimum_arrival_ps != 0 {
@@ -3227,6 +3323,7 @@ impl RouteSearch {
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             self.seen.fill(0);
+            self.start_mark.fill(0);
             self.epoch = 1;
         }
         let epoch = self.epoch;
@@ -3242,7 +3339,8 @@ impl RouteSearch {
         });
         let mut queue = BinaryHeap::new();
         for &start in starts {
-            let arrival_ps = tree_delays_ps.get(&start).copied().unwrap_or(0);
+            self.start_mark[start.0] = epoch;
+            let arrival_ps = tree_delays_ps[start.0];
             let distance = timing_tree_cost(arrival_ps, criticality, delay_quantum_ps);
             self.seen[start.0] = epoch;
             self.distance[start.0] = distance;
@@ -3276,7 +3374,7 @@ impl RouteSearch {
             }
 
             for &(neighbor, pip) in graph.routing_neighbors(wire).ok()? {
-                if starts.contains(&neighbor) {
+                if self.start_mark[neighbor.0] == epoch {
                     continue;
                 }
                 if corridor.is_some_and(|corridor| {
@@ -3392,7 +3490,7 @@ fn shortest_hold_path(
     present_factor: u32,
     costs: &RoutingCosts,
     criticality: u64,
-    tree_delays_ps: &BTreeMap<WireId, u64>,
+    tree_delays_ps: &[u64],
     minimum_arrival_ps: u64,
 ) -> Option<(Vec<WireId>, Vec<PipId>)> {
     let device = graph.device();
@@ -3400,7 +3498,7 @@ fn shortest_hold_path(
     let mut visits = HashMap::<HoldRouteState, HoldRouteVisit>::new();
     let mut queue = BinaryHeap::new();
     for &start in starts {
-        let arrival_ps = tree_delays_ps.get(&start).copied().unwrap_or(0);
+        let arrival_ps = tree_delays_ps[start.0];
         let state = (start, hold_delay_bucket(arrival_ps, minimum_arrival_ps));
         let distance = timing_tree_cost(arrival_ps, criticality, ROUTING_DELAY_QUANTUM_PS);
         visits.insert(state, (distance, arrival_ps, None));
@@ -3742,7 +3840,7 @@ mod tests {
     };
 
     use super::{
-        Placement, PlacementConstraints, PlacementNeighbor, PnrError, RouteSearch,
+        PinWireCache, Placement, PlacementConstraints, PlacementNeighbor, PnrError, RouteSearch,
         RoutingConstraints, RoutingCosts, place_analytically_with_net_sink_weights,
         place_and_route, place_with_constraints, placement_neighbors,
         refine_placement_with_net_sink_weights_limited, refine_placement_with_net_weights,
@@ -4002,6 +4100,7 @@ mod tests {
             route_reaches_all_sinks(
                 &UnifiedGraph::new(&design, &device),
                 &placement,
+                &PinWireCache::build(&UnifiedGraph::new(&design, &device), &placement),
                 &rerouted.routes[0]
             )
             .unwrap()
@@ -4066,7 +4165,7 @@ mod tests {
         let costs = RoutingCosts::new(vec![10, 10], BTreeMap::new());
         let mut search = RouteSearch::new(device.wires().len());
         let starts = [slow_tree, fast_tree].into_iter().collect();
-        let tree_delays = BTreeMap::from([(slow_tree, 100), (fast_tree, 0)]);
+        let tree_delays = vec![100, 0];
 
         let (wires, _) = search
             .shortest_path(
@@ -4119,7 +4218,7 @@ mod tests {
                 Some(&costs),
                 0,
                 50,
-                &BTreeMap::from([(start, 0)]),
+                &[0],
                 500,
             )
             .unwrap();
