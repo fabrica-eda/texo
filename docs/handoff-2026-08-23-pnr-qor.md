@@ -123,6 +123,22 @@ cluster → LUT → retimed FF (~650+390 ps).
   weighting-based seed variant has now lost to the connectivity-only descent;
   the structural difference vs nextpnr is its unified placer applying timing
   weight continuously during spread/legalization, not a solve we can bolt on.
+- Estimated-STA feedback inside the solve (new `estimate_placement_timing` in
+  texo-timing: Manhattan×250 ps + 300 ps per net edge, shared STA machinery),
+  iterating while *estimated* score improves and gating the final weighted
+  placement by real routed score: WNS −287 ps (identical basin) but +205 s.
+  Estimated-timing ranking does not transfer to routed outcome either —
+  finding 1 extends to placement-based delay estimates at this utilization.
+  Reverted; the gate itself worked (no QoR regression).
+
+**Verdict after five weighting variants (routed weights as competing seed,
+routed weights as replacement, static carry weights, capped blend iteration,
+estimated-STA iteration): on this netlist at 1.6% utilization every
+criticality-weighted analytical solve lands in a worse basin than pure-HPWL
+descent. Closing the remaining −287 ps needs a genuinely unified iterative
+placer (spread/legalization interwoven with timing weight) or denser-design
+evidence before more density-side work — not another reweighting of the
+existing solve→refine pipeline.**
 
 ## Next steps (priority order)
 
