@@ -202,6 +202,22 @@ not rank. A real turnover gain needs a faster *routed* trial (router-level
 work: bounded search for criticality-1 nets, targeted ripup), not smarter
 pre-route scoring.
 
+### Experiment 9 (plain-net search bounding): neutral, reverted
+
+Extended the corridor to criticality-1 nets (`PLAIN_ROUTE_CORRIDOR_MARGIN`).
+Margin 4: WNS −301 ps and slower — frequent fallbacks double-searched, and
+the old costs-less retry lost delay awareness. Margin 10 with a
+cost-preserving unbounded retry: final placement bit-identical to baseline,
+no measurable speedup. Two findings: (1) plain nets were never the small-
+trial bottleneck — their Manhattan-guided sweeps already stay local at this
+utilization; (2) the real cost center of ~1 s small trials is the
+detailed-quantum transition search on released critical nets, where arrival
+becomes part of the A* state (`routing_transition_cost`, state =
+(wire, distance, arrival)) and multiplies visited states. Future router work
+should target that state space (coarser arrival buckets on non-failing
+sinks, or per-sink quantum escalation) and targeted ripup; plain-net
+bounding is a dead end here.
+
 ## Failed experiments (patches kept, not merged)
 
 - Bound2bound reweighting alone: `/tmp/opencode/b2b-experiment.patch`
