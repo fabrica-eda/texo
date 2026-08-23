@@ -447,17 +447,7 @@ impl TimingDrivenContext<'_> {
             (initial_implementation, initial_timing),
             (implementation, timing),
         ];
-        if metrics_enabled() {
-            let winner = if timing_score(&candidates[0].1) > timing_score(&candidates[1].1) {
-                "initial"
-            } else {
-                "timing_driven"
-            };
-            eprintln!(
-                "[metrics] seed={} initial_wns={:?} timed_wns={:?}",
-                winner, candidates[0].1.worst_slack_ps, candidates[1].1.worst_slack_ps
-            );
-        }
+        report_seed_selection(&candidates);
         let mut archive = select_timing_frontier(candidates);
         let placement_refiner = PlacementRefiner::new(
             self.design,
@@ -1322,6 +1312,25 @@ fn placement_sink_budgets(
         );
     }
     budgets
+}
+
+/// Reports which placement seed survives archive selection when
+/// `TEXO_METRICS` is set. The AXI4 self-test consistently keeps the
+/// connectivity-only seed, which motivated blending criticality into a
+/// single solve rather than tuning the replacement.
+fn report_seed_selection(candidates: &[(PnrResult, TimingReport)]) {
+    if !metrics_enabled() || candidates.len() < 2 {
+        return;
+    }
+    let winner = if timing_score(&candidates[0].1) > timing_score(&candidates[1].1) {
+        "initial"
+    } else {
+        "timing_driven"
+    };
+    eprintln!(
+        "[metrics] seed={winner} initial_wns={:?} timed_wns={:?}",
+        candidates[0].1.worst_slack_ps, candidates[1].1.worst_slack_ps
+    );
 }
 
 fn timing_net_weights(
