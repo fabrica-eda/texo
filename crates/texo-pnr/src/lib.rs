@@ -644,7 +644,7 @@ pub fn refine_placement_with_net_weights(
     net_weights: &BTreeMap<NetId, u64>,
 ) -> Result<Placement, PnrError> {
     let graph = UnifiedGraph::new(design, device);
-    let (_, neighbors) = placement_neighbors(design, Some(net_weights), None);
+    let (_, neighbors) = placement_neighbors(design, Some(net_weights), None, None);
     let mut candidate_cache = BTreeMap::new();
     let units = placement_units(&graph, constraints, &mut candidate_cache)?;
     let mut placed = validate_refinement_start(&graph, &units, placement)?;
@@ -679,7 +679,7 @@ pub fn refine_placement_with_net_sink_weights(
     sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
 ) -> Result<Placement, PnrError> {
     let graph = UnifiedGraph::new(design, device);
-    let (_, neighbors) = placement_neighbors(design, None, Some(sink_weights));
+    let (_, neighbors) = placement_neighbors(design, None, Some(sink_weights), None);
     let mut candidate_cache = BTreeMap::new();
     let units = placement_units(&graph, constraints, &mut candidate_cache)?;
     let mut placed = validate_refinement_start(&graph, &units, placement)?;
@@ -712,11 +712,13 @@ pub fn refine_placement_with_net_sink_weights_limited(
     constraints: &PlacementConstraints,
     placement: Placement,
     sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
+    sink_budgets: Option<&BTreeMap<(NetId, CellPinId), u32>>,
     max_moved_units: usize,
 ) -> Result<Placement, PnrError> {
     PlacementRefiner::new(design, device, constraints)?.refine_with_net_sink_weights_limited(
         placement,
         sink_weights,
+        sink_budgets,
         max_moved_units,
     )
 }
@@ -763,9 +765,11 @@ impl<'a> PlacementRefiner<'a> {
         &self,
         placement: Placement,
         sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
+        sink_budgets: Option<&BTreeMap<(NetId, CellPinId), u32>>,
         max_moved_units: usize,
     ) -> Result<Placement, PnrError> {
-        let (_, neighbors) = placement_neighbors(self.graph.design(), None, Some(sink_weights));
+        let (_, neighbors) =
+            placement_neighbors(self.graph.design(), None, Some(sink_weights), sink_budgets);
         let mut placed = validate_refinement_start(&self.graph, &self.units, placement)?;
         let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
         refine_placement(
@@ -1341,9 +1345,15 @@ struct PlacementNeighbor {
     cell: CellId,
     weight: u64,
     timing_driven: bool,
+    /// Free Manhattan distance before this edge accrues placement cost.
+    /// Derived from routed-delay budgets: a connection inside its delay
+    /// budget behaves like slack rubber, and only the excess over the
+    /// allowance is pulled like a spring. Zero means unconstrained.
+    budget: u32,
 }
 
 fn refinement_edge_cost(edge: PlacementNeighbor, distance: u64) -> u64 {
+    let distance = distance.saturating_sub(u64::from(edge.budget));
     let distance = if edge.timing_driven {
         distance.saturating_mul(distance)
     } else {
@@ -1360,7 +1370,7 @@ fn place(
 ) -> Result<Placement, PnrError> {
     let design = graph.design();
     let device = graph.device();
-    let (degree, neighbors) = placement_neighbors(design, net_weights, sink_weights);
+    let (degree, neighbors) = placement_neighbors(design, net_weights, sink_weights, None);
 
     let mut candidate_cache = BTreeMap::new();
     let mut units = placement_units(graph, constraints, &mut candidate_cache)?;
@@ -1424,7 +1434,7 @@ fn analytical_place(
     const CENTER_WEIGHT: f64 = 0.01;
     let design = graph.design();
     let device = graph.device();
-    let (_, neighbors) = placement_neighbors(design, None, Some(sink_weights));
+    let (_, neighbors) = placement_neighbors(design, None, Some(sink_weights), None);
     let mut candidate_cache = BTreeMap::new();
     let units = placement_units(graph, constraints, &mut candidate_cache)?;
     let mut unit_by_cell = vec![usize::MAX; design.cells().len()];
@@ -1819,6 +1829,7 @@ fn placement_neighbors(
     design: &Design,
     net_weights: Option<&BTreeMap<NetId, u64>>,
     sink_weights: Option<&BTreeMap<(NetId, CellPinId), u64>>,
+    sink_budgets: Option<&BTreeMap<(NetId, CellPinId), u32>>,
 ) -> (Vec<usize>, Vec<Vec<PlacementNeighbor>>) {
     let mut degree = vec![0_usize; design.cells().len()];
     let mut neighbors = vec![Vec::new(); design.cells().len()];
@@ -1834,6 +1845,10 @@ fn placement_neighbors(
                 .and_then(|weights| weights.get(&(NetId(net_index), sink_pin)))
                 .copied()
                 .unwrap_or(net_timing_weight);
+            let budget = sink_budgets
+                .and_then(|budgets| budgets.get(&(NetId(net_index), sink_pin)))
+                .copied()
+                .unwrap_or(0);
             let edge_weight = if design.cells()[driver.0].kind == texo_model::ResourceKind::Clock
                 || net.sinks.len() > MAX_PLACEMENT_FANOUT
             {
@@ -1850,11 +1865,13 @@ fn placement_neighbors(
                         cell: sink,
                         weight: edge_weight,
                         timing_driven: timing_weight > 1,
+                        budget,
                     });
                     neighbors[sink.0].push(PlacementNeighbor {
                         cell: driver,
                         weight: edge_weight,
                         timing_driven: timing_weight > 1,
+                        budget,
                     });
                 }
             }
@@ -3946,6 +3963,7 @@ mod tests {
             cell: CellId(0),
             weight: 2,
             timing_driven: false,
+            budget: 0,
         };
         let critical = PlacementNeighbor {
             timing_driven: true,
@@ -3973,6 +3991,7 @@ mod tests {
             &design,
             None,
             Some(&BTreeMap::from([((NetId(0), critical_in), 64)])),
+            None,
         );
         let critical_edge = neighbors[source.0]
             .iter()
@@ -4122,6 +4141,7 @@ mod tests {
             &PlacementConstraints::new(),
             initial.clone(),
             &BTreeMap::new(),
+            None,
             1,
         )
         .unwrap();

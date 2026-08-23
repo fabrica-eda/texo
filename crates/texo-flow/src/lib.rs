@@ -855,9 +855,16 @@ impl TimingDrivenContext<'_> {
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<TimingCandidate, Ecp5FlowError> {
         let refinement_weights = timing_placement_weights(timing, self.timing_constraints);
+        let sink_budgets = placement_sink_budgets(
+            self.design,
+            self.architecture.device(),
+            &implementation.placement,
+            timing,
+        );
         let refined_placement = placement_refiner.refine_with_net_sink_weights_limited(
             implementation.placement.clone(),
             &refinement_weights,
+            Some(&sink_budgets),
             max_refined_units,
         )?;
         progress(Ecp5FlowStage::TimingDrivenPlaced);
@@ -1252,6 +1259,56 @@ fn emit_placement_metric(
 /// fits the placer's `u32` edge weights.
 fn clamp_placement_sink_weight(weight: u64) -> u64 {
     weight.min(1024)
+}
+
+/// Derives per-connection free-distance allowances from routed delays and
+/// setup slack.
+///
+/// Each connection's allowance is the Manhattan distance that still meets its
+/// delay target at the realized picoseconds-per-tile rate, so the refinement
+/// objective charges only connections exceeding their share of the period:
+/// satisfied connections behave like slack rubber and violated ones like
+/// springs. Per-endpoint slacks attribute a whole failing path's deficit to
+/// every connection on it, so the tightening is capped at half the current
+/// delay.
+fn placement_sink_budgets(
+    design: &Design,
+    device: &Device,
+    placement: &Placement,
+    timing: &TimingReport,
+) -> BTreeMap<(NetId, CellPinId), u32> {
+    let slacks = timing
+        .net_setup_slacks
+        .iter()
+        .map(|edge| ((edge.net, edge.sink), edge.slack_ps))
+        .collect::<BTreeMap<_, _>>();
+    let mut budgets = BTreeMap::new();
+    for edge in &timing.net_delays {
+        let driver_cell = design.pins()[design.nets()[edge.net.0].driver.0].cell;
+        let Some(driver_point) = placement.point(driver_cell, device) else {
+            continue;
+        };
+        let Some(sink_point) = placement.point(design.pins()[edge.sink.0].cell, device) else {
+            continue;
+        };
+        let distance = driver_point.manhattan(sink_point).max(1);
+        let delay = edge.delay.max_ps.max(1);
+        let slack = slacks.get(&(edge.net, edge.sink)).copied().unwrap_or(0);
+        let target_delay = if slack < 0 {
+            delay
+                .saturating_sub(u64::try_from(slack.unsigned_abs()).unwrap_or(u64::MAX))
+                .max(delay / 2)
+                .max(1)
+        } else {
+            delay
+        };
+        let allowance = distance.saturating_mul(target_delay) / delay;
+        budgets.insert(
+            (edge.net, edge.sink),
+            u32::try_from(allowance).unwrap_or(u32::MAX),
+        );
+    }
+    budgets
 }
 
 fn timing_net_weights(
