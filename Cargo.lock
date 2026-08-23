@@ -3044,7 +3044,7 @@ dependencies = [
 [[package]]
 name = "struo-celox"
 version = "0.1.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=c58e76c01fb110c1ed0765e1da7950a727fdc47d#c58e76c01fb110c1ed0765e1da7950a727fdc47d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=62a57f3f45935829320fd66e533597c9a146e452#62a57f3f45935829320fd66e533597c9a146e452"
 dependencies = [
  "celox",
  "struo-ir",
@@ -3054,7 +3054,7 @@ dependencies = [
 [[package]]
 name = "struo-example-axi4-smartconnect"
 version = "0.1.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=c58e76c01fb110c1ed0765e1da7950a727fdc47d#c58e76c01fb110c1ed0765e1da7950a727fdc47d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=62a57f3f45935829320fd66e533597c9a146e452#62a57f3f45935829320fd66e533597c9a146e452"
 dependencies = [
  "struo-frontend-veryl",
  "struo-rtl",
@@ -3063,7 +3063,7 @@ dependencies = [
 [[package]]
 name = "struo-formal"
 version = "0.1.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=c58e76c01fb110c1ed0765e1da7950a727fdc47d#c58e76c01fb110c1ed0765e1da7950a727fdc47d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=62a57f3f45935829320fd66e533597c9a146e452#62a57f3f45935829320fd66e533597c9a146e452"
 dependencies = [
  "struo-ir",
 ]
@@ -3071,7 +3071,7 @@ dependencies = [
 [[package]]
 name = "struo-frontend-veryl"
 version = "0.1.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=c58e76c01fb110c1ed0765e1da7950a727fdc47d#c58e76c01fb110c1ed0765e1da7950a727fdc47d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=62a57f3f45935829320fd66e533597c9a146e452#62a57f3f45935829320fd66e533597c9a146e452"
 dependencies = [
  "struo-rtl",
  "veryl-analyzer",
@@ -3082,22 +3082,22 @@ dependencies = [
 [[package]]
 name = "struo-ir"
 version = "0.1.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=c58e76c01fb110c1ed0765e1da7950a727fdc47d#c58e76c01fb110c1ed0765e1da7950a727fdc47d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=62a57f3f45935829320fd66e533597c9a146e452#62a57f3f45935829320fd66e533597c9a146e452"
 
 [[package]]
 name = "struo-rtl"
 version = "0.1.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=c58e76c01fb110c1ed0765e1da7950a727fdc47d#c58e76c01fb110c1ed0765e1da7950a727fdc47d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=62a57f3f45935829320fd66e533597c9a146e452#62a57f3f45935829320fd66e533597c9a146e452"
 
 [[package]]
 name = "struo-sim"
 version = "0.1.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=c58e76c01fb110c1ed0765e1da7950a727fdc47d#c58e76c01fb110c1ed0765e1da7950a727fdc47d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=62a57f3f45935829320fd66e533597c9a146e452#62a57f3f45935829320fd66e533597c9a146e452"
 
 [[package]]
 name = "struo-synth"
 version = "0.1.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=c58e76c01fb110c1ed0765e1da7950a727fdc47d#c58e76c01fb110c1ed0765e1da7950a727fdc47d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=62a57f3f45935829320fd66e533597c9a146e452#62a57f3f45935829320fd66e533597c9a146e452"
 dependencies = [
  "struo-formal",
  "struo-ir",
@@ -3107,7 +3107,7 @@ dependencies = [
 [[package]]
 name = "struo-target-ecp5"
 version = "0.1.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=c58e76c01fb110c1ed0765e1da7950a727fdc47d#c58e76c01fb110c1ed0765e1da7950a727fdc47d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=62a57f3f45935829320fd66e533597c9a146e452#62a57f3f45935829320fd66e533597c9a146e452"
 dependencies = [
  "serde",
  "serde_json",

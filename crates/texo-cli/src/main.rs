@@ -1227,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    fn axi4_nextpnr_export_preserves_duplicate_named_cells() {
+    fn axi4_nextpnr_export_preserves_every_mapped_cell() {
         let rtl = axi4_crossbar_self_test().unwrap();
         let synthesized = synthesize(&rtl).unwrap();
         let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
@@ -1236,7 +1236,9 @@ mod tests {
             .iter()
             .map(ecp5_cell_name)
             .collect::<BTreeSet<_>>();
-        assert!(unique_names.len() < mapped.cells().len());
+        // Struo keeps retimed replica names unique since PR #35, so the
+        // lossless exporter must pass every cell through unchanged.
+        assert_eq!(unique_names.len(), mapped.cells().len());
 
         let document: Value =
             serde_json::from_str(&lossless_nextpnr_json(&mapped).unwrap()).unwrap();
@@ -1244,6 +1246,6 @@ mod tests {
             .as_object()
             .unwrap();
         assert_eq!(cells.len(), mapped.cells().len());
-        assert!(cells.keys().any(|name| name.contains("$texo_duplicate")));
+        assert!(cells.keys().all(|name| !name.contains("$texo_duplicate")));
     }
 }
