@@ -584,6 +584,12 @@ impl TimingDrivenContext<'_> {
     ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
         for move_distance in CRITICAL_PATH_MOVE_DISTANCES {
             for _ in 0..MAX_CRITICAL_PATH_VERTEX_REFINEMENTS {
+                if archive
+                    .iter()
+                    .any(|(_, timing)| timing.worst_slack_ps.is_some_and(|slack| slack >= 0))
+                {
+                    return Ok(archive);
+                }
                 let seed = archive
                     .iter()
                     .max_by_key(|(_, timing)| timing_score(timing))
@@ -825,15 +831,7 @@ impl TimingDrivenContext<'_> {
         let Some(worst_slack_ps) = timing.worst_slack_ps else {
             return Ok(Vec::new());
         };
-        let worst_connections = timing
-            .net_setup_slacks
-            .iter()
-            .filter(|edge| edge.slack_ps == worst_slack_ps)
-            .map(|edge| {
-                let driver = self.design.nets()[edge.net.0].driver;
-                (edge.net, driver, edge.sink)
-            })
-            .collect::<Vec<_>>();
+        let worst_connections = worst_setup_connections(self.design, timing, worst_slack_ps);
         let connection_delays = timing
             .net_delays
             .iter()
@@ -906,6 +904,10 @@ impl TimingDrivenContext<'_> {
                 routing_costs.set_detailed_timing_nets(BTreeSet::new());
                 if let Ok(candidate) = trial {
                     let improves_objective = timing_score(&candidate.1) > timing_score(timing);
+                    let closes_setup = candidate
+                        .1
+                        .worst_slack_ps
+                        .is_some_and(|slack_ps| slack_ps >= 0);
                     progress(Ecp5FlowStage::TimingTrialDecision { improves_objective });
                     if best_for_cell.as_ref().is_none_or(|(_, best_timing)| {
                         timing_score(&candidate.1) > timing_score(best_timing)
@@ -913,6 +915,13 @@ impl TimingDrivenContext<'_> {
                         best_for_cell = Some(candidate.clone());
                     }
                     candidates.push(candidate);
+                    if closes_setup {
+                        // Detailed 10 ps and 1 ps rerouting still runs after
+                        // this vertex pass. Do not spend full routing trials
+                        // evaluating alternative placements once setup is
+                        // already feasible.
+                        return Ok(candidates);
+                    }
                 }
             }
             if let Some((best_implementation, best_timing)) = best_for_cell
@@ -961,6 +970,19 @@ impl TimingDrivenContext<'_> {
         progress(timing_snapshot(&timing));
         Ok((implementation, timing))
     }
+}
+
+fn worst_setup_connections(
+    design: &Design,
+    timing: &TimingReport,
+    worst_slack_ps: i128,
+) -> Vec<(NetId, CellPinId, CellPinId)> {
+    timing
+        .net_setup_slacks
+        .iter()
+        .filter(|edge| edge.slack_ps == worst_slack_ps)
+        .map(|edge| (edge.net, design.nets()[edge.net.0].driver, edge.sink))
+        .collect()
 }
 
 const MAX_INCREMENTAL_REFINEMENTS: usize = 8;
