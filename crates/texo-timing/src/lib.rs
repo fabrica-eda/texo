@@ -307,6 +307,45 @@ pub fn analyze_timing(
     validate_constraints(design, constraints)?;
     validate_model(design, model)?;
     let net_delays = routed_net_delays(design, device, implementation, pip_delays)?;
+    timing_report_from_net_delays(design, model, constraints, net_delays)
+}
+
+/// Estimates one net-edge routing delay from placement geometry.
+///
+/// Driver-to-sink Manhattan distance times `ps_per_tile_ps` plus
+/// `hop_overhead_ps` for pin access. The absolute picoseconds are not
+/// characterized values; they exist to rank or pre-screen placement deltas
+/// without paying for routing. Returns `None` when either pin has no
+/// physical wire under the placement.
+#[must_use]
+pub fn estimate_edge_delay(
+    design: &Design,
+    device: &Device,
+    placement: &Placement,
+    driver_pin: CellPinId,
+    sink_pin: CellPinId,
+    ps_per_tile_ps: u64,
+    hop_overhead_ps: u64,
+) -> Option<u64> {
+    let graph = UnifiedGraph::new(design, device);
+    let driver_wire = bound_wire(&graph, placement, driver_pin, device).ok()?;
+    let sink_wire = bound_wire(&graph, placement, sink_pin, device).ok()?;
+    Some(
+        device.wires()[driver_wire.0]
+            .point
+            .manhattan(device.wires()[sink_wire.0].point)
+            .saturating_mul(ps_per_tile_ps)
+            .saturating_add(hop_overhead_ps),
+    )
+}
+
+/// Builds the full setup/hold report from a set of per-sink net delays.
+fn timing_report_from_net_delays(
+    design: &Design,
+    model: &TimingModel,
+    constraints: &TimingConstraints,
+    net_delays: Vec<NetDelay>,
+) -> Result<TimingReport, TimingError> {
     let delays_by_sink = net_delays
         .iter()
         .map(|delay| ((delay.net, delay.sink), delay.delay))

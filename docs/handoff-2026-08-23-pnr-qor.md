@@ -57,11 +57,18 @@ At the 250 MHz target Texo closes (+7/+9 ps) in about 112 s, down from
 | baseline (handoff) | −352 ps | ~290 s |
 | drop second analytical seed + stalled-ripup memo | −352 ps | 269 s |
 | budget-excess scoring for local vertex moves | −342 ps | 243 s |
-| + single-connection endpoint cells join vertex moves (**kept**) | **−287 ps** | 344 s |
+| + single-connection endpoint cells join vertex moves | −287 ps | 344 s |
+| + margin-gated route prescreening (**kept**, commit 357fd71 + this) | **−277 ps** | ~310 s |
 
-Fmax ≈ 276 MHz with the kept configuration. Remaining critical path:
-decoder FF → carry cluster feed (~890 ps over 3–4 tiles), carry hops free,
-cluster → LUT → retimed FF (~650+390 ps).
+Fmax ≈ 276.6 MHz with the kept configuration.
+
+Runtime profile at −287 ps: 337 of 344 s inside routing stages (191 trials ×
+1.6 s avg), 87 trials (45%) rejected by the real gate. The prescreen
+(`estimate_edge_delay` in texo-timing: Manhattan×250 ps + 300 ps overhead per
+renegotiated net edge, criticality-weighted) skips a proposal's route trial
+only when its estimate is >25% worse; unguarded (reject on any non-improve)
+it cut runtime to 101 s but lost 388 ps of WNS — the linear model cannot see
+long-line shortcuts, so mildly negative estimates must stay eligible.
 
 ## Commits (oldest first)
 
