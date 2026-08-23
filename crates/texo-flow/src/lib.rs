@@ -667,7 +667,7 @@ impl TimingDrivenContext<'_> {
     }
 
     fn refine_critical_routes_multiresolution(
-        &self,
+        &mut self,
         mut archive: Vec<TimingCandidate>,
         routing_costs: &mut RoutingCosts,
         progress: &mut impl FnMut(Ecp5FlowStage),
@@ -680,16 +680,19 @@ impl TimingDrivenContext<'_> {
                 })
                 .expect("the timing archive is non-empty")
                 .clone();
-            let Some(worst_slack_ps) = seed.1.worst_slack_ps else {
+            if seed.1.worst_slack_ps.is_none() {
                 break;
-            };
+            }
+            // Timing-driven ripup: lift every data-net route so the whole
+            // design renegotiates while the failing connections pull toward
+            // fast resources with exact picosecond costs. Freezing satisfied
+            // nets here would let them keep hoarding the short resources the
+            // failing paths need, which is why only clock trunks stay locked.
             let detailed_sinks = seed
                 .1
                 .net_setup_slacks
                 .iter()
-                .filter_map(|edge| {
-                    (edge.slack_ps == worst_slack_ps).then_some((edge.net, edge.sink))
-                })
+                .filter_map(|edge| (edge.slack_ps < 0).then_some((edge.net, edge.sink)))
                 .collect::<BTreeSet<_>>();
             if detailed_sinks.is_empty() {
                 break;
@@ -698,12 +701,11 @@ impl TimingDrivenContext<'_> {
                 .iter()
                 .map(|(net, _)| *net)
                 .collect::<BTreeSet<_>>();
-            let frozen = freeze_route_sinks_except(
+            let frozen = self.packing.global_routing_constraints_cached(
                 self.design,
-                self.architecture.device(),
+                self.architecture,
                 &seed.0.placement,
-                &seed.0.routes,
-                &detailed_sinks,
+                self.global_routing_cache,
             )?;
             routing_costs
                 .set_net_criticalities(timing_net_weights(&seed.1, self.timing_constraints));
