@@ -230,6 +230,16 @@ start). Next router targets, in order: per-sink quantum escalation for the
 multiresolution ripup's detailed nets, and targeted ripup scoped to nets
 contending with the failing region.
 
+### Experiment 11 (targeted ripup): negative, reverted
+
+Scoped the multiresolution ripup to nets whose routes pass within the
+failing endpoints' bounding rectangle (+4, then +12 tiles): WNS −346 ps
+(−69 vs baseline) at ~30 s faster, identical for both margins. The failing
+endpoints span the whole decoder array, so widening the region changes
+nothing — the value of the global renegotiation is renegotiating *outside*
+the failing region too, under fresh criticalities and history, not local
+congestion relief. Global data-route ripup stays.
+
 ## Failed experiments (patches kept, not merged)
 
 - Bound2bound reweighting alone: `/tmp/opencode/b2b-experiment.patch`
