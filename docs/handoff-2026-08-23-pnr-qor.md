@@ -164,6 +164,27 @@ c. Reshape `estimate_edge_delay` to the double-rate-near/far form before any
    further prescreen tuning.
 d. Optional later: router-level slack-failure ripup using real delays.
 
+### Port result (same day): experiment 7, negative
+
+Implemented a–c faithfully (AnalyticalAnchor in texo-pnr stamped after the
+plain solve with drift-weighted attraction; DelayEstimator with
+overhead/near-knee/far shape; normalised criticality weights `1 + 10·crit²`;
+loop of up to 8 anchored rounds, stall-2 stop; single route trial gated by
+real score). Result: **WNS −441 ps vs −277 ps baseline** at ~230 s. The
+anchored candidate won the early routed comparison and refinement descended
+from it into a worse final state — the same failure signature as the v9
+replace-style run, now with all nextpnr ingredients present.
+
+Interpretation: on this design class (1.6% utilisation, carry-dominated,
+many parallel decoder paths) the connectivity-only global placement plus our
+greedy refinement is genuinely better than any criticality-informed global
+solve we have built — including one structurally faithful to HeAP. What
+nextpnr has that we still do not is the *estimate-driven detail* stage
+(timing_opt.cc: 30 rounds of crit-path cell swaps scored by estimates) and
+router2's per-round real-delay feedback; those act on an already-good
+placement instead of replacing its seed. Any further work should target that
+layer, not the analytical solve.
+
 ## Failed experiments (patches kept, not merged)
 
 - Bound2bound reweighting alone: `/tmp/opencode/b2b-experiment.patch`
