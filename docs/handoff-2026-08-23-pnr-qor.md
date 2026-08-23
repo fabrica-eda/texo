@@ -112,6 +112,58 @@ Remaining known costs, in priority order for future sessions:
 5. Critical path structure at 300 MHz: two general-routing nets into/out of a
    carry cluster (~712/855 ps over 2–3 tiles) dominate; carry hops are free.
 
+## Why nextpnr feels fundamentally different (source-verified 2026-08-24)
+
+Cloned nextpnr master (`/tmp/opencode/nextpnr-src`, sparse: common+ecp5).
+The intuition is correct; the difference is one architectural idea Texo lacks,
+not tuning:
+
+1. **Anchored iterative re-solve** (`common/place/placer_heap.cc:961-971`):
+   every HeAP iteration re-solves the QP with an extra arc pulling each cell
+   toward its previous *legalised* position, weight `alpha*iter/dist`
+   (alpha default 0.1). The placement evolves continuously across
+   iterations, so updated timing weights never jump basins.
+   `while (stalled < 5 && solved_hpwl <= legal_hpwl * 0.8)` (line 249) runs
+   solve → CutSpreader → strict legalisation → `tmg.run()` per iteration.
+   Our v9 replace-style re-solve failed precisely because it had **no anchor**
+   and jumped basins; this is the missing piece, not weights themselves.
+2. **Estimated STA every iteration** (`tmg.run()` → TimingAnalyser over
+   `ctx->predictArcDelay`): slacks come from `Arch::estimateDelay`
+   (`ecp5/arch.cc:465`): `(80-9*speed) * (6 + max(dx-5,0) + max(dy-5,0)
+   + 2*(min(dx,5)+min(dy,5)))` — fixed overhead plus *double rate for the
+   first five tiles*, i.e. long lines make far tiles relatively cheap. Our
+   linear Manhattan prescreen model has the wrong shape, which is why the
+   unguarded filter lost 388 ps (v11).
+3. **Normalised criticality** (`common/kernel/timing.cc:778-786`):
+   `crit = clamp(1 - (slack - worst)/(-worst), 0, 1)` per port, fed back as
+   multiplicative weight `(1 + timingWeight * crit^exponent)`
+   (placer_heap.cc:946). Bounded [1, 1+tw], unlike our urgency weights that
+   span 1..64+.
+4. **Estimate-driven detail moves**: `timing_opt.cc:51` runs 30 rounds of
+   tmg.run() → find_crit_paths(0.98, 50000) → cell swaps scored purely by
+   estimated delays, no routing. Thousands of free evaluations.
+5. **router2 feedback** (`common/route/router2.cc:1735-1777`): after every
+   `do_route()`, real routed arc delays are pushed into the same
+   TimingAnalyser (`update_route_delays` → `tmg.set_route_delay`), nets are
+   re-sorted by criticality, and arcs failing slack get ripped up next round.
+
+Net effect: nextpnr evaluates timing tens of thousands of times per run at
+~microsecond cost (geometry estimates), while Texo evaluates it ~170 times at
+~1.5 s cost (full route trials). Every weighting experiment we ran bolted
+weights onto the expensive pipeline instead of building the cheap loop.
+
+### Port plan (priority order)
+
+a. Anchor term in `analytical_place`: accept an optional previous legal
+   placement; add diagonal/rhs contributions `alpha*iter/dist` toward it.
+b. Iterate solve→spread→legalise→`estimate_placement_timing`(rebuild with the
+   arch.cc-shaped model)→normalised-criticality weights until HPWL stalls;
+   descend refinement from the result once. This replaces the failed
+   replace-style experiment with its missing ingredient.
+c. Reshape `estimate_edge_delay` to the double-rate-near/far form before any
+   further prescreen tuning.
+d. Optional later: router-level slack-failure ripup using real delays.
+
 ## Failed experiments (patches kept, not merged)
 
 - Bound2bound reweighting alone: `/tmp/opencode/b2b-experiment.patch`
