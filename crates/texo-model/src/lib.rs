@@ -863,8 +863,8 @@ impl<'a> UnifiedGraph<'a> {
     /// # Errors
     ///
     /// Returns an error for an unknown wire ID.
-    pub fn routing_neighbors(&self, wire: WireId) -> Result<Vec<(WireId, PipId)>, ModelError> {
-        Ok(self.device.routing_neighbors(wire)?.to_vec())
+    pub fn routing_neighbors(&self, wire: WireId) -> Result<&[(WireId, PipId)], ModelError> {
+        self.device.routing_neighbors(wire)
     }
 
     /// Returns outgoing arcs for any logical or physical node.
@@ -1007,7 +1007,8 @@ impl<'a> UnifiedGraph<'a> {
             .collect();
         arcs.extend(
             self.routing_neighbors(wire)?
-                .into_iter()
+                .iter()
+                .copied()
                 .map(|(neighbor, pip)| GraphArc {
                     to: GraphNode::Wire(neighbor),
                     kind: GraphEdgeKind::Pip(pip),

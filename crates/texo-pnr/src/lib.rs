@@ -2594,7 +2594,7 @@ impl RouteSearch {
                 return Some((path_wires, path_pips));
             }
 
-            for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
+            for &(neighbor, pip) in graph.routing_neighbors(wire).ok()? {
                 if corridor.is_some_and(|corridor| {
                     !point_inside_corridor(device.wires()[neighbor.0].point, corridor)
                 }) {
@@ -2732,7 +2732,7 @@ fn shortest_hold_path(
             continue;
         }
 
-        for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
+        for &(neighbor, pip) in graph.routing_neighbors(wire).ok()? {
             let congestion = congestion_cost(
                 wire_occupancy[neighbor.0],
                 device.wires()[neighbor.0].capacity,
