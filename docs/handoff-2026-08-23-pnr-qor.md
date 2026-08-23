@@ -218,6 +218,18 @@ should target that state space (coarser arrival buckets on non-failing
 sinks, or per-sink quantum escalation) and targeted ripup; plain-net
 bounding is a dead end here.
 
+### Experiment 10 (detailed-quantum state space): positive, kept (commit 45de64b)
+
+Confirmed the diagnosis by ablation: running vertex-pass detailed searches
+at the default 50 ps quantum instead of 10 ps left WNS and hold identical
+(−277/−381) while cutting median trial routing from 0.92 s to 0.67 s.
+Vertex passes now use `ROUTING_DELAY_QUANTUM_PS` (now public); the
+multiresolution ripup keeps its fine quantum since it touches only failing
+sinks' nets. Flow: **−277 ps @ 232 s** (from −352 ps @ ~290 s at session
+start). Next router targets, in order: per-sink quantum escalation for the
+multiresolution ripup's detailed nets, and targeted ripup scoped to nets
+contending with the failing region.
+
 ## Failed experiments (patches kept, not merged)
 
 - Bound2bound reweighting alone: `/tmp/opencode/b2b-experiment.patch`
