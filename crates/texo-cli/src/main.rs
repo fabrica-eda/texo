@@ -34,7 +34,7 @@ Usage:
   texo demo                         run the deterministic abstract-grid PnR demo
   texo ecp5-demo <architecture> <package> <speed-grade> <constraints.lpf> [checkpoint.json]
                                     run a verified Struo/Celox ECP5 XOR flow
-  texo axi4-pnr <architecture> <package> <speed-grade> <constraints.lpf> [checkpoint.json]
+  texo axi4-pnr <architecture> <package> <speed-grade> <constraints.lpf> [checkpoint.json] [weight-exponent]
                                     run the Struo AXI4 self-test through native Texo PnR
   texo axi4-json <design.json>      export the same mapped AXI4 design for nextpnr
   texo target-info <architecture>   inspect an ECP5 architecture snapshot
@@ -51,6 +51,17 @@ fn main() -> ExitCode {
             eprintln!("error: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Parses the optional trailing placement weight exponent argument.
+fn parse_weight_exponent(args: &mut impl Iterator<Item = String>) -> Result<u32, Box<dyn Error>> {
+    match args.next() {
+        Some(arg) => arg.parse::<u32>().map_err(|_| {
+            format!("axi4-pnr placement weight exponent must be a positive integer\n\n{USAGE}")
+                .into()
+        }),
+        None => Ok(1),
     }
 }
 
@@ -97,8 +108,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .next()
                 .ok_or_else(|| format!("axi4-pnr requires an LPF path\n\n{USAGE}"))?;
             let checkpoint = args.next();
+            let exponent = parse_weight_exponent(&mut args)?;
             if args.next().is_some() {
-                return Err(format!("axi4-pnr accepts at most five arguments\n\n{USAGE}").into());
+                return Err(format!("axi4-pnr accepts at most six arguments\n\n{USAGE}").into());
             }
             axi4_pnr(
                 &architecture,
@@ -106,6 +118,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &speed_grade,
                 &lpf,
                 checkpoint.as_deref(),
+                exponent,
             )
         }
         Some("axi4-json") => parse_axi4_json(args),
@@ -438,6 +451,7 @@ fn axi4_pnr(
     speed_grade: &str,
     lpf_path: &str,
     checkpoint_path: Option<&str>,
+    placement_weight_exponent: u32,
 ) -> Result<(), Box<dyn Error>> {
     let rtl = axi4_crossbar_self_test()?;
     let mut evidence = Evidence::new();
@@ -492,6 +506,7 @@ fn axi4_pnr(
             speed_grade: Some(speed_grade),
             package: Some(package),
             lpf: Some(&lpf),
+            placement_weight_exponent,
             ..Ecp5FlowOptions::default()
         },
         &mut evidence,
@@ -722,6 +737,7 @@ fn ecp5_checkpoint(
             "device": device.name(),
             "package": package,
             "speed_grade": result.speed_grade,
+            "placement_weight_exponent": result.placement_weight_exponent,
             "project_trellis_revision": architecture.provenance().project_trellis_revision,
             "database_revision": architecture.provenance().database_revision,
         },

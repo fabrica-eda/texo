@@ -156,6 +156,11 @@ pub struct Ecp5FlowOptions<'a> {
     pub allow_unconstrained_io: bool,
     /// Minimum recognized clock-pin fanout for automatic DCCA promotion.
     pub global_clock_fanout: usize,
+    /// Exponent applied to sink criticality weights in the timing-driven
+    /// analytical solve. One keeps the plain weights; larger values sharpen
+    /// the contrast around critical paths and select a different placement
+    /// basin. Recorded in checkpoints so artifacts remain reproducible.
+    pub placement_weight_exponent: u32,
 }
 
 impl Default for Ecp5FlowOptions<'_> {
@@ -166,6 +171,7 @@ impl Default for Ecp5FlowOptions<'_> {
             lpf: None,
             allow_unconstrained_io: false,
             global_clock_fanout: DEFAULT_GLOBAL_CLOCK_FANOUT,
+            placement_weight_exponent: 1,
         }
     }
 }
@@ -187,6 +193,8 @@ pub struct Ecp5FlowResult {
     pub implementation: PnrResult,
     /// Post-route PIP-delay timing analysis.
     pub timing: TimingReport,
+    /// Placement-weight exponent the flow was configured with.
+    pub placement_weight_exponent: u32,
 }
 
 /// Completed milestones emitted by the native ECP5 implementation flow.
@@ -319,12 +327,7 @@ pub fn implement_struo_ecp5_with_progress(
 
     let mut staged_evidence = evidence.clone();
     staged_evidence.record(Gate::MappedNetlistComplete);
-    let placement = place_analytically_with_net_sink_weights(
-        &design,
-        architecture.device(),
-        packing.constraints(),
-        &BTreeMap::new(),
-    )?;
+    let placement = initial_analytical_placement(&design, architecture, &packing)?;
     progress(Ecp5FlowStage::Placed);
     let mut global_routing_cache = architecture.global_routing_cache();
     let routing = packing.global_routing_constraints_cached(
@@ -362,6 +365,7 @@ pub fn implement_struo_ecp5_with_progress(
         speed_grade,
         timing_model: &timing_model,
         timing_constraints: &timing_constraints,
+        placement_weight_exponent: options.placement_weight_exponent,
     }
     .optimize(initial_implementation, initial_timing, &mut progress)?;
     progress(Ecp5FlowStage::Timed);
@@ -379,6 +383,7 @@ pub fn implement_struo_ecp5_with_progress(
         packing,
         implementation,
         timing,
+        placement_weight_exponent: options.placement_weight_exponent,
     })
 }
 
@@ -411,6 +416,7 @@ struct TimingDrivenContext<'a> {
     speed_grade: &'a SpeedGradeRecord,
     timing_model: &'a TimingModel,
     timing_constraints: &'a TimingConstraints,
+    placement_weight_exponent: u32,
 }
 
 impl TimingDrivenContext<'_> {
@@ -423,13 +429,7 @@ impl TimingDrivenContext<'_> {
         if initial_timing.met_timing() {
             return Ok((initial_implementation, initial_timing));
         }
-        let placement_weights = timing_placement_weights(&initial_timing, self.timing_constraints);
-        let placement = place_analytically_with_net_sink_weights(
-            self.design,
-            self.architecture.device(),
-            self.packing.constraints(),
-            &placement_weights,
-        )?;
+        let placement = self.timing_driven_placement(&initial_timing)?;
         progress(Ecp5FlowStage::TimingDrivenPlaced);
         let routing = self.packing.global_routing_constraints_cached(
             self.design,
@@ -510,10 +510,49 @@ impl TimingDrivenContext<'_> {
         }
         archive.extend(hold_repairs);
         archive = select_timing_frontier(archive);
-        Ok(archive
+        let (final_implementation, final_timing) = archive
             .into_iter()
             .max_by_key(|(_, timing)| timing_score(timing))
-            .expect("the timing archive is non-empty"))
+            .expect("the timing archive is non-empty");
+        emit_placement_metric(
+            "final",
+            self.design,
+            self.architecture.device(),
+            &final_implementation.placement,
+            Some(&final_timing),
+        );
+        Ok((final_implementation, final_timing))
+    }
+
+    /// Solves the timing-driven analytical placement that seeds refinement.
+    ///
+    /// The configured `placement_weight_exponent` sharpens the sink
+    /// criticality weights before the solve.
+    fn timing_driven_placement(
+        &self,
+        initial_timing: &TimingReport,
+    ) -> Result<Placement, Ecp5FlowError> {
+        let exponent = self.placement_weight_exponent;
+        let mut weights = timing_placement_weights(initial_timing, self.timing_constraints);
+        if exponent > 1 {
+            for weight in weights.values_mut() {
+                *weight = clamp_placement_sink_weight(weight.saturating_pow(exponent));
+            }
+        }
+        let placement = place_analytically_with_net_sink_weights(
+            self.design,
+            self.architecture.device(),
+            self.packing.constraints(),
+            &weights,
+        )?;
+        emit_placement_metric(
+            "timing_driven_place",
+            self.design,
+            self.architecture.device(),
+            &placement,
+            None,
+        );
+        Ok(placement)
     }
 
     fn close_setup_critically(
@@ -1163,6 +1202,58 @@ fn analyze_ecp5_implementation(
     )?)
 }
 
+/// Total driver-to-sink Manhattan distance over every net edge.
+fn placement_hpwl(design: &Design, device: &Device, placement: &Placement) -> u64 {
+    let mut total = 0_u64;
+    for net in design.nets() {
+        let driver_cell = design.pins()[net.driver.0].cell;
+        let Some(driver_point) = placement.point(driver_cell, device) else {
+            continue;
+        };
+        for &sink in &net.sinks {
+            let sink_cell = design.pins()[sink.0].cell;
+            if let Some(sink_point) = placement.point(sink_cell, device) {
+                total = total.saturating_add(driver_point.manhattan(sink_point));
+            }
+        }
+    }
+    total
+}
+
+fn metrics_enabled() -> bool {
+    std::env::var_os("TEXO_METRICS").is_some()
+}
+
+/// Emits one stage-wise placement quality line when `TEXO_METRICS` is set.
+///
+/// This is a measurement hook for initial-solution studies, not part of the
+/// release contract.
+fn emit_placement_metric(
+    stage: &str,
+    design: &Design,
+    device: &Device,
+    placement: &Placement,
+    timing: Option<&TimingReport>,
+) {
+    if !metrics_enabled() {
+        return;
+    }
+    let hpwl = placement_hpwl(design, device, placement);
+    match timing {
+        Some(timing) => eprintln!(
+            "[metrics] stage={stage} hpwl={hpwl} wns={:?} hold={:?} pips={}",
+            timing.worst_slack_ps, timing.worst_hold_slack_ps, 0,
+        ),
+        None => eprintln!("[metrics] stage={stage} hpwl={hpwl}"),
+    }
+}
+
+/// Caps an amplified sink weight so fanout multiplication downstream still
+/// fits the placer's `u32` edge weights.
+fn clamp_placement_sink_weight(weight: u64) -> u64 {
+    weight.min(1024)
+}
+
 fn timing_net_weights(
     timing: &TimingReport,
     constraints: &TimingConstraints,
@@ -1405,6 +1496,28 @@ impl SlackViolations {
     fn total_negative_slack_ps(self) -> i128 {
         -i128::try_from(self.total_deficit_ps).unwrap_or(i128::MAX)
     }
+}
+
+/// Solves the connectivity-only analytical placement that starts the flow.
+fn initial_analytical_placement(
+    design: &Design,
+    architecture: &Ecp5Architecture,
+    packing: &Ecp5Packing,
+) -> Result<Placement, Ecp5FlowError> {
+    let placement = place_analytically_with_net_sink_weights(
+        design,
+        architecture.device(),
+        packing.constraints(),
+        &BTreeMap::new(),
+    )?;
+    emit_placement_metric(
+        "initial_place",
+        design,
+        architecture.device(),
+        &placement,
+        None,
+    );
+    Ok(placement)
 }
 
 fn timing_snapshot(timing: &TimingReport) -> Ecp5FlowStage {
