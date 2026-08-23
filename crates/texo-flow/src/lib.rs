@@ -447,6 +447,21 @@ impl TimingDrivenContext<'_> {
             (initial_implementation, initial_timing),
             (implementation, timing),
         ];
+        if metrics_enabled() {
+            let winner = if timing_score(&candidates[0].1)
+                > timing_score(&candidates[1].1)
+            {
+                "initial"
+            } else {
+                "timing_driven"
+            };
+            eprintln!(
+                "[metrics] seed={} initial_wns={:?} timed_wns={:?}",
+                winner,
+                candidates[0].1.worst_slack_ps,
+                candidates[1].1.worst_slack_ps
+            );
+        }
         let mut archive = select_timing_frontier(candidates);
         let placement_refiner = PlacementRefiner::new(
             self.design,
