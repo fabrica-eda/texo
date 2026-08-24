@@ -907,3 +907,29 @@ Adjacent saved-binary A/B runs measured 44.79 s wall / 34.93 s user without
 the local cache and **44.08 s wall / 34.30 s user** with it. Both produced
 -214/-399 ps and 25,675 PIPs exactly. The cache lifetime therefore matches the
 placement-graph transaction rather than the architecture or closure lifetime.
+
+## Recovery-only speculative placement checkpoints (2026-08-25)
+
+Replacing the local critical-cell portfolio with unconditional speculative
+batches exposed why the remaining route trials matter. Six-cell and two-cell
+batches reached 32.30 and 30.68 seconds respectively but both ended at -369 ps
+WNS; a one-cell first-improvement variant reached 25.74 seconds but fell to
+-555 ps. The established search is a best-improvement method over as many as
+six routed cell alternatives, not merely an inefficient way to accumulate
+locally attractive moves.
+
+A guarded fast path now handles only the distinct recovery case after a global
+multiresolution reroute has pushed WNS below -800 ps. It speculatively combines
+the first two legal local moves and accepts the checkpoint only if the complete
+route and STA objective improves and WNS gains at least 32 ps. Rejected
+checkpoint fingerprints are removed from the trial cache so the original
+per-cell best-improvement search remains a true fallback. On AXI4 exactly one
+checkpoint qualified: it recovered 313 ps at once.
+
+The final implementation remains identical at the reported level: **-214 ps
+WNS, -3905 ps setup TNS, -399 ps WHS, and 25,675 PIPs**. Critical closure fell
+from about 25.0 to 24.1 seconds. Adjacent non-metrics saved-binary runs measured
+44.65 s wall / 34.14 s user for the prior implementation and **44.03 s wall /
+34.07 s user** for the recovery checkpoint path. The modest wall reduction is
+primarily lower system work; treat the phase reduction as the stronger signal
+until more benchmarks exercise severe post-ripup recovery.

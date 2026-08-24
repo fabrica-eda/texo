@@ -1455,6 +1455,99 @@ impl TimingDrivenContext<'_, '_> {
             global_routes_from_implementation(self.packing, implementation);
         let mut placement = implementation.placement.clone();
         let mut candidates = Vec::new();
+        if max_move_distance <= 2 && worst_slack_ps <= LOCAL_BATCH_RECOVERY_WNS_PS {
+            let mut batch = placement.clone();
+            let mut batch_moves = Vec::new();
+            for (cell, (_, connections, targets)) in cells.iter().take(LOCAL_CRITICAL_BATCH_SIZE) {
+                let proposals = placement_refiner.refine_cell_connection_delays(
+                    batch.clone(),
+                    *cell,
+                    connections,
+                    targets,
+                    routing_costs.pip_delays_ps(),
+                    None,
+                    max_move_distance,
+                    1,
+                )?;
+                let Some(refined) = proposals.into_iter().next() else {
+                    break;
+                };
+                if self.estimate_rejects(&batch, &refined, &prescreen_weights) {
+                    break;
+                }
+                batch_moves.push((*cell, batch.bindings()[cell.0], refined.bindings()[cell.0]));
+                batch = refined;
+            }
+            if batch_moves.len() == LOCAL_CRITICAL_BATCH_SIZE {
+                let trial_key = (seed_fingerprint, placement_fingerprint(self.design, &batch));
+                if self.critical_move_trials.insert(trial_key) {
+                    for &(cell, from, to) in &batch_moves {
+                        progress(Ecp5FlowStage::CriticalPathMove { cell, from, to });
+                    }
+                    let recomputed_global_routing;
+                    let base = if let Some(incumbent) = incumbent_global_routing.as_ref()
+                        && global_clock_endpoints_unchanged(
+                            self.design,
+                            self.packing,
+                            &implementation.placement,
+                            &batch,
+                        ) {
+                        incumbent
+                    } else {
+                        recomputed_global_routing =
+                            self.packing.global_routing_constraints_cached(
+                                self.design,
+                                self.architecture,
+                                &batch,
+                                self.global_routing_cache,
+                            )?;
+                        &recomputed_global_routing
+                    };
+                    progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
+                    let frozen = freeze_unchanged_routes(
+                        self.design,
+                        implementation,
+                        &batch,
+                        base,
+                        &critical_sinks,
+                    );
+                    routing_costs.set_net_criticalities(prescreen_weights.clone());
+                    routing_costs.set_sink_criticalities(route_arc_weights.clone());
+                    routing_costs.set_sink_min_delays_ps(BTreeMap::new());
+                    routing_costs.set_detailed_timing_nets(released_net_ids(&critical_sinks));
+                    routing_costs.set_detailed_delay_quantum_ps(texo_pnr::ROUTING_DELAY_QUANTUM_PS);
+                    let trial =
+                        self.route_local_trial_and_analyze(batch, &frozen, routing_costs, progress);
+                    routing_costs.set_detailed_timing_nets(BTreeSet::new());
+                    if let Ok(candidate) = trial {
+                        let improves_objective = timing_score(&candidate.1) > timing_score(timing);
+                        let wns_gain = candidate
+                            .1
+                            .worst_slack_ps
+                            .zip(timing.worst_slack_ps)
+                            .map_or(0, |(candidate, incumbent)| candidate - incumbent);
+                        let accepts_batch =
+                            improves_objective && wns_gain >= LOCAL_CRITICAL_BATCH_MIN_WNS_GAIN_PS;
+                        progress(Ecp5FlowStage::TimingTrialDecision {
+                            improves_objective: accepts_batch,
+                        });
+                        if profile {
+                            eprintln!(
+                                "[metrics] critical_batch distance={max_move_distance} moves={} wns_gain={wns_gain} accepted={accepts_batch}",
+                                batch_moves.len(),
+                            );
+                        }
+                        if accepts_batch {
+                            return Ok(vec![candidate]);
+                        }
+                    }
+                    // A rejected speculative checkpoint must not suppress the
+                    // established per-cell fallback when it later reaches the
+                    // same cumulative placement through routed feedback.
+                    self.critical_move_trials.remove(&trial_key);
+                }
+            }
+        }
         for (cell, (_, connections, targets)) in cells.into_iter().take(MAX_CRITICAL_PATH_CELLS) {
             let proposal_started = Instant::now();
             let proposals = placement_refiner.refine_cell_connection_delays(
@@ -1778,6 +1871,9 @@ const GLOBAL_RIPUP_REARM_SLACK_PS: i128 = 250;
 // AXI4 self-test: final WNS and placement were bit-identical without it while
 // each multiresolution round paid one more ~30 s global ripup.
 const MAX_CRITICAL_PATH_CELLS: usize = 6;
+const LOCAL_CRITICAL_BATCH_SIZE: usize = 2;
+const LOCAL_CRITICAL_BATCH_MIN_WNS_GAIN_PS: i128 = 32;
+const LOCAL_BATCH_RECOVERY_WNS_PS: i128 = -800;
 const MAX_PROJECTED_PATH_CELL_CANDIDATES: usize = 4;
 const MAX_CRITICAL_CLOSURE_ROUNDS: usize = 4;
 const MAX_CRITICAL_PATH_VERTEX_REFINEMENTS: usize = 4;
