@@ -232,6 +232,19 @@ impl PlacementConstraints {
         });
     }
 
+    /// Removes the atomic group whose ordered cell columns exactly match
+    /// `cells`.
+    ///
+    /// Target-specific post-route packing ECOs use this to release one
+    /// dedicated edge without rebuilding or weakening unrelated constraints.
+    pub fn remove_group(&mut self, cells: &[CellId]) -> bool {
+        let Some(index) = self.groups.iter().position(|group| group.cells == cells) else {
+            return false;
+        };
+        self.groups.remove(index);
+        true
+    }
+
     /// Target-supplied atomic groups in insertion order.
     #[must_use]
     pub fn groups(&self) -> &[PlacementGroup] {
@@ -323,6 +336,40 @@ impl Placement {
             .and_then(|bel| device.bels().get(bel.0))
             .map(|bel| bel.point)
     }
+}
+
+/// Re-resolves target-selected physical pins without changing any BEL.
+///
+/// This is the cheap path for a packing ECO that only changes pin-name
+/// bindings while preserving an already legal placement. Callers must ensure
+/// the new constraints do not add a stricter placement group; releasing a
+/// dedicated edge satisfies that requirement.
+///
+/// # Errors
+///
+/// Returns an error when the placement has the wrong number of cells or a new
+/// physical pin name is unavailable on the existing BEL.
+pub fn rebind_placement_pins(
+    design: &Design,
+    device: &Device,
+    constraints: &PlacementConstraints,
+    placement: &Placement,
+) -> Result<Placement, PnrError> {
+    if placement.bindings.len() != design.cells().len() {
+        return Err(PnrError::InvalidPlacement {
+            reason: format!(
+                "expected {} cell bindings, received {}",
+                design.cells().len(),
+                placement.bindings.len()
+            ),
+        });
+    }
+    let graph = UnifiedGraph::new(design, device);
+    finish_placement(
+        &graph,
+        constraints,
+        placement.bindings.iter().copied().map(Some).collect(),
+    )
 }
 
 /// One ordered driver-to-endpoint route.
@@ -5216,9 +5263,28 @@ fn shortest_hold_path(
     metadata: RoutingResourceMetadata<'_>,
 ) -> Option<(Vec<WireId>, Vec<PipId>)> {
     let goal_point = metadata.wire_points[goal.0];
+    // Hold repair is a local ECO. Searching the whole device in the
+    // (wire, delay-bucket) state space is both disproportionately expensive
+    // and liable to trade a short hold deficit for a destructive long detour.
+    // Use the same architecture-scaled corridor as timing-driven setup
+    // routing; the retained tree may still enter through any source adjacent
+    // to the corridor.
+    let start_point = starts
+        .iter()
+        .map(|start| metadata.wire_points[start.0])
+        .min_by_key(|point| (point.manhattan(goal_point), *point))
+        .expect("a route tree always contains its driver");
+    let corridor = routing_corridor(start_point, goal_point, graph.device(), TIMING_ROUTE_MARGIN);
     let mut visits = HashMap::<HoldRouteState, HoldRouteVisit>::new();
     let mut queue = BinaryHeap::new();
     for &start in starts {
+        if !point_inside_corridor(metadata.wire_points[start.0], corridor)
+            && !graph.routing_neighbors(start).ok()?.any(|(neighbor, _)| {
+                point_inside_corridor(metadata.wire_points[neighbor.0], corridor)
+            })
+        {
+            continue;
+        }
         let arrival_ps = tree_delays_ps[start.0];
         let state = (start, hold_delay_bucket(arrival_ps, minimum_arrival_ps));
         let distance = timing_tree_cost(arrival_ps, criticality, ROUTING_DELAY_QUANTUM_PS);
@@ -5251,6 +5317,9 @@ fn shortest_hold_path(
 
         for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
             if starts.contains(&neighbor) {
+                continue;
+            }
+            if !point_inside_corridor(metadata.wire_points[neighbor.0], corridor) {
                 continue;
             }
             let congestion =

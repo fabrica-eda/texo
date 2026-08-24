@@ -681,6 +681,64 @@ impl Ecp5Packing {
         Ok(old_ff)
     }
 
+    /// Releases one dedicated LUT-to-FF edge onto the FF's general-routing
+    /// `M` input.
+    ///
+    /// The current placement remains legal, but the LUT and FF cease to be an
+    /// atomic group so a post-route hold ECO may route extra minimum delay or
+    /// move the FF independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the exact pair is not currently packed, its data
+    /// pin is missing, or the corresponding placement group is missing.
+    pub fn release_lut_ff_pair(
+        &mut self,
+        design: &Design,
+        lut: CellId,
+        ff: CellId,
+    ) -> Result<(), PackingError> {
+        let lut_name = design
+            .cells()
+            .get(lut.0)
+            .map_or_else(|| format!("cell#{}", lut.0), |cell| cell.name.clone());
+        let ff_name = design
+            .cells()
+            .get(ff.0)
+            .map_or_else(|| format!("cell#{}", ff.0), |cell| cell.name.clone());
+        let Some(pair_index) = self
+            .lut_ff_pairs
+            .iter()
+            .position(|pair| pair.lut == lut && pair.ff == ff)
+        else {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: lut_name,
+                ff: ff_name,
+                reason: "exact LUT/FF pair is not currently dedicated".into(),
+            });
+        };
+        let data_pin = design.cells()[ff.0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == "DI")
+            .ok_or_else(|| PackingError::MissingFfDataPin {
+                cell: design.cells()[ff.0].name.clone(),
+            })?;
+        if !self.constraints.remove_group(&[lut, ff]) {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: design.cells()[lut.0].name.clone(),
+                ff: design.cells()[ff.0].name.clone(),
+                reason: "dedicated-path placement group cannot be released".into(),
+            });
+        }
+        self.constraints.bind_pin_name(data_pin, "M");
+        self.lut_ff_pairs.remove(pair_index);
+        self.general_routing_ffs.push(ff);
+        self.general_routing_ffs.sort_unstable();
+        Ok(())
+    }
+
     /// Split `CCU2C` pairs assigned to the two LUTs in one ECP5 slice.
     #[must_use]
     pub fn carry_pairs(&self) -> &[[CellId; 2]] {
@@ -3418,6 +3476,47 @@ mod tests {
             architecture.bel_metadata(lut_bel).z + 1,
             architecture.bel_metadata(ff_bel).z
         );
+    }
+
+    #[test]
+    fn releases_a_dedicated_lut_ff_edge_for_general_routing() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let lut = design.add_cell("lut", ResourceKind::Lut(4));
+        for name in ["A", "B", "C", "D"] {
+            design.add_pin(lut, name, PinDirection::Input).unwrap();
+        }
+        let lut_output = design.add_pin(lut, "F", PinDirection::Output).unwrap();
+        let ff = add_ff(&mut design, "ff");
+        let ff_data = design.cells()[ff.0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == "DI")
+            .unwrap();
+        design.add_net("lut_to_ff", lut_output, [ff_data]).unwrap();
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+        let placement =
+            place_with_constraints(&design, architecture.device(), packing.constraints()).unwrap();
+
+        packing.release_lut_ff_pair(&design, lut, ff).unwrap();
+        let rebound = texo_pnr::rebind_placement_pins(
+            &design,
+            architecture.device(),
+            packing.constraints(),
+            &placement,
+        )
+        .unwrap();
+        let rebound_pin = rebound.pin_binding(ff_data).unwrap();
+
+        assert!(packing.lut_ff_pairs().is_empty());
+        assert_eq!(packing.general_routing_ffs(), &[ff]);
+        assert!(packing.constraints().groups().is_empty());
+        assert_eq!(
+            packing.constraints().pin_name_bindings().get(&ff_data),
+            Some(&"M".to_owned())
+        );
+        assert_eq!(architecture.device().bel_pins()[rebound_pin.0].name, "M");
     }
 
     #[test]

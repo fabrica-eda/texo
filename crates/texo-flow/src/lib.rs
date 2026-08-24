@@ -17,9 +17,9 @@ use texo_pnr::{
     NetRoute, Placement, PlacementConnectionDelayWorkspace, PlacementConstraints,
     PlacementRefinementWorkspace, PlacementRefiner, PnrError, PnrResult, RouteCapacityProjection,
     RoutingConstraints, RoutingCosts, RoutingWorkspace, place_analytically_with_net_sink_weights,
-    place_and_route_with_constraints, placement_from_partial_bindings, retain_route_for_sinks,
-    route_with_timing_costs_workspace_and_progress, route_with_workspace_and_progress,
-    swap_placement_cells,
+    place_and_route_with_constraints, placement_from_partial_bindings, rebind_placement_pins,
+    retain_route_for_sinks, route_with_timing_costs_workspace_and_progress,
+    route_with_workspace_and_progress, swap_placement_cells,
 };
 use texo_struo::{ImportedEcp5Design, PrimitiveMetadata};
 use texo_target_ecp5::{
@@ -329,14 +329,18 @@ pub fn implement_struo_ecp5_with_progress(
         .ok_or_else(|| Ecp5FlowError::UnknownSpeedGrade(speed_grade_name.into()))?;
 
     let mut design = imported.design().clone();
-    let constant_luts = imported.metadata().iter().filter_map(|(&cell, metadata)| {
-        matches!(metadata, PrimitiveMetadata::Constant { .. }).then_some(cell)
-    });
+    let constant_luts = imported
+        .metadata()
+        .iter()
+        .filter_map(|(&cell, metadata)| {
+            matches!(metadata, PrimitiveMetadata::Constant { .. }).then_some(cell)
+        })
+        .collect::<BTreeSet<_>>();
     let mut packing = match options.lut_ff_pairs {
         Some(pairs) => {
             pack_lut_ffs_with_pairs(&design, architecture, named_lut_ff_pairs(&design, pairs)?)?
         }
-        None => pack_lut_ffs_excluding(&design, architecture, constant_luts)?,
+        None => pack_lut_ffs_excluding(&design, architecture, constant_luts.iter().copied())?,
     };
     packing.pack_carry_pairs(
         &design,
@@ -399,7 +403,7 @@ pub fn implement_struo_ecp5_with_progress(
         |event| progress(Ecp5FlowStage::Routing(event)),
     )?;
     progress(Ecp5FlowStage::Routed);
-    let mut timing_model = ecp5_timing_model(&design, &packing, speed_grade)?;
+    let mut timing_model = ecp5_timing_model(&design, &packing, speed_grade, &constant_luts)?;
     let mut timing_constraints = ecp5_timing_constraints(&design, &packing)?;
     let mut initial_timing = analyze_ecp5_implementation(
         &design,
@@ -464,6 +468,7 @@ pub fn implement_struo_ecp5_with_progress(
             &packing,
             &initial_implementation,
             &initial_timing,
+            &constant_luts,
             costs,
             &mut global_routing_cache,
             &mut routing_workspace,
@@ -473,25 +478,30 @@ pub fn implement_struo_ecp5_with_progress(
         packing = candidate.packing;
         initial_implementation = candidate.implementation;
         initial_timing = candidate.timing;
-        timing_model = ecp5_timing_model(&design, &packing, speed_grade)?;
+        timing_model = ecp5_timing_model(&design, &packing, speed_grade, &constant_luts)?;
         timing_constraints = ecp5_timing_constraints(&design, &packing)?;
         costs.set_net_criticalities(timing_net_weights(&initial_timing, &timing_constraints));
         costs.set_sink_criticalities(timing_arc_weights(&initial_timing, &timing_constraints));
     }
     report_metric_phase("dedicated_edge_search", &mut phase_started);
 
-    let (implementation, timing) = if let Some(costs) = closure_routing_costs.as_mut() {
+    let (mut implementation, mut timing) = if let Some(costs) = closure_routing_costs.as_mut() {
+        // Keep the closure context's long-lived placement-refiner borrow off
+        // the authoritative packing so a post-closure packing ECO can mutate
+        // it after this scope. Assignment tables are Arc-backed, making this
+        // clone shallow for the device-sized data.
+        let closure_packing = packing.clone();
         let placement_refiner = PlacementRefiner::new_with_workspace(
             &design,
             architecture.device(),
-            packing.constraints(),
+            closure_packing.constraints(),
             &mut placement_refinement_workspace,
         )?;
         report_metric_phase("closure_refiner_build", &mut phase_started);
-        TimingDrivenContext {
+        let optimized = TimingDrivenContext {
             design: &design,
             architecture,
-            packing: &packing,
+            packing: &closure_packing,
             placement_refiner: &placement_refiner,
             global_routing_cache: &mut global_routing_cache,
             speed_grade,
@@ -501,10 +511,31 @@ pub fn implement_struo_ecp5_with_progress(
             global_ripup_attempted: false,
             critical_move_trials: BTreeSet::new(),
         }
-        .optimize(initial_implementation, initial_timing, costs, &mut progress)?
+        .optimize(initial_implementation, initial_timing, costs, &mut progress)?;
+        drop(placement_refiner);
+        optimized
     } else {
         (initial_implementation, initial_timing)
     };
+    if let Some(costs) = closure_routing_costs.as_mut()
+        && timing.worst_slack_ps.is_some_and(|slack| slack >= 0)
+        && timing.worst_hold_slack_ps.is_some_and(|slack| slack < 0)
+    {
+        repair_hold_with_dedicated_edge_release(
+            &design,
+            architecture,
+            speed_grade,
+            &constant_luts,
+            &mut packing,
+            &mut implementation,
+            &mut timing,
+            costs,
+            &mut global_routing_cache,
+            &mut routing_workspace,
+            &mut placement_refinement_workspace,
+            &mut progress,
+        )?;
+    }
     report_metric_phase("timing_closure", &mut phase_started);
     progress(Ecp5FlowStage::Timed);
     staged_evidence.record(Gate::PhysicalImplementation);
@@ -563,6 +594,312 @@ struct DedicatedEdgeCandidate {
     timing: TimingReport,
 }
 
+/// Repairs post-setup hold failures whose routing freedom was removed by an
+/// earlier dedicated LUT→FF packing choice. Pairs are released one at a time,
+/// locally rerouted with their required minimum delay, and committed only
+/// after full STA preserves setup closure and improves the timing objective.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn repair_hold_with_dedicated_edge_release(
+    design: &Design,
+    architecture: &Ecp5Architecture,
+    speed_grade: &SpeedGradeRecord,
+    constant_cells: &BTreeSet<CellId>,
+    packing: &mut Ecp5Packing,
+    implementation: &mut PnrResult,
+    timing: &mut TimingReport,
+    routing_costs: &mut RoutingCosts,
+    global_routing_cache: &mut Ecp5GlobalRoutingCache<'_>,
+    routing_workspace: &mut RoutingWorkspace,
+    placement_refinement_workspace: &mut PlacementRefinementWorkspace,
+    progress: &mut impl FnMut(Ecp5FlowStage),
+) -> Result<(), Ecp5FlowError> {
+    loop {
+        let mut candidates = timing
+            .hold_checks
+            .iter()
+            .filter(|check| check.slack_ps < 0)
+            .filter_map(|check| {
+                packing
+                    .lut_ff_pairs()
+                    .iter()
+                    .copied()
+                    .find(|pair| pair.ff == check.cell)
+                    .map(|pair| (check.slack_ps, check.data_pin, pair))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|&(slack, pin, pair)| (slack, pair.lut, pair.ff, pin));
+        if candidates.is_empty() {
+            break;
+        }
+
+        let minimums = hold_sink_min_delays(timing);
+        let mut accepted = false;
+        for (slack_ps, data_pin, pair) in candidates {
+            let Some(net) = design.pins()[data_pin.0].net() else {
+                continue;
+            };
+            let key = (net, data_pin);
+            let Some(&minimum_ps) = minimums.get(&key) else {
+                continue;
+            };
+            let mut trial_packing = packing.clone();
+            trial_packing.release_lut_ff_pair(design, pair.lut, pair.ff)?;
+            let trial_model =
+                ecp5_timing_model(design, &trial_packing, speed_grade, constant_cells)?;
+            let trial_constraints = ecp5_timing_constraints(design, &trial_packing)?;
+            let requested_minimums = BTreeMap::from([(key, minimum_ps)]);
+            let Some((mut trial_implementation, mut trial_timing)) = route_hold_trial(
+                design,
+                architecture,
+                speed_grade,
+                &trial_packing,
+                implementation,
+                timing,
+                &trial_model,
+                &trial_constraints,
+                requested_minimums.clone(),
+                routing_costs,
+                global_routing_cache,
+                routing_workspace,
+                progress,
+            )?
+            else {
+                if metrics_enabled() {
+                    eprintln!(
+                        "[metrics] hold_pair_release lut={} ff={} slack={} rejected=routing",
+                        pair.lut.0, pair.ff.0, slack_ps
+                    );
+                }
+                continue;
+            };
+            // Re-score a newly general-routed edge after STA. Before release
+            // it was a short dedicated arc and therefore carried little
+            // setup criticality; one feedback route lets the router select a
+            // path that satisfies the same hold floor without needlessly
+            // crossing setup closure.
+            for _ in 0..MAX_HOLD_ROUTE_FEEDBACKS {
+                if trial_timing.worst_slack_ps.is_some_and(|setup| setup >= 0) {
+                    break;
+                }
+                let previous_fingerprint =
+                    implementation_topology_fingerprint(design, &trial_implementation);
+                let Some((refined_implementation, refined_timing)) = route_hold_trial(
+                    design,
+                    architecture,
+                    speed_grade,
+                    &trial_packing,
+                    &trial_implementation,
+                    &trial_timing,
+                    &trial_model,
+                    &trial_constraints,
+                    requested_minimums.clone(),
+                    routing_costs,
+                    global_routing_cache,
+                    routing_workspace,
+                    progress,
+                )?
+                else {
+                    break;
+                };
+                let unchanged =
+                    implementation_topology_fingerprint(design, &refined_implementation)
+                        == previous_fingerprint;
+                if timing_score(&refined_timing) <= timing_score(&trial_timing) {
+                    break;
+                }
+                trial_implementation = refined_implementation;
+                trial_timing = refined_timing;
+                if unchanged {
+                    break;
+                }
+            }
+            if trial_timing
+                .worst_slack_ps
+                .is_some_and(|setup| (-MAX_HOLD_SETUP_RECOVERY_PS..0).contains(&setup))
+            {
+                let placement_refiner = PlacementRefiner::new_with_workspace(
+                    design,
+                    architecture.device(),
+                    trial_packing.constraints(),
+                    placement_refinement_workspace,
+                )?;
+                let recovered = TimingDrivenContext {
+                    design,
+                    architecture,
+                    packing: &trial_packing,
+                    placement_refiner: &placement_refiner,
+                    global_routing_cache,
+                    speed_grade,
+                    timing_model: &trial_model,
+                    timing_constraints: &trial_constraints,
+                    routing_workspace,
+                    global_ripup_attempted: true,
+                    critical_move_trials: BTreeSet::new(),
+                }
+                .refine_critical_path_vertices(
+                    vec![(trial_implementation, trial_timing)],
+                    &placement_refiner,
+                    routing_costs,
+                    progress,
+                )?;
+                (trial_implementation, trial_timing) = recovered
+                    .into_iter()
+                    .max_by_key(|(implementation, timing)| {
+                        (timing_score(timing), Reverse(implementation.total_pips))
+                    })
+                    .expect("setup recovery archive is non-empty");
+            }
+            let improves = trial_timing.worst_slack_ps.is_some_and(|setup| setup >= 0)
+                && timing_score(&trial_timing) > timing_score(timing);
+            progress(Ecp5FlowStage::TimingTrialDecision {
+                improves_objective: improves,
+            });
+            if metrics_enabled() {
+                eprintln!(
+                    "[metrics] hold_pair_release lut={} ff={} slack={} wns={:?} whs={:?} accepted={improves}",
+                    pair.lut.0,
+                    pair.ff.0,
+                    slack_ps,
+                    trial_timing.worst_slack_ps,
+                    trial_timing.worst_hold_slack_ps,
+                );
+            }
+            if improves {
+                *packing = trial_packing;
+                *implementation = trial_implementation;
+                *timing = trial_timing;
+                accepted = true;
+                break;
+            }
+        }
+        if !accepted {
+            break;
+        }
+    }
+
+    // Once dedicated blockers have been released, repair all remaining
+    // general-routing hold arcs together. This also handles designs whose
+    // violations never involved a dedicated edge.
+    let minimums = hold_sink_min_delays(timing);
+    if !minimums.is_empty() {
+        let model = ecp5_timing_model(design, packing, speed_grade, constant_cells)?;
+        let constraints = ecp5_timing_constraints(design, packing)?;
+        if let Some((trial_implementation, trial_timing)) = route_hold_trial(
+            design,
+            architecture,
+            speed_grade,
+            packing,
+            implementation,
+            timing,
+            &model,
+            &constraints,
+            minimums,
+            routing_costs,
+            global_routing_cache,
+            routing_workspace,
+            progress,
+        )? && trial_timing.worst_slack_ps.is_some_and(|setup| setup >= 0)
+            && timing_score(&trial_timing) > timing_score(timing)
+        {
+            progress(Ecp5FlowStage::TimingTrialDecision {
+                improves_objective: true,
+            });
+            *implementation = trial_implementation;
+            *timing = trial_timing;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_hold_trial(
+    design: &Design,
+    architecture: &Ecp5Architecture,
+    speed_grade: &SpeedGradeRecord,
+    packing: &Ecp5Packing,
+    implementation: &PnrResult,
+    timing: &TimingReport,
+    timing_model: &TimingModel,
+    timing_constraints: &TimingConstraints,
+    minimums: BTreeMap<(NetId, CellPinId), u64>,
+    routing_costs: &RoutingCosts,
+    global_routing_cache: &mut Ecp5GlobalRoutingCache<'_>,
+    routing_workspace: &mut RoutingWorkspace,
+    progress: &mut impl FnMut(Ecp5FlowStage),
+) -> Result<Option<TimingCandidate>, Ecp5FlowError> {
+    let released = minimums.keys().copied().collect::<BTreeSet<_>>();
+    // Re-resolve physical pin bindings under the trial packing. Merely
+    // cloning the incumbent placement would retain the old dedicated `DI`
+    // binding even after the logical FF input was rebound to general `M`.
+    let trial_placement = rebind_placement_pins(
+        design,
+        architecture.device(),
+        packing.constraints(),
+        &implementation.placement,
+    )?;
+    let recomputed_global_routing;
+    let base = if global_clock_endpoints_unchanged(
+        design,
+        packing,
+        &implementation.placement,
+        &trial_placement,
+    ) {
+        if let Some(incumbent) = global_routes_from_implementation(packing, implementation) {
+            recomputed_global_routing = incumbent;
+            &recomputed_global_routing
+        } else {
+            recomputed_global_routing = packing.global_routing_constraints_cached(
+                design,
+                architecture,
+                &trial_placement,
+                global_routing_cache,
+            )?;
+            &recomputed_global_routing
+        }
+    } else {
+        recomputed_global_routing = packing.global_routing_constraints_cached(
+            design,
+            architecture,
+            &trial_placement,
+            global_routing_cache,
+        )?;
+        &recomputed_global_routing
+    };
+    progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
+    let frozen = freeze_unchanged_routes(design, implementation, &trial_placement, base, &released);
+    let mut costs = routing_costs.clone();
+    costs.set_max_iterations(LOCAL_TRIAL_ROUTING_ITERATIONS);
+    costs.set_net_criticalities(timing_net_weights(timing, timing_constraints));
+    costs.set_sink_criticalities(timing_arc_weights(timing, timing_constraints));
+    costs.set_sink_min_delays_ps(minimums);
+    let routed = match route_with_timing_costs_workspace_and_progress(
+        design,
+        architecture.device(),
+        trial_placement,
+        &frozen,
+        &costs,
+        routing_workspace,
+        |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
+    ) {
+        Ok(routed) => routed,
+        Err(PnrError::CongestionNotResolved { .. } | PnrError::Unroutable { .. }) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    progress(Ecp5FlowStage::TimingDrivenRouted);
+    let report = analyze_ecp5_implementation(
+        design,
+        architecture,
+        speed_grade,
+        &routed,
+        timing_model,
+        timing_constraints,
+    )?;
+    progress(timing_snapshot(&report));
+    Ok(Some((routed, report)))
+}
+
 /// Evaluates a bounded portfolio of dedicated LUT→FF edge transfers against
 /// the routed topology. Each proposal swaps the paired and general-routed FF
 /// BELs, reroutes only nets incident to those cells, and is accepted only when
@@ -575,6 +912,7 @@ fn optimize_dedicated_lut_ff_edge(
     packing: &Ecp5Packing,
     implementation: &PnrResult,
     timing: &TimingReport,
+    constant_cells: &BTreeSet<CellId>,
     routing_costs: &mut RoutingCosts,
     global_routing_cache: &mut Ecp5GlobalRoutingCache<'_>,
     routing_workspace: &mut RoutingWorkspace,
@@ -705,7 +1043,8 @@ fn optimize_dedicated_lut_ff_edge(
             }
         };
         progress(Ecp5FlowStage::TimingDrivenRouted);
-        let trial_timing_model = ecp5_timing_model(design, &trial_packing, speed_grade)?;
+        let trial_timing_model =
+            ecp5_timing_model(design, &trial_packing, speed_grade, constant_cells)?;
         let trial_timing_constraints = ecp5_timing_constraints(design, &trial_packing)?;
         let trial_timing = analyze_ecp5_implementation(
             design,
@@ -746,12 +1085,12 @@ fn optimize_dedicated_lut_ff_edge(
     Ok(best)
 }
 
-struct TimingDrivenContext<'a, 'work> {
+struct TimingDrivenContext<'a, 'work, 'cache> {
     design: &'a Design,
     architecture: &'a Ecp5Architecture,
     packing: &'a Ecp5Packing,
     placement_refiner: &'work PlacementRefiner<'a>,
-    global_routing_cache: &'work mut Ecp5GlobalRoutingCache<'a>,
+    global_routing_cache: &'work mut Ecp5GlobalRoutingCache<'cache>,
     speed_grade: &'a SpeedGradeRecord,
     timing_model: &'a TimingModel,
     timing_constraints: &'a TimingConstraints,
@@ -766,7 +1105,7 @@ struct TimingDrivenContext<'a, 'work> {
     critical_move_trials: BTreeSet<(u64, u64)>,
 }
 
-impl TimingDrivenContext<'_, '_> {
+impl TimingDrivenContext<'_, '_, '_> {
     fn optimize(
         &mut self,
         initial_implementation: PnrResult,
@@ -1914,7 +2253,7 @@ impl TimingDrivenContext<'_, '_> {
 
 fn emit_archive_metric(
     stage: &str,
-    context: &TimingDrivenContext<'_, '_>,
+    context: &TimingDrivenContext<'_, '_, '_>,
     archive: &[TimingCandidate],
 ) {
     if !metrics_enabled() {
@@ -1964,6 +2303,8 @@ fn worst_setup_connections(
 const MAX_INCREMENTAL_REFINEMENTS: usize = 8;
 const MAX_CONSECUTIVE_MONOTONIC_WNS_REGRESSIONS: usize = 2;
 const LOCAL_TRIAL_ROUTING_ITERATIONS: u32 = 5;
+const MAX_HOLD_ROUTE_FEEDBACKS: usize = 2;
+const MAX_HOLD_SETUP_RECOVERY_PS: i128 = 100;
 const MAX_DEDICATED_EDGE_TRIALS: usize = 1;
 // Geometry delay model for pre-screening route trials. Calibrated loosely
 // against the measured AXI4 hops: same-tile LUT-to-FF edges land near 300 ps,
@@ -2786,6 +3127,7 @@ fn ecp5_timing_model(
     design: &Design,
     packing: &Ecp5Packing,
     speed_grade: &SpeedGradeRecord,
+    constant_cells: &BTreeSet<CellId>,
 ) -> Result<TimingModel, Ecp5FlowError> {
     let records = speed_grade
         .cells
@@ -2802,6 +3144,16 @@ fn ecp5_timing_model(
         .iter()
         .flat_map(|pair| [(pair[0], "TRELLIS_CARRY0"), (pair[1], "TRELLIS_CARRY1")])
         .collect::<BTreeMap<_, _>>();
+    let constant_nets = design
+        .nets()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, net)| {
+            constant_cells
+                .contains(&design.pins()[net.driver.0].cell)
+                .then_some(NetId(index))
+        })
+        .collect::<BTreeSet<_>>();
     let mut model = TimingModel::new();
     for (index, cell) in design.cells().iter().enumerate() {
         let cell_id = CellId(index);
@@ -2858,6 +3210,16 @@ fn ecp5_timing_model(
             let Some(signal) = find_cell_pin(design, cell_id, logical_signal) else {
                 continue;
             };
+            // A directly driven constant cannot launch a transition, so it is
+            // not a setup/hold endpoint. Keeping these checks made the hold
+            // repairer search enormous constant fanout nets for delay that has
+            // no physical meaning.
+            if design.pins()[signal.0]
+                .net()
+                .is_some_and(|net| constant_nets.contains(&net))
+            {
+                continue;
+            }
             let Some(clock) = find_cell_pin(design, cell_id, &check.clock_pin) else {
                 continue;
             };
@@ -3078,10 +3440,10 @@ mod tests {
     };
     use texo_model::{BelId, CellId, Design, Device, NetId, PinDirection, ResourceKind};
     use texo_pnr::{PlacementConstraints, place_and_route};
-    use texo_struo::import_ecp5;
+    use texo_struo::{PrimitiveMetadata, import_ecp5};
     use texo_target_ecp5::{
         PipClassTimingRecord, TimingCornersRecord, find_global_clock_requirements, pack_lut_ffs,
-        parse_lpf, read_architecture, resolve_lpf_port_cells,
+        pack_lut_ffs_excluding, parse_lpf, read_architecture, resolve_lpf_port_cells,
     };
 
     use super::{
@@ -3434,8 +3796,13 @@ mod tests {
             .unwrap();
 
         let constraints = ecp5_timing_constraints(&design, &packing).unwrap();
-        let timing_model =
-            ecp5_timing_model(&design, &packing, &architecture.speed_grades()["6"]).unwrap();
+        let timing_model = ecp5_timing_model(
+            &design,
+            &packing,
+            &architecture.speed_grades()["6"],
+            &BTreeSet::new(),
+        )
+        .unwrap();
         let global_net = packing.global_clocks()[0].global_net;
         let ff = design
             .cells()
@@ -3453,6 +3820,58 @@ mod tests {
         assert_eq!(timing_model.clock_to_q(ff_q).unwrap().1.max_ps, 525);
         assert_eq!(timing_model.setup_hold(ff_data).unwrap().2.min_ps, 233);
         assert!(timing_model.setup_hold(ff_lsr).is_none());
+    }
+
+    #[test]
+    fn omits_setup_and_hold_checks_for_constant_driven_register_inputs() {
+        let mut source = Netlist::new("constant_register");
+        let data = source.add_constant(false);
+        let clock = source.add_input("clock");
+        let state = source.add_register_output("state");
+        source.add_register(RegisterCell::new(
+            "state",
+            state,
+            data,
+            clock,
+            ClockEdge::Rising,
+            None,
+            None,
+        ));
+        source.add_output("state", state);
+
+        let imported = import_ecp5(&map_to_ecp5(&source).unwrap()).unwrap();
+        let architecture = read_architecture(ECP5_FIXTURE.as_bytes()).unwrap();
+        let constant_cells = imported
+            .metadata()
+            .iter()
+            .filter_map(|(&cell, metadata)| {
+                matches!(metadata, PrimitiveMetadata::Constant { .. }).then_some(cell)
+            })
+            .collect::<BTreeSet<_>>();
+        let packing = pack_lut_ffs_excluding(
+            imported.design(),
+            &architecture,
+            constant_cells.iter().copied(),
+        )
+        .unwrap();
+        let model = ecp5_timing_model(
+            imported.design(),
+            &packing,
+            &architecture.speed_grades()["6"],
+            &constant_cells,
+        )
+        .unwrap();
+        let register = imported
+            .design()
+            .cells()
+            .iter()
+            .position(|cell| cell.kind == ResourceKind::Register)
+            .map(CellId)
+            .unwrap();
+        let data_pin = find_cell_pin(imported.design(), register, "DI").unwrap();
+
+        assert_eq!(constant_cells.len(), 1);
+        assert!(model.setup_hold(data_pin).is_none());
     }
 
     #[test]
@@ -3518,6 +3937,7 @@ mod tests {
             imported.design(),
             &packing,
             &architecture.speed_grades()["6"],
+            &BTreeSet::new(),
         )
         .unwrap();
         let pair = imported.carry_pairs()[0];
