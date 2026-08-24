@@ -762,3 +762,33 @@ cap reached 57.57 seconds, and persistent spatial indexing reached **56.45
 seconds**. Relative to the 66.51-second architecture-scaled A* baseline, the
 combined capacity/topology work is 10.06 seconds (15.1%) faster while setup
 WNS is 26 ps better.
+
+## Shared immutable route DAGs (2026-08-24)
+
+Local placement trials previously copied every frozen `NetRoute` three times:
+from the incumbent result into constraints, from constraints into the router's
+working vector, and from the successful working vector into the persistent
+occupancy snapshot. The route topology is immutable for all but the released
+nets, so `PnrResult`, `RoutingConstraints`, and `RoutingWorkspace` now share
+those trees with `Arc`. Negotiation replaces only dirty net entries. Occupancy
+synchronization first tests pointer identity and falls back to structural
+equality only for independently constructed but equivalent trees.
+
+Constraint validation and negotiated routing also share one placement-specific
+pin-to-wire cache. Resource-reference validation now derives counts directly
+from borrowed arcs instead of cloning and re-sorting the route. These changes
+preserve route ordering, congestion decisions, and timing costs.
+
+Alternating identical AXI4 runs measured the committed baseline at 61.95 s and
+the shared-tree form at 60.72 s; another adjacent pair measured 64.08 s and
+61.45 s. A final combined run completed in 60.63 s. Every run reproduced
+**-214/-399 ps and 25,665 PIPs** exactly. Runtime is noisy on this host, but the
+direction held in both adjacent comparisons (about 2--4%).
+
+The more important profile result is structural: one 57.41-second metrics run
+spent 2.64 seconds loading the architecture, 16.70 seconds in 113 routing
+transactions, and 1.48 seconds in their STA passes. At least 36.6 seconds lies
+outside negotiated routing and STA. The next optimization target must therefore
+be split at whole-flow boundaries before further tuning A*: graph/packing,
+initial placement, and candidate construction are now more plausible dominant
+costs than the local router itself.

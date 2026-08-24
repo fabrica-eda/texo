@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::Instant;
 
 use texo_model::{
@@ -1904,7 +1905,7 @@ fn freeze_route_sinks_except(
     design: &Design,
     device: &Device,
     placement: &Placement,
-    routes: &[NetRoute],
+    routes: &[Arc<NetRoute>],
     released: &BTreeSet<(NetId, CellPinId)>,
 ) -> Result<RoutingConstraints, PnrError> {
     let mut frozen = RoutingConstraints::new();
@@ -2354,7 +2355,7 @@ fn ecp5_pip_delays(
     let selected = implementation
         .routes
         .iter()
-        .flat_map(NetRoute::pips)
+        .flat_map(|route| route.pips())
         .collect::<BTreeSet<_>>();
     let mut source_fanout = BTreeMap::new();
     for &pip_id in &selected {

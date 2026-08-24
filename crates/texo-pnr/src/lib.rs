@@ -43,7 +43,7 @@ pub struct PlacementConstraints {
 /// locked tree and accounts for every fixed wire and PIP normally.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RoutingConstraints {
-    routes: BTreeMap<NetId, NetRoute>,
+    routes: BTreeMap<NetId, Arc<NetRoute>>,
 }
 
 /// Characterized costs used by timing-driven negotiated routing.
@@ -178,13 +178,14 @@ impl RoutingConstraints {
     }
 
     /// Sets the immutable route tree for one logical net.
-    pub fn add_route(&mut self, route: NetRoute) {
+    pub fn add_route(&mut self, route: impl Into<Arc<NetRoute>>) {
+        let route = route.into();
         self.routes.insert(route.net, route);
     }
 
     /// Immutable route trees indexed by logical net.
     #[must_use]
-    pub const fn routes(&self) -> &BTreeMap<NetId, NetRoute> {
+    pub const fn routes(&self) -> &BTreeMap<NetId, Arc<NetRoute>> {
         &self.routes
     }
 }
@@ -364,7 +365,7 @@ pub struct RouteCapacityProjection {
 impl RouteCapacityProjection {
     /// Projects routed arcs onto the resources they occupy.
     #[must_use]
-    pub fn new(routes: &[NetRoute], costs: &RoutingCosts) -> Self {
+    pub fn new(routes: &[Arc<NetRoute>], costs: &RoutingCosts) -> Self {
         let mut projection = Self::default();
         for route in routes {
             for arc in &route.arcs {
@@ -408,21 +409,12 @@ impl NetRoute {
         arcs.sort_by(|left, right| {
             (left.sink, &left.wires, &left.pips).cmp(&(right.sink, &right.wires, &right.pips))
         });
-        let mut wire_refs = BTreeMap::<WireId, u32>::new();
-        let mut pip_refs = BTreeMap::<PipId, u32>::new();
-        for arc in &arcs {
-            for &wire in &arc.wires {
-                *wire_refs.entry(wire).or_default() += 1;
-            }
-            for &pip in &arc.pips {
-                *pip_refs.entry(pip).or_default() += 1;
-            }
-        }
+        let (wire_refs, pip_refs) = route_resource_refs(&arcs);
         Self {
             net,
             arcs,
-            wire_refs: wire_refs.into_iter().collect(),
-            pip_refs: pip_refs.into_iter().collect(),
+            wire_refs,
+            pip_refs,
         }
     }
 
@@ -533,6 +525,25 @@ impl NetRoute {
     }
 }
 
+type RouteResourceRefs = (Vec<(WireId, u32)>, Vec<(PipId, u32)>);
+
+fn route_resource_refs(arcs: &[RouteArc]) -> RouteResourceRefs {
+    let mut wire_refs = BTreeMap::<WireId, u32>::new();
+    let mut pip_refs = BTreeMap::<PipId, u32>::new();
+    for arc in arcs {
+        for &wire in &arc.wires {
+            *wire_refs.entry(wire).or_default() += 1;
+        }
+        for &pip in &arc.pips {
+            *pip_refs.entry(pip).or_default() += 1;
+        }
+    }
+    (
+        wire_refs.into_iter().collect(),
+        pip_refs.into_iter().collect(),
+    )
+}
+
 fn reconstruct_endpoint_arc(
     sink: Option<CellPinId>,
     driver: WireId,
@@ -559,7 +570,7 @@ pub struct PnrResult {
     /// Legal cell-to-BEL assignment.
     pub placement: Placement,
     /// One physical route tree per logical net.
-    pub routes: Vec<NetRoute>,
+    pub routes: Vec<Arc<NetRoute>>,
     /// Number of unique PIPs used across all net trees.
     pub total_pips: usize,
 }
@@ -587,7 +598,7 @@ pub struct RoutingWorkspace {
     /// Routes whose resource usage is currently reflected by occupancy.
     /// A failed negotiation invalidates this snapshot; the next call then
     /// falls back to a full sparse reset.
-    resident_routes: Vec<Option<NetRoute>>,
+    resident_routes: Vec<Option<Arc<NetRoute>>>,
     resident_valid: bool,
 }
 
@@ -646,7 +657,7 @@ impl RoutingWorkspace {
         device: &Device,
         net_count: usize,
         constraints: &RoutingConstraints,
-    ) -> Vec<Option<NetRoute>> {
+    ) -> Vec<Option<Arc<NetRoute>>> {
         if self.device_identity != std::ptr::from_ref(device) as usize
             || self.wire_occupancy.len() != device.wires().len()
             || self.pip_occupancy.len() != device.pips().len()
@@ -672,14 +683,19 @@ impl RoutingWorkspace {
             for (index, new) in target.iter().enumerate() {
                 let old = self.resident_routes[index].clone();
                 let new = new.as_ref();
-                if old.as_ref() == new {
+                if old
+                    .as_ref()
+                    .zip(new)
+                    .is_some_and(|(old, new)| Arc::ptr_eq(old, new) || old.as_ref() == new.as_ref())
+                    || old.is_none() && new.is_none()
+                {
                     continue;
                 }
-                if let Some(old) = old.as_ref() {
-                    remove_route_occupancy(self, old, new);
+                if let Some(old) = old.as_deref() {
+                    remove_route_occupancy(self, old, new.map(Arc::as_ref));
                 }
                 if let Some(new) = new {
-                    add_route_occupancy_delta(self, new, old.as_ref());
+                    add_route_occupancy_delta(self, new, old.as_deref());
                 }
             }
         }
@@ -689,7 +705,7 @@ impl RoutingWorkspace {
         target
     }
 
-    fn commit_routes(&mut self, routes: &[NetRoute]) {
+    fn commit_routes(&mut self, routes: &[Arc<NetRoute>]) {
         self.resident_routes = routes.iter().cloned().map(Some).collect();
         self.resident_valid = true;
     }
@@ -1025,7 +1041,8 @@ fn finish_routing_with_workspace(
     workspace: &mut RoutingWorkspace,
     progress: &mut impl FnMut(RoutingProgress),
 ) -> Result<PnrResult, PnrError> {
-    validate_routing_constraints(graph, &placement, routing_constraints)?;
+    let pin_wires = PinWireCache::build(graph, &placement);
+    validate_routing_constraints(graph, &placement, &pin_wires, routing_constraints)?;
     validate_routing_costs(graph, routing_costs)?;
     let routes = workspace.prepare_routes(
         graph.device(),
@@ -1035,6 +1052,7 @@ fn finish_routing_with_workspace(
     let routes = route(
         graph,
         &placement,
+        &pin_wires,
         routing_constraints,
         routing_costs,
         workspace,
@@ -3589,6 +3607,7 @@ const MAX_ROUTING_ITERATIONS: u32 = 32;
 fn validate_routing_constraints(
     graph: &UnifiedGraph<'_>,
     placement: &Placement,
+    pin_wires: &PinWireCache,
     constraints: &RoutingConstraints,
 ) -> Result<(), PnrError> {
     let design = graph.design();
@@ -3610,9 +3629,9 @@ fn validate_routing_constraints(
         let driver_bel = placement
             .bel(driver_cell)
             .ok_or(PnrError::MissingPlacement { cell: driver_cell })?;
-        let driver_wire = bound_wire(graph, placement, net.driver, driver_bel)?;
-        let rebuilt = NetRoute::new(net_id, route.arcs.clone());
-        if rebuilt.wire_refs != route.wire_refs || rebuilt.pip_refs != route.pip_refs {
+        let driver_wire = pin_wires.resolve(graph, placement, net.driver, driver_bel)?;
+        let (wire_refs, pip_refs) = route_resource_refs(&route.arcs);
+        if wire_refs != route.wire_refs || pip_refs != route.pip_refs {
             return Err(PnrError::InvalidRoutingConstraint {
                 net: net_id,
                 reason: "route resource reference counts are stale".into(),
@@ -3670,7 +3689,8 @@ fn validate_routing_constraints(
                 let sink_bel = placement
                     .bel(sink_cell)
                     .ok_or(PnrError::MissingPlacement { cell: sink_cell })?;
-                if arc.wires.last().copied() != Some(bound_wire(graph, placement, sink, sink_bel)?)
+                if arc.wires.last().copied()
+                    != Some(pin_wires.resolve(graph, placement, sink, sink_bel)?)
                 {
                     return Err(PnrError::InvalidRoutingConstraint {
                         net: net_id,
@@ -3839,16 +3859,17 @@ fn route_reaches_all_sinks(
     Ok(true)
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn route(
     graph: &UnifiedGraph<'_>,
     placement: &Placement,
+    pin_wires: &PinWireCache,
     constraints: &RoutingConstraints,
     costs: Option<&RoutingCosts>,
     workspace: &mut RoutingWorkspace,
-    mut routes: Vec<Option<NetRoute>>,
+    mut routes: Vec<Option<Arc<NetRoute>>>,
     progress: &mut impl FnMut(RoutingProgress),
-) -> Result<Vec<NetRoute>, PnrError> {
+) -> Result<Vec<Arc<NetRoute>>, PnrError> {
     let design = graph.design();
     let metadata = RoutingResourceMetadata {
         wire_points: &workspace.wire_points,
@@ -3878,7 +3899,6 @@ fn route(
             );
         }
     }
-    let pin_wires = PinWireCache::build(graph, placement);
     let mut routing_order = routing_order(design, constraints, costs);
     routing_order.sort_unstable();
     let mut dirty = BTreeMap::<usize, BTreeSet<CellPinId>>::new();
@@ -3932,7 +3952,7 @@ fn route(
                         pip.0,
                     );
                 }
-                routes[index] = Some(preserved);
+                routes[index] = Some(Arc::new(preserved));
             }
         }
         let mut ordinal = 0;
@@ -3952,8 +3972,8 @@ fn route(
             let route = route_net(
                 graph,
                 placement,
-                &pin_wires,
-                preserved.as_ref(),
+                pin_wires,
+                preserved.as_deref(),
                 net_id,
                 wire_occupancy,
                 pip_occupancy,
@@ -3991,7 +4011,7 @@ fn route(
                     pip.0,
                 );
             }
-            routes[index] = Some(route);
+            routes[index] = Some(Arc::new(route));
         }
 
         // History grows once per iteration for exactly the resources that are
@@ -4098,7 +4118,7 @@ struct ArcOwnerIndex {
 
 impl ArcOwnerIndex {
     fn build(
-        routes: &[Option<NetRoute>],
+        routes: &[Option<Arc<NetRoute>>],
         metadata: RoutingResourceMetadata<'_>,
         wire_occupancy: &[u16],
         pip_occupancy: &[u16],
@@ -4136,7 +4156,7 @@ impl ArcOwnerIndex {
 
 fn congested_route_arcs(
     metadata: RoutingResourceMetadata<'_>,
-    routes: &[Option<NetRoute>],
+    routes: &[Option<Arc<NetRoute>>],
     constraints: &RoutingConstraints,
     costs: Option<&RoutingCosts>,
     wire_occupancy: &[u16],
@@ -5106,6 +5126,7 @@ impl From<ModelError> for PnrError {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
 
     use texo_model::{
         BelId, CellId, Design, Device, NetId, PinDirection, Point, ResourceKind, UnifiedGraph,
@@ -5893,15 +5914,15 @@ mod tests {
         let retained_sink = texo_model::CellPinId(2);
         let shared = WireId(1);
         let routes = vec![
-            Some(NetRoute::new(
+            Some(Arc::new(NetRoute::new(
                 NetId(0),
                 vec![RouteArc {
                     sink: Some(critical_sink),
                     wires: vec![WireId(0), shared, WireId(2)],
                     pips: vec![],
                 }],
-            )),
-            Some(NetRoute::new(
+            ))),
+            Some(Arc::new(NetRoute::new(
                 NetId(1),
                 vec![
                     RouteArc {
@@ -5915,7 +5936,7 @@ mod tests {
                         pips: vec![],
                     },
                 ],
-            )),
+            ))),
         ];
         let wire_points = vec![Point::new(0, 0); 7];
         let wire_capacities = vec![1; 7];
@@ -5977,7 +5998,7 @@ mod tests {
             ((owner, low_sink), 1),
             ((owner, critical_sink), 64),
         ]));
-        let projection = RouteCapacityProjection::new(&[route], &costs);
+        let projection = RouteCapacityProjection::new(&[Arc::new(route)], &costs);
 
         assert_eq!(
             projected_resource_penalty(projection.wire_owners.get(&low_only), moving, 1),
