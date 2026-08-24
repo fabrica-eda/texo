@@ -1086,3 +1086,14 @@ seconds**, flow time from 26.197 to **25.351 seconds**, wall time from 31.99 to
 **31.21 seconds**, and user CPU from 30.47 to **29.55 seconds**. This is an
 exact graph-query optimization: it changes neither candidate order nor route
 or timing decisions.
+
+The remaining local-search table originally keyed `(WireId, hop)` and endpoint
+pairs through Rust's general-purpose tuple hash. Both IDs are guaranteed to
+fit 32 bits by the physical model, so these states are now packed into one
+`u64` and hashed with a single SplitMix64 finalizer. A raw identity hasher was
+measured and rejected: regular ECP5 wire IDs collided badly in hashbrown and
+grew the final empty pass to 1.107 seconds. Mixing the packed integer reduced
+that pass further to **410 and 407 ms** in consecutive runs, and critical
+refinement to **14.046 and 14.037 seconds**. The second complete run measured
+**25.325 seconds** flow, **31.13 seconds** wall, and **29.63 seconds** user CPU,
+with the same -214/-3905/-399 ps result and 25,655 PIPs.

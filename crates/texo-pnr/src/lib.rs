@@ -4,6 +4,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::error::Error;
 use std::fmt;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use texo_model::{
@@ -1423,9 +1424,43 @@ pub struct PlacementRefinementWorkspace {
 /// the device or PIP delay table changes.
 #[derive(Default)]
 pub struct PlacementConnectionDelayWorkspace {
-    delays: HashMap<(WireId, WireId), Option<u64>>,
+    delays: PackedRouteMap<Option<u64>>,
     queue: BinaryHeap<Reverse<(u64, u8, WireId)>>,
-    best: HashMap<(WireId, u8), u64>,
+    best: PackedRouteMap<u64>,
+}
+
+#[derive(Default)]
+struct PackedRouteHasher(u64);
+
+impl Hasher for PackedRouteHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Packed route maps use u64 keys, whose Hash implementation calls
+        // `write_u64`; retain a deterministic fallback for trait completeness.
+        self.0 = bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+        });
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        let mut mixed = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        self.0 = mixed ^ (mixed >> 31);
+    }
+}
+
+type PackedRouteMap<Value> = HashMap<u64, Value, BuildHasherDefault<PackedRouteHasher>>;
+
+fn packed_wire_pair(start: WireId, goal: WireId) -> u64 {
+    ((start.0 as u64) << 32) | goal.0 as u64
+}
+
+fn packed_hop_state(wire: WireId, hops: u8) -> u64 {
+    ((wire.0 as u64) << 8) | u64::from(hops)
 }
 
 impl PlacementConnectionDelayWorkspace {
@@ -1658,7 +1693,7 @@ impl<'a> PlacementRefiner<'a> {
             (fixed_wire, current_moving_wire)
         };
         let mut local_queue = BinaryHeap::new();
-        let mut local_best = HashMap::new();
+        let mut local_best = PackedRouteMap::default();
         let Some(current_delay) = local_connection_delay(
             &self.graph,
             current_start,
@@ -2326,7 +2361,8 @@ fn assignment_connection_excess(
         let sink_bel = assignment_bel(unit, assignment, sink_cell, placed)?;
         let driver_wire = candidate_pin_wire(graph, constraints, driver_pin, driver_bel)?;
         let sink_wire = candidate_pin_wire(graph, constraints, sink_pin, sink_bel)?;
-        let delay = if let Some(delay) = workspace.delays.get(&(driver_wire, sink_wire)) {
+        let endpoint_key = packed_wire_pair(driver_wire, sink_wire);
+        let delay = if let Some(delay) = workspace.delays.get(&endpoint_key) {
             *delay
         } else {
             let delay = local_connection_delay(
@@ -2337,7 +2373,7 @@ fn assignment_connection_excess(
                 &mut workspace.queue,
                 &mut workspace.best,
             );
-            workspace.delays.insert((driver_wire, sink_wire), delay);
+            workspace.delays.insert(endpoint_key, delay);
             delay
         }?;
         total = total.saturating_add(delay);
@@ -2352,7 +2388,7 @@ fn local_connection_delay(
     goal: WireId,
     pip_delays_ps: &[u32],
     queue: &mut BinaryHeap<Reverse<(u64, u8, WireId)>>,
-    best: &mut HashMap<(WireId, u8), u64>,
+    best: &mut PackedRouteMap<u64>,
 ) -> Option<u64> {
     // Long-line entry/exit PIPs can put even a modest tile displacement over
     // eight graph edges.  A too-small bound made a badly displaced critical
@@ -2370,12 +2406,16 @@ fn local_connection_delay(
     queue.clear();
     best.clear();
     queue.push(Reverse((0_u64, 0_u8, start)));
-    best.insert((start, 0_u8), 0_u64);
+    best.insert(packed_hop_state(start, 0), 0_u64);
     while let Some(Reverse((delay, hops, wire))) = queue.pop() {
         if wire == goal {
             return Some(delay);
         }
-        if hops == MAX_LOCAL_HOPS || best.get(&(wire, hops)).is_some_and(|known| *known < delay) {
+        if hops == MAX_LOCAL_HOPS
+            || best
+                .get(&packed_hop_state(wire, hops))
+                .is_some_and(|known| *known < delay)
+        {
             continue;
         }
         for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
@@ -2384,7 +2424,7 @@ fn local_connection_delay(
             }
             let next_hops = hops + 1;
             let next_delay = delay.saturating_add(u64::from(pip_delays_ps[pip.0]));
-            let key = (neighbor, next_hops);
+            let key = packed_hop_state(neighbor, next_hops);
             if best.get(&key).is_none_or(|known| next_delay < *known) {
                 best.insert(key, next_delay);
                 queue.push(Reverse((next_delay, next_hops, neighbor)));
