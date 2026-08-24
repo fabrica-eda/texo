@@ -1097,3 +1097,21 @@ that pass further to **410 and 407 ms** in consecutive runs, and critical
 refinement to **14.046 and 14.037 seconds**. The second complete run measured
 **25.325 seconds** flow, **31.13 seconds** wall, and **29.63 seconds** user CPU,
 with the same -214/-3905/-399 ps result and 25,655 PIPs.
+
+Two topology representations were then measured and rejected. First, a
+pass-persistent `resource -> (net, sink arc)` index kept every owner in nested
+hash/tree containers and updated it after each arc change. Although output was
+identical, it made critical refinement **16.326 seconds**, flow **28.182
+seconds**, and raised RSS by about 32 MiB. The current round-end index is
+already sparse because it records only overused resources; an event-driven
+router needs a compact flat owner table, not a general persistent map.
+
+Second, monotonic placement anchored each weighted sink to the single
+incumbent sibling-tree wire currently nearest that sink. It reduced the final
+route to 25,645 PIPs but trapped placement on the old branch structure:
+**-375 ps WNS**, 14.952 seconds of critical refinement, and 27.417 seconds of
+flow. A retained route tree must therefore remain a candidate-dependent
+source *set*. The next coarse placement layer should expose a distance field
+to that complete set, then let the physical graph projection choose the exact
+source for a shortlist; collapsing the set to one point loses necessary
+topology freedom.
