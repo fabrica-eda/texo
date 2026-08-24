@@ -101,6 +101,11 @@ impl RoutingCosts {
         self.max_iterations = max_iterations.clamp(1, MAX_ROUTING_ITERATIONS);
     }
 
+    /// Restores the full negotiated-congestion iteration budget.
+    pub fn reset_max_iterations(&mut self) {
+        self.max_iterations = MAX_ROUTING_ITERATIONS;
+    }
+
     /// Negotiated-congestion iteration limit for this routing trial.
     #[must_use]
     pub const fn max_iterations(&self) -> u32 {
@@ -527,6 +532,11 @@ pub struct RoutingWorkspace {
     wire_points: Vec<Point>,
     wire_capacities: Vec<u16>,
     pip_capacities: Vec<u16>,
+    /// Routes whose resource usage is currently reflected by occupancy.
+    /// A failed negotiation invalidates this snapshot; the next call then
+    /// falls back to a full sparse reset.
+    resident_routes: Vec<Option<NetRoute>>,
+    resident_valid: bool,
 }
 
 impl RoutingWorkspace {
@@ -550,6 +560,8 @@ impl RoutingWorkspace {
                 .iter()
                 .map(texo_model::Pip::capacity)
                 .collect(),
+            resident_routes: Vec::new(),
+            resident_valid: false,
         }
     }
 
@@ -569,6 +581,128 @@ impl RoutingWorkspace {
             self.pip_occupancy[index] = 0;
             self.pip_history[index] = 0;
         }
+        self.resident_routes.clear();
+        self.resident_valid = false;
+    }
+
+    /// Synchronizes persistent occupancy to a new set of frozen routes.
+    /// Unchanged net trees cost one equality check; only changed trees touch
+    /// resource counters. History remains trial-local so rejected searches do
+    /// not bias the next transaction.
+    fn prepare_routes(
+        &mut self,
+        device: &Device,
+        net_count: usize,
+        constraints: &RoutingConstraints,
+    ) -> Vec<Option<NetRoute>> {
+        if self.device_identity != std::ptr::from_ref(device) as usize
+            || self.wire_occupancy.len() != device.wires().len()
+            || self.pip_occupancy.len() != device.pips().len()
+        {
+            *self = Self::new(device);
+        }
+        for &index in &self.touched_wires {
+            self.wire_history[index] = 0;
+        }
+        for &index in &self.touched_pips {
+            self.pip_history[index] = 0;
+        }
+        let mut target = vec![None; net_count];
+        for (&net, route) in constraints.routes() {
+            target[net.0] = Some(route.clone());
+        }
+        if !self.resident_valid || self.resident_routes.len() != net_count {
+            self.prepare(device);
+            for route in target.iter().flatten() {
+                add_route_occupancy(self, route);
+            }
+        } else {
+            for (index, new) in target.iter().enumerate() {
+                let old = self.resident_routes[index].clone();
+                let new = new.as_ref();
+                if old.as_ref() == new {
+                    continue;
+                }
+                if let Some(old) = old.as_ref() {
+                    remove_route_occupancy(self, old, new);
+                }
+                if let Some(new) = new {
+                    add_route_occupancy_delta(self, new, old.as_ref());
+                }
+            }
+        }
+        // Until negotiation succeeds, occupancy no longer has a committed
+        // route snapshot to synchronize from safely.
+        self.resident_valid = false;
+        target
+    }
+
+    fn commit_routes(&mut self, routes: &[NetRoute]) {
+        self.resident_routes = routes.iter().cloned().map(Some).collect();
+        self.resident_valid = true;
+    }
+}
+
+fn add_route_occupancy(workspace: &mut RoutingWorkspace, route: &NetRoute) {
+    for wire in route.wires() {
+        increment_occupancy(
+            &mut workspace.wire_occupancy,
+            &mut workspace.touched_wires,
+            wire.0,
+        );
+    }
+    for pip in route.pips() {
+        increment_occupancy(
+            &mut workspace.pip_occupancy,
+            &mut workspace.touched_pips,
+            pip.0,
+        );
+    }
+}
+
+fn remove_route_occupancy(
+    workspace: &mut RoutingWorkspace,
+    old: &NetRoute,
+    replacement: Option<&NetRoute>,
+) {
+    for wire in old
+        .wires()
+        .filter(|&wire| replacement.is_none_or(|route| route.wire_ref_count(wire) == 0))
+    {
+        workspace.wire_occupancy[wire.0] -= 1;
+    }
+    for pip in old
+        .pips()
+        .filter(|&pip| replacement.is_none_or(|route| route.pip_ref_count(pip) == 0))
+    {
+        workspace.pip_occupancy[pip.0] -= 1;
+    }
+}
+
+fn add_route_occupancy_delta(
+    workspace: &mut RoutingWorkspace,
+    new: &NetRoute,
+    previous: Option<&NetRoute>,
+) {
+    for wire in new
+        .wires()
+        .filter(|&wire| previous.is_none_or(|route| route.wire_ref_count(wire) == 0))
+    {
+        increment_occupancy(
+            &mut workspace.wire_occupancy,
+            &mut workspace.touched_wires,
+            wire.0,
+        );
+    }
+    for pip in new
+        .pips()
+        .filter(|&pip| previous.is_none_or(|route| route.pip_ref_count(pip) == 0))
+    {
+        increment_occupancy(
+            &mut workspace.pip_occupancy,
+            &mut workspace.touched_pips,
+            pip.0,
+        );
     }
 }
 
@@ -841,13 +975,18 @@ fn finish_routing_with_workspace(
 ) -> Result<PnrResult, PnrError> {
     validate_routing_constraints(graph, &placement, routing_constraints)?;
     validate_routing_costs(graph, routing_costs)?;
-    workspace.prepare(graph.device());
+    let routes = workspace.prepare_routes(
+        graph.device(),
+        graph.design().nets().len(),
+        routing_constraints,
+    );
     let routes = route(
         graph,
         &placement,
         routing_constraints,
         routing_costs,
         workspace,
+        routes,
         progress,
     )?;
     for route in &routes {
@@ -860,6 +999,7 @@ fn finish_routing_with_workspace(
         }
     }
     let total_pips = routes.iter().map(|route| route.pips().len()).sum();
+    workspace.commit_routes(&routes);
     Ok(PnrResult {
         placement,
         routes,
@@ -3435,6 +3575,7 @@ fn route(
     constraints: &RoutingConstraints,
     costs: Option<&RoutingCosts>,
     workspace: &mut RoutingWorkspace,
+    mut routes: Vec<Option<NetRoute>>,
     progress: &mut impl FnMut(RoutingProgress),
 ) -> Result<Vec<NetRoute>, PnrError> {
     let design = graph.design();
@@ -3448,11 +3589,8 @@ fn route(
     let wire_history = &mut workspace.wire_history;
     let pip_history = &mut workspace.pip_history;
     let mut overuse = OveruseTracker::default();
-    let mut routes = vec![None; design.nets().len()];
-    for (&net, route) in constraints.routes() {
-        routes[net.0] = Some(route.clone());
+    for route in routes.iter().flatten() {
         for wire in route.wires() {
-            increment_occupancy(wire_occupancy, &mut workspace.touched_wires, wire.0);
             track_entry(
                 &mut overuse.wires,
                 wire_occupancy[wire.0],
@@ -3461,7 +3599,6 @@ fn route(
             );
         }
         for pip in route.pips() {
-            increment_occupancy(pip_occupancy, &mut workspace.touched_pips, pip.0);
             track_entry(
                 &mut overuse.pips,
                 pip_occupancy[pip.0],
@@ -5045,6 +5182,8 @@ mod tests {
         assert_eq!(costs.max_iterations(), 8);
         costs.set_max_iterations(0);
         assert_eq!(costs.max_iterations(), 1);
+        costs.reset_max_iterations();
+        assert_eq!(costs.max_iterations(), MAX_ROUTING_ITERATIONS);
         costs.set_max_iterations(MAX_ROUTING_ITERATIONS + 1);
         assert_eq!(costs.max_iterations(), MAX_ROUTING_ITERATIONS);
     }

@@ -598,3 +598,53 @@ the remaining runtime increase comes from the subsequent closure trajectory
 exploring the improved packing basin more deeply. A post-closure-only variant
 finished in 74.30 seconds but rejected all four candidates and retained
 -318/-397 ps, so it was not selected.
+
+## Persistent routing transactions (2026-08-24)
+
+`RoutingWorkspace` now retains the last successfully routed net trees together
+with the occupancy they contribute. Before a new local placement/packing
+trial, its frozen routes are compared with that resident snapshot per net:
+
+- unchanged trees retain their occupancy without being rebuilt;
+- removed or replaced trees decrement only their resource-set difference;
+- new frozen trees increment only their resource-set difference; and
+- negotiation history is cleared for the touched resources, so a rejected
+  search cannot poison the next transaction.
+
+A successful route atomically becomes the next resident snapshot. A failed
+negotiation invalidates it and deliberately falls back to the prior sparse
+full reset on the following call. Rejection needs no special rollback API:
+the next trial's frozen incumbent trees are the transaction target, and the
+same difference synchronizer restores them. Thus placement/packing search can
+keep its stateless `PnrResult` contract while the expensive physical occupancy
+state remains persistent underneath it.
+
+The ECP5-wide PIP delay table is also constructed once for timing closure and
+shared by the dedicated-edge ECO and later placement refinements. Local ECOs
+temporarily use eight negotiated-congestion iterations, then restore the full
+32-iteration budget. The saved runtime was spent on widening the routed
+dedicated-edge search from one candidate to four rather than merely reducing
+the flow's work.
+
+Measured on the same AXI4 300 MHz input:
+
+| flow | routed packing candidates | final WNS / WHS | PIPs | runtime |
+|---|---:|---:|---:|---:|
+| rebuild baseline | 1 | -254 / -397 ps | 25,660 | 84.00 s |
+| persistent routes | 1 | -254 / -397 ps | 25,660 | 73.75 s |
+| persistent routes, wider search | 4 | **-254 / -397 ps** | **25,660** | **78.90 s** |
+
+The four packing trials themselves route in roughly 160--180 ms each after
+the first cached placement check. The wider run is still 5.10 seconds faster
+than the one-candidate rebuild baseline with identical selected QoR, and it
+evaluates three additional real-route alternatives. This is why speed and QoR
+are coupled here: actual route+STA is the reliable objective, so cheaper
+transactions buy more objective evaluations before the runtime budget is
+exhausted.
+
+This does not close the nextpnr gap: its reference run remains about 3.14
+seconds and reaches roughly 309.6 MHz. The next structural target is the inner
+A*/negotiation cost and a cheap topology/capacity projection capable of
+screening thousands of placement moves; persistent transactions remove the
+state-reconstruction tax but do not yet provide that candidate-generation
+layer.

@@ -386,7 +386,6 @@ pub fn implement_struo_ecp5_with_progress(
         &timing_constraints,
     )?;
     progress(timing_snapshot(&initial_timing));
-
     if options.initial_timing_reroute && !initial_timing.met_timing() {
         let mut costs = ecp5_routing_costs(
             architecture,
@@ -414,11 +413,25 @@ pub fn implement_struo_ecp5_with_progress(
         )?;
         progress(timing_snapshot(&initial_timing));
     }
+    let mut closure_routing_costs = options
+        .optimize_timing
+        .then(|| {
+            ecp5_routing_costs(
+                architecture,
+                speed_grade,
+                timing_net_weights(&initial_timing, &timing_constraints),
+            )
+        })
+        .transpose()?;
+    if let Some(costs) = closure_routing_costs.as_mut() {
+        costs.set_sink_criticalities(timing_arc_weights(&initial_timing, &timing_constraints));
+    }
 
     if options.optimize_timing
         && options.initial_placement.is_none()
         && options.lut_ff_pairs.is_none()
         && !initial_timing.met_timing()
+        && let Some(costs) = closure_routing_costs.as_mut()
         && let Some(candidate) = optimize_dedicated_lut_ff_edge(
             &design,
             architecture,
@@ -426,7 +439,7 @@ pub fn implement_struo_ecp5_with_progress(
             &packing,
             &initial_implementation,
             &initial_timing,
-            &timing_constraints,
+            costs,
             &mut global_routing_cache,
             &mut routing_workspace,
             &mut progress,
@@ -437,9 +450,11 @@ pub fn implement_struo_ecp5_with_progress(
         initial_timing = candidate.timing;
         timing_model = ecp5_timing_model(&design, &packing, speed_grade)?;
         timing_constraints = ecp5_timing_constraints(&design, &packing)?;
+        costs.set_net_criticalities(timing_net_weights(&initial_timing, &timing_constraints));
+        costs.set_sink_criticalities(timing_arc_weights(&initial_timing, &timing_constraints));
     }
 
-    let (implementation, timing) = if options.optimize_timing {
+    let (implementation, timing) = if let Some(costs) = closure_routing_costs.as_mut() {
         TimingDrivenContext {
             design: &design,
             architecture,
@@ -451,7 +466,7 @@ pub fn implement_struo_ecp5_with_progress(
             routing_workspace: &mut routing_workspace,
             stalled_ripup_wns_ps: None,
         }
-        .optimize(initial_implementation, initial_timing, &mut progress)?
+        .optimize(initial_implementation, initial_timing, costs, &mut progress)?
     } else {
         (initial_implementation, initial_timing)
     };
@@ -513,7 +528,7 @@ fn optimize_dedicated_lut_ff_edge(
     packing: &Ecp5Packing,
     implementation: &PnrResult,
     timing: &TimingReport,
-    timing_constraints: &TimingConstraints,
+    routing_costs: &mut RoutingCosts,
     global_routing_cache: &mut Ecp5GlobalRoutingCache<'_>,
     routing_workspace: &mut RoutingWorkspace,
     progress: &mut impl FnMut(Ecp5FlowStage),
@@ -569,12 +584,6 @@ fn optimize_dedicated_lut_ff_edge(
         return Ok(None);
     }
 
-    let mut routing_costs = ecp5_routing_costs(
-        architecture,
-        speed_grade,
-        timing_net_weights(timing, timing_constraints),
-    )?;
-    routing_costs.set_sink_criticalities(timing_arc_weights(timing, timing_constraints));
     routing_costs.set_max_iterations(LOCAL_TRIAL_ROUTING_ITERATIONS);
     let incumbent_score = timing_score(timing);
     let mut best = None;
@@ -633,7 +642,7 @@ fn optimize_dedicated_lut_ff_edge(
             architecture.device(),
             trial_placement,
             &frozen,
-            &routing_costs,
+            routing_costs,
             routing_workspace,
             |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
         ) {
@@ -686,6 +695,7 @@ fn optimize_dedicated_lut_ff_edge(
             });
         }
     }
+    routing_costs.reset_max_iterations();
     Ok(best)
 }
 
@@ -710,6 +720,7 @@ impl TimingDrivenContext<'_, '_> {
         &mut self,
         initial_implementation: PnrResult,
         initial_timing: TimingReport,
+        routing_costs: &mut RoutingCosts,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<(PnrResult, TimingReport), Ecp5FlowError> {
         if initial_timing.met_timing() {
@@ -719,9 +730,6 @@ impl TimingDrivenContext<'_, '_> {
         // selection on the measured designs (the connectivity-only solve wins
         // after routing), so refinement descends directly from the initial
         // implementation and the second solve's route-and-analyze is skipped.
-        let routing_weights = timing_net_weights(&initial_timing, self.timing_constraints);
-        let mut routing_costs =
-            ecp5_routing_costs(self.architecture, self.speed_grade, routing_weights)?;
         routing_costs
             .set_sink_criticalities(timing_arc_weights(&initial_timing, self.timing_constraints));
         let mut archive = vec![(initial_implementation, initial_timing)];
@@ -730,12 +738,8 @@ impl TimingDrivenContext<'_, '_> {
             self.architecture.device(),
             self.packing.constraints(),
         )?;
-        archive = self.refine_setup_monotonically(
-            archive,
-            &placement_refiner,
-            &mut routing_costs,
-            progress,
-        )?;
+        archive =
+            self.refine_setup_monotonically(archive, &placement_refiner, routing_costs, progress)?;
         for _ in 0..MAX_LOCAL_CONNECTION_REFINEMENTS {
             let seed = archive
                 .iter()
@@ -746,7 +750,7 @@ impl TimingDrivenContext<'_, '_> {
                 &seed.0,
                 &seed.1,
                 &placement_refiner,
-                &mut routing_costs,
+                routing_costs,
                 progress,
             )?;
             let Some(improved) = refinements
@@ -760,17 +764,13 @@ impl TimingDrivenContext<'_, '_> {
             archive = select_timing_frontier(archive);
         }
         archive =
-            self.close_setup_critically(archive, &placement_refiner, &mut routing_costs, progress)?;
+            self.close_setup_critically(archive, &placement_refiner, routing_costs, progress)?;
         if !archive
             .iter()
             .any(|(_, timing)| timing.worst_slack_ps.is_some_and(|slack| slack >= 0))
         {
-            archive = self.escape_placement_basin(
-                archive,
-                &placement_refiner,
-                &mut routing_costs,
-                progress,
-            )?;
+            archive =
+                self.escape_placement_basin(archive, &placement_refiner, routing_costs, progress)?;
         }
         let mut hold_repairs = Vec::new();
         for (implementation, timing) in &archive {
@@ -778,7 +778,7 @@ impl TimingDrivenContext<'_, '_> {
                 continue;
             }
             if let Some(repaired) =
-                self.repair_hold_locally(implementation, timing, &mut routing_costs, progress)?
+                self.repair_hold_locally(implementation, timing, routing_costs, progress)?
                 && repaired.1.worst_slack_ps.is_some_and(|slack| slack >= 0)
                 && timing_score(&repaired.1) > timing_score(timing)
             {
@@ -1559,7 +1559,7 @@ fn worst_setup_connections(
 
 const MAX_INCREMENTAL_REFINEMENTS: usize = 8;
 const LOCAL_TRIAL_ROUTING_ITERATIONS: u32 = 8;
-const MAX_DEDICATED_EDGE_TRIALS: usize = 1;
+const MAX_DEDICATED_EDGE_TRIALS: usize = 4;
 // Geometry delay model for pre-screening route trials. Calibrated loosely
 // against the measured AXI4 hops: same-tile LUT-to-FF edges land near 300 ps,
 // multi-tile general-routing hops near 250 ps per tile. A proposal whose
