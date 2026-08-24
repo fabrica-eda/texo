@@ -1,9 +1,11 @@
 //! Flow orchestration and explicit verification evidence.
 
 use std::cmp::Reverse;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
 use texo_model::{
@@ -466,6 +468,7 @@ pub fn implement_struo_ecp5_with_progress(
             timing_constraints: &timing_constraints,
             routing_workspace: &mut routing_workspace,
             stalled_ripup_wns_ps: None,
+            critical_move_trials: BTreeSet::new(),
         }
         .optimize(initial_implementation, initial_timing, costs, &mut progress)?
     } else {
@@ -714,6 +717,10 @@ struct TimingDrivenContext<'a, 'work> {
     /// local changes otherwise trigger the same expensive failed search in
     /// every closure round.
     stalled_ripup_wns_ps: Option<i128>,
+    /// Exact seed-route/proposed-placement pairs already sent through a local
+    /// negotiated route and STA. Closure rounds often rediscover the same
+    /// move; only a changed route topology makes it worth evaluating again.
+    critical_move_trials: BTreeSet<(u64, u64)>,
 }
 
 impl TimingDrivenContext<'_, '_> {
@@ -1400,6 +1407,7 @@ impl TimingDrivenContext<'_, '_> {
         routing_costs.set_sink_criticalities(route_arc_weights.clone());
         let capacity_projection =
             RouteCapacityProjection::new(&implementation.routes, routing_costs);
+        let seed_fingerprint = implementation_topology_fingerprint(self.design, implementation);
         let mut placement = implementation.placement.clone();
         let mut candidates = Vec::new();
         for (cell, (_, connections, targets)) in cells.into_iter().take(MAX_CRITICAL_PATH_CELLS) {
@@ -1424,6 +1432,13 @@ impl TimingDrivenContext<'_, '_> {
             let mut best_for_cell = None;
             for refined in proposals {
                 if self.estimate_rejects(&placement, &refined, &prescreen_weights) {
+                    continue;
+                }
+                let trial_key = (
+                    seed_fingerprint,
+                    placement_fingerprint(self.design, &refined),
+                );
+                if !self.critical_move_trials.insert(trial_key) {
                     continue;
                 }
                 let to = refined.bindings()[cell.0];
@@ -2196,6 +2211,29 @@ fn slack_violations(slacks: impl Iterator<Item = i128>) -> SlackViolations {
 }
 
 type TimingCandidate = (PnrResult, TimingReport);
+
+fn placement_fingerprint(design: &Design, placement: &Placement) -> u64 {
+    let mut fingerprint = DefaultHasher::new();
+    placement.bindings().hash(&mut fingerprint);
+    for pin in 0..design.pins().len() {
+        placement.pin_binding(CellPinId(pin)).hash(&mut fingerprint);
+    }
+    fingerprint.finish()
+}
+
+fn implementation_topology_fingerprint(design: &Design, implementation: &PnrResult) -> u64 {
+    let mut fingerprint = DefaultHasher::new();
+    placement_fingerprint(design, &implementation.placement).hash(&mut fingerprint);
+    for route in &implementation.routes {
+        route.net.hash(&mut fingerprint);
+        for arc in &route.arcs {
+            arc.sink.hash(&mut fingerprint);
+            arc.wires.hash(&mut fingerprint);
+            arc.pips.hash(&mut fingerprint);
+        }
+    }
+    fingerprint.finish()
+}
 
 fn select_timing_frontier(candidates: Vec<TimingCandidate>) -> Vec<TimingCandidate> {
     select_timing_candidates(candidates, TIMING_FRONTIER_WIDTH)

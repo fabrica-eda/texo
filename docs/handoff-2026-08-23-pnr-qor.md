@@ -724,3 +724,16 @@ The next structural waste visible in the trace is round-level duplication:
 when a closure seed does not change, the same cell/BEL move is routed and
 analyzed again in later rounds. Candidate identity plus seed route identity
 should become a transposition table before widening the projected search.
+
+## Exact closure-move transpositions (2026-08-24)
+
+Critical-path closure now fingerprints the complete seed placement and route
+arcs together with each proposed placement. A proposal already routed from
+that exact physical topology is skipped in later closure rounds. Placement
+alone is deliberately insufficient: after a global ripup changes the route
+tree, the same cell move remains eligible because its interference can change.
+
+The selected capacity-projection result is bit-identical at -214/-399 ps and
+25,665 PIPs. Runtime fell from 59.78 to 58.31 seconds, another 1.47 seconds
+(2.5%). This is a conservative transposition table rather than approximate
+memoization; it cannot reuse a result across genuinely different topologies.
