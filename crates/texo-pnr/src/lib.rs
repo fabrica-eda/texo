@@ -1416,6 +1416,26 @@ pub struct PlacementRefinementWorkspace {
     validated_group_shapes: Vec<ValidatedGroupShape>,
 }
 
+/// Scratch storage for exact local connection-delay scoring.
+///
+/// A timing-refinement pass can reuse both completed endpoint queries and the
+/// allocation behind each bounded route search. Create a fresh workspace when
+/// the device or PIP delay table changes.
+#[derive(Default)]
+pub struct PlacementConnectionDelayWorkspace {
+    delays: HashMap<(WireId, WireId), Option<u64>>,
+    queue: BinaryHeap<Reverse<(u64, u8, WireId)>>,
+    best: HashMap<(WireId, u8), u64>,
+}
+
+impl PlacementConnectionDelayWorkspace {
+    /// Creates empty pass-local delay-search storage.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 struct ValidatedGroupShape {
     assignments: Arc<[Vec<BelId>]>,
     candidate_sets: Vec<Arc<[BelId]>>,
@@ -1637,9 +1657,16 @@ impl<'a> PlacementRefiner<'a> {
         } else {
             (fixed_wire, current_moving_wire)
         };
-        let Some(current_delay) =
-            local_connection_delay(&self.graph, current_start, current_goal, pip_delays_ps)
-        else {
+        let mut local_queue = BinaryHeap::new();
+        let mut local_best = HashMap::new();
+        let Some(current_delay) = local_connection_delay(
+            &self.graph,
+            current_start,
+            current_goal,
+            pip_delays_ps,
+            &mut local_queue,
+            &mut local_best,
+        ) else {
             return Ok(None);
         };
 
@@ -1710,8 +1737,14 @@ impl<'a> PlacementRefiner<'a> {
             } else {
                 (fixed_wire, moving_wire)
             };
-            let Some(delay) = local_connection_delay(&self.graph, start, goal, pip_delays_ps)
-            else {
+            let Some(delay) = local_connection_delay(
+                &self.graph,
+                start,
+                goal,
+                pip_delays_ps,
+                &mut local_queue,
+                &mut local_best,
+            ) else {
                 continue;
             };
             if delay < current_delay
@@ -1759,6 +1792,48 @@ impl<'a> PlacementRefiner<'a> {
         max_move_distance: u64,
         max_candidates: usize,
     ) -> Result<Vec<Placement>, PnrError> {
+        let mut workspace = PlacementConnectionDelayWorkspace::new();
+        self.refine_cell_connection_delays_with_cache(
+            placement,
+            moving_cell,
+            connections,
+            targets_ps,
+            pip_delays_ps,
+            capacity_projection,
+            max_move_distance,
+            max_candidates,
+            &mut workspace,
+        )
+    }
+
+    /// Proposes placements while reusing exact local-route delays computed by
+    /// other cells in the same refinement pass.
+    ///
+    /// `workspace` must be fresh when the device or PIP delay table changes.
+    /// Its cached entries depend only on the two endpoint wires and that table,
+    /// so placements within one pass may safely share it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the starting placement or timing table is invalid.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an internally validated placement-unit table is
+    /// inconsistent with the design.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    pub fn refine_cell_connection_delays_with_cache(
+        &self,
+        placement: Placement,
+        moving_cell: CellId,
+        connections: &[(CellPinId, CellPinId)],
+        targets_ps: &[u64],
+        pip_delays_ps: &[u32],
+        capacity_projection: Option<&RouteCapacityProjection>,
+        max_move_distance: u64,
+        max_candidates: usize,
+        workspace: &mut PlacementConnectionDelayWorkspace,
+    ) -> Result<Vec<Placement>, PnrError> {
         if pip_delays_ps.len() != self.graph.device().pips().len() {
             return Err(PnrError::InvalidRoutingCosts {
                 reason: format!(
@@ -1805,7 +1880,6 @@ impl<'a> PlacementRefiner<'a> {
             .position(|&cell| cell == moving_cell)
             .expect("the selected unit contains its moving cell");
         let broad_path_move = max_move_distance > 2;
-        let mut local_delay_cache = HashMap::new();
         // Local moves score by the routed-delay excess over the per-connection
         // allowance targets so already-satisfied connections stop absorbing
         // moves. Broad path moves stay span-ranked: measuring excess on every
@@ -1825,7 +1899,7 @@ impl<'a> PlacementRefiner<'a> {
                 targets_ps,
                 &placed,
                 pip_delays_ps,
-                &mut local_delay_cache,
+                workspace,
             )
             .map(|(excess, _)| excess)
         };
@@ -1920,7 +1994,7 @@ impl<'a> PlacementRefiner<'a> {
                     targets_ps,
                     &placed,
                     pip_delays_ps,
-                    &mut local_delay_cache,
+                    workspace,
                 ) else {
                     continue;
                 };
@@ -2237,7 +2311,7 @@ fn assignment_connection_excess(
     targets_ps: &[u64],
     placed: &[Option<BelId>],
     pip_delays_ps: &[u32],
-    local_delay_cache: &mut HashMap<(WireId, WireId), Option<u64>>,
+    workspace: &mut PlacementConnectionDelayWorkspace,
 ) -> Option<(u64, u64)> {
     let design = graph.design();
     let mut total = 0_u64;
@@ -2252,11 +2326,18 @@ fn assignment_connection_excess(
         let sink_bel = assignment_bel(unit, assignment, sink_cell, placed)?;
         let driver_wire = candidate_pin_wire(graph, constraints, driver_pin, driver_bel)?;
         let sink_wire = candidate_pin_wire(graph, constraints, sink_pin, sink_bel)?;
-        let delay = if let Some(delay) = local_delay_cache.get(&(driver_wire, sink_wire)) {
+        let delay = if let Some(delay) = workspace.delays.get(&(driver_wire, sink_wire)) {
             *delay
         } else {
-            let delay = local_connection_delay(graph, driver_wire, sink_wire, pip_delays_ps);
-            local_delay_cache.insert((driver_wire, sink_wire), delay);
+            let delay = local_connection_delay(
+                graph,
+                driver_wire,
+                sink_wire,
+                pip_delays_ps,
+                &mut workspace.queue,
+                &mut workspace.best,
+            );
+            workspace.delays.insert((driver_wire, sink_wire), delay);
             delay
         }?;
         total = total.saturating_add(delay);
@@ -2270,6 +2351,8 @@ fn local_connection_delay(
     start: WireId,
     goal: WireId,
     pip_delays_ps: &[u32],
+    queue: &mut BinaryHeap<Reverse<(u64, u8, WireId)>>,
+    best: &mut HashMap<(WireId, u8), u64>,
 ) -> Option<u64> {
     // Long-line entry/exit PIPs can put even a modest tile displacement over
     // eight graph edges.  A too-small bound made a badly displaced critical
@@ -2284,8 +2367,10 @@ fn local_connection_delay(
         device,
         LOCAL_MARGIN,
     );
-    let mut queue = BinaryHeap::from([Reverse((0_u64, 0_u8, start))]);
-    let mut best = HashMap::from([((start, 0_u8), 0_u64)]);
+    queue.clear();
+    best.clear();
+    queue.push(Reverse((0_u64, 0_u8, start)));
+    best.insert((start, 0_u8), 0_u64);
     while let Some(Reverse((delay, hops, wire))) = queue.pop() {
         if wire == goal {
             return Some(delay);

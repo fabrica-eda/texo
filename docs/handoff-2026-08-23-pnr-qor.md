@@ -1062,3 +1062,27 @@ but ended at -301 ps WNS; mixing event-driven eviction only for
 criticality-1 arcs was worse at -457 ps and 31.107 seconds. Resource prices,
 arc ordering, and victim ownership must therefore be replaced coherently
 rather than mixed with the round-based negotiator.
+
+## Pass-local exact placement-delay workspace (2026-08-25)
+
+The local radius-1/2 placement objective runs a bounded 16-hop route search
+for each physical endpoint pair. Its result depends on the two endpoint wires
+and the PIP delay table, not on the rest of the placement. The critical-path
+loop nevertheless discarded both completed queries and the search heap/hash
+allocations after every cell. Near the final solution, one radius-2 pass that
+found no proposal spent 943 ms almost entirely repeating this work.
+
+`PlacementConnectionDelayWorkspace` now lives for one critical refinement
+pass. It memoizes exact endpoint-pair results across adjacent path cells and
+reuses the allocation behind the bounded-search heap and visited-cost table
+for every new pair. The lifetime is deliberately shorter than the full timing
+closure: an earlier refiner-lifetime cache paid table-identity and oversized
+hash costs after the useful working set had changed.
+
+The deterministic AXI4 result remained exactly **-214 ps WNS, -3905 ps setup
+TNS, -399 ps WHS, and 25,655 PIPs**. The final empty radius-2 proposal pass
+fell from 943 to **591 ms**, critical refinement from 15.074 to **14.256
+seconds**, flow time from 26.197 to **25.351 seconds**, wall time from 31.99 to
+**31.21 seconds**, and user CPU from 30.47 to **29.55 seconds**. This is an
+exact graph-query optimization: it changes neither candidate order nor route
+or timing decisions.

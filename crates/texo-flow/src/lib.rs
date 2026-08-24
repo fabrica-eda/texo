@@ -14,10 +14,10 @@ use texo_model::{
 };
 pub use texo_pnr::RoutingProgress;
 use texo_pnr::{
-    NetRoute, Placement, PlacementConstraints, PlacementRefinementWorkspace, PlacementRefiner,
-    PnrError, PnrResult, RouteCapacityProjection, RoutingConstraints, RoutingCosts,
-    RoutingWorkspace, place_analytically_with_net_sink_weights, place_and_route_with_constraints,
-    placement_from_partial_bindings, retain_route_for_sinks,
+    NetRoute, Placement, PlacementConnectionDelayWorkspace, PlacementConstraints,
+    PlacementRefinementWorkspace, PlacementRefiner, PnrError, PnrResult, RouteCapacityProjection,
+    RoutingConstraints, RoutingCosts, RoutingWorkspace, place_analytically_with_net_sink_weights,
+    place_and_route_with_constraints, placement_from_partial_bindings, retain_route_for_sinks,
     route_with_timing_costs_workspace_and_progress, route_with_workspace_and_progress,
     swap_placement_cells,
 };
@@ -1455,11 +1455,16 @@ impl TimingDrivenContext<'_, '_> {
             global_routes_from_implementation(self.packing, implementation);
         let mut placement = implementation.placement.clone();
         let mut candidates = Vec::new();
+        // A critical pass revisits many of the same physical endpoint pairs
+        // while considering adjacent path cells.  Their bounded local-route
+        // delays are placement-independent once the wires are known, so keep
+        // the exact results for this pass rather than re-running A* per cell.
+        let mut local_delay_workspace = PlacementConnectionDelayWorkspace::new();
         if max_move_distance <= 2 && worst_slack_ps <= LOCAL_BATCH_RECOVERY_WNS_PS {
             let mut batch = placement.clone();
             let mut batch_moves = Vec::new();
             for (cell, (_, connections, targets)) in cells.iter().take(LOCAL_CRITICAL_BATCH_SIZE) {
-                let proposals = placement_refiner.refine_cell_connection_delays(
+                let proposals = placement_refiner.refine_cell_connection_delays_with_cache(
                     batch.clone(),
                     *cell,
                     connections,
@@ -1468,6 +1473,7 @@ impl TimingDrivenContext<'_, '_> {
                     None,
                     max_move_distance,
                     1,
+                    &mut local_delay_workspace,
                 )?;
                 let Some(refined) = proposals.into_iter().next() else {
                     break;
@@ -1550,7 +1556,7 @@ impl TimingDrivenContext<'_, '_> {
         }
         for (cell, (_, connections, targets)) in cells.into_iter().take(MAX_CRITICAL_PATH_CELLS) {
             let proposal_started = Instant::now();
-            let proposals = placement_refiner.refine_cell_connection_delays(
+            let proposals = placement_refiner.refine_cell_connection_delays_with_cache(
                 placement.clone(),
                 cell,
                 &connections,
@@ -1563,6 +1569,7 @@ impl TimingDrivenContext<'_, '_> {
                 } else {
                     1
                 },
+                &mut local_delay_workspace,
             )?;
             // The topology projection ranks the failing path itself. Before
             // paying for negotiated routing, score its small shortlist by
