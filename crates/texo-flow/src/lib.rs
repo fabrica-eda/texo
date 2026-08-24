@@ -930,6 +930,25 @@ impl TimingDrivenContext<'_, '_> {
         }
     }
 
+    /// Returns whether the cumulative geometric estimate of a speculative
+    /// multi-cell move does not regress.  Batches use this stricter gate than
+    /// single-cell proposals because their independent moves can interact.
+    fn batch_estimate_improves(
+        &self,
+        old: &Placement,
+        new: &Placement,
+        weights: &BTreeMap<NetId, u64>,
+    ) -> bool {
+        let nets = self.moved_nets(old, new).collect::<BTreeSet<_>>();
+        match (
+            self.weighted_net_estimate(old, &nets, weights),
+            self.weighted_net_estimate(new, &nets, weights),
+        ) {
+            (Some(old_estimate), Some(new_estimate)) => new_estimate <= old_estimate,
+            _ => true,
+        }
+    }
+
     fn close_setup_critically(
         &mut self,
         mut archive: Vec<TimingCandidate>,
@@ -1047,7 +1066,7 @@ impl TimingDrivenContext<'_, '_> {
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
         for move_distance in CRITICAL_PATH_MOVE_DISTANCES {
-            for _ in 0..MAX_CRITICAL_PATH_VERTEX_REFINEMENTS {
+            for refinement_round in 0..MAX_CRITICAL_PATH_VERTEX_REFINEMENTS {
                 if archive
                     .iter()
                     .any(|(_, timing)| timing.worst_slack_ps.is_some_and(|slack| slack >= 0))
@@ -1059,7 +1078,8 @@ impl TimingDrivenContext<'_, '_> {
                     .max_by_key(|(_, timing)| timing_score(timing))
                     .expect("the timing archive is non-empty")
                     .clone();
-                let Some(improved) = self
+                let trial_started = Instant::now();
+                let refinement = self
                     .refine_critical_path_cells(
                         &seed.0,
                         &seed.1,
@@ -1070,10 +1090,23 @@ impl TimingDrivenContext<'_, '_> {
                     )?
                     .into_iter()
                     .max_by_key(|(_, timing)| timing_score(timing))
-                    .filter(|(_, timing)| timing_score(timing) > timing_score(&seed.1))
-                else {
-                    break;
-                };
+                    .filter(|(_, timing)| timing_score(timing) > timing_score(&seed.1));
+                if metrics_enabled() {
+                    eprintln!(
+                        "[metrics] critical_transition distance={move_distance} round={} elapsed={:?} seed_wns={:?} child_wns={:?} child_tns={:?}",
+                        refinement_round + 1,
+                        trial_started.elapsed(),
+                        seed.1.worst_slack_ps,
+                        refinement
+                            .as_ref()
+                            .and_then(|candidate| candidate.1.worst_slack_ps),
+                        refinement.as_ref().map(|candidate| slack_violations(
+                            candidate.1.setup_checks.iter().map(|check| check.slack_ps)
+                        )
+                        .total_negative_slack_ps()),
+                    );
+                }
+                let Some(improved) = refinement else { break };
                 archive.push(improved);
                 archive = select_timing_frontier(archive);
             }
@@ -1488,11 +1521,14 @@ impl TimingDrivenContext<'_, '_> {
         let mut placement = implementation.placement.clone();
         let mut candidates = Vec::new();
         // A critical pass revisits many of the same physical endpoint pairs
-        // while considering adjacent path cells.  Their bounded local-route
+        // while considering adjacent path cells. Their bounded local-route
         // delays are placement-independent once the wires are known, so keep
         // the exact results for this pass rather than re-running A* per cell.
         let mut local_delay_workspace = PlacementConnectionDelayWorkspace::new();
-        if max_move_distance <= 2 && worst_slack_ps <= LOCAL_BATCH_RECOVERY_WNS_PS {
+        if max_move_distance <= 2
+            && (worst_slack_ps <= LOCAL_BATCH_RECOVERY_WNS_PS
+                || worst_slack_ps >= LOCAL_BATCH_NEAR_CLOSURE_WNS_PS)
+        {
             let mut batch = placement.clone();
             let mut batch_moves = Vec::new();
             for (cell, (_, connections, targets)) in cells.iter().take(LOCAL_CRITICAL_BATCH_SIZE) {
@@ -1516,7 +1552,9 @@ impl TimingDrivenContext<'_, '_> {
                 batch_moves.push((*cell, batch.bindings()[cell.0], refined.bindings()[cell.0]));
                 batch = refined;
             }
-            if batch_moves.len() == LOCAL_CRITICAL_BATCH_SIZE {
+            if batch_moves.len() == LOCAL_CRITICAL_BATCH_SIZE
+                && self.batch_estimate_improves(&placement, &batch, &prescreen_weights)
+            {
                 let trial_key = (seed_fingerprint, placement_fingerprint(self.design, &batch));
                 if self.critical_move_trials.insert(trial_key) {
                     for &(cell, from, to) in &batch_moves {
@@ -1629,7 +1667,16 @@ impl TimingDrivenContext<'_, '_> {
                 .into_iter()
                 .map(|(_, projected_rank, proposal)| (projected_rank, proposal))
                 .collect::<Vec<_>>();
-            proposal_time += proposal_started.elapsed();
+            let proposal_elapsed = proposal_started.elapsed();
+            proposal_time += proposal_elapsed;
+            if profile && proposal_elapsed >= Duration::from_millis(20) {
+                eprintln!(
+                    "[metrics] critical_proposals distance={max_move_distance} cell={} connections={} elapsed={proposal_elapsed:?} candidates={}",
+                    cell.0,
+                    connections.len(),
+                    proposals.len(),
+                );
+            }
             if proposals.is_empty() {
                 continue;
             }
@@ -1889,7 +1936,7 @@ fn worst_setup_connections(
 const MAX_INCREMENTAL_REFINEMENTS: usize = 8;
 const MAX_CONSECUTIVE_MONOTONIC_WNS_REGRESSIONS: usize = 2;
 const LOCAL_TRIAL_ROUTING_ITERATIONS: u32 = 5;
-const MAX_DEDICATED_EDGE_TRIALS: usize = 4;
+const MAX_DEDICATED_EDGE_TRIALS: usize = 1;
 // Geometry delay model for pre-screening route trials. Calibrated loosely
 // against the measured AXI4 hops: same-tile LUT-to-FF edges land near 300 ps,
 // multi-tile general-routing hops near 250 ps per tile. A proposal whose
@@ -1910,6 +1957,7 @@ const MAX_CRITICAL_PATH_CELLS: usize = 6;
 const LOCAL_CRITICAL_BATCH_SIZE: usize = 2;
 const LOCAL_CRITICAL_BATCH_MIN_WNS_GAIN_PS: i128 = 32;
 const LOCAL_BATCH_RECOVERY_WNS_PS: i128 = -800;
+const LOCAL_BATCH_NEAR_CLOSURE_WNS_PS: i128 = -400;
 const MAX_PROJECTED_PATH_CELL_CANDIDATES: usize = 4;
 const MAX_CRITICAL_CLOSURE_ROUNDS: usize = 4;
 const MAX_CRITICAL_PATH_VERTEX_REFINEMENTS: usize = 4;

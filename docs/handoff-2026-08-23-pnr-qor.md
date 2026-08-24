@@ -1160,3 +1160,51 @@ WHS, and 25,655 PIPs**. Critical closure fell from 14.451 to **12.969
 seconds**, complete timing closure from 19.143 to **17.669 seconds**, flow from
 23.209 to **21.709 seconds**, wall from 29.31 to **27.84 seconds**, and user CPU
 from 27.68 to **26.12 seconds**.
+
+## Critical-search hierarchy and dominated local routes (2026-08-25)
+
+The radius schedule is a real search hierarchy, not an arbitrary portfolio.
+Four radius-1 rounds shape local slots, four radius-2 rounds escape the local
+tile, and four radius-16 rounds change coarse path topology. Doubling the
+per-radius depth ran in 14.877 seconds but regressed WNS to -482 ps; depth five
+ended at -395 ps; interleaving `[1, 2, 16]` ran in 14.026 seconds but ended at
+-746 ps. Simple occupied-BEL swaps likewise either produced -848/-431 ps or,
+when restricted enough to preserve QoR, found no usable move. The unresolved
+blockers are packing groups and routing ownership, not singleton occupancy.
+
+The exact local delay search also retained every `(wire, hop-count)` state,
+even when the same wire had already been reached in fewer hops and no more
+delay. It now stores a per-wire cumulative hop Pareto frontier and never
+enqueues such dominated states. Two expensive proposal misses fell from 201
+to 89 ms and from 175 to 73 ms. This pruning is exact: the final result stayed
+at **-214 ps WNS, -3905 ps TNS, -399 ps WHS, and 25,655 PIPs**.
+
+Two-cell local batches were previously enabled only for severe recovery below
+-800 ps. Metrics showed a second useful regime near closure: one batch moved
+WNS from -305 to -245 ps. Batches now run in the severe (<= -800 ps) and
+near-closure (>= -400 ps) bands, and their cumulative criticality-weighted
+geometry must not regress before routing. This retained only the +313 ps and
++60 ps batches while suppressing routed batches that produced -289 ps or only
++12 ps. Final timing stayed **-214/-3905/-399 ps**; the selected route grew by
+three PIPs to 25,658. Consecutive runs measured 20.88--21.62 seconds of flow,
+12.87--12.98 seconds of critical closure, and 25.84--26.08 seconds user CPU.
+
+## Dedicated-edge portfolio bound (2026-08-25)
+
+Disabling post-route LUT-to-FF reassignment changed the trajectory and ended
+at -225 ps WNS with 25,842 PIPs, so packing topology is necessary. On this
+deterministic design, however, only the first ranked candidate was accepted;
+later candidates could not affect the winning descent. Capping the initial
+portfolio from four trials to one preserved the exact final timing trajectory.
+Candidate preparation, packing clone/reassignment, and placement swap together
+measured below 1 ms; the one incremental route and STA add about 0.18 seconds.
+Repeating this search after final critical placement found three legal
+candidates and none improved WNS, so no final packing ECO is retained.
+
+The final critical path is already geographically compact
+(`R20C67 -> R20C68 -> R20C69 -> R20C71 -> R20C70`) but its first adjacent
+hop costs 841 ps. The next design target is therefore an owner-aware route
+transaction: project the unloaded fast path, identify the exact lower-critical
+sink arcs occupying it, and release those victims together with the critical
+arc. Releasing every corridor or victim immediately was previously shown to
+lose QoR; ownership, path choice, and rip-up must be one coherent operation.

@@ -1426,7 +1426,7 @@ pub struct PlacementRefinementWorkspace {
 pub struct PlacementConnectionDelayWorkspace {
     delays: PackedRouteMap<Option<u64>>,
     queue: BinaryHeap<Reverse<(u64, u8, WireId)>>,
-    best: PackedRouteMap<u64>,
+    best: PackedRouteMap<[u64; LOCAL_HOP_STATES]>,
 }
 
 #[derive(Default)]
@@ -1457,10 +1457,6 @@ type PackedRouteMap<Value> = HashMap<u64, Value, BuildHasherDefault<PackedRouteH
 
 fn packed_wire_pair(start: WireId, goal: WireId) -> u64 {
     ((start.0 as u64) << 32) | goal.0 as u64
-}
-
-fn packed_hop_state(wire: WireId, hops: u8) -> u64 {
-    ((wire.0 as u64) << 8) | u64::from(hops)
 }
 
 impl PlacementConnectionDelayWorkspace {
@@ -2388,13 +2384,12 @@ fn local_connection_delay(
     goal: WireId,
     pip_delays_ps: &[u32],
     queue: &mut BinaryHeap<Reverse<(u64, u8, WireId)>>,
-    best: &mut PackedRouteMap<u64>,
+    best: &mut PackedRouteMap<[u64; LOCAL_HOP_STATES]>,
 ) -> Option<u64> {
     // Long-line entry/exit PIPs can put even a modest tile displacement over
     // eight graph edges.  A too-small bound made a badly displaced critical
     // vertex impossible to score, so the detailed placer could never move it
     // back toward its path.  The one-tile corridor keeps this search local.
-    const MAX_LOCAL_HOPS: u8 = 16;
     const LOCAL_MARGIN: u32 = 1;
     let device = graph.device();
     let corridor = routing_corridor(
@@ -2406,15 +2401,15 @@ fn local_connection_delay(
     queue.clear();
     best.clear();
     queue.push(Reverse((0_u64, 0_u8, start)));
-    best.insert(packed_hop_state(start, 0), 0_u64);
+    best.insert(start.0 as u64, [0; LOCAL_HOP_STATES]);
     while let Some(Reverse((delay, hops, wire))) = queue.pop() {
         if wire == goal {
             return Some(delay);
         }
         if hops == MAX_LOCAL_HOPS
             || best
-                .get(&packed_hop_state(wire, hops))
-                .is_some_and(|known| *known < delay)
+                .get(&(wire.0 as u64))
+                .is_some_and(|frontier| frontier[usize::from(hops)] < delay)
         {
             continue;
         }
@@ -2424,15 +2419,26 @@ fn local_connection_delay(
             }
             let next_hops = hops + 1;
             let next_delay = delay.saturating_add(u64::from(pip_delays_ps[pip.0]));
-            let key = packed_hop_state(neighbor, next_hops);
-            if best.get(&key).is_none_or(|known| next_delay < *known) {
-                best.insert(key, next_delay);
-                queue.push(Reverse((next_delay, next_hops, neighbor)));
+            let frontier = best
+                .entry(neighbor.0 as u64)
+                .or_insert([u64::MAX; LOCAL_HOP_STATES]);
+            if frontier[usize::from(next_hops)] <= next_delay {
+                continue;
             }
+            // A route reaching the same wire in fewer hops and no more delay
+            // dominates this state for every remaining hop budget.  Store the
+            // cumulative Pareto frontier so those states never enter the heap.
+            for known in &mut frontier[usize::from(next_hops)..] {
+                *known = (*known).min(next_delay);
+            }
+            queue.push(Reverse((next_delay, next_hops, neighbor)));
         }
     }
     None
 }
+
+const MAX_LOCAL_HOPS: u8 = 16;
+const LOCAL_HOP_STATES: usize = MAX_LOCAL_HOPS as usize + 1;
 
 #[derive(Clone, Debug)]
 struct PlacementUnit {
