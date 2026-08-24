@@ -624,9 +624,15 @@ fn route_distances(
             .get(&pip_id)
             .copied()
             .ok_or(TimingError::MissingPipDelay(pip_id))?;
-        adjacency.entry(pip.from).or_default().push((pip.to, delay));
-        if pip.bidirectional {
-            adjacency.entry(pip.to).or_default().push((pip.from, delay));
+        adjacency
+            .entry(pip.from())
+            .or_default()
+            .push((pip.to(), delay));
+        if pip.bidirectional() {
+            adjacency
+                .entry(pip.to())
+                .or_default()
+                .push((pip.from(), delay));
         }
     }
 

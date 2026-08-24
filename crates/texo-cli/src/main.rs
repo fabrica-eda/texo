@@ -820,11 +820,11 @@ fn checkpoint_routes(result: &Ecp5FlowResult, architecture: &Ecp5Architecture) -
                     let pip = &device.pips()[pip_id.0];
                     json!({
                         "pip_id": pip_id.0,
-                        "from_wire_id": pip.from.0,
-                        "from": device.wires()[pip.from.0].name,
-                        "to_wire_id": pip.to.0,
-                        "to": device.wires()[pip.to.0].name,
-                        "bidirectional": pip.bidirectional,
+                        "from_wire_id": pip.from().0,
+                        "from": device.wires()[pip.from().0].name,
+                        "to_wire_id": pip.to().0,
+                        "to": device.wires()[pip.to().0].name,
+                        "bidirectional": pip.bidirectional(),
                         "fixed": architecture.pip_metadata(*pip_id).fixed,
                     })
                 })

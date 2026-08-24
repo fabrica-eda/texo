@@ -279,6 +279,78 @@ pub struct PnrResult {
     pub total_pips: usize,
 }
 
+/// Reusable negotiated-routing state sized for one physical device.
+///
+/// Production devices contain millions of wires and tens of millions of
+/// PIPs. Keeping occupancy, history, and A* scratch allocations alive across
+/// timing trials avoids repeatedly allocating and releasing hundreds of
+/// megabytes while preserving the stateless routing result contract.
+#[derive(Debug)]
+pub struct RoutingWorkspace {
+    device_identity: usize,
+    wire_occupancy: Vec<u16>,
+    pip_occupancy: Vec<u16>,
+    wire_history: Vec<u32>,
+    pip_history: Vec<u32>,
+    touched_wires: Vec<usize>,
+    touched_pips: Vec<usize>,
+    search: RouteSearch,
+    tree_arrival_ps: Vec<u64>,
+    wire_points: Vec<Point>,
+    wire_capacities: Vec<u16>,
+    pip_capacities: Vec<u16>,
+}
+
+impl RoutingWorkspace {
+    /// Allocates routing state for `device` once.
+    #[must_use]
+    pub fn new(device: &Device) -> Self {
+        Self {
+            device_identity: std::ptr::from_ref(device) as usize,
+            wire_occupancy: vec![0; device.wires().len()],
+            pip_occupancy: vec![0; device.pips().len()],
+            wire_history: vec![0; device.wires().len()],
+            pip_history: vec![0; device.pips().len()],
+            touched_wires: Vec::new(),
+            touched_pips: Vec::new(),
+            search: RouteSearch::new(device.wires().len()),
+            tree_arrival_ps: vec![UNROUTED_ARRIVAL_PS; device.wires().len()],
+            wire_points: device.wires().iter().map(|wire| wire.point).collect(),
+            wire_capacities: device.wires().iter().map(|wire| wire.capacity).collect(),
+            pip_capacities: device
+                .pips()
+                .iter()
+                .map(texo_model::Pip::capacity)
+                .collect(),
+        }
+    }
+
+    fn prepare(&mut self, device: &Device) {
+        if self.device_identity != std::ptr::from_ref(device) as usize
+            || self.wire_occupancy.len() != device.wires().len()
+            || self.pip_occupancy.len() != device.pips().len()
+        {
+            *self = Self::new(device);
+            return;
+        }
+        for index in self.touched_wires.drain(..) {
+            self.wire_occupancy[index] = 0;
+            self.wire_history[index] = 0;
+        }
+        for index in self.touched_pips.drain(..) {
+            self.pip_occupancy[index] = 0;
+            self.pip_history[index] = 0;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RoutingResourceMetadata<'a> {
+    wire_points: &'a [Point],
+    wire_capacities: &'a [u16],
+    pip_capacities: &'a [u16],
+}
+
 /// Retains only the branches needed to reach `sinks` from a routed net's
 /// driver. The returned partial tree can be supplied as a routing constraint;
 /// the router will preserve its shared trunk and grow the missing sink arcs.
@@ -334,8 +406,14 @@ pub fn retain_route_for_sinks(
                     net: route.net,
                     reason: format!("unknown PIP {pip_id:?}"),
                 })?;
-        adjacent.entry(pip.from).or_default().push((pip.to, pip_id));
-        adjacent.entry(pip.to).or_default().push((pip.from, pip_id));
+        adjacent
+            .entry(pip.from())
+            .or_default()
+            .push((pip.to(), pip_id));
+        adjacent
+            .entry(pip.to())
+            .or_default()
+            .push((pip.from(), pip_id));
     }
     let mut parent = BTreeMap::<WireId, (WireId, PipId)>::new();
     let mut visited = BTreeSet::from([driver_wire]);
@@ -481,11 +559,13 @@ pub fn route_with_placement_and_progress(
     routing_constraints: &RoutingConstraints,
     mut progress: impl FnMut(RoutingProgress),
 ) -> Result<PnrResult, PnrError> {
-    finish_routing(
+    let mut workspace = RoutingWorkspace::new(device);
+    finish_routing_with_workspace(
         &UnifiedGraph::new(design, device),
         placement,
         routing_constraints,
         None,
+        &mut workspace,
         &mut progress,
     )
 }
@@ -503,11 +583,60 @@ pub fn route_with_timing_costs_and_progress(
     routing_costs: &RoutingCosts,
     mut progress: impl FnMut(RoutingProgress),
 ) -> Result<PnrResult, PnrError> {
-    finish_routing(
+    let mut workspace = RoutingWorkspace::new(device);
+    finish_routing_with_workspace(
         &UnifiedGraph::new(design, device),
         placement,
         routing_constraints,
         Some(routing_costs),
+        &mut workspace,
+        &mut progress,
+    )
+}
+
+/// Routes an existing placement using reusable device-sized state.
+///
+/// # Errors
+///
+/// Returns an invalid routing-constraint, model, or routability error.
+pub fn route_with_workspace_and_progress(
+    design: &Design,
+    device: &Device,
+    placement: Placement,
+    routing_constraints: &RoutingConstraints,
+    workspace: &mut RoutingWorkspace,
+    mut progress: impl FnMut(RoutingProgress),
+) -> Result<PnrResult, PnrError> {
+    finish_routing_with_workspace(
+        &UnifiedGraph::new(design, device),
+        placement,
+        routing_constraints,
+        None,
+        workspace,
+        &mut progress,
+    )
+}
+
+/// Routes with characterized costs using reusable device-sized state.
+///
+/// # Errors
+///
+/// Returns an invalid cost/constraint, model, or routability error.
+pub fn route_with_timing_costs_workspace_and_progress(
+    design: &Design,
+    device: &Device,
+    placement: Placement,
+    routing_constraints: &RoutingConstraints,
+    routing_costs: &RoutingCosts,
+    workspace: &mut RoutingWorkspace,
+    mut progress: impl FnMut(RoutingProgress),
+) -> Result<PnrResult, PnrError> {
+    finish_routing_with_workspace(
+        &UnifiedGraph::new(design, device),
+        placement,
+        routing_constraints,
+        Some(routing_costs),
+        workspace,
         &mut progress,
     )
 }
@@ -519,13 +648,34 @@ fn finish_routing(
     routing_costs: Option<&RoutingCosts>,
     progress: &mut impl FnMut(RoutingProgress),
 ) -> Result<PnrResult, PnrError> {
+    let mut workspace = RoutingWorkspace::new(graph.device());
+    finish_routing_with_workspace(
+        graph,
+        placement,
+        routing_constraints,
+        routing_costs,
+        &mut workspace,
+        progress,
+    )
+}
+
+fn finish_routing_with_workspace(
+    graph: &UnifiedGraph<'_>,
+    placement: Placement,
+    routing_constraints: &RoutingConstraints,
+    routing_costs: Option<&RoutingCosts>,
+    workspace: &mut RoutingWorkspace,
+    progress: &mut impl FnMut(RoutingProgress),
+) -> Result<PnrResult, PnrError> {
     validate_routing_constraints(graph, &placement, routing_constraints)?;
     validate_routing_costs(graph, routing_costs)?;
+    workspace.prepare(graph.device());
     let routes = route(
         graph,
         &placement,
         routing_constraints,
         routing_costs,
+        workspace,
         progress,
     )?;
     for route in &routes {
@@ -1281,7 +1431,7 @@ fn local_connection_delay(
         if hops == MAX_LOCAL_HOPS || best.get(&(wire, hops)).is_some_and(|known| *known < delay) {
             continue;
         }
-        for &(neighbor, pip) in graph.routing_neighbors(wire).ok()? {
+        for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
             if !point_inside_corridor(device.wires()[neighbor.0].point, corridor) {
                 continue;
             }
@@ -2710,7 +2860,7 @@ fn validate_routing_constraints(
                     reason: format!("unknown PIP {pip:?}"),
                 });
             };
-            if !wires.contains(&pip_data.from) || !wires.contains(&pip_data.to) {
+            if !wires.contains(&pip_data.from()) || !wires.contains(&pip_data.to()) {
                 return Err(PnrError::InvalidRoutingConstraint {
                     net: net_id,
                     reason: format!("PIP {pip:?} has an endpoint outside the locked tree"),
@@ -2731,9 +2881,9 @@ fn validate_routing_constraints(
         let mut outgoing = BTreeMap::<WireId, Vec<WireId>>::new();
         for &pip in &route.pips {
             let pip = &device.pips()[pip.0];
-            outgoing.entry(pip.from).or_default().push(pip.to);
-            if pip.bidirectional {
-                outgoing.entry(pip.to).or_default().push(pip.from);
+            outgoing.entry(pip.from()).or_default().push(pip.to());
+            if pip.bidirectional() {
+                outgoing.entry(pip.to()).or_default().push(pip.from());
             }
         }
         let mut reachable = BTreeSet::from([driver_wire]);
@@ -2896,33 +3046,38 @@ fn route(
     placement: &Placement,
     constraints: &RoutingConstraints,
     costs: Option<&RoutingCosts>,
+    workspace: &mut RoutingWorkspace,
     progress: &mut impl FnMut(RoutingProgress),
 ) -> Result<Vec<NetRoute>, PnrError> {
     let design = graph.design();
-    let device = graph.device();
-    let mut wire_occupancy = vec![0_u16; device.wires().len()];
-    let mut pip_occupancy = vec![0_u16; device.pips().len()];
-    let mut wire_history = vec![0_u32; device.wires().len()];
-    let mut pip_history = vec![0_u32; device.pips().len()];
+    let metadata = RoutingResourceMetadata {
+        wire_points: &workspace.wire_points,
+        wire_capacities: &workspace.wire_capacities,
+        pip_capacities: &workspace.pip_capacities,
+    };
+    let wire_occupancy = &mut workspace.wire_occupancy;
+    let pip_occupancy = &mut workspace.pip_occupancy;
+    let wire_history = &mut workspace.wire_history;
+    let pip_history = &mut workspace.pip_history;
     let mut overuse = OveruseTracker::default();
     let mut routes = vec![None; design.nets().len()];
     for (&net, route) in constraints.routes() {
         routes[net.0] = Some(route.clone());
         for &wire in &route.wires {
-            wire_occupancy[wire.0] += 1;
+            increment_occupancy(wire_occupancy, &mut workspace.touched_wires, wire.0);
             track_entry(
                 &mut overuse.wires,
                 wire_occupancy[wire.0],
-                device.wires()[wire.0].capacity,
+                metadata.wire_capacities[wire.0],
                 wire.0,
             );
         }
         for &pip in &route.pips {
-            pip_occupancy[pip.0] += 1;
+            increment_occupancy(pip_occupancy, &mut workspace.touched_pips, pip.0);
             track_entry(
                 &mut overuse.pips,
                 pip_occupancy[pip.0],
-                device.pips()[pip.0].capacity,
+                metadata.pip_capacities[pip.0],
                 pip.0,
             );
         }
@@ -2941,10 +3096,6 @@ fn route(
             dirty.insert(index);
         }
     }
-    let mut search = RouteSearch::new(device.wires().len());
-    // One shared per-net tree-arrival scratch buffer, sized once for the
-    // device. route_net seeds and cleans only the wires it touches.
-    let mut tree_arrival_ps = vec![UNROUTED_ARRIVAL_PS; device.wires().len()];
     for iteration in 0..MAX_ROUTING_ITERATIONS {
         let present_factor = 1_u32 << iteration.min(12);
         progress(RoutingProgress::Iteration {
@@ -2958,7 +3109,7 @@ fn route(
                     track_entry(
                         &mut overuse.wires,
                         wire_occupancy[wire.0],
-                        device.wires()[wire.0].capacity,
+                        metadata.wire_capacities[wire.0],
                         wire.0,
                     );
                 }
@@ -2967,7 +3118,7 @@ fn route(
                     track_entry(
                         &mut overuse.pips,
                         pip_occupancy[pip.0],
-                        device.pips()[pip.0].capacity,
+                        metadata.pip_capacities[pip.0],
                         pip.0,
                     );
                 }
@@ -2992,30 +3143,31 @@ fn route(
                 &pin_wires,
                 constraints.routes().get(&net_id),
                 net_id,
-                &wire_occupancy,
-                &pip_occupancy,
-                &wire_history,
-                &pip_history,
+                wire_occupancy,
+                pip_occupancy,
+                wire_history,
+                pip_history,
                 present_factor,
                 costs,
-                &mut search,
-                &mut tree_arrival_ps,
+                &mut workspace.search,
+                &mut workspace.tree_arrival_ps,
+                metadata,
             )?;
             for &wire in &route.wires {
-                wire_occupancy[wire.0] += 1;
+                increment_occupancy(wire_occupancy, &mut workspace.touched_wires, wire.0);
                 track_entry(
                     &mut overuse.wires,
                     wire_occupancy[wire.0],
-                    device.wires()[wire.0].capacity,
+                    metadata.wire_capacities[wire.0],
                     wire.0,
                 );
             }
             for &pip in &route.pips {
-                pip_occupancy[pip.0] += 1;
+                increment_occupancy(pip_occupancy, &mut workspace.touched_pips, pip.0);
                 track_entry(
                     &mut overuse.pips,
                     pip_occupancy[pip.0],
-                    device.pips()[pip.0].capacity,
+                    metadata.pip_capacities[pip.0],
                     pip.0,
                 );
             }
@@ -3026,11 +3178,11 @@ fn route(
         // currently overused; the trackers make that O(conflicts) instead of
         // a full device rescan, with identical resulting history values.
         for &index in &overuse.wires {
-            let excess = wire_occupancy[index] - device.wires()[index].capacity;
+            let excess = wire_occupancy[index] - metadata.wire_capacities[index];
             wire_history[index] = wire_history[index].saturating_add(u32::from(excess));
         }
         for &index in &overuse.pips {
-            let excess = pip_occupancy[index] - device.pips()[index].capacity;
+            let excess = pip_occupancy[index] - metadata.pip_capacities[index];
             pip_history[index] = pip_history[index].saturating_add(u32::from(excess));
         }
         let overused_wires = overuse.wires.len();
@@ -3041,7 +3193,7 @@ fn route(
                 .map(|route| route.expect("every net was routed in this iteration"))
                 .collect());
         }
-        dirty = congested_routes(device, &routes, &wire_occupancy, &pip_occupancy);
+        dirty = congested_routes(metadata, &routes, wire_occupancy, pip_occupancy);
     }
 
     Err(PnrError::CongestionNotResolved {
@@ -3049,6 +3201,13 @@ fn route(
         overused_wires: overuse.wires.len(),
         overused_pips: overuse.pips.len(),
     })
+}
+
+fn increment_occupancy(occupancy: &mut [u16], touched: &mut Vec<usize>, index: usize) {
+    if occupancy[index] == 0 {
+        touched.push(index);
+    }
+    occupancy[index] += 1;
 }
 
 /// Deterministic net routing order: locked trees first, then criticality,
@@ -3105,7 +3264,7 @@ fn routing_order_key(
 }
 
 fn congested_routes(
-    device: &Device,
+    metadata: RoutingResourceMetadata<'_>,
     routes: &[Option<NetRoute>],
     wire_occupancy: &[u16],
     pip_occupancy: &[u16],
@@ -3120,11 +3279,11 @@ fn congested_routes(
             (route
                 .wires
                 .iter()
-                .any(|wire| wire_occupancy[wire.0] > device.wires()[wire.0].capacity)
+                .any(|wire| wire_occupancy[wire.0] > metadata.wire_capacities[wire.0])
                 || route
                     .pips
                     .iter()
-                    .any(|pip| pip_occupancy[pip.0] > device.pips()[pip.0].capacity))
+                    .any(|pip| pip_occupancy[pip.0] > metadata.pip_capacities[pip.0]))
             .then_some(index)
         })
         .collect()
@@ -3145,6 +3304,7 @@ fn route_net(
     costs: Option<&RoutingCosts>,
     search: &mut RouteSearch,
     tree_arrival_ps: &mut [u64],
+    metadata: RoutingResourceMetadata<'_>,
 ) -> Result<NetRoute, PnrError> {
     let design = graph.design();
     let device = graph.device();
@@ -3218,6 +3378,7 @@ fn route_net(
                 delay_quantum_ps,
                 tree_arrival_ps,
                 minimum_arrival_ps,
+                metadata,
             )
             .ok_or_else(|| PnrError::Unroutable {
                 net: net.name.clone(),
@@ -3328,6 +3489,7 @@ fn bound_wire(
     }
 }
 
+#[derive(Debug)]
 struct RouteSearch {
     epoch: u32,
     seen: Vec<u32>,
@@ -3338,7 +3500,13 @@ struct RouteSearch {
     arrival_ps: Vec<u64>,
     previous_wire: Vec<usize>,
     previous_pip: Vec<usize>,
+    /// Frontier storage retained across sink and placement trials. Large
+    /// critical searches can grow this to hundreds of thousands of entries;
+    /// clearing keeps the allocation while preserving an empty logical queue.
+    queue: BinaryHeap<Reverse<RouteQueueEntry>>,
 }
+
+type RouteQueueEntry = (u64, u64, u64, WireId);
 
 type HoldRouteState = (WireId, u32);
 type HoldRouteVisit = (u64, u64, Option<(HoldRouteState, PipId)>);
@@ -3353,6 +3521,7 @@ impl RouteSearch {
             arrival_ps: vec![0; wire_count],
             previous_wire: vec![usize::MAX; wire_count],
             previous_pip: vec![usize::MAX; wire_count],
+            queue: BinaryHeap::new(),
         }
     }
 
@@ -3372,6 +3541,7 @@ impl RouteSearch {
         delay_quantum_ps: u64,
         tree_delays_ps: &[u64],
         minimum_arrival_ps: u64,
+        metadata: RoutingResourceMetadata<'_>,
     ) -> Option<(Vec<WireId>, Vec<PipId>)> {
         if minimum_arrival_ps != 0 {
             return shortest_hold_path(
@@ -3387,6 +3557,7 @@ impl RouteSearch {
                 criticality,
                 tree_delays_ps,
                 minimum_arrival_ps,
+                metadata,
             );
         }
         self.epoch = self.epoch.wrapping_add(1);
@@ -3397,16 +3568,16 @@ impl RouteSearch {
         }
         let epoch = self.epoch;
         let device = graph.device();
-        let goal_point = device.wires()[goal.0].point;
-        let corridor = (criticality > 1).then(|| {
+        let goal_point = metadata.wire_points[goal.0];
+        let corridor = (criticality != 0).then(|| {
             let start_point = starts
                 .iter()
-                .map(|start| device.wires()[start.0].point)
+                .map(|start| metadata.wire_points[start.0])
                 .min_by_key(|point| (point.manhattan(goal_point), *point))
                 .expect("a route tree always contains its driver");
             routing_corridor(start_point, goal_point, device, TIMING_ROUTE_MARGIN)
         });
-        let mut queue = BinaryHeap::new();
+        self.queue.clear();
         for &start in starts {
             self.start_mark[start.0] = epoch;
             let arrival_ps = tree_delays_ps[start.0];
@@ -3416,15 +3587,15 @@ impl RouteSearch {
             self.arrival_ps[start.0] = arrival_ps;
             self.previous_wire[start.0] = usize::MAX;
             self.previous_pip[start.0] = usize::MAX;
-            queue.push(Reverse((
-                distance.saturating_add(device.wires()[start.0].point.manhattan(goal_point)),
+            self.queue.push(Reverse((
+                distance.saturating_add(metadata.wire_points[start.0].manhattan(goal_point)),
                 distance,
                 arrival_ps,
                 start,
             )));
         }
 
-        while let Some(Reverse((_, distance, arrival_ps, wire))) = queue.pop() {
+        while let Some(Reverse((_, distance, arrival_ps, wire))) = self.queue.pop() {
             if self.seen[wire.0] != epoch
                 || (self.distance[wire.0], self.arrival_ps[wire.0]) != (distance, arrival_ps)
             {
@@ -3442,23 +3613,23 @@ impl RouteSearch {
                 return Some((path_wires, path_pips));
             }
 
-            for &(neighbor, pip) in graph.routing_neighbors(wire).ok()? {
+            for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
                 if self.start_mark[neighbor.0] == epoch {
                     continue;
                 }
                 if corridor.is_some_and(|corridor| {
-                    !point_inside_corridor(device.wires()[neighbor.0].point, corridor)
+                    !point_inside_corridor(metadata.wire_points[neighbor.0], corridor)
                 }) {
                     continue;
                 }
                 let congestion = congestion_cost(
                     wire_occupancy[neighbor.0],
-                    device.wires()[neighbor.0].capacity,
+                    metadata.wire_capacities[neighbor.0],
                     wire_history[neighbor.0],
                     present_factor,
                 ) + congestion_cost(
                     pip_occupancy[pip.0],
-                    device.pips()[pip.0].capacity,
+                    metadata.pip_capacities[pip.0],
                     pip_history[pip.0],
                     present_factor,
                 );
@@ -3491,8 +3662,8 @@ impl RouteSearch {
                 self.previous_wire[neighbor.0] = wire.0;
                 self.previous_pip[neighbor.0] = pip.0;
                 let estimate = next_distance
-                    .saturating_add(device.wires()[neighbor.0].point.manhattan(goal_point));
-                queue.push(Reverse((
+                    .saturating_add(metadata.wire_points[neighbor.0].manhattan(goal_point));
+                self.queue.push(Reverse((
                     estimate,
                     next_distance,
                     next_arrival_ps,
@@ -3515,6 +3686,7 @@ impl RouteSearch {
                 ROUTING_DELAY_QUANTUM_PS,
                 tree_delays_ps,
                 minimum_arrival_ps,
+                metadata,
             );
         }
         None
@@ -3561,9 +3733,9 @@ fn shortest_hold_path(
     criticality: u64,
     tree_delays_ps: &[u64],
     minimum_arrival_ps: u64,
+    metadata: RoutingResourceMetadata<'_>,
 ) -> Option<(Vec<WireId>, Vec<PipId>)> {
-    let device = graph.device();
-    let goal_point = device.wires()[goal.0].point;
+    let goal_point = metadata.wire_points[goal.0];
     let mut visits = HashMap::<HoldRouteState, HoldRouteVisit>::new();
     let mut queue = BinaryHeap::new();
     for &start in starts {
@@ -3572,7 +3744,7 @@ fn shortest_hold_path(
         let distance = timing_tree_cost(arrival_ps, criticality, ROUTING_DELAY_QUANTUM_PS);
         visits.insert(state, (distance, arrival_ps, None));
         queue.push(Reverse((
-            distance.saturating_add(device.wires()[start.0].point.manhattan(goal_point)),
+            distance.saturating_add(metadata.wire_points[start.0].manhattan(goal_point)),
             distance,
             arrival_ps,
             state,
@@ -3597,18 +3769,18 @@ fn shortest_hold_path(
             continue;
         }
 
-        for &(neighbor, pip) in graph.routing_neighbors(wire).ok()? {
+        for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
             if starts.contains(&neighbor) {
                 continue;
             }
             let congestion = congestion_cost(
                 wire_occupancy[neighbor.0],
-                device.wires()[neighbor.0].capacity,
+                metadata.wire_capacities[neighbor.0],
                 wire_history[neighbor.0],
                 present_factor,
             ) + congestion_cost(
                 pip_occupancy[pip.0],
-                device.pips()[pip.0].capacity,
+                metadata.pip_capacities[pip.0],
                 pip_history[pip.0],
                 present_factor,
             );
@@ -3639,7 +3811,7 @@ fn shortest_hold_path(
                 (next_distance, next_arrival_ps, Some((state, pip))),
             );
             let estimate = next_distance
-                .saturating_add(device.wires()[neighbor.0].point.manhattan(goal_point));
+                .saturating_add(metadata.wire_points[neighbor.0].manhattan(goal_point));
             queue.push(Reverse((
                 estimate,
                 next_distance,
@@ -3916,11 +4088,12 @@ mod tests {
 
     use super::{
         PinWireCache, Placement, PlacementConstraints, PlacementNeighbor, PnrError, RouteSearch,
-        RoutingConstraints, RoutingCosts, place_analytically_with_net_sink_weights,
-        place_and_route, place_with_constraints, placement_neighbors,
-        refine_placement_with_net_sink_weights_limited, refine_placement_with_net_weights,
-        refinement_edge_cost, retain_route_for_sinks, route_reaches_all_sinks,
-        route_with_placement_and_progress, route_with_timing_costs_and_progress, routing_corridor,
+        RoutingConstraints, RoutingCosts, RoutingResourceMetadata, RoutingWorkspace,
+        place_analytically_with_net_sink_weights, place_and_route, place_with_constraints,
+        placement_neighbors, refine_placement_with_net_sink_weights_limited,
+        refine_placement_with_net_weights, refinement_edge_cost, retain_route_for_sinks,
+        route_reaches_all_sinks, route_with_placement_and_progress,
+        route_with_timing_costs_and_progress, route_with_workspace_and_progress, routing_corridor,
         routing_step_cost, routing_transition_cost, timing_tree_cost,
     };
 
@@ -4115,6 +4288,36 @@ mod tests {
     }
 
     #[test]
+    fn reusable_workspace_does_not_leak_occupancy_between_trials() {
+        let design = two_cell_design();
+        let device = Device::rectangular_logic(4, 1).unwrap();
+        let placement =
+            place_with_constraints(&design, &device, &PlacementConstraints::new()).unwrap();
+        let mut workspace = RoutingWorkspace::new(&device);
+
+        let first = route_with_workspace_and_progress(
+            &design,
+            &device,
+            placement.clone(),
+            &RoutingConstraints::new(),
+            &mut workspace,
+            |_| {},
+        )
+        .unwrap();
+        let second = route_with_workspace_and_progress(
+            &design,
+            &device,
+            placement,
+            &RoutingConstraints::new(),
+            &mut workspace,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
     fn partial_route_preserves_shared_tree_and_routes_only_missing_sink_arc() {
         let mut design = Design::new();
         let source = design.add_cell("source", ResourceKind::Logic);
@@ -4244,6 +4447,26 @@ mod tests {
         let mut search = RouteSearch::new(device.wires().len());
         let starts = [slow_tree, fast_tree].into_iter().collect();
         let tree_delays = vec![100, 0];
+        let wire_points = device
+            .wires()
+            .iter()
+            .map(|wire| wire.point)
+            .collect::<Vec<_>>();
+        let wire_capacities = device
+            .wires()
+            .iter()
+            .map(|wire| wire.capacity)
+            .collect::<Vec<_>>();
+        let pip_capacities = device
+            .pips()
+            .iter()
+            .map(texo_model::Pip::capacity)
+            .collect::<Vec<_>>();
+        let metadata = RoutingResourceMetadata {
+            wire_points: &wire_points,
+            wire_capacities: &wire_capacities,
+            pip_capacities: &pip_capacities,
+        };
 
         let (wires, _) = search
             .shortest_path(
@@ -4260,6 +4483,7 @@ mod tests {
                 50,
                 &tree_delays,
                 0,
+                metadata,
             )
             .unwrap();
 
@@ -4282,6 +4506,26 @@ mod tests {
         let graph = UnifiedGraph::new(&design, &device);
         let costs = RoutingCosts::new(vec![10, 10, 400, 400], BTreeMap::new());
         let mut search = RouteSearch::new(device.wires().len());
+        let wire_points = device
+            .wires()
+            .iter()
+            .map(|wire| wire.point)
+            .collect::<Vec<_>>();
+        let wire_capacities = device
+            .wires()
+            .iter()
+            .map(|wire| wire.capacity)
+            .collect::<Vec<_>>();
+        let pip_capacities = device
+            .pips()
+            .iter()
+            .map(texo_model::Pip::capacity)
+            .collect::<Vec<_>>();
+        let metadata = RoutingResourceMetadata {
+            wire_points: &wire_points,
+            wire_capacities: &wire_capacities,
+            pip_capacities: &pip_capacities,
+        };
 
         let (_, pips) = search
             .shortest_path(
@@ -4298,6 +4542,7 @@ mod tests {
                 50,
                 &[0],
                 500,
+                metadata,
             )
             .unwrap();
 

@@ -1252,7 +1252,7 @@ fn placed_pin_wire(
 fn incoming_pips(device: &Device) -> Vec<Vec<PipId>> {
     let mut incoming = vec![Vec::new(); device.wires().len()];
     for (index, pip) in device.pips().iter().enumerate() {
-        incoming[pip.to.0].push(PipId(index));
+        incoming[pip.to().0].push(PipId(index));
     }
     incoming
 }
@@ -1277,7 +1277,7 @@ fn forward_route(
             }
             return Some((wires, pips));
         }
-        for &(next, pip) in device.routing_neighbors(wire).ok()? {
+        for (next, pip) in device.routing_neighbors(wire).ok()? {
             if !seen[next.0] {
                 seen[next.0] = true;
                 previous[next.0] = Some((wire, pip));
@@ -1337,7 +1337,7 @@ impl GlobalReverseSearch {
                 return Some((join, wires, pips));
             }
             for &pip in &incoming[wire.0] {
-                let prior = device.pips()[pip.0].from;
+                let prior = device.pips()[pip.0].from();
                 if self.seen[prior.0] != epoch {
                     self.seen[prior.0] = epoch;
                     self.next_wire[prior.0] = wire.0;
@@ -1378,7 +1378,7 @@ fn add_global_trunk(
 
     let tap_pip = only_original_incoming(architecture, &cache.incoming, tap)?;
     add_pip_to_tree(device, tap_pip, wires, pips);
-    let tap_source = device.pips()[tap_pip.0].from;
+    let tap_source = device.pips()[tap_pip.0].from();
     let tap_info = architecture
         .global_info(device.wires()[tap_source.0].point)
         .ok_or_else(|| "tap source has no global metadata".to_owned())?;
@@ -1392,7 +1392,7 @@ fn add_global_trunk(
 
     let spine_pip = only_original_incoming(architecture, &cache.incoming, spine)?;
     add_pip_to_tree(device, spine_pip, wires, pips);
-    let spine_source = device.pips()[spine_pip.0].from;
+    let spine_source = device.pips()[spine_pip.0].from();
     let root_name = format!("G_{}PCLK{network}", tap_info.quadrant.wire_prefix());
     let root = cache
         .unique_wires
@@ -1441,8 +1441,7 @@ fn add_exact_pip(
     let pip = device
         .routing_neighbors(from)
         .map_err(|error| error.to_string())?
-        .iter()
-        .find_map(|&(neighbor, pip)| (neighbor == to).then_some(pip))
+        .find_map(|(neighbor, pip)| (neighbor == to).then_some(pip))
         .ok_or_else(|| {
             format!(
                 "missing fixed connection `{}` -> `{}`",
@@ -1461,8 +1460,8 @@ fn add_pip_to_tree(
     pips: &mut BTreeSet<PipId>,
 ) {
     let pip_data = &device.pips()[pip.0];
-    wires.insert(pip_data.from);
-    wires.insert(pip_data.to);
+    wires.insert(pip_data.from());
+    wires.insert(pip_data.to());
     pips.insert(pip);
 }
 
@@ -1568,7 +1567,7 @@ fn fixed_carry_successors(
                 continue;
             }
         }
-        for &(neighbor, pip) in architecture
+        for (neighbor, pip) in architecture
             .device()
             .routing_neighbors(wire)
             .expect("routing index contains every wire")
@@ -2404,7 +2403,7 @@ fn add_global_clock_aliases(
         .collect::<BTreeMap<_, _>>();
     let mut incoming = vec![Vec::new(); device.wires().len()];
     for (index, pip) in device.pips().iter().enumerate() {
-        incoming[pip.to.0].push(PipId(index));
+        incoming[pip.to().0].push(PipId(index));
     }
     let mut aliases = BTreeSet::new();
 
@@ -2430,7 +2429,7 @@ fn add_global_clock_aliases(
             aliases.insert((tap_wire, tile_wire));
 
             let tap_pip = single_incoming_pip(device, &incoming, tap_wire, "tap driver")?;
-            let tap_source = device.pips()[tap_pip.0].from;
+            let tap_source = device.pips()[tap_pip.0].from();
             let tap_source_info =
                 global_info_at(device, global_info, device.wires()[tap_source.0].point)?;
             let spine_point =
@@ -2450,7 +2449,7 @@ fn add_global_clock_aliases(
             aliases.insert((spine_wire, tap_source));
 
             let spine_pip = single_incoming_pip(device, &incoming, spine_wire, "spine driver")?;
-            let spine_source = device.pips()[spine_pip.0].from;
+            let spine_source = device.pips()[spine_pip.0].from();
             let root_name = format!("G_{}PCLK{network}", tap_source_info.quadrant.wire_prefix());
             let root = wire_by_name.get(&root_name).copied().ok_or_else(|| {
                 ImportError::InvalidGlobalTopology {

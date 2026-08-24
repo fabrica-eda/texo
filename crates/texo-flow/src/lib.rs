@@ -12,9 +12,9 @@ use texo_model::{
 pub use texo_pnr::RoutingProgress;
 use texo_pnr::{
     NetRoute, Placement, PlacementConstraints, PlacementRefiner, PnrError, PnrResult,
-    RoutingConstraints, RoutingCosts, place_analytically_with_net_sink_weights,
-    place_and_route_with_constraints, retain_route_for_sinks, route_with_placement_and_progress,
-    route_with_timing_costs_and_progress,
+    RoutingConstraints, RoutingCosts, RoutingWorkspace, place_analytically_with_net_sink_weights,
+    place_and_route_with_constraints, retain_route_for_sinks,
+    route_with_timing_costs_workspace_and_progress, route_with_workspace_and_progress,
 };
 use texo_struo::{ImportedEcp5Design, PrimitiveMetadata};
 use texo_target_ecp5::{
@@ -338,11 +338,13 @@ pub fn implement_struo_ecp5_with_progress(
         &mut global_routing_cache,
     )?;
     progress(Ecp5FlowStage::GlobalClocksRouted);
-    let initial_implementation = route_with_placement_and_progress(
+    let mut routing_workspace = RoutingWorkspace::new(architecture.device());
+    let initial_implementation = route_with_workspace_and_progress(
         &design,
         architecture.device(),
         placement,
         &routing,
+        &mut routing_workspace,
         |event| progress(Ecp5FlowStage::Routing(event)),
     )?;
     progress(Ecp5FlowStage::Routed);
@@ -366,7 +368,8 @@ pub fn implement_struo_ecp5_with_progress(
         speed_grade,
         timing_model: &timing_model,
         timing_constraints: &timing_constraints,
-        stalled_ripup_seed: None,
+        routing_workspace: &mut routing_workspace,
+        stalled_ripup_wns_ps: None,
     }
     .optimize(initial_implementation, initial_timing, &mut progress)?;
     progress(Ecp5FlowStage::Timed);
@@ -417,11 +420,12 @@ struct TimingDrivenContext<'a> {
     speed_grade: &'a SpeedGradeRecord,
     timing_model: &'a TimingModel,
     timing_constraints: &'a TimingConstraints,
-    /// Signature `(total_pips, timing_score)` of the archive seed whose global
-    /// ripup last failed to improve the objective. A full data-route ripup
-    /// costs ~100 s, so later closure rounds skip it while the best candidate
-    /// is unchanged.
-    stalled_ripup_seed: Option<(usize, TimingScore)>,
+    routing_workspace: &'a mut RoutingWorkspace,
+    /// Setup slack at which a full data-route ripup last failed. Re-arm only
+    /// after placement improves WNS by roughly one general-routing tile; tiny
+    /// local changes otherwise trigger the same expensive failed search in
+    /// every closure round.
+    stalled_ripup_wns_ps: Option<i128>,
 }
 
 impl TimingDrivenContext<'_> {
@@ -738,11 +742,11 @@ impl TimingDrivenContext<'_> {
             if seed.1.worst_slack_ps.is_none() {
                 break;
             }
-            let seed_signature = (seed.0.total_pips, timing_score(&seed.1));
-            if self.stalled_ripup_seed == Some(seed_signature) {
-                // The same incumbent already lost a full ripup round and no
-                // refinement moved it since; renegotiating every data route
-                // again would only burn ~100 s per quantum.
+            let seed_wns_ps = seed.1.worst_slack_ps.expect("checked above");
+            if !should_retry_global_ripup(self.stalled_ripup_wns_ps, seed_wns_ps) {
+                // A previous global renegotiation failed, and intervening
+                // placement refinement has not shifted the timing basin far
+                // enough to justify scanning every data net again.
                 break;
             }
             // Timing-driven ripup: lift every data-net route so the whole
@@ -789,7 +793,7 @@ impl TimingDrivenContext<'_> {
             let improves_objective = timing_score(&trial.1) > timing_score(&seed.1);
             progress(Ecp5FlowStage::TimingTrialDecision { improves_objective });
             if !improves_objective {
-                self.stalled_ripup_seed = Some(seed_signature);
+                self.stalled_ripup_wns_ps = Some(seed_wns_ps);
                 break;
             }
             archive.push(trial);
@@ -888,7 +892,7 @@ impl TimingDrivenContext<'_> {
     }
 
     fn repair_hold_locally(
-        &self,
+        &mut self,
         implementation: &PnrResult,
         timing: &TimingReport,
         routing_costs: &mut RoutingCosts,
@@ -957,7 +961,6 @@ impl TimingDrivenContext<'_> {
             self.global_routing_cache,
         )?;
         progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
-        let criticalities = timing_net_weights(timing, self.timing_constraints);
         let released = released_timing_sinks(timing, self.timing_constraints);
         let incremental_routing = freeze_unchanged_routes(
             self.design,
@@ -966,7 +969,7 @@ impl TimingDrivenContext<'_> {
             &refined_routing,
             &released,
         );
-        routing_costs.set_net_criticalities(criticalities);
+        routing_costs.set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
         routing_costs.set_sink_min_delays_ps(BTreeMap::new());
         self.route_and_analyze(
             refined_placement,
@@ -1148,12 +1151,10 @@ impl TimingDrivenContext<'_> {
                 routing_costs.set_sink_min_delays_ps(BTreeMap::new());
                 routing_costs.set_detailed_timing_nets(released_net_ids(&released));
                 // Measured: the finest quantum left WNS and hold untouched while slowing
-            // small-trial routing by ~27%, so detailed searches here run at the
-            // default granularity and only the multiresolution ripup keeps a
-            // fine quantum.
-            routing_costs.set_detailed_delay_quantum_ps(
-                texo_pnr::ROUTING_DELAY_QUANTUM_PS,
-            );
+                // small-trial routing by ~27%, so detailed searches here run at the
+                // default granularity and only the multiresolution ripup keeps a
+                // fine quantum.
+                routing_costs.set_detailed_delay_quantum_ps(texo_pnr::ROUTING_DELAY_QUANTUM_PS);
                 let trial = self.route_and_analyze(refined, &frozen, Some(routing_costs), progress);
                 routing_costs.set_detailed_timing_nets(BTreeSet::new());
                 if let Ok(candidate) = trial {
@@ -1188,7 +1189,7 @@ impl TimingDrivenContext<'_> {
     }
 
     fn route_and_analyze(
-        &self,
+        &mut self,
         placement: Placement,
         routing: &RoutingConstraints,
         costs: Option<&RoutingCosts>,
@@ -1197,20 +1198,22 @@ impl TimingDrivenContext<'_> {
         let profile = metrics_enabled();
         let started = Instant::now();
         let implementation = if let Some(costs) = costs {
-            route_with_timing_costs_and_progress(
+            route_with_timing_costs_workspace_and_progress(
                 self.design,
                 self.architecture.device(),
                 placement,
                 routing,
                 costs,
+                self.routing_workspace,
                 |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
             )?
         } else {
-            route_with_placement_and_progress(
+            route_with_workspace_and_progress(
                 self.design,
                 self.architecture.device(),
                 placement,
                 routing,
+                self.routing_workspace,
                 |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
             )?
         };
@@ -1264,6 +1267,10 @@ const MAX_LOCAL_CONNECTION_CANDIDATES: usize = 8;
 const TIMING_FRONTIER_WIDTH: usize = 1;
 const REFINED_PLACEMENT_UNIT_LIMITS: [usize; 4] = [256, 128, 64, 32];
 const DETAILED_ROUTING_QUANTA_PS: [u64; 1] = [10];
+// A failed full-chip negotiation is retried only after placement has improved
+// setup by approximately one measured general-routing tile. This is a basin
+// change, unlike the small local moves between adjacent closure rounds.
+const GLOBAL_RIPUP_REARM_SLACK_PS: i128 = 250;
 // The second 1 ps quantum measured as a pure extra full renegotiation on the
 // AXI4 self-test: final WNS and placement were bit-identical without it while
 // each multiresolution round paid one more ~30 s global ripup.
@@ -1283,6 +1290,12 @@ const BASIN_ESCAPE_WEIGHT_EXPONENT: u32 = 4;
 // it is not a random restart or a whole-design perturbation.
 const CRITICAL_PATH_MOVE_DISTANCES: [u64; 3] = [1, 2, 16];
 const MAX_RELEASED_CRITICAL_NETS: usize = 64;
+
+fn should_retry_global_ripup(last_failed_wns_ps: Option<i128>, seed_wns_ps: i128) -> bool {
+    last_failed_wns_ps.is_none_or(|failed_wns_ps| {
+        seed_wns_ps >= failed_wns_ps.saturating_add(GLOBAL_RIPUP_REARM_SLACK_PS)
+    })
+}
 
 fn ecp5_routing_costs(
     architecture: &Ecp5Architecture,
@@ -1837,7 +1850,7 @@ fn ecp5_pip_delays(
     let mut source_fanout = BTreeMap::new();
     for &pip_id in &selected {
         let pip = &device.pips()[pip_id.0];
-        *source_fanout.entry(pip.from).or_insert(0_u64) += 1;
+        *source_fanout.entry(pip.from()).or_insert(0_u64) += 1;
     }
     selected
         .into_iter()
@@ -1850,7 +1863,7 @@ fn ecp5_pip_delays(
                     speed_grade: speed_grade.name.clone(),
                     timing_class: metadata.timing_class.to_owned(),
                 })?;
-            let fanout = source_fanout[&device.pips()[pip_id.0].from];
+            let fanout = source_fanout[&device.pips()[pip_id.0].from()];
             Ok((pip_id, pip_class_delay(class, fanout)?))
         })
         .collect()
@@ -2178,7 +2191,8 @@ mod tests {
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, criticality_weight,
         delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, find_cell_pin,
         freeze_route_sinks_except, implement, implement_struo_ecp5, implement_with_constraints,
-        pip_class_delay, slack_violations, staged_timing_score, verify_post_map_with_celox,
+        pip_class_delay, should_retry_global_ripup, slack_violations, staged_timing_score,
+        verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -2197,6 +2211,13 @@ mod tests {
         assert_eq!(delay_weighted_criticality(64, 500, 4_000), 32);
         assert_eq!(delay_weighted_criticality(64, 1_000, 4_000), 64);
         assert_eq!(delay_weighted_criticality(64, 2_000, 4_000), 64);
+    }
+
+    #[test]
+    fn failed_global_ripup_requires_a_material_wns_change_to_rearm() {
+        assert!(should_retry_global_ripup(None, -1_000));
+        assert!(!should_retry_global_ripup(Some(-500), -251));
+        assert!(should_retry_global_ripup(Some(-500), -250));
     }
 
     #[test]
@@ -2219,7 +2240,10 @@ mod tests {
         let narrow = slack_violations([-100, 0].into_iter()).score();
         let widespread = slack_violations(std::iter::repeat_n(-99, 100)).score();
 
-        assert!(narrow > widespread);
+        assert!(
+            staged_timing_score(narrow, narrow, -100, -100)
+                > staged_timing_score(widespread, widespread, -99, -99)
+        );
     }
 
     #[test]

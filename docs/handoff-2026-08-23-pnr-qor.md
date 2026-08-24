@@ -61,6 +61,154 @@ At the 250 MHz target Texo closes (+7/+9 ps) in about 112 s, down from
 | + margin-gated route prescreening (commit 49efc28) | −277 ps | ~310 s |
 | + incremental congestion tracking, single ripup quantum (**kept**) | **−277 ps** | **245 s** |
 
+## Runtime update (2026-08-24, full-ripup circuit breaker)
+
+Re-ran the current 300 MHz AXI4 benchmark while comparing the installed
+nextpnr ECP5 default router against both router1 and router2 source. The
+dominant remaining structural difference is that nextpnr owns a persistent
+arc queue and routing state: it routes 6536 connections in 0.99 s and rips up
+the seven negative-slack arcs in place. Texo instead evaluates placement moves
+by rebuilding routed candidates and periodically renegotiates all 2350 data
+nets.
+
+One attempted router2-style fast path retained satisfied branches and released
+only negative-slack sinks. It cost 2--5 s per closure round, regressed timing
+every time on this sparse design, and was reverted. The useful measurement was
+that after the first successful full-chip ripup, three later full-chip ripups
+all regressed. Each local placement improvement had re-enabled the same
+18--19 s failed search.
+
+Kept change: a failed global ripup now stays stalled until placement WNS has
+improved by 250 ps (approximately one measured general-routing tile), instead
+of re-arming after any placement change. On the deterministic benchmark this
+removes two redundant full negotiations:
+
+| Build | Runtime | WNS / hold | PIPs |
+|---|---:|---:|---:|
+| preceding measured trial | 214.32 s | −277 / −381 ps | 29488 |
+| ripup re-arm threshold | **159.20 s** | **−277 / −381 ps** | **29488** |
+
+The immediately preceding trial included about 12 s from the rejected
+connection-only experiment, so the isolated circuit-breaker gain is roughly
+38 s (about 19%); the observed end-to-end reduction is 25.7%. The same
+nextpnr command completed in 3.14 s and routed at 309.60 MHz, confirming that
+this change removes waste but does not close the architectural runtime gap.
+The next large step remains a persistent connection router with uphill and
+downhill indexes, an arc priority queue, in-place conflict ripup, and routed
+delay feedback; more full-route placement trials cannot approach nextpnr's
+cost model.
+
+## Runtime update (2026-08-24, reusable routing workspace)
+
+The timing-driven loop previously rebuilt device-sized scratch storage for
+every placement trial. On the 85K device that meant repeatedly allocating and
+zeroing occupancy/history arrays for 3,798,913 wires and 29,116,611 PIPs, plus
+the A* search arrays and route-tree arrival array. This work was independent of
+the handful of nets released by most incremental trials.
+
+Kept change: `RoutingWorkspace` now owns those arrays for the full flow. It
+clears occupancy and history through touched-index lists, resets the existing
+generation-stamped A* workspace in place, and is passed through every initial,
+incremental, and full-ripup route call. The original public routing entry
+points remain as allocating compatibility wrappers; workspace-aware entry
+points serve repeated callers. A regression test routes the same placement
+twice through one workspace and verifies that no occupancy leaks between
+trials.
+
+| Build | Runtime | user / sys | WNS / hold | PIPs |
+|---|---:|---:|---:|---:|
+| ripup re-arm threshold | 159.20 s | 148.57 / 10.44 s | -277 / -381 ps | 29488 |
+| + reusable routing workspace | 149.84 s | 147.77 / 2.39 s | -277 / -381 ps | 29488 |
+| + persistent A* frontier | 148.76 s | 146.75 / 2.30 s | -277 / -381 ps | 29488 |
+| + criticality-1 routing corridor | 147.52 s | 145.48 / 2.37 s | -277 / -381 ps | 29488 |
+| + 32-bit downhill adjacency | 145.22 s | 143.75 / 1.77 s | -277 / -381 ps | 29488 |
+| + 12-byte physical PIPs | 136.62 s | 135.03 / 1.84 s | -277 / -381 ps | 29488 |
+| + SoA routing hot metadata | **122.32 s** | **120.81 / 1.79 s** | **-277 / -381 ps** | **29488** |
+
+This removes another 9.36 s (5.9%) end to end and cuts kernel/system time by
+77%, with identical deterministic QoR and route size. Small incremental route
+trials that previously took roughly 57--90 ms now commonly take 15--25 ms;
+the remaining 0.5--0.9 s trials are dominated by A* search rather than scratch
+initialization. Relative to the 214.32 s measured trial before the two kept
+runtime changes, the workspace alone gives a 30.1% cumulative reduction.
+
+Two follow-up constant-factor changes also stayed bit-identical. The A*
+`BinaryHeap` now lives in `RouteSearch`, so a large critical search retains
+its frontier allocation for later connections instead of freeing and
+regrowing it. Timing nets with the minimum nonzero criticality now get the
+same bounded corridor as all other timing nets; an unsuccessful corridor
+still falls back to the original unbounded search. Together these remove a
+further 2.32 s (1.5%), for a 31.2% cumulative reduction from 214.32 s.
+
+The next kept series ports another important nextpnr/chipdb property: dense
+physical IDs use compact storage, and the router's hot numeric data is
+separate from names and other cold metadata. `Device::routing_neighbors`
+previously stored every one of the 29,116,611 downhill arcs as two 64-bit
+Rust IDs (16 bytes); it now stores two 32-bit IDs (8 bytes). `Pip` similarly
+shrinks from 24 to 12 bytes. Custom serde continues to encode the historical
+`(usize, usize)` adjacency tuples and named PIP fields, verified by loading the
+existing 715 MiB architecture cache unchanged. The serialized file therefore
+does not shrink yet, but the in-memory graph loses about 555 MiB.
+
+Finally, A* no longer randomly fetches coordinates and capacities from large
+`Wire` records that also contain names, or from the full PIP records. The
+flow-persistent `RoutingWorkspace` owns structure-of-arrays copies of wire
+points, wire capacities, and PIP capacities (about 92 MiB), leaving a net
+runtime-memory reduction around 464 MiB while making the search working set
+contiguous. This last change alone removes 14.30 s (10.5%). The complete kept
+series is 122.32 s: 23.2% faster than the 159.20 s circuit-breaker build and
+42.9% faster than the 214.32 s preceding measured trial, with bit-identical
+placement, route, WNS, hold, and PIP count.
+
+Attempted and reverted in between: a compact uphill CSR plus reverse A* from
+each sink. Some individual searches became faster, but choosing a different
+equal/near-equal connection path changed the negotiated-routing basin. WNS
+progress lagged badly and small trials grew to 2.3 s after global ripup. A
+useful nextpnr-style bidirectional router therefore cannot be bolted onto the
+current stateless net rebuild: it needs persistent per-connection route state,
+conflict ownership, and in-place arc ripup as one coherent change.
+
+## QoR-first follow-up (2026-08-24)
+
+The objective is not to freeze QoR while optimizing runtime. Runtime is search
+budget that must ultimately raise Fmax/QoR. Several nextpnr-inspired ways of
+spending that budget were measured after the 122.32 s router build. None beat
+the incumbent, so all were reverted:
+
+| Experiment | Runtime | WNS @300 | Result |
+|---|---:|---:|---|
+| aggregate score reordered WNS-first | 140.00 s | -470 ps | worse basin and slower |
+| per-sink criticality + critical-first tree + fine sinks | 119.99 s | -381 ps | faster trials, worse tree |
+| fine quantum only on failing sinks | 100.82 s | -361 ps | 21 s saved, 84 ps lost |
+| failing sinks first, then coarse fanout | 90.27 s | -346 ps | recovered 15 ps, still worse |
+| preceding build + two closure rounds | 95.65 s | -346 ps | extra search was neutral |
+| aggregate improvement with a 25 ps WNS-regression gate | 94.55 s | -346 ps | blocked necessary turnover |
+| fully restored incumbent (confirmation run) | 124.46 s | **-277 ps** | -10,235 ps TNS, 29,488 PIPs |
+| deterministic net-order portfolio after a failed ripup | 144.93 s | -277 ps | alternate order added ~20 s, identical route |
+| retained-tree setup/min-corner arrival reconstruction | 158.86 s | -277 ps | inactive on setup's whole-net releases |
+| exact worst-arc-only ripup | 129.06 s | -277 ps | frozen resource owners made the retry identical |
+| early critical-corridor victims (128 nets) | 136.56 s | -278 ps | changed basin; hold -372 ps, no Fmax gain |
+| corridor victims gated to WNS >= -400 ps | 144.13 s | -277 ps | preserved basin; -323 ps candidate rejected by STA |
+
+The router2 comparison remains useful, but arc criticality, critical-first
+ordering, and per-arc ripup form one coupled design. Texo's net-level route
+tree shares earlier sink branches with later sinks; changing only arc order or
+delay resolution therefore changes the placement-refinement basin rather than
+reproducing router2. The next QoR attempt should introduce persistent
+per-connection ownership and in-place conflict/timing ripup first, then add
+bidirectional arc search and per-arc criticality on that state model. The
+current aggregate timing objective must also remain able to accept temporary
+WNS regressions: both strict WNS ordering and a small Pareto-style gate lost
+the deterministic -277 ps basin.
+
+The arc/victim experiments sharpen that conclusion. Arc-only ripup cannot
+evict a fast-resource owner, while preselecting victims by a geometric
+corridor either perturbs the placement trajectory too early or produces a
+worse late candidate. The missing router2 mechanism is dynamic resource
+ownership: route the critical arc, discover the actual conflicts, rip up
+those owning arcs in place, and iterate without rebuilding unrelated net
+trees. Static victim selection is not an adequate substitute.
+
 Fmax ≈ 276.6 MHz. Runtime profile that drove the last two changes:
 98% of the flow is route trials; per-trial breakdown showed `route_net` A*
 dominating (~1.3 s even for 14-net releases), full-scan congestion history
@@ -72,9 +220,11 @@ multiresolution round with a bit-identical result — the 1 ps pass contributed
 nothing on this design.
 
 Remaining known costs, in priority order for future sessions:
-1. Unbounded A* for criticality-1 nets (no corridor) — the long tail of
-   0.7–1.6 s small trials.
-2. Detailed-quantum transition searches turn arrival into part of the A*
+1. Forward-only A* remains the long tail: some 14--40-net trials still take
+   0.4--0.7 s even with bounded timing corridors. Do not reintroduce reverse
+   A* alone; the next router-level step is persistent per-connection state,
+   resource ownership, and in-place conflict ripup, then bidirectional search.
+2. Detailed-quantum transition searches make arrival affect the A*
    state, multiplying visited states for the released critical nets.
 3. Global ripups renegotiate all 2350 nets when only the failing region
    contends; targeted ripup would trade QoR risk for most of the remaining

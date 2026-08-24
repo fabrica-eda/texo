@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Stable index of a cell in a [`Design`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -453,17 +455,195 @@ pub struct Wire {
 }
 
 /// A directed or bidirectional programmable connection between two wires.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[repr(C)]
 pub struct Pip {
-    /// Source wire.
-    pub from: WireId,
-    /// Destination wire.
-    pub to: WireId,
-    /// Whether the connection can also be traversed from `to` to `from`.
-    pub bidirectional: bool,
-    /// Maximum number of nets that may occupy this resource.
-    pub capacity: u16,
+    from: u32,
+    to: u32,
+    capacity: u16,
+    bidirectional: bool,
 }
+
+impl Pip {
+    fn new(
+        from: WireId,
+        to: WireId,
+        bidirectional: bool,
+        capacity: u16,
+    ) -> Result<Self, ModelError> {
+        Ok(Self {
+            from: from
+                .0
+                .try_into()
+                .map_err(|_| ModelError::RoutingIndexOverflow)?,
+            to: to
+                .0
+                .try_into()
+                .map_err(|_| ModelError::RoutingIndexOverflow)?,
+            capacity,
+            bidirectional,
+        })
+    }
+
+    /// Source wire.
+    #[must_use]
+    pub const fn from(&self) -> WireId {
+        WireId(self.from as usize)
+    }
+
+    /// Destination wire.
+    #[must_use]
+    pub const fn to(&self) -> WireId {
+        WireId(self.to as usize)
+    }
+
+    /// Whether the connection can also be traversed from `to` to `from`.
+    #[must_use]
+    pub const fn bidirectional(&self) -> bool {
+        self.bidirectional
+    }
+
+    /// Maximum number of nets that may occupy this resource.
+    #[must_use]
+    pub const fn capacity(&self) -> u16 {
+        self.capacity
+    }
+}
+
+impl Serialize for Pip {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("Pip", 4)?;
+        state.serialize_field("from", &self.from())?;
+        state.serialize_field("to", &self.to())?;
+        state.serialize_field("bidirectional", &self.bidirectional)?;
+        state.serialize_field("capacity", &self.capacity)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Pip {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SerializedPip {
+            from: WireId,
+            to: WireId,
+            bidirectional: bool,
+            capacity: u16,
+        }
+
+        let pip = SerializedPip::deserialize(deserializer)?;
+        Self::new(pip.from, pip.to, pip.bidirectional, pip.capacity)
+            .map_err(|_| D::Error::custom("routing wire ID exceeds 32 bits"))
+    }
+}
+
+/// Compact in-memory routing adjacency entry.
+///
+/// ECP5 devices have tens of millions of routing arcs but stay well within a
+/// 32-bit ID space. The custom serde representation remains the historical
+/// `(usize, usize)` tuple so existing architecture caches stay readable.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CompactRoutingNeighbor {
+    wire: u32,
+    pip: u32,
+}
+
+impl CompactRoutingNeighbor {
+    fn new(wire: WireId, pip: PipId) -> Result<Self, ModelError> {
+        Ok(Self {
+            wire: wire
+                .0
+                .try_into()
+                .map_err(|_| ModelError::RoutingIndexOverflow)?,
+            pip: pip
+                .0
+                .try_into()
+                .map_err(|_| ModelError::RoutingIndexOverflow)?,
+        })
+    }
+
+    fn expand(self) -> (WireId, PipId) {
+        (WireId(self.wire as usize), PipId(self.pip as usize))
+    }
+}
+
+impl Serialize for CompactRoutingNeighbor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        (self.wire as usize, self.pip as usize).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CompactRoutingNeighbor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let (wire, pip) = <(usize, usize)>::deserialize(deserializer)?;
+        Ok(Self {
+            wire: wire
+                .try_into()
+                .map_err(|_| D::Error::custom("routing wire ID exceeds 32 bits"))?,
+            pip: pip
+                .try_into()
+                .map_err(|_| D::Error::custom("routing PIP ID exceeds 32 bits"))?,
+        })
+    }
+}
+
+/// Iterator over outgoing routing neighbors in stable traversal order.
+#[derive(Clone, Debug)]
+pub struct RoutingNeighbors<'a> {
+    entries: std::slice::Iter<'a, CompactRoutingNeighbor>,
+}
+
+impl RoutingNeighbors<'_> {
+    /// Number of remaining routing neighbors.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no routing neighbors remain.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.as_slice().is_empty()
+    }
+}
+
+impl Iterator for RoutingNeighbors<'_> {
+    type Item = (WireId, PipId);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.entries
+            .next()
+            .copied()
+            .map(CompactRoutingNeighbor::expand)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.entries.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for RoutingNeighbors<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.entries
+            .next_back()
+            .copied()
+            .map(CompactRoutingNeighbor::expand)
+    }
+}
+
+impl ExactSizeIterator for RoutingNeighbors<'_> {}
 
 /// Physical target database.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -476,7 +656,7 @@ pub struct Device {
     wires: Vec<Wire>,
     pips: Vec<Pip>,
     bels_by_kind: BTreeMap<ResourceKind, Vec<BelId>>,
-    routing_neighbors: Vec<Vec<(WireId, PipId)>>,
+    routing_neighbors: Vec<Vec<CompactRoutingNeighbor>>,
 }
 
 impl Device {
@@ -639,15 +819,14 @@ impl Device {
             return Err(ModelError::ZeroCapacity);
         }
         let id = PipId(self.pips.len());
-        self.pips.push(Pip {
-            from,
-            to,
-            bidirectional,
-            capacity,
-        });
-        insert_routing_neighbor(&mut self.routing_neighbors[from.0], (to, id));
-        if bidirectional {
-            insert_routing_neighbor(&mut self.routing_neighbors[to.0], (from, id));
+        let forward = CompactRoutingNeighbor::new(to, id)?;
+        let reverse = bidirectional
+            .then(|| CompactRoutingNeighbor::new(from, id))
+            .transpose()?;
+        self.pips.push(Pip::new(from, to, bidirectional, capacity)?);
+        insert_routing_neighbor(&mut self.routing_neighbors[from.0], forward);
+        if let Some(reverse) = reverse {
+            insert_routing_neighbor(&mut self.routing_neighbors[to.0], reverse);
         }
         Ok(id)
     }
@@ -705,9 +884,11 @@ impl Device {
     /// # Errors
     ///
     /// Returns an error for an unknown wire ID.
-    pub fn routing_neighbors(&self, wire: WireId) -> Result<&[(WireId, PipId)], ModelError> {
+    pub fn routing_neighbors(&self, wire: WireId) -> Result<RoutingNeighbors<'_>, ModelError> {
         self.wire(wire)?;
-        Ok(&self.routing_neighbors[wire.0])
+        Ok(RoutingNeighbors {
+            entries: self.routing_neighbors[wire.0].iter(),
+        })
     }
 
     fn validate_point(&self, point: Point) -> Result<(), ModelError> {
@@ -735,7 +916,10 @@ impl Device {
     }
 }
 
-fn insert_routing_neighbor(neighbors: &mut Vec<(WireId, PipId)>, neighbor: (WireId, PipId)) {
+fn insert_routing_neighbor(
+    neighbors: &mut Vec<CompactRoutingNeighbor>,
+    neighbor: CompactRoutingNeighbor,
+) {
     let index = neighbors
         .binary_search(&neighbor)
         .unwrap_or_else(|index| index);
@@ -863,7 +1047,7 @@ impl<'a> UnifiedGraph<'a> {
     /// # Errors
     ///
     /// Returns an error for an unknown wire ID.
-    pub fn routing_neighbors(&self, wire: WireId) -> Result<&[(WireId, PipId)], ModelError> {
+    pub fn routing_neighbors(&self, wire: WireId) -> Result<RoutingNeighbors<'_>, ModelError> {
         self.device.routing_neighbors(wire)
     }
 
@@ -1007,8 +1191,6 @@ impl<'a> UnifiedGraph<'a> {
             .collect();
         arcs.extend(
             self.routing_neighbors(wire)?
-                .iter()
-                .copied()
                 .map(|(neighbor, pip)| GraphArc {
                     to: GraphNode::Wire(neighbor),
                     kind: GraphEdgeKind::Pip(pip),
@@ -1081,6 +1263,8 @@ pub enum ModelError {
     PointOutsideDevice(Point),
     /// A physical resource had no capacity.
     ZeroCapacity,
+    /// Routing IDs exceeded the compact physical-graph representation.
+    RoutingIndexOverflow,
     /// A logical pin cannot bind to the selected BEL.
     IncompatibleBinding {
         /// Logical pin.
@@ -1116,6 +1300,9 @@ impl fmt::Display for ModelError {
                 write!(f, "point ({}, {}) is outside the device", point.x, point.y)
             }
             Self::ZeroCapacity => write!(f, "physical resource capacity must be non-zero"),
+            Self::RoutingIndexOverflow => {
+                write!(f, "routing resource IDs must fit in 32 bits")
+            }
             Self::IncompatibleBinding { cell_pin, bel } => {
                 write!(f, "cell pin {} cannot bind to BEL {}", cell_pin.0, bel.0)
             }
@@ -1128,9 +1315,15 @@ impl Error for ModelError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        BufferSpec, Design, Device, GraphEdgeKind, GraphNode, PinDirection, Point, ResourceKind,
-        UnifiedGraph,
+        BufferSpec, CompactRoutingNeighbor, Design, Device, GraphEdgeKind, GraphNode, PinDirection,
+        Pip, Point, ResourceKind, UnifiedGraph,
     };
+
+    #[test]
+    fn physical_pip_uses_compact_wire_ids() {
+        assert_eq!(std::mem::size_of::<Pip>(), 12);
+        assert_eq!(std::mem::size_of::<CompactRoutingNeighbor>(), 8);
+    }
 
     #[test]
     fn rejects_a_net_with_reversed_pin_directions() {
@@ -1268,16 +1461,16 @@ mod tests {
         let bidirectional = device.add_pip(third, first, true, 1).unwrap();
 
         assert_eq!(
-            device.routing_neighbors(first).unwrap(),
-            &[
+            device.routing_neighbors(first).unwrap().collect::<Vec<_>>(),
+            vec![
                 (second, to_second),
                 (third, to_third),
                 (third, bidirectional),
             ]
         );
         assert_eq!(
-            device.routing_neighbors(third).unwrap(),
-            &[(first, bidirectional)]
+            device.routing_neighbors(third).unwrap().collect::<Vec<_>>(),
+            vec![(first, bidirectional)]
         );
         assert!(device.routing_neighbors(second).unwrap().is_empty());
     }
