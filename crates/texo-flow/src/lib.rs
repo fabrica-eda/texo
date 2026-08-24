@@ -1348,9 +1348,19 @@ impl TimingDrivenContext<'_, '_, '_> {
                 .expect("the timing archive is non-empty")
                 .clone();
             let mut improved = None;
+            let mut equivalent_move_peak = None;
             for max_units in REFINED_PLACEMENT_UNIT_LIMITS {
+                if equivalent_move_peak.is_some_and(|peak| max_units > peak) {
+                    if metrics_enabled() {
+                        eprintln!(
+                            "[metrics] monotonic_trial round={} units={max_units} skipped=inactive_limit",
+                            refinement_round + 1,
+                        );
+                    }
+                    continue;
+                }
                 let trial_started = Instant::now();
-                let candidate = self.refine_candidate(
+                let (candidate, move_peak) = self.refine_candidate(
                     &seed.0,
                     &seed.1,
                     placement_refiner,
@@ -1358,6 +1368,7 @@ impl TimingDrivenContext<'_, '_, '_> {
                     max_units,
                     progress,
                 )?;
+                equivalent_move_peak = Some(move_peak);
                 if metrics_enabled() {
                     eprintln!(
                         "[metrics] monotonic_trial round={} units={max_units} elapsed={:?} wns={:?} tns={:?}",
@@ -1678,7 +1689,7 @@ impl TimingDrivenContext<'_, '_, '_> {
         routing_costs: &mut RoutingCosts,
         max_refined_units: usize,
         progress: &mut impl FnMut(Ecp5FlowStage),
-    ) -> Result<Option<TimingCandidate>, Ecp5FlowError> {
+    ) -> Result<(Option<TimingCandidate>, usize), Ecp5FlowError> {
         let refinement_weights = timing_placement_weights(timing, self.timing_constraints);
         let sink_budgets = placement_sink_budgets(
             self.design,
@@ -1686,19 +1697,20 @@ impl TimingDrivenContext<'_, '_, '_> {
             &implementation.placement,
             timing,
         );
-        let refined_placement = placement_refiner.refine_with_net_sink_weights_limited(
-            implementation.placement.clone(),
-            &refinement_weights,
-            Some(&sink_budgets),
-            max_refined_units,
-        )?;
+        let (refined_placement, move_peak) = placement_refiner
+            .refine_with_net_sink_weights_limited_and_move_peak(
+                implementation.placement.clone(),
+                &refinement_weights,
+                Some(&sink_budgets),
+                max_refined_units,
+            )?;
         progress(Ecp5FlowStage::TimingDrivenPlaced);
         if self.estimate_rejects(
             &implementation.placement,
             &refined_placement,
             &timing_net_weights(timing, self.timing_constraints),
         ) {
-            return Ok(None);
+            return Ok((None, move_peak));
         }
         let refined_routing = self.packing.global_routing_constraints_cached(
             self.design,
@@ -1718,16 +1730,17 @@ impl TimingDrivenContext<'_, '_, '_> {
         routing_costs.set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
         routing_costs.set_sink_criticalities(timing_arc_weights(timing, self.timing_constraints));
         routing_costs.set_sink_min_delays_ps(BTreeMap::new());
-        match self.route_local_trial_and_analyze(
+        let candidate = match self.route_local_trial_and_analyze(
             refined_placement,
             &incremental_routing,
             routing_costs,
             progress,
         ) {
-            Ok(candidate) => Ok(Some(candidate)),
-            Err(Ecp5FlowError::Pnr(_)) => Ok(None),
-            Err(error) => Err(error),
-        }
+            Ok(candidate) => Some(candidate),
+            Err(Ecp5FlowError::Pnr(_)) => None,
+            Err(error) => return Err(error),
+        };
+        Ok((candidate, move_peak))
     }
 
     fn refine_local_connections(

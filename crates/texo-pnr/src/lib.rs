@@ -1422,7 +1422,7 @@ pub fn refine_placement_with_net_weights(
     let units = placement_units(&graph, constraints, &mut candidate_cache)?;
     let mut placed = validate_refinement_start(&graph, &units, placement, None)?;
     let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
-    refine_placement(
+    let _ = refine_placement(
         &graph,
         constraints,
         &units,
@@ -1458,7 +1458,7 @@ pub fn refine_placement_with_net_sink_weights(
     let units = placement_units(&graph, constraints, &mut candidate_cache)?;
     let mut placed = validate_refinement_start(&graph, &units, placement, None)?;
     let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
-    refine_placement(
+    let _ = refine_placement(
         &graph,
         constraints,
         &units,
@@ -1668,6 +1668,33 @@ impl<'a> PlacementRefiner<'a> {
         sink_budgets: Option<&BTreeMap<(NetId, CellPinId), u32>>,
         max_moved_units: usize,
     ) -> Result<Placement, PnrError> {
+        self.refine_with_net_sink_weights_limited_and_move_peak(
+            placement,
+            sink_weights,
+            sink_budgets,
+            max_moved_units,
+        )
+        .map(|(placement, _)| placement)
+    }
+
+    /// Refines a placement and also reports the largest number of units moved
+    /// in any pass.
+    ///
+    /// When this peak is below the requested limit, the limit never affected
+    /// the result. Timing-closure portfolios can use that fact to skip an
+    /// exactly equivalent trial at another still-higher limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as
+    /// [`Self::refine_with_net_sink_weights_limited`].
+    pub fn refine_with_net_sink_weights_limited_and_move_peak(
+        &self,
+        placement: Placement,
+        sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
+        sink_budgets: Option<&BTreeMap<(NetId, CellPinId), u32>>,
+        max_moved_units: usize,
+    ) -> Result<(Placement, usize), PnrError> {
         let (_, neighbors) =
             placement_neighbors(self.graph.design(), None, Some(sink_weights), sink_budgets);
         let mut placed = validate_refinement_start(
@@ -1677,7 +1704,7 @@ impl<'a> PlacementRefiner<'a> {
             Some(&self.spatial_indexes),
         )?;
         let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
-        refine_placement(
+        let move_peak = refine_placement(
             &self.graph,
             self.constraints,
             &self.units,
@@ -1687,7 +1714,10 @@ impl<'a> PlacementRefiner<'a> {
             Some(max_moved_units),
             Some(&self.spatial_indexes),
         );
-        finish_placement(&self.graph, self.constraints, placed)
+        Ok((
+            finish_placement(&self.graph, self.constraints, placed)?,
+            move_peak,
+        ))
     }
 
     /// Moves one endpoint placement unit to an unoccupied nearby assignment
@@ -2715,7 +2745,7 @@ fn place(
         }
     }
 
-    refine_placement(
+    let _ = refine_placement(
         graph,
         constraints,
         &units,
@@ -3303,7 +3333,7 @@ fn refine_placement(
     occupied: &mut BTreeSet<BelId>,
     move_limit: Option<usize>,
     cached_spatial_indexes: Option<&BTreeMap<(u8, usize), Arc<SpatialChoiceIndex>>>,
-) {
+) -> usize {
     let device = graph.device();
     let mut pin_usage = HashMap::new();
     for unit in units {
@@ -3345,6 +3375,7 @@ fn refine_placement(
         )
     });
 
+    let mut move_peak = 0;
     for _ in 0..MAX_PLACEMENT_REFINEMENT_PASSES {
         let mut moved = 0;
         for &index in &order {
@@ -3434,10 +3465,12 @@ fn refine_placement(
                 break;
             }
         }
+        move_peak = move_peak.max(moved);
         if moved == 0 || move_limit.is_some_and(|limit| moved >= limit) {
             break;
         }
     }
+    move_peak
 }
 
 fn refinement_target(
@@ -6055,6 +6088,32 @@ mod tests {
             .count();
 
         assert!(changed <= 1);
+    }
+
+    #[test]
+    fn inactive_refinement_limits_produce_the_same_placement() {
+        let design = two_cell_design();
+        let device = Device::rectangular_logic(5, 1).unwrap();
+        let constraints = PlacementConstraints::new();
+        let initial = Placement {
+            bindings: vec![BelId(0), BelId(4)],
+            pin_bindings: BTreeMap::new(),
+        };
+        let refiner = PlacementRefiner::new(&design, &device, &constraints).unwrap();
+        let (broad, move_peak) = refiner
+            .refine_with_net_sink_weights_limited_and_move_peak(
+                initial.clone(),
+                &BTreeMap::new(),
+                None,
+                10,
+            )
+            .unwrap();
+
+        assert!(move_peak < 10);
+        let equivalent = refiner
+            .refine_with_net_sink_weights_limited(initial, &BTreeMap::new(), None, move_peak + 1)
+            .unwrap();
+        assert_eq!(broad, equivalent);
     }
 
     #[test]
