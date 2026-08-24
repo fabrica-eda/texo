@@ -885,9 +885,12 @@ impl Device {
     ///
     /// Returns an error for an unknown wire ID.
     pub fn routing_neighbors(&self, wire: WireId) -> Result<RoutingNeighbors<'_>, ModelError> {
-        self.wire(wire)?;
+        let entries = self
+            .routing_neighbors
+            .get(wire.0)
+            .ok_or(ModelError::UnknownWire(wire))?;
         Ok(RoutingNeighbors {
-            entries: self.routing_neighbors[wire.0].iter(),
+            entries: entries.iter(),
         })
     }
 

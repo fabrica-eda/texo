@@ -1002,3 +1002,12 @@ kept exactly **-214 ps WNS, -3905 ps setup TNS, -399 ps WHS, and 25,675
 PIPs**. Flow time fell from 27.214 to **27.033 seconds**, critical refinement
 from 15.625 to **15.559 seconds**, wall time from 33.03 to **32.95 seconds**,
 and maximum RSS from 3,023,520 to **2,991,864 KiB**.
+
+`Device::routing_neighbors` also used to validate a wire by randomly reading
+the cold `Wire` table before indexing the same-ID adjacency table. Those
+tables are constructed with identical lengths, so a checked adjacency lookup
+provides the same unknown-wire error without touching names and other cold
+wire metadata on every expanded node. Removing that second lookup kept QoR
+identical and reduced the next metrics run to **26.954 seconds** of flow,
+**15.502 seconds** of critical refinement, **32.83 seconds** wall, and 31.12
+seconds user CPU.
