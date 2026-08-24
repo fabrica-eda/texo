@@ -360,8 +360,8 @@ pub struct NetRoute {
 /// while a resource used only by a noncritical branch remains a cheap victim.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RouteCapacityProjection {
-    wire_owners: HashMap<WireId, Vec<(NetId, u64)>>,
-    pip_owners: HashMap<PipId, Vec<(NetId, u64)>>,
+    wire_owners: HashMap<WireId, Vec<(NetId, u64, usize)>>,
+    pip_owners: HashMap<PipId, Vec<(NetId, u64, usize)>>,
     routes: BTreeMap<NetId, Arc<NetRoute>>,
 }
 
@@ -398,11 +398,63 @@ impl RouteCapacityProjection {
     }
 }
 
-fn update_projected_owner(owners: &mut Vec<(NetId, u64)>, net: NetId, criticality: u64) {
-    if let Some((_, known)) = owners.iter_mut().find(|(owner, _)| *owner == net) {
-        *known = (*known).max(criticality);
+fn projected_release_scope_penalty(
+    owners: Option<&Vec<(NetId, u64, usize)>>,
+    moving_net: NetId,
+    capacity: u16,
+) -> u64 {
+    const ARC_RELEASE_PENALTY_PS: u64 = 25;
+    const OVERSIZED_TRANSACTION_PENALTY_PS: u64 = 1_000_000;
+    let victims = projected_victim_nets(owners, moving_net, capacity);
+    let affected = victims
+        .into_iter()
+        .filter_map(|net| {
+            owners?
+                .iter()
+                .find(|(owner, _, _)| *owner == net)
+                .map(|(_, _, arcs)| *arcs)
+        })
+        .sum::<usize>();
+    if affected > MAX_PROJECTED_BLOCKER_SINKS {
+        OVERSIZED_TRANSACTION_PENALTY_PS
     } else {
-        owners.push((net, criticality));
+        (affected as u64).saturating_mul(ARC_RELEASE_PENALTY_PS)
+    }
+}
+
+const MAX_PROJECTED_BLOCKER_SINKS: usize = 8;
+
+fn projected_victim_nets(
+    owners: Option<&Vec<(NetId, u64, usize)>>,
+    moving_net: NetId,
+    capacity: u16,
+) -> Vec<NetId> {
+    let Some(owners) = owners else {
+        return Vec::new();
+    };
+    let mut victims = owners
+        .iter()
+        .filter(|(net, _, _)| *net != moving_net)
+        .map(|&(net, criticality, _)| (net, criticality))
+        .collect::<Vec<_>>();
+    let required = victims
+        .len()
+        .saturating_add(1)
+        .saturating_sub(usize::from(capacity));
+    victims.sort_unstable_by_key(|&(net, criticality)| (criticality, net));
+    victims
+        .into_iter()
+        .take(required)
+        .map(|(net, _)| net)
+        .collect()
+}
+
+fn update_projected_owner(owners: &mut Vec<(NetId, u64, usize)>, net: NetId, criticality: u64) {
+    if let Some((_, known, arcs)) = owners.iter_mut().find(|(owner, _, _)| *owner == net) {
+        *known = (*known).max(criticality);
+        *arcs += 1;
+    } else {
+        owners.push((net, criticality, 1));
     }
 }
 
@@ -2238,6 +2290,16 @@ fn local_connection_projected_cost_from_starts(
                 projection.pip_owners.get(&pip),
                 net,
                 device.pips()[pip.0].capacity(),
+            ))
+            .saturating_add(projected_release_scope_penalty(
+                projection.wire_owners.get(&neighbor),
+                net,
+                device.wires()[neighbor.0].capacity,
+            ))
+            .saturating_add(projected_release_scope_penalty(
+                projection.pip_owners.get(&pip),
+                net,
+                device.pips()[pip.0].capacity(),
             ));
             let next_cost = cost
                 .saturating_add(u64::from(pip_delays_ps[pip.0]))
@@ -2253,7 +2315,7 @@ fn local_connection_projected_cost_from_starts(
 }
 
 fn projected_resource_penalty(
-    owners: Option<&Vec<(NetId, u64)>>,
+    owners: Option<&Vec<(NetId, u64, usize)>>,
     moving_net: NetId,
     capacity: u16,
 ) -> u64 {
@@ -2264,8 +2326,8 @@ fn projected_resource_penalty(
     };
     let mut victims = owners
         .iter()
-        .filter(|(net, _)| *net != moving_net)
-        .map(|&(_, criticality)| criticality)
+        .filter(|(net, _, _)| *net != moving_net)
+        .map(|&(_, criticality, _)| criticality)
         .collect::<Vec<_>>();
     let required = victims
         .len()
@@ -5485,7 +5547,8 @@ mod tests {
         RouteCapacityProjection, RouteQueueEntry, RouteSearch, RoutingConstraints, RoutingCosts,
         RoutingResourceMetadata, RoutingWorkspace, congested_route_arcs,
         local_connection_projected_cost_from_starts, place_analytically_with_net_sink_weights,
-        place_and_route, place_with_constraints, placement_neighbors, projected_resource_penalty,
+        place_and_route, place_with_constraints, placement_neighbors,
+        projected_release_scope_penalty, projected_resource_penalty,
         refine_placement_with_net_sink_weights_limited, refine_placement_with_net_weights,
         refinement_edge_cost, retain_route_for_sinks, route_reaches_all_sinks,
         route_with_placement_and_progress, route_with_timing_costs_and_progress,
@@ -6406,6 +6469,14 @@ mod tests {
         assert_eq!(
             projected_resource_penalty(projection.wire_owners.get(&shared), owner, 1),
             0
+        );
+        assert_eq!(
+            projected_release_scope_penalty(projection.wire_owners.get(&low_only), moving, 1),
+            25
+        );
+        assert_eq!(
+            projected_release_scope_penalty(projection.wire_owners.get(&shared), moving, 1),
+            50
         );
     }
 

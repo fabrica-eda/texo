@@ -1208,3 +1208,22 @@ transaction: project the unloaded fast path, identify the exact lower-critical
 sink arcs occupying it, and release those victims together with the critical
 arc. Releasing every corridor or victim immediately was previously shown to
 lose QoR; ownership, path choice, and rip-up must be one coherent operation.
+
+The owner-aware projection exposed a missing dimension immediately. Pricing
+owners only by criticality selected a nominally cheap fast path whose victim
+was one 268-sink shared trunk; moving one logical owner therefore meant
+releasing 268 coupled arcs, not one noncritical arc. Limiting the final
+transaction to eight blockers found no small victim set for any of the three
+largest critical connections (841, 504, and 297 ps). Rerouting each connection
+alone also reproduced the incumbent exactly in 7--13 ms. The final bottleneck
+is not a missed singleton collision.
+
+`RouteCapacityProjection` now records the number of sink arcs through each
+`(resource, owner net)` and adds that release scope to broad-placement path
+cost. Up to eight coupled arcs pay 25 ps each; a larger shared-trunk rewrite is
+priced out of this local hierarchy and must be handled by a future coarse
+topology transaction. This graph-fidelity change preserved **-214 ps WNS,
+-3905 ps TNS, -399 ps WHS, and 25,658 PIPs**. The measured run took **20.608
+seconds** of flow, **12.293 seconds** of critical closure, **26.55 seconds**
+wall, and 24.85 seconds user CPU. The experimental final blocker/reroute pass
+is not retained; only the placement projection's transaction-size model is.
