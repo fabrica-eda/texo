@@ -4656,17 +4656,27 @@ struct RouteSearch {
     /// Epoch-stamped members of the currently growing tree. Replaces
     /// `starts.contains` on every edge relaxation with one array load.
     start_mark: Vec<u32>,
-    distance: Vec<u64>,
-    arrival_ps: Vec<u64>,
-    previous_wire: Vec<usize>,
-    previous_pip: Vec<usize>,
+    distance: Vec<u32>,
+    arrival_ps: Vec<u32>,
+    previous_wire: Vec<u32>,
+    previous_pip: Vec<u32>,
     /// Frontier storage retained across sink and placement trials. Large
     /// critical searches can grow this to hundreds of thousands of entries;
     /// clearing keeps the allocation while preserving an empty logical queue.
     queue: BinaryHeap<Reverse<RouteQueueEntry>>,
 }
 
-type RouteQueueEntry = (u64, u64, u64, WireId);
+type RouteQueueEntry = (u32, u32, u32, u32);
+
+fn compact_route_value(value: u64) -> u32 {
+    value
+        .try_into()
+        .expect("physical route delay and cost fit u32")
+}
+
+fn compact_route_index(index: usize) -> u32 {
+    index.try_into().expect("physical routing IDs fit u32")
+}
 
 type HoldRouteState = (WireId, u32);
 type HoldRouteVisit = (u64, u64, Option<(HoldRouteState, PipId)>);
@@ -4682,8 +4692,8 @@ impl RouteSearch {
             start_mark: vec![0; wire_count],
             distance: vec![0; wire_count],
             arrival_ps: vec![0; wire_count],
-            previous_wire: vec![usize::MAX; wire_count],
-            previous_pip: vec![usize::MAX; wire_count],
+            previous_wire: vec![u32::MAX; wire_count],
+            previous_pip: vec![u32::MAX; wire_count],
             queue: BinaryHeap::new(),
         }
     }
@@ -4764,37 +4774,45 @@ impl RouteSearch {
             self.start_mark[start.0] = epoch;
             let arrival_ps = tree_delays_ps[start.0];
             let distance = timing_tree_cost(arrival_ps, criticality, delay_quantum_ps);
+            let compact_arrival = compact_route_value(arrival_ps);
+            let compact_distance = compact_route_value(distance);
             self.seen[start.0] = epoch;
-            self.distance[start.0] = distance;
-            self.arrival_ps[start.0] = arrival_ps;
-            self.previous_wire[start.0] = usize::MAX;
-            self.previous_pip[start.0] = usize::MAX;
+            self.distance[start.0] = compact_distance;
+            self.arrival_ps[start.0] = compact_arrival;
+            self.previous_wire[start.0] = u32::MAX;
+            self.previous_pip[start.0] = u32::MAX;
             self.queue.push(Reverse((
-                distance.saturating_add(Self::remaining_cost_estimate(
+                compact_route_value(distance.saturating_add(Self::remaining_cost_estimate(
                     metadata.wire_points[start.0],
                     goal_point,
                     criticality,
                     delay_quantum_ps,
-                )),
-                distance,
-                arrival_ps,
-                start,
+                ))),
+                compact_distance,
+                compact_arrival,
+                compact_route_index(start.0),
             )));
         }
 
-        while let Some(Reverse((_, distance, arrival_ps, wire))) = self.queue.pop() {
+        while let Some(Reverse((_, compact_distance, compact_arrival, compact_wire))) =
+            self.queue.pop()
+        {
+            let wire = WireId(compact_wire as usize);
             if self.seen[wire.0] != epoch
-                || (self.distance[wire.0], self.arrival_ps[wire.0]) != (distance, arrival_ps)
+                || (self.distance[wire.0], self.arrival_ps[wire.0])
+                    != (compact_distance, compact_arrival)
             {
                 continue;
             }
+            let distance = u64::from(compact_distance);
+            let arrival_ps = u64::from(compact_arrival);
             if wire == goal {
                 let mut path_wires = vec![wire];
                 let mut path_pips = Vec::new();
                 let mut cursor = wire.0;
-                while self.previous_wire[cursor] != usize::MAX {
-                    path_pips.push(PipId(self.previous_pip[cursor]));
-                    cursor = self.previous_wire[cursor];
+                while self.previous_wire[cursor] != u32::MAX {
+                    path_pips.push(PipId(self.previous_pip[cursor] as usize));
+                    cursor = self.previous_wire[cursor] as usize;
                     path_wires.push(WireId(cursor));
                 }
                 return Some((path_wires, path_pips));
@@ -4825,20 +4843,22 @@ impl RouteSearch {
                     )
                 };
                 let next_distance = distance.saturating_add(step);
+                let compact_next_distance = compact_route_value(next_distance);
+                let compact_next_arrival = compact_route_value(next_arrival_ps);
                 if neighbor == goal && next_arrival_ps < minimum_arrival_ps {
                     continue;
                 }
                 if self.seen[neighbor.0] == epoch
                     && (self.distance[neighbor.0], self.arrival_ps[neighbor.0])
-                        <= (next_distance, next_arrival_ps)
+                        <= (compact_next_distance, compact_next_arrival)
                 {
                     continue;
                 }
                 self.seen[neighbor.0] = epoch;
-                self.distance[neighbor.0] = next_distance;
-                self.arrival_ps[neighbor.0] = next_arrival_ps;
-                self.previous_wire[neighbor.0] = wire.0;
-                self.previous_pip[neighbor.0] = pip.0;
+                self.distance[neighbor.0] = compact_next_distance;
+                self.arrival_ps[neighbor.0] = compact_next_arrival;
+                self.previous_wire[neighbor.0] = compact_route_index(wire.0);
+                self.previous_pip[neighbor.0] = compact_route_index(pip.0);
                 let estimate = next_distance.saturating_add(Self::remaining_cost_estimate(
                     metadata.wire_points[neighbor.0],
                     goal_point,
@@ -4846,10 +4866,10 @@ impl RouteSearch {
                     delay_quantum_ps,
                 ));
                 self.queue.push(Reverse((
-                    estimate,
-                    next_distance,
-                    next_arrival_ps,
-                    neighbor,
+                    compact_route_value(estimate),
+                    compact_next_distance,
+                    compact_next_arrival,
+                    compact_route_index(neighbor.0),
                 )));
             }
         }
@@ -5266,7 +5286,7 @@ mod tests {
     use super::{
         MAX_ROUTING_ITERATIONS, NetRoute, PinWireCache, Placement, PlacementConstraints,
         PlacementNeighbor, PlacementRefinementWorkspace, PlacementRefiner, PnrError, RouteArc,
-        RouteCapacityProjection, RouteSearch, RoutingConstraints, RoutingCosts,
+        RouteCapacityProjection, RouteQueueEntry, RouteSearch, RoutingConstraints, RoutingCosts,
         RoutingResourceMetadata, RoutingWorkspace, congested_route_arcs,
         place_analytically_with_net_sink_weights, place_and_route, place_with_constraints,
         placement_neighbors, projected_resource_penalty,
@@ -5712,6 +5732,11 @@ mod tests {
         assert_eq!(routing_transition_cost(24, 48, 64, 0, 50), 0);
         assert_eq!(routing_transition_cost(48, 72, 64, 0, 10), 3);
         assert_eq!(routing_transition_cost(48, 72, 64, 0, 1), 24);
+    }
+
+    #[test]
+    fn route_frontier_entry_stays_compact() {
+        assert_eq!(std::mem::size_of::<RouteQueueEntry>(), 16);
     }
 
     #[test]

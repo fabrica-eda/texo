@@ -984,3 +984,21 @@ Final QoR stayed exactly **-214 ps WNS, -3905 ps setup TNS, -399 ps WHS, and
 25,675 PIPs**. Two exact-order hot-loop experiments were rejected alongside
 this result: delay/heuristic lookup tables were neutral (33.64 vs 33.70 s),
 and a four-way frontier heap slowed negotiation to 19.834 seconds.
+
+## Compact route-search state (2026-08-25)
+
+The device graph already guarantees 32-bit physical wire and PIP IDs, but A*
+still stored its distance, arrival, predecessor IDs, and four-field frontier
+tuple as 64-bit values. On the 85K graph this made the persistent search
+scratch 40 bytes per wire and each of the 374.9 million pushed frontier
+entries 32 bytes. Physical FPGA path delays and negotiated scores are far
+below the 32-bit limit.
+
+`RouteSearch` now uses checked 32-bit values for its hot state and converts to
+64-bit only while evaluating a transition. The frontier tuple is 16 bytes and
+has a size regression test; tuple ordering and path reconstruction are
+unchanged. On top of the incremental congestion cache, the AXI4 metrics run
+kept exactly **-214 ps WNS, -3905 ps setup TNS, -399 ps WHS, and 25,675
+PIPs**. Flow time fell from 27.214 to **27.033 seconds**, critical refinement
+from 15.625 to **15.559 seconds**, wall time from 33.03 to **32.95 seconds**,
+and maximum RSS from 3,023,520 to **2,991,864 KiB**.
