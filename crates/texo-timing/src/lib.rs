@@ -3,8 +3,7 @@
 //! Both early/minimum and late/maximum propagation are modeled so setup and
 //! hold checks can share one characterized target timing model.
 
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 
@@ -565,13 +564,9 @@ fn routed_net_delays(
             .copied()
             .ok_or(TimingError::MissingRoute(net_id))?;
         let driver_wire = bound_wire(&graph, &implementation.placement, net.driver, device)?;
-        let distances = route_distances(route, driver_wire, device, pip_delays)?;
         for &sink in &net.sinks {
             let sink_wire = bound_wire(&graph, &implementation.placement, sink, device)?;
-            let delay = distances
-                .get(&sink_wire)
-                .copied()
-                .ok_or(TimingError::UnreachableSink { net: net_id, sink })?;
+            let delay = route_arc_delay(route, net_id, sink, driver_wire, sink_wire, pip_delays)?;
             result.push(NetDelay {
                 net: net_id,
                 sink,
@@ -605,72 +600,30 @@ fn bound_wire(
     graph.bound_wire(pin, bel).map_err(TimingError::Model)
 }
 
-fn route_distances(
+fn route_arc_delay(
     route: &NetRoute,
+    net: NetId,
+    sink: CellPinId,
     source: WireId,
-    device: &Device,
+    sink_wire: WireId,
     pip_delays: &BTreeMap<PipId, DelayRange>,
-) -> Result<BTreeMap<WireId, DelayRange>, TimingError> {
-    if source.0 >= device.wires().len() {
-        return Err(TimingError::Model(ModelError::UnknownWire(source)));
-    }
-    let mut adjacency: BTreeMap<WireId, Vec<(WireId, DelayRange)>> = BTreeMap::new();
-    for &pip_id in &route.pips {
-        let pip = device
-            .pips()
-            .get(pip_id.0)
-            .ok_or(TimingError::UnknownRoutedPip(pip_id))?;
-        let delay = pip_delays
+) -> Result<DelayRange, TimingError> {
+    let arc = route
+        .arc(sink)
+        .filter(|arc| {
+            arc.wires.first().copied() == Some(source)
+                && arc.wires.last().copied() == Some(sink_wire)
+        })
+        .ok_or(TimingError::UnreachableSink { net, sink })?;
+    let mut delay = DelayRange::zero();
+    for &pip_id in &arc.pips {
+        let edge_delay = pip_delays
             .get(&pip_id)
             .copied()
             .ok_or(TimingError::MissingPipDelay(pip_id))?;
-        adjacency
-            .entry(pip.from())
-            .or_default()
-            .push((pip.to(), delay));
-        if pip.bidirectional() {
-            adjacency
-                .entry(pip.to())
-                .or_default()
-                .push((pip.from(), delay));
-        }
+        delay = delay.checked_add(edge_delay)?;
     }
-
-    let minimum = scalar_route_distances(source, &adjacency, |delay| delay.min_ps)?;
-    let maximum = scalar_route_distances(source, &adjacency, |delay| delay.max_ps)?;
-    Ok(minimum
-        .into_iter()
-        .filter_map(|(wire, min_ps)| {
-            maximum
-                .get(&wire)
-                .copied()
-                .map(|max_ps| (wire, DelayRange { min_ps, max_ps }))
-        })
-        .collect())
-}
-
-fn scalar_route_distances(
-    source: WireId,
-    adjacency: &BTreeMap<WireId, Vec<(WireId, DelayRange)>>,
-    select: impl Fn(DelayRange) -> u64,
-) -> Result<BTreeMap<WireId, u64>, TimingError> {
-    let mut distances = BTreeMap::from([(source, 0_u64)]);
-    let mut pending = BinaryHeap::from([Reverse((0_u64, source))]);
-    while let Some(Reverse((distance, wire))) = pending.pop() {
-        if distances.get(&wire).copied() != Some(distance) {
-            continue;
-        }
-        for &(next, edge_delay) in adjacency.get(&wire).map_or(&[][..], Vec::as_slice) {
-            let candidate = distance
-                .checked_add(select(edge_delay))
-                .ok_or(TimingError::DelayOverflow)?;
-            if distances.get(&next).is_none_or(|&known| candidate < known) {
-                distances.insert(next, candidate);
-                pending.push(Reverse((candidate, next)));
-            }
-        }
-    }
-    Ok(distances)
+    Ok(delay)
 }
 
 fn pin_arrivals(

@@ -445,6 +445,8 @@ impl TimingDrivenContext<'_> {
         let routing_weights = timing_net_weights(&initial_timing, self.timing_constraints);
         let mut routing_costs =
             ecp5_routing_costs(self.architecture, self.speed_grade, routing_weights)?;
+        routing_costs
+            .set_sink_criticalities(timing_arc_weights(&initial_timing, self.timing_constraints));
         let mut archive = vec![(initial_implementation, initial_timing)];
         let placement_refiner = PlacementRefiner::new(
             self.design,
@@ -775,6 +777,8 @@ impl TimingDrivenContext<'_> {
             )?;
             routing_costs
                 .set_net_criticalities(timing_net_weights(&seed.1, self.timing_constraints));
+            routing_costs
+                .set_sink_criticalities(timing_arc_weights(&seed.1, self.timing_constraints));
             routing_costs.set_sink_min_delays_ps(BTreeMap::new());
             routing_costs.set_detailed_timing_nets(detailed_nets);
             routing_costs.set_detailed_delay_quantum_ps(delay_quantum_ps);
@@ -867,6 +871,8 @@ impl TimingDrivenContext<'_> {
             progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
             routing_costs
                 .set_net_criticalities(timing_net_weights(&seed.1, self.timing_constraints));
+            routing_costs
+                .set_sink_criticalities(timing_arc_weights(&seed.1, self.timing_constraints));
             routing_costs.set_sink_min_delays_ps(BTreeMap::new());
             let trial =
                 match self.route_and_analyze(kicked, &routing, Some(routing_costs), progress) {
@@ -911,6 +917,7 @@ impl TimingDrivenContext<'_> {
             &repair_sinks,
         )?;
         routing_costs.set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
+        routing_costs.set_sink_criticalities(timing_arc_weights(timing, self.timing_constraints));
         routing_costs.set_sink_min_delays_ps(minimums);
         match self.route_and_analyze(
             implementation.placement.clone(),
@@ -970,6 +977,7 @@ impl TimingDrivenContext<'_> {
             &released,
         );
         routing_costs.set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
+        routing_costs.set_sink_criticalities(timing_arc_weights(timing, self.timing_constraints));
         routing_costs.set_sink_min_delays_ps(BTreeMap::new());
         self.route_and_analyze(
             refined_placement,
@@ -1041,6 +1049,8 @@ impl TimingDrivenContext<'_> {
                 freeze_unchanged_routes(self.design, implementation, &placement, &base, &released);
             routing_costs
                 .set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
+            routing_costs
+                .set_sink_criticalities(timing_arc_weights(timing, self.timing_constraints));
             routing_costs.set_sink_min_delays_ps(BTreeMap::new());
             if let Ok(candidate) =
                 self.route_and_analyze(placement, &frozen, Some(routing_costs), progress)
@@ -1103,7 +1113,7 @@ impl TimingDrivenContext<'_> {
             .iter()
             .map(|(net, _, sink)| (*net, *sink))
             .collect::<BTreeSet<_>>();
-        let released = release_entire_nets(self.design, &critical_sinks);
+        let released = critical_sinks;
         let prescreen_weights = timing_net_weights(timing, self.timing_constraints);
         let mut placement = implementation.placement.clone();
         let mut candidates = Vec::new();
@@ -1148,6 +1158,8 @@ impl TimingDrivenContext<'_> {
                 );
                 routing_costs
                     .set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
+                routing_costs
+                    .set_sink_criticalities(timing_arc_weights(timing, self.timing_constraints));
                 routing_costs.set_sink_min_delays_ps(BTreeMap::new());
                 routing_costs.set_detailed_timing_nets(released_net_ids(&released));
                 // Measured: the finest quantum left WNS and hold untouched while slowing
@@ -1470,6 +1482,30 @@ fn timing_net_weights(
     weights
 }
 
+fn timing_arc_weights(
+    timing: &TimingReport,
+    constraints: &TimingConstraints,
+) -> BTreeMap<(NetId, CellPinId), u64> {
+    let Some(period_ps) = constraints.clock_periods_ps().values().copied().min() else {
+        return BTreeMap::new();
+    };
+    let Some(worst_slack_ps) = timing.worst_slack_ps else {
+        return BTreeMap::new();
+    };
+    let period_ps = i128::from(period_ps.max(1));
+    let critical_limit = worst_slack_ps + period_ps;
+    let mut weights = BTreeMap::<(NetId, CellPinId), u64>::new();
+    for edge in &timing.net_setup_slacks {
+        let urgency = (critical_limit - edge.slack_ps).clamp(0, period_ps);
+        let weight = criticality_weight(urgency, period_ps);
+        weights
+            .entry((edge.net, edge.sink))
+            .and_modify(|known| *known = (*known).max(weight))
+            .or_insert(weight);
+    }
+    weights
+}
+
 fn timing_placement_weights(
     timing: &TimingReport,
     constraints: &TimingConstraints,
@@ -1572,7 +1608,7 @@ fn released_timing_sinks(
         .filter_map(|(net, weight)| (weight > 1).then_some((Reverse(weight), net)))
         .collect::<Vec<_>>();
     ranked.sort_unstable();
-    let released = ranked
+    ranked
         .into_iter()
         .take(MAX_RELEASED_CRITICAL_NETS)
         .flat_map(|(_, net)| {
@@ -1581,40 +1617,11 @@ fn released_timing_sinks(
                 .iter()
                 .filter_map(move |edge| (edge.net == net).then_some((net, edge.sink)))
         })
-        .collect::<BTreeSet<_>>();
-    release_entire_nets_from_timing(timing, &released)
-}
-
-fn release_entire_nets_from_timing(
-    timing: &TimingReport,
-    released: &BTreeSet<(NetId, CellPinId)>,
-) -> BTreeSet<(NetId, CellPinId)> {
-    let nets = released_net_ids(released);
-    timing
-        .net_delays
-        .iter()
-        .filter_map(|edge| nets.contains(&edge.net).then_some((edge.net, edge.sink)))
         .collect()
 }
 
 fn released_net_ids(released: &BTreeSet<(NetId, CellPinId)>) -> BTreeSet<NetId> {
     released.iter().map(|(net, _)| *net).collect()
-}
-
-fn release_entire_nets(
-    design: &Design,
-    released: &BTreeSet<(NetId, CellPinId)>,
-) -> BTreeSet<(NetId, CellPinId)> {
-    released_net_ids(released)
-        .into_iter()
-        .flat_map(|net| {
-            design.nets()[net.0]
-                .sinks
-                .iter()
-                .copied()
-                .map(move |sink| (net, sink))
-        })
-        .collect()
 }
 
 fn freeze_unchanged_routes(
@@ -1634,17 +1641,54 @@ fn freeze_unchanged_routes(
         .collect::<BTreeSet<_>>();
     let mut frozen = base.clone();
     for route in &implementation.routes {
-        if base.routes().contains_key(&route.net)
-            || released.iter().any(|(net, _)| *net == route.net)
-        {
+        if base.routes().contains_key(&route.net) {
             continue;
         }
         let net = &design.nets()[route.net.0];
-        let touches_moved_cell = std::iter::once(net.driver)
-            .chain(net.sinks.iter().copied())
-            .any(|pin| moved.contains(&design.pins()[pin.0].cell));
-        if !touches_moved_cell {
-            frozen.add_route(route.clone());
+        if moved.contains(&design.pins()[net.driver.0].cell) {
+            continue;
+        }
+        let mut released_sinks = route
+            .arcs
+            .iter()
+            .filter_map(|arc| {
+                arc.sink.filter(|&sink| {
+                    released.contains(&(route.net, sink))
+                        || moved.contains(&design.pins()[sink.0].cell)
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        loop {
+            let released_pips = route
+                .arcs
+                .iter()
+                .filter(|arc| arc.sink.is_some_and(|sink| released_sinks.contains(&sink)))
+                .flat_map(|arc| arc.pips.iter().copied())
+                .collect::<BTreeSet<_>>();
+            let coupled = route
+                .arcs
+                .iter()
+                .filter_map(|arc| {
+                    arc.sink.filter(|sink| {
+                        !released_sinks.contains(sink)
+                            && arc.pips.iter().any(|pip| released_pips.contains(pip))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let before = released_sinks.len();
+            released_sinks.extend(coupled);
+            if released_sinks.len() == before {
+                break;
+            }
+        }
+        let retained = route
+            .arcs
+            .iter()
+            .filter(|arc| arc.sink.is_none_or(|sink| !released_sinks.contains(&sink)))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !retained.is_empty() {
+            frozen.add_route(NetRoute::new(route.net, retained));
         }
     }
     frozen
@@ -1845,7 +1889,7 @@ fn ecp5_pip_delays(
     let selected = implementation
         .routes
         .iter()
-        .flat_map(|route| route.pips.iter().copied())
+        .flat_map(NetRoute::pips)
         .collect::<BTreeSet<_>>();
     let mut source_fanout = BTreeMap::new();
     for &pip_id in &selected {

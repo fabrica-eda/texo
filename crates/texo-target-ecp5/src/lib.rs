@@ -1142,11 +1142,15 @@ impl Ecp5Packing {
                         .map_err(|reason| global_route_error(net, reason))?;
                 }
             }
-            constraints.add_route(NetRoute {
-                net: clock.global_net,
-                wires: wires.into_iter().collect(),
-                pips: pips.into_iter().collect(),
-            });
+            let sinks = net
+                .sinks
+                .iter()
+                .copied()
+                .map(|sink| Ok((sink, placed_pin_wire(&graph, placement, sink)?)))
+                .collect::<Result<Vec<_>, PackingError>>()?;
+            let route = NetRoute::from_tree(clock.global_net, source, sinks, pips, device)
+                .map_err(|reason| global_route_error(net, reason))?;
+            constraints.add_route(route);
         }
         Ok(constraints)
     }

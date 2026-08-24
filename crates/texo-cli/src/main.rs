@@ -809,13 +809,11 @@ fn checkpoint_routes(result: &Ecp5FlowResult, architecture: &Ecp5Architecture) -
                 .expect("a routed net driver has a physical BEL pin");
             let driver_wire = device.bel_pins()[driver_bel_pin.0].wire;
             let wires = route
-                .wires
-                .iter()
+                .wires()
                 .map(|wire| json!({ "wire_id": wire.0, "wire": device.wires()[wire.0].name }))
                 .collect::<Vec<_>>();
             let pips = route
-                .pips
-                .iter()
+                .pips()
                 .map(|pip_id| {
                     let pip = &device.pips()[pip_id.0];
                     json!({
@@ -825,7 +823,7 @@ fn checkpoint_routes(result: &Ecp5FlowResult, architecture: &Ecp5Architecture) -
                         "to_wire_id": pip.to().0,
                         "to": device.wires()[pip.to().0].name,
                         "bidirectional": pip.bidirectional(),
-                        "fixed": architecture.pip_metadata(*pip_id).fixed,
+                        "fixed": architecture.pip_metadata(pip_id).fixed,
                     })
                 })
                 .collect::<Vec<_>>();

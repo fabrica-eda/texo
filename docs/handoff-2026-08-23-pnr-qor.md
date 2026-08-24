@@ -7,6 +7,38 @@ Close the Fmax gap between Texo and nextpnr on the AXI4 self-test design
 and deterministic. All numbers below are from this machine; treat them as
 relative indicators, not absolute claims.
 
+## 2026-08-24 arc-owned routing redesign
+
+The aggregate `NetRoute { wires, pips }` representation was replaced outright
+with ordered driver-to-sink `RouteArc`s. Compatibility was intentionally not
+preserved. `NetRoute` now derives sorted wire/PIP reference counts from its
+arcs, so removing one sink decrements shared resources and releases them only
+when their last arc reference disappears.
+
+Negotiated routing now builds sparse wire/PIP reverse-owner indexes for
+overused resources. Capacity arbitration ranks the actual owner arcs by
+per-sink timing criticality, keeps locked architecture arcs, and requeues only
+the lower-criticality conflicting arcs. If a released arc shares a PIP trunk
+with sibling arcs of the same net, those structurally coupled siblings are
+released transitively; otherwise the rest of the net stays bound. STA no
+longer reconstructs sink paths from an aggregate undirected tree and instead
+sums each canonical ordered arc directly.
+
+Measured on the same 300 MHz AXI4 benchmark:
+
+| router | runtime | setup WNS | hold WHS | PIPs |
+|---|---:|---:|---:|---:|
+| aggregate-tree baseline (`103ad88`) | 124.46 s | -277 ps | -381 ps | 29,488 |
+| strict conflicting-arc-only | 51.24 s | -496 ps | -300 ps | 29,656 |
+| arc owner + shared-PIP coupled victims | 102.28 s | **-266 ps** | -533 ps | 29,651 |
+
+The strict branch-only policy proves that arc ownership removes most of the
+runtime, but freezing a sibling's shared parent trunk can trap the critical arc
+on a slow topology. Releasing only the transitive shared-PIP component recovers
+setup QoR while remaining about 18% faster than the aggregate-tree baseline.
+Hold QoR regressed and remains separate follow-up work; the flow currently
+gates hold repair on setup closure.
+
 ## Benchmark environment
 
 ```sh

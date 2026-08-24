@@ -53,6 +53,7 @@ pub struct RoutingCosts {
     pip_min_delays_ps: Vec<u32>,
     net_criticalities: BTreeMap<NetId, u64>,
     sink_min_delays_ps: BTreeMap<(NetId, CellPinId), u64>,
+    sink_criticalities: BTreeMap<(NetId, CellPinId), u64>,
     detailed_timing_nets: BTreeSet<NetId>,
     detailed_delay_quantum_ps: u64,
 }
@@ -66,6 +67,7 @@ impl RoutingCosts {
             pip_delays_ps,
             net_criticalities,
             sink_min_delays_ps: BTreeMap::new(),
+            sink_criticalities: BTreeMap::new(),
             detailed_timing_nets: BTreeSet::new(),
             detailed_delay_quantum_ps: 1,
         }
@@ -111,6 +113,20 @@ impl RoutingCosts {
     #[must_use]
     pub const fn sink_min_delays_ps(&self) -> &BTreeMap<(NetId, CellPinId), u64> {
         &self.sink_min_delays_ps
+    }
+
+    /// Replaces setup criticalities for individual driver-to-sink arcs.
+    pub fn set_sink_criticalities(
+        &mut self,
+        sink_criticalities: BTreeMap<(NetId, CellPinId), u64>,
+    ) {
+        self.sink_criticalities = sink_criticalities;
+    }
+
+    /// Setup criticalities for individual driver-to-sink arcs.
+    #[must_use]
+    pub const fn sink_criticalities(&self) -> &BTreeMap<(NetId, CellPinId), u64> {
+        &self.sink_criticalities
     }
 
     /// Replaces the nets routed with exact picosecond delay resolution.
@@ -257,15 +273,183 @@ impl Placement {
     }
 }
 
-/// Routed tree for one logical net.
+/// One ordered driver-to-endpoint route.
+///
+/// Logical sink arcs carry `Some(sink)`. `None` is reserved for immutable
+/// architecture topology, such as an enabled global-clock quadrant with no
+/// logical sink at its leaf.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteArc {
+    /// Logical sink reached by this arc, when it represents a design edge.
+    pub sink: Option<CellPinId>,
+    /// Wires ordered from the placed driver to the endpoint.
+    pub wires: Vec<WireId>,
+    /// PIPs ordered from the placed driver to the endpoint. PIP `i` connects
+    /// `wires[i]` to `wires[i + 1]`.
+    pub pips: Vec<PipId>,
+}
+
+/// Per-sink routes and shared-resource reference counts for one logical net.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetRoute {
-    /// Logical net represented by this tree.
+    /// Logical net represented by these arcs.
     pub net: NetId,
-    /// Occupied routing wires in stable ID order.
-    pub wires: Vec<WireId>,
-    /// Enabled programmable interconnect points in stable ID order.
-    pub pips: Vec<PipId>,
+    /// Canonical driver-to-endpoint arcs, ordered by logical sink then path.
+    pub arcs: Vec<RouteArc>,
+    wire_refs: Vec<(WireId, u32)>,
+    pip_refs: Vec<(PipId, u32)>,
+}
+
+impl NetRoute {
+    /// Builds a route and derives its shared-resource reference counts.
+    #[must_use]
+    pub fn new(net: NetId, mut arcs: Vec<RouteArc>) -> Self {
+        arcs.sort_by(|left, right| {
+            (left.sink, &left.wires, &left.pips).cmp(&(right.sink, &right.wires, &right.pips))
+        });
+        let mut wire_refs = BTreeMap::<WireId, u32>::new();
+        let mut pip_refs = BTreeMap::<PipId, u32>::new();
+        for arc in &arcs {
+            for &wire in &arc.wires {
+                *wire_refs.entry(wire).or_default() += 1;
+            }
+            for &pip in &arc.pips {
+                *pip_refs.entry(pip).or_default() += 1;
+            }
+        }
+        Self {
+            net,
+            arcs,
+            wire_refs: wire_refs.into_iter().collect(),
+            pip_refs: pip_refs.into_iter().collect(),
+        }
+    }
+
+    /// Decomposes a driver-rooted physical tree into canonical endpoint arcs.
+    /// Extra leaves are retained as architecture topology arcs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a topology description when a PIP is unknown, the selected
+    /// resources are not one driver-rooted tree, or a sink is disconnected.
+    pub fn from_tree(
+        net: NetId,
+        driver: WireId,
+        sinks: impl IntoIterator<Item = (CellPinId, WireId)>,
+        pips: impl IntoIterator<Item = PipId>,
+        device: &Device,
+    ) -> Result<Self, String> {
+        let pips = pips.into_iter().collect::<BTreeSet<_>>();
+        let mut adjacent = BTreeMap::<WireId, Vec<(WireId, PipId)>>::new();
+        for &pip_id in &pips {
+            let pip = device
+                .pips()
+                .get(pip_id.0)
+                .ok_or_else(|| format!("unknown PIP {pip_id:?}"))?;
+            adjacent
+                .entry(pip.from())
+                .or_default()
+                .push((pip.to(), pip_id));
+            if pip.bidirectional() {
+                adjacent
+                    .entry(pip.to())
+                    .or_default()
+                    .push((pip.from(), pip_id));
+            }
+        }
+        let mut parent = BTreeMap::<WireId, (WireId, PipId)>::new();
+        let mut reached_pips = BTreeSet::new();
+        let mut children = BTreeMap::<WireId, usize>::new();
+        let mut visited = BTreeSet::from([driver]);
+        let mut pending = vec![driver];
+        while let Some(wire) = pending.pop() {
+            for &(next, pip) in adjacent.get(&wire).map_or(&[][..], Vec::as_slice) {
+                if visited.insert(next) {
+                    parent.insert(next, (wire, pip));
+                    reached_pips.insert(pip);
+                    *children.entry(wire).or_default() += 1;
+                    pending.push(next);
+                }
+            }
+        }
+        if reached_pips != pips {
+            return Err("physical route is not one driver-rooted tree".into());
+        }
+
+        let sinks = sinks.into_iter().collect::<Vec<_>>();
+        let sink_wires = sinks.iter().map(|&(_, wire)| wire).collect::<BTreeSet<_>>();
+        let mut arcs = Vec::new();
+        for (sink, sink_wire) in sinks {
+            arcs.push(
+                reconstruct_endpoint_arc(Some(sink), driver, sink_wire, &parent)
+                    .ok_or_else(|| format!("sink pin {} is disconnected", sink.0))?,
+            );
+        }
+        for &leaf in visited
+            .iter()
+            .filter(|wire| !children.contains_key(wire) && !sink_wires.contains(wire))
+        {
+            arcs.push(
+                reconstruct_endpoint_arc(None, driver, leaf, &parent)
+                    .ok_or_else(|| "topology leaf is disconnected".to_owned())?,
+            );
+        }
+        Ok(Self::new(net, arcs))
+    }
+
+    /// Unique occupied wires in stable ID order.
+    #[must_use]
+    pub fn wires(&self) -> impl ExactSizeIterator<Item = WireId> + '_ {
+        self.wire_refs.iter().map(|&(wire, _)| wire)
+    }
+
+    /// Unique enabled PIPs in stable ID order.
+    #[must_use]
+    pub fn pips(&self) -> impl ExactSizeIterator<Item = PipId> + '_ {
+        self.pip_refs.iter().map(|&(pip, _)| pip)
+    }
+
+    /// Number of arcs sharing `wire` inside this net.
+    #[must_use]
+    pub fn wire_ref_count(&self, wire: WireId) -> u32 {
+        self.wire_refs
+            .binary_search_by_key(&wire, |&(candidate, _)| candidate)
+            .map_or(0, |index| self.wire_refs[index].1)
+    }
+
+    /// Number of arcs sharing `pip` inside this net.
+    #[must_use]
+    pub fn pip_ref_count(&self, pip: PipId) -> u32 {
+        self.pip_refs
+            .binary_search_by_key(&pip, |&(candidate, _)| candidate)
+            .map_or(0, |index| self.pip_refs[index].1)
+    }
+
+    /// Finds the route arc for one logical sink.
+    #[must_use]
+    pub fn arc(&self, sink: CellPinId) -> Option<&RouteArc> {
+        self.arcs.iter().find(|arc| arc.sink == Some(sink))
+    }
+}
+
+fn reconstruct_endpoint_arc(
+    sink: Option<CellPinId>,
+    driver: WireId,
+    endpoint: WireId,
+    parent: &BTreeMap<WireId, (WireId, PipId)>,
+) -> Option<RouteArc> {
+    let mut wires = vec![endpoint];
+    let mut pips = Vec::new();
+    let mut cursor = endpoint;
+    while cursor != driver {
+        let &(previous, pip) = parent.get(&cursor)?;
+        pips.push(pip);
+        wires.push(previous);
+        cursor = previous;
+    }
+    wires.reverse();
+    pips.reverse();
+    Some(RouteArc { sink, wires, pips })
 }
 
 /// Complete result of the reference `PnR` engine.
@@ -383,88 +567,32 @@ pub fn retain_route_for_sinks(
             reason: format!("pin {} is not a sink of the routed net", sink.0),
         });
     }
-    let driver_cell = design.pins()[net.driver.0].cell;
-    let driver_bel = placement
-        .bel(driver_cell)
-        .ok_or(PnrError::MissingPlacement { cell: driver_cell })?;
-    let driver_wire = bound_wire(&graph, placement, net.driver, driver_bel)?;
-    let route_wires = route.wires.iter().copied().collect::<BTreeSet<_>>();
-    if !route_wires.contains(&driver_wire) {
-        return Err(PnrError::InvalidRoutingConstraint {
-            net: route.net,
-            reason: "route does not contain its placed driver wire".into(),
-        });
-    }
-
-    let mut adjacent = BTreeMap::<WireId, Vec<(WireId, PipId)>>::new();
-    for &pip_id in &route.pips {
-        let pip =
-            device
-                .pips()
-                .get(pip_id.0)
-                .ok_or_else(|| PnrError::InvalidRoutingConstraint {
-                    net: route.net,
-                    reason: format!("unknown PIP {pip_id:?}"),
-                })?;
-        adjacent
-            .entry(pip.from())
-            .or_default()
-            .push((pip.to(), pip_id));
-        adjacent
-            .entry(pip.to())
-            .or_default()
-            .push((pip.from(), pip_id));
-    }
-    let mut parent = BTreeMap::<WireId, (WireId, PipId)>::new();
-    let mut visited = BTreeSet::from([driver_wire]);
-    let mut pending = vec![driver_wire];
-    while let Some(wire) = pending.pop() {
-        for &(next, pip) in adjacent.get(&wire).map_or(&[][..], Vec::as_slice) {
-            if visited.insert(next) {
-                parent.insert(next, (wire, pip));
-                pending.push(next);
-            }
-        }
-    }
-    if visited != route_wires || route.pips.len().saturating_add(1) != route.wires.len() {
-        return Err(PnrError::InvalidRoutingConstraint {
-            net: route.net,
-            reason: "route is not one connected tree rooted at its driver".into(),
-        });
-    }
-
-    let mut retained_wires = BTreeSet::from([driver_wire]);
-    let mut retained_pips = BTreeSet::new();
     for &sink in sinks {
         let sink_cell = design.pins()[sink.0].cell;
         let sink_bel = placement
             .bel(sink_cell)
             .ok_or(PnrError::MissingPlacement { cell: sink_cell })?;
-        let mut wire = bound_wire(&graph, placement, sink, sink_bel)?;
-        if !route_wires.contains(&wire) {
+        let sink_wire = bound_wire(&graph, placement, sink, sink_bel)?;
+        let Some(arc) = route.arc(sink) else {
             return Err(PnrError::InvalidRoutingConstraint {
                 net: route.net,
                 reason: format!("route does not reach retained sink pin {}", sink.0),
             });
-        }
-        while wire != driver_wire {
-            let &(previous, pip) =
-                parent
-                    .get(&wire)
-                    .ok_or_else(|| PnrError::InvalidRoutingConstraint {
-                        net: route.net,
-                        reason: format!("retained sink pin {} is disconnected", sink.0),
-                    })?;
-            retained_wires.insert(wire);
-            retained_pips.insert(pip);
-            wire = previous;
+        };
+        if arc.wires.last().copied() != Some(sink_wire) {
+            return Err(PnrError::InvalidRoutingConstraint {
+                net: route.net,
+                reason: format!("route arc for sink pin {} ends on another wire", sink.0),
+            });
         }
     }
-    Ok(Some(NetRoute {
-        net: route.net,
-        wires: retained_wires.into_iter().collect(),
-        pips: retained_pips.into_iter().collect(),
-    }))
+    let arcs = route
+        .arcs
+        .iter()
+        .filter(|arc| arc.sink.is_none_or(|sink| sinks.contains(&sink)))
+        .cloned()
+        .collect();
+    Ok(Some(NetRoute::new(route.net, arcs)))
 }
 
 /// Deterministic progress event from negotiated routing.
@@ -679,15 +807,15 @@ fn finish_routing_with_workspace(
         progress,
     )?;
     for route in &routes {
-        if route.pips.len().saturating_add(1) != route.wires.len() {
+        if route.pips().len().saturating_add(1) != route.wires().len() {
             return Err(PnrError::RouteIsNotTree {
                 net: route.net,
-                wires: route.wires.len(),
-                pips: route.pips.len(),
+                wires: route.wires().len(),
+                pips: route.pips().len(),
             });
         }
     }
-    let total_pips = routes.iter().map(|route| route.pips.len()).sum();
+    let total_pips = routes.iter().map(|route| route.pips().len()).sum();
     Ok(PnrResult {
         placement,
         routes,
@@ -2832,77 +2960,78 @@ fn validate_routing_constraints(
                 reason: "route key and route net differ".into(),
             });
         }
-        let wires = route.wires.iter().copied().collect::<BTreeSet<_>>();
-        if wires.len() != route.wires.len() {
-            return Err(PnrError::InvalidRoutingConstraint {
-                net: net_id,
-                reason: "wire list contains duplicates".into(),
-            });
-        }
-        if route.pips.iter().copied().collect::<BTreeSet<_>>().len() != route.pips.len() {
-            return Err(PnrError::InvalidRoutingConstraint {
-                net: net_id,
-                reason: "PIP list contains duplicates".into(),
-            });
-        }
-        for &wire in &route.wires {
-            if wire.0 >= device.wires().len() {
-                return Err(PnrError::InvalidRoutingConstraint {
-                    net: net_id,
-                    reason: format!("unknown wire {wire:?}"),
-                });
-            }
-        }
-        for &pip in &route.pips {
-            let Some(pip_data) = device.pips().get(pip.0) else {
-                return Err(PnrError::InvalidRoutingConstraint {
-                    net: net_id,
-                    reason: format!("unknown PIP {pip:?}"),
-                });
-            };
-            if !wires.contains(&pip_data.from()) || !wires.contains(&pip_data.to()) {
-                return Err(PnrError::InvalidRoutingConstraint {
-                    net: net_id,
-                    reason: format!("PIP {pip:?} has an endpoint outside the locked tree"),
-                });
-            }
-        }
         let driver_cell = design.pins()[net.driver.0].cell;
         let driver_bel = placement
             .bel(driver_cell)
             .ok_or(PnrError::MissingPlacement { cell: driver_cell })?;
         let driver_wire = bound_wire(graph, placement, net.driver, driver_bel)?;
-        if !wires.contains(&driver_wire) {
+        let rebuilt = NetRoute::new(net_id, route.arcs.clone());
+        if rebuilt.wire_refs != route.wire_refs || rebuilt.pip_refs != route.pip_refs {
             return Err(PnrError::InvalidRoutingConstraint {
                 net: net_id,
-                reason: "locked tree does not contain the placed driver wire".into(),
+                reason: "route resource reference counts are stale".into(),
             });
         }
-        let mut outgoing = BTreeMap::<WireId, Vec<WireId>>::new();
-        for &pip in &route.pips {
-            let pip = &device.pips()[pip.0];
-            outgoing.entry(pip.from()).or_default().push(pip.to());
-            if pip.bidirectional() {
-                outgoing.entry(pip.to()).or_default().push(pip.from());
+        let mut routed_sinks = BTreeSet::new();
+        for arc in &route.arcs {
+            if arc.wires.first().copied() != Some(driver_wire) {
+                return Err(PnrError::InvalidRoutingConstraint {
+                    net: net_id,
+                    reason: "route arc does not start at the placed driver wire".into(),
+                });
             }
-        }
-        let mut reachable = BTreeSet::from([driver_wire]);
-        let mut pending = vec![driver_wire];
-        while let Some(wire) = pending.pop() {
-            for &next in outgoing.get(&wire).map_or(&[][..], Vec::as_slice) {
-                if reachable.insert(next) {
-                    pending.push(next);
+            if arc.pips.len().saturating_add(1) != arc.wires.len() {
+                return Err(PnrError::InvalidRoutingConstraint {
+                    net: net_id,
+                    reason: "route arc does not have one PIP between each wire".into(),
+                });
+            }
+            if arc.wires.iter().copied().collect::<BTreeSet<_>>().len() != arc.wires.len() {
+                return Err(PnrError::InvalidRoutingConstraint {
+                    net: net_id,
+                    reason: "route arc contains a cycle".into(),
+                });
+            }
+            for ((&from, &to), &pip_id) in arc
+                .wires
+                .iter()
+                .zip(arc.wires.iter().skip(1))
+                .zip(&arc.pips)
+            {
+                let Some(pip) = device.pips().get(pip_id.0) else {
+                    return Err(PnrError::InvalidRoutingConstraint {
+                        net: net_id,
+                        reason: format!("unknown PIP {pip_id:?}"),
+                    });
+                };
+                if !((pip.from() == from && pip.to() == to)
+                    || (pip.bidirectional() && pip.from() == to && pip.to() == from))
+                {
+                    return Err(PnrError::InvalidRoutingConstraint {
+                        net: net_id,
+                        reason: format!("PIP {pip_id:?} does not connect its adjacent arc wires"),
+                    });
                 }
             }
-        }
-        if reachable != wires {
-            return Err(PnrError::InvalidRoutingConstraint {
-                net: net_id,
-                reason: format!(
-                    "locked tree has {} wires disconnected from its driver",
-                    wires.len() - reachable.len()
-                ),
-            });
+            if let Some(sink) = arc.sink {
+                if !net.sinks.contains(&sink) || !routed_sinks.insert(sink) {
+                    return Err(PnrError::InvalidRoutingConstraint {
+                        net: net_id,
+                        reason: format!("sink pin {} is unknown or has multiple arcs", sink.0),
+                    });
+                }
+                let sink_cell = design.pins()[sink.0].cell;
+                let sink_bel = placement
+                    .bel(sink_cell)
+                    .ok_or(PnrError::MissingPlacement { cell: sink_cell })?;
+                if arc.wires.last().copied() != Some(bound_wire(graph, placement, sink, sink_bel)?)
+                {
+                    return Err(PnrError::InvalidRoutingConstraint {
+                        net: net_id,
+                        reason: format!("route arc ends away from sink pin {}", sink.0),
+                    });
+                }
+            }
         }
     }
     Ok(())
@@ -2942,6 +3071,26 @@ fn validate_routing_costs(
         if !(1..=64).contains(&criticality) {
             return Err(PnrError::InvalidRoutingCosts {
                 reason: format!("net {} criticality {criticality} is outside 1..=64", net.0),
+            });
+        }
+    }
+    for (&(net, sink), &criticality) in &costs.sink_criticalities {
+        let Some(net_data) = graph.design().nets().get(net.0) else {
+            return Err(PnrError::InvalidRoutingCosts {
+                reason: format!("arc criticality names unknown net {}", net.0),
+            });
+        };
+        if !net_data.sinks.contains(&sink) {
+            return Err(PnrError::InvalidRoutingCosts {
+                reason: format!("pin {} is not a sink of net {}", sink.0, net.0),
+            });
+        }
+        if !(1..=64).contains(&criticality) {
+            return Err(PnrError::InvalidRoutingCosts {
+                reason: format!(
+                    "net {} sink {} criticality {criticality} is outside 1..=64",
+                    net.0, sink.0
+                ),
             });
         }
     }
@@ -3020,6 +3169,7 @@ impl PinWireCache {
     }
 }
 
+#[cfg(test)]
 fn route_reaches_all_sinks(
     graph: &UnifiedGraph<'_>,
     placement: &Placement,
@@ -3027,13 +3177,16 @@ fn route_reaches_all_sinks(
     route: &NetRoute,
 ) -> Result<bool, PnrError> {
     let net = &graph.design().nets()[route.net.0];
-    let wires = route.wires.iter().copied().collect::<BTreeSet<_>>();
     for &sink in &net.sinks {
         let cell = graph.design().pins()[sink.0].cell;
         let bel = placement
             .bel(cell)
             .ok_or(PnrError::MissingPlacement { cell })?;
-        if !wires.contains(&pin_wires.resolve(graph, placement, sink, bel)?) {
+        let sink_wire = pin_wires.resolve(graph, placement, sink, bel)?;
+        if route
+            .arc(sink)
+            .is_none_or(|arc| arc.wires.last().copied() != Some(sink_wire))
+        {
             return Ok(false);
         }
     }
@@ -3063,7 +3216,7 @@ fn route(
     let mut routes = vec![None; design.nets().len()];
     for (&net, route) in constraints.routes() {
         routes[net.0] = Some(route.clone());
-        for &wire in &route.wires {
+        for wire in route.wires() {
             increment_occupancy(wire_occupancy, &mut workspace.touched_wires, wire.0);
             track_entry(
                 &mut overuse.wires,
@@ -3072,7 +3225,7 @@ fn route(
                 wire.0,
             );
         }
-        for &pip in &route.pips {
+        for pip in route.pips() {
             increment_occupancy(pip_occupancy, &mut workspace.touched_pips, pip.0);
             track_entry(
                 &mut overuse.pips,
@@ -3085,15 +3238,13 @@ fn route(
     let pin_wires = PinWireCache::build(graph, placement);
     let mut routing_order = routing_order(design, constraints, costs);
     routing_order.sort_unstable();
-    let mut dirty = BTreeSet::new();
-    for index in 0..design.nets().len() {
-        let complete = if let Some(route) = constraints.routes().get(&NetId(index)) {
-            route_reaches_all_sinks(graph, placement, &pin_wires, route)?
-        } else {
-            false
-        };
-        if !complete {
-            dirty.insert(index);
+    let mut dirty = BTreeMap::<usize, BTreeSet<CellPinId>>::new();
+    for (index, (net, route)) in design.nets().iter().zip(&routes).enumerate() {
+        let route = route.as_ref();
+        for &sink in &net.sinks {
+            if route.is_none_or(|route| route.arc(sink).is_none()) {
+                dirty.entry(index).or_default().insert(sink);
+            }
         }
     }
     for iteration in 0..MAX_ROUTING_ITERATIONS {
@@ -3102,9 +3253,21 @@ fn route(
             iteration,
             nets: dirty.len(),
         });
-        for &index in &dirty {
+        for (&index, dirty_sinks) in &dirty {
             if let Some(previous) = routes[index].take() {
-                for &wire in &previous.wires {
+                let preserved = NetRoute::new(
+                    previous.net,
+                    previous
+                        .arcs
+                        .iter()
+                        .filter(|arc| arc.sink.is_none_or(|sink| !dirty_sinks.contains(&sink)))
+                        .cloned()
+                        .collect(),
+                );
+                for wire in previous
+                    .wires()
+                    .filter(|&wire| preserved.wire_ref_count(wire) == 0)
+                {
                     wire_occupancy[wire.0] -= 1;
                     track_entry(
                         &mut overuse.wires,
@@ -3113,7 +3276,10 @@ fn route(
                         wire.0,
                     );
                 }
-                for &pip in &previous.pips {
+                for pip in previous
+                    .pips()
+                    .filter(|&pip| preserved.pip_ref_count(pip) == 0)
+                {
                     pip_occupancy[pip.0] -= 1;
                     track_entry(
                         &mut overuse.pips,
@@ -3122,11 +3288,12 @@ fn route(
                         pip.0,
                     );
                 }
+                routes[index] = Some(preserved);
             }
         }
         let mut ordinal = 0;
         for &(_, index) in &routing_order {
-            if !dirty.contains(&index) {
+            if !dirty.contains_key(&index) {
                 continue;
             }
             ordinal += 1;
@@ -3137,11 +3304,12 @@ fn route(
                 net: NetId(index),
             });
             let net_id = NetId(index);
+            let preserved = routes[index].take();
             let route = route_net(
                 graph,
                 placement,
                 &pin_wires,
-                constraints.routes().get(&net_id),
+                preserved.as_ref(),
                 net_id,
                 wire_occupancy,
                 pip_occupancy,
@@ -3153,7 +3321,11 @@ fn route(
                 &mut workspace.tree_arrival_ps,
                 metadata,
             )?;
-            for &wire in &route.wires {
+            for wire in route.wires().filter(|&wire| {
+                preserved
+                    .as_ref()
+                    .is_none_or(|old| old.wire_ref_count(wire) == 0)
+            }) {
                 increment_occupancy(wire_occupancy, &mut workspace.touched_wires, wire.0);
                 track_entry(
                     &mut overuse.wires,
@@ -3162,7 +3334,11 @@ fn route(
                     wire.0,
                 );
             }
-            for &pip in &route.pips {
+            for pip in route.pips().filter(|&pip| {
+                preserved
+                    .as_ref()
+                    .is_none_or(|old| old.pip_ref_count(pip) == 0)
+            }) {
                 increment_occupancy(pip_occupancy, &mut workspace.touched_pips, pip.0);
                 track_entry(
                     &mut overuse.pips,
@@ -3193,7 +3369,14 @@ fn route(
                 .map(|route| route.expect("every net was routed in this iteration"))
                 .collect());
         }
-        dirty = congested_routes(metadata, &routes, wire_occupancy, pip_occupancy);
+        dirty = congested_route_arcs(
+            metadata,
+            &routes,
+            constraints,
+            costs,
+            wire_occupancy,
+            pip_occupancy,
+        );
     }
 
     Err(PnrError::CongestionNotResolved {
@@ -3263,30 +3446,120 @@ fn routing_order_key(
     )
 }
 
-fn congested_routes(
+#[derive(Default)]
+struct ArcOwnerIndex {
+    wires: HashMap<WireId, BTreeMap<NetId, BTreeSet<Option<CellPinId>>>>,
+    pips: HashMap<PipId, BTreeMap<NetId, BTreeSet<Option<CellPinId>>>>,
+}
+
+impl ArcOwnerIndex {
+    fn build(
+        routes: &[Option<NetRoute>],
+        metadata: RoutingResourceMetadata<'_>,
+        wire_occupancy: &[u16],
+        pip_occupancy: &[u16],
+    ) -> Self {
+        let mut owners = Self::default();
+        for route in routes.iter().flatten() {
+            for arc in &route.arcs {
+                for &wire in &arc.wires {
+                    if wire_occupancy[wire.0] > metadata.wire_capacities[wire.0] {
+                        owners
+                            .wires
+                            .entry(wire)
+                            .or_default()
+                            .entry(route.net)
+                            .or_default()
+                            .insert(arc.sink);
+                    }
+                }
+                for &pip in &arc.pips {
+                    if pip_occupancy[pip.0] > metadata.pip_capacities[pip.0] {
+                        owners
+                            .pips
+                            .entry(pip)
+                            .or_default()
+                            .entry(route.net)
+                            .or_default()
+                            .insert(arc.sink);
+                    }
+                }
+            }
+        }
+        owners
+    }
+}
+
+fn congested_route_arcs(
     metadata: RoutingResourceMetadata<'_>,
     routes: &[Option<NetRoute>],
+    constraints: &RoutingConstraints,
+    costs: Option<&RoutingCosts>,
     wire_occupancy: &[u16],
     pip_occupancy: &[u16],
-) -> BTreeSet<usize> {
-    routes
+) -> BTreeMap<usize, BTreeSet<CellPinId>> {
+    let owners = ArcOwnerIndex::build(routes, metadata, wire_occupancy, pip_occupancy);
+    let mut dirty = BTreeMap::<usize, BTreeSet<CellPinId>>::new();
+    for (wire, resource_owners) in owners.wires {
+        select_arc_victims(
+            &resource_owners,
+            usize::from(metadata.wire_capacities[wire.0]),
+            constraints,
+            costs,
+            &mut dirty,
+        );
+    }
+    for (pip, resource_owners) in owners.pips {
+        select_arc_victims(
+            &resource_owners,
+            usize::from(metadata.pip_capacities[pip.0]),
+            constraints,
+            costs,
+            &mut dirty,
+        );
+    }
+    dirty
+}
+
+fn select_arc_victims(
+    owners: &BTreeMap<NetId, BTreeSet<Option<CellPinId>>>,
+    capacity: usize,
+    constraints: &RoutingConstraints,
+    costs: Option<&RoutingCosts>,
+    dirty: &mut BTreeMap<usize, BTreeSet<CellPinId>>,
+) {
+    if owners.len() <= capacity {
+        return;
+    }
+    let mut ranked = owners
         .iter()
-        .enumerate()
-        .filter_map(|(index, route)| {
-            let route = route
-                .as_ref()
-                .expect("every net was routed before congestion analysis");
-            (route
-                .wires
+        .map(|(&net, sinks)| {
+            let locked = sinks.iter().any(|sink| {
+                constraints
+                    .routes()
+                    .get(&net)
+                    .is_some_and(|route| route.arcs.iter().any(|arc| arc.sink == *sink))
+            });
+            let criticality = sinks
                 .iter()
-                .any(|wire| wire_occupancy[wire.0] > metadata.wire_capacities[wire.0])
-                || route
-                    .pips
-                    .iter()
-                    .any(|pip| pip_occupancy[pip.0] > metadata.pip_capacities[pip.0]))
-            .then_some(index)
+                .filter_map(|sink| sink.map(|sink| routing_arc_criticality(costs, net, sink)))
+                .max()
+                .unwrap_or(u64::MAX);
+            ((Reverse(locked), Reverse(criticality), net), net, sinks)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(key, _, _)| *key);
+    for &(_, net, sinks) in ranked.iter().skip(capacity) {
+        for &sink in sinks.iter().flatten() {
+            if constraints
+                .routes()
+                .get(&net)
+                .is_none_or(|route| route.arc(sink).is_none())
+            {
+                dirty.entry(net.0).or_default().insert(sink);
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -3314,12 +3587,20 @@ fn route_net(
         .bel(driver_cell)
         .ok_or(PnrError::MissingPlacement { cell: driver_cell })?;
     let driver_wire = pin_wires.resolve(graph, placement, net.driver, driver_bel)?;
-    let mut tree_wires =
-        fixed.map_or_else(BTreeSet::new, |route| route.wires.iter().copied().collect());
+    let mut arcs = fixed.map_or_else(Vec::new, |route| route.arcs.clone());
+    let mut tree_wires = fixed.map_or_else(BTreeSet::new, |route| route.wires().collect());
     tree_wires.insert(driver_wire);
-    let mut tree_pips =
-        fixed.map_or_else(BTreeSet::new, |route| route.pips.iter().copied().collect());
-    let criticality = routing_criticality(costs, net_id);
+    let mut parent = BTreeMap::<WireId, (WireId, PipId)>::new();
+    for arc in &arcs {
+        for ((&from, &to), &pip) in arc
+            .wires
+            .iter()
+            .zip(arc.wires.iter().skip(1))
+            .zip(&arc.pips)
+        {
+            parent.entry(to).or_insert((from, pip));
+        }
+    }
     let delay_quantum_ps = costs.map_or(ROUTING_DELAY_QUANTUM_PS, |costs| {
         if costs.detailed_timing_nets.contains(&net_id) {
             costs.detailed_delay_quantum_ps
@@ -3332,8 +3613,18 @@ fn route_net(
     // carry a real nonnegative arrival, matching the previous map-based
     // representation where absent entries were only ever written by insertion
     // rather than merged with a zero seed.
-    for &wire in &tree_wires {
-        tree_arrival_ps[wire.0] = 0;
+    tree_arrival_ps[driver_wire.0] = 0;
+    for arc in &arcs {
+        let mut arrival_ps = 0_u64;
+        for (&wire, &pip) in arc.wires.iter().skip(1).zip(&arc.pips) {
+            arrival_ps = arrival_ps.saturating_add(u64::from(
+                costs.map_or(0, |costs| costs.pip_delays_ps[pip.0]),
+            ));
+            tree_arrival_ps[wire.0] = match tree_arrival_ps[wire.0] {
+                UNROUTED_ARRIVAL_PS => arrival_ps,
+                known => known.min(arrival_ps),
+            };
+        }
     }
     let sinks = ordered_sinks(net_id, &net.sinks, costs);
     for sink_pin in &sinks {
@@ -3346,8 +3637,37 @@ fn route_net(
             .and_then(|costs| costs.sink_min_delays_ps.get(&(net_id, *sink_pin)))
             .copied()
             .unwrap_or(0);
+        let criticality = routing_arc_criticality(costs, net_id, *sink_pin);
+        if arcs.iter().any(|arc| arc.sink == Some(*sink_pin)) {
+            if tree_arrival_ps[sink_wire.0] >= minimum_arrival_ps {
+                continue;
+            }
+            return Err(PnrError::Unroutable {
+                net: net.name.clone(),
+                driver: format!(
+                    "hold-constrained tree via {}",
+                    device.wires()[driver_wire.0].name
+                ),
+                sink: format!(
+                    "{}.{} requires at least {minimum_arrival_ps} ps",
+                    design.cells()[sink_cell.0].name,
+                    design.pins()[sink_pin.0].name
+                ),
+            });
+        }
         if tree_wires.contains(&sink_wire) {
             if tree_arrival_ps[sink_wire.0] >= minimum_arrival_ps {
+                arcs.push(
+                    reconstruct_route_arc(*sink_pin, driver_wire, sink_wire, &parent).ok_or_else(
+                        || PnrError::InvalidRoutingConstraint {
+                            net: net_id,
+                            reason: format!(
+                                "tree path to sink pin {} has no unique parent",
+                                sink_pin.0
+                            ),
+                        },
+                    )?,
+                );
                 continue;
             }
             return Err(PnrError::Unroutable {
@@ -3413,17 +3733,35 @@ fn route_net(
                 tree_arrival_ps[wire.0] = 0;
             }
         }
+        for (&wire, (&previous, &pip)) in path_wires
+            .iter()
+            .zip(path_wires.iter().skip(1).zip(&path_pips))
+        {
+            parent.insert(wire, (previous, pip));
+        }
         tree_wires.extend(path_wires);
-        tree_pips.extend(path_pips);
+        arcs.push(
+            reconstruct_route_arc(*sink_pin, driver_wire, sink_wire, &parent).ok_or_else(|| {
+                PnrError::InvalidRoutingConstraint {
+                    net: net_id,
+                    reason: format!("new route to sink pin {} has no driver path", sink_pin.0),
+                }
+            })?,
+        );
     }
     for &wire in &tree_wires {
         tree_arrival_ps[wire.0] = UNROUTED_ARRIVAL_PS;
     }
-    Ok(NetRoute {
-        net: net_id,
-        wires: tree_wires.into_iter().collect(),
-        pips: tree_pips.into_iter().collect(),
-    })
+    Ok(NetRoute::new(net_id, arcs))
+}
+
+fn reconstruct_route_arc(
+    sink: CellPinId,
+    driver: WireId,
+    sink_wire: WireId,
+    parent: &BTreeMap<WireId, (WireId, PipId)>,
+) -> Option<RouteArc> {
+    reconstruct_endpoint_arc(Some(sink), driver, sink_wire, parent)
 }
 
 /// Arrival sentinel for wires outside the routed tree under optimization.
@@ -3432,11 +3770,12 @@ const UNROUTED_ARRIVAL_PS: u64 = u64::MAX;
 fn ordered_sinks(net: NetId, sinks: &[CellPinId], costs: Option<&RoutingCosts>) -> Vec<CellPinId> {
     let mut ordered = sinks.to_vec();
     ordered.sort_by_key(|&sink| {
+        let criticality = routing_arc_criticality(costs, net, sink);
         let minimum = costs
             .and_then(|costs| costs.sink_min_delays_ps.get(&(net, sink)))
             .copied()
             .unwrap_or(0);
-        (Reverse(minimum), sink)
+        (Reverse(criticality), Reverse(minimum), sink)
     });
     ordered
 }
@@ -3446,6 +3785,12 @@ fn routing_criticality(costs: Option<&RoutingCosts>, net: NetId) -> u64 {
         .and_then(|costs| costs.net_criticalities.get(&net))
         .copied()
         .unwrap_or(0)
+}
+
+fn routing_arc_criticality(costs: Option<&RoutingCosts>, net: NetId, sink: CellPinId) -> u64 {
+    costs
+        .and_then(|costs| costs.sink_criticalities.get(&(net, sink)).copied())
+        .unwrap_or_else(|| routing_criticality(costs, net))
 }
 
 fn routed_tree_pip_delay(costs: &RoutingCosts, pip: PipId, minimum_arrival_ps: u64) -> u32 {
@@ -4087,14 +4432,15 @@ mod tests {
     };
 
     use super::{
-        PinWireCache, Placement, PlacementConstraints, PlacementNeighbor, PnrError, RouteSearch,
-        RoutingConstraints, RoutingCosts, RoutingResourceMetadata, RoutingWorkspace,
-        place_analytically_with_net_sink_weights, place_and_route, place_with_constraints,
-        placement_neighbors, refine_placement_with_net_sink_weights_limited,
-        refine_placement_with_net_weights, refinement_edge_cost, retain_route_for_sinks,
-        route_reaches_all_sinks, route_with_placement_and_progress,
-        route_with_timing_costs_and_progress, route_with_workspace_and_progress, routing_corridor,
-        routing_step_cost, routing_transition_cost, timing_tree_cost,
+        NetRoute, PinWireCache, Placement, PlacementConstraints, PlacementNeighbor, PnrError,
+        RouteArc, RouteSearch, RoutingConstraints, RoutingCosts, RoutingResourceMetadata,
+        RoutingWorkspace, congested_route_arcs, place_analytically_with_net_sink_weights,
+        place_and_route, place_with_constraints, placement_neighbors,
+        refine_placement_with_net_sink_weights_limited, refine_placement_with_net_weights,
+        refinement_edge_cost, retain_route_for_sinks, route_reaches_all_sinks,
+        route_with_placement_and_progress, route_with_timing_costs_and_progress,
+        route_with_workspace_and_progress, routing_corridor, routing_step_cost,
+        routing_transition_cost, timing_tree_cost,
     };
 
     fn two_cell_design() -> Design {
@@ -4121,9 +4467,9 @@ mod tests {
             result.placement.bindings()[1]
         );
         assert_eq!(result.routes.len(), 1);
-        assert!(!result.routes[0].wires.is_empty());
-        assert!(!result.routes[0].pips.is_empty());
-        assert_eq!(result.total_pips, result.routes[0].pips.len());
+        assert!(result.routes[0].wires().next().is_some());
+        assert!(result.routes[0].pips().next().is_some());
+        assert_eq!(result.total_pips, result.routes[0].pips().len());
     }
 
     #[test]
@@ -4351,7 +4697,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(partial.pips.len() < full.routes[0].pips.len());
+        assert!(partial.pips().len() < full.routes[0].pips().len());
 
         let mut constraints = RoutingConstraints::new();
         constraints.add_route(partial.clone());
@@ -4372,9 +4718,8 @@ mod tests {
         assert_eq!(iterations, vec![1]);
         assert!(
             partial
-                .pips
-                .iter()
-                .all(|pip| rerouted.routes[0].pips.contains(pip))
+                .pips()
+                .all(|pip| rerouted.routes[0].pips().any(|item| item == pip))
         );
         assert!(
             route_reaches_all_sinks(
@@ -4796,5 +5141,67 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn critical_arc_evicts_only_the_conflicting_noncritical_arc() {
+        let critical_sink = texo_model::CellPinId(0);
+        let conflicting_sink = texo_model::CellPinId(1);
+        let retained_sink = texo_model::CellPinId(2);
+        let shared = WireId(1);
+        let routes = vec![
+            Some(NetRoute::new(
+                NetId(0),
+                vec![RouteArc {
+                    sink: Some(critical_sink),
+                    wires: vec![WireId(0), shared, WireId(2)],
+                    pips: vec![],
+                }],
+            )),
+            Some(NetRoute::new(
+                NetId(1),
+                vec![
+                    RouteArc {
+                        sink: Some(conflicting_sink),
+                        wires: vec![WireId(3), shared, WireId(4)],
+                        pips: vec![],
+                    },
+                    RouteArc {
+                        sink: Some(retained_sink),
+                        wires: vec![WireId(3), WireId(5), WireId(6)],
+                        pips: vec![],
+                    },
+                ],
+            )),
+        ];
+        let wire_points = vec![Point::new(0, 0); 7];
+        let wire_capacities = vec![1; 7];
+        let pip_capacities = vec![];
+        let metadata = RoutingResourceMetadata {
+            wire_points: &wire_points,
+            wire_capacities: &wire_capacities,
+            pip_capacities: &pip_capacities,
+        };
+        let mut costs = RoutingCosts::new(vec![], BTreeMap::new());
+        costs.set_sink_criticalities(BTreeMap::from([
+            ((NetId(0), critical_sink), 64),
+            ((NetId(1), conflicting_sink), 1),
+            ((NetId(1), retained_sink), 1),
+        ]));
+
+        let dirty = congested_route_arcs(
+            metadata,
+            &routes,
+            &RoutingConstraints::new(),
+            Some(&costs),
+            &[1, 2, 1, 1, 1, 1, 1],
+            &[],
+        );
+
+        assert_eq!(
+            dirty,
+            BTreeMap::from([(NetId(1).0, BTreeSet::from([conflicting_sink]))])
+        );
+        assert!(!dirty[&NetId(1).0].contains(&retained_sink));
     }
 }
