@@ -599,6 +599,88 @@ impl Ecp5Packing {
         &self.lut_ff_pairs
     }
 
+    /// Transfers one LUT's dedicated data edge to another directly-driven FF.
+    ///
+    /// The replacement FF takes the same placement-group column as the old
+    /// FF. The displaced FF is changed to its general-routing `M` input. This
+    /// is the atomic packing mutation used by post-route timing ECOs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the LUT is not currently paired, the replacement
+    /// is not a general-routed direct fanout, or the packing group is missing.
+    pub fn reassign_lut_ff_pair(
+        &mut self,
+        design: &Design,
+        lut: CellId,
+        new_ff: CellId,
+    ) -> Result<CellId, PackingError> {
+        let lut_name = design
+            .cells()
+            .get(lut.0)
+            .map_or_else(|| format!("cell#{}", lut.0), |cell| cell.name.clone());
+        let new_ff_name = design
+            .cells()
+            .get(new_ff.0)
+            .map_or_else(|| format!("cell#{}", new_ff.0), |cell| cell.name.clone());
+        let Some(pair_index) = self.lut_ff_pairs.iter().position(|pair| pair.lut == lut) else {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: lut_name,
+                ff: new_ff_name,
+                reason: "LUT has no current dedicated-path FF".into(),
+            });
+        };
+        if !self.general_routing_ffs.contains(&new_ff) {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: lut_name,
+                ff: new_ff_name,
+                reason: "replacement FF is not available on general routing".into(),
+            });
+        }
+        let new_data_pin = design
+            .cells()
+            .get(new_ff.0)
+            .and_then(|cell| {
+                cell.pins()
+                    .iter()
+                    .copied()
+                    .find(|pin| design.pins()[pin.0].name == "DI")
+            })
+            .ok_or_else(|| PackingError::MissingFfDataPin {
+                cell: new_ff_name.clone(),
+            })?;
+        if lut_driver(design, new_data_pin) != Some(lut) {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: lut_name,
+                ff: new_ff_name,
+                reason: "LUT does not directly drive the replacement FF data input".into(),
+            });
+        }
+        let old_ff = self.lut_ff_pairs[pair_index].ff;
+        let old_data_pin = design.cells()[old_ff.0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == "DI")
+            .ok_or_else(|| PackingError::MissingFfDataPin {
+                cell: design.cells()[old_ff.0].name.clone(),
+            })?;
+        if !self.constraints.replace_group_cell(old_ff, new_ff) {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: design.cells()[lut.0].name.clone(),
+                ff: new_ff_name,
+                reason: "dedicated-path placement group cannot be reassigned".into(),
+            });
+        }
+        self.constraints.bind_pin_name(old_data_pin, "M");
+        self.constraints.unbind_pin_name(new_data_pin);
+        self.lut_ff_pairs[pair_index].ff = new_ff;
+        self.general_routing_ffs.retain(|&ff| ff != new_ff);
+        self.general_routing_ffs.push(old_ff);
+        self.general_routing_ffs.sort_unstable();
+        Ok(old_ff)
+    }
+
     /// Split `CCU2C` pairs assigned to the two LUTs in one ECP5 slice.
     #[must_use]
     pub fn carry_pairs(&self) -> &[[CellId; 2]] {
@@ -1850,6 +1932,38 @@ pub fn pack_lut_ffs_excluding(
         clock_frequencies_hz: BTreeMap::new(),
         unsupported_lpf_commands: Vec::new(),
     })
+}
+
+/// Enumerates every structurally legal ordinary LUT-to-FF dedicated-path
+/// candidate before one FF per LUT is selected.
+#[must_use]
+pub fn lut_ff_pair_candidates(
+    design: &Design,
+    excluded_luts: impl IntoIterator<Item = CellId>,
+) -> Vec<LutFfPair> {
+    let excluded_luts = excluded_luts.into_iter().collect::<BTreeSet<_>>();
+    let mut candidates = Vec::new();
+    for (index, cell) in design.cells().iter().enumerate() {
+        if cell.kind != ResourceKind::Register {
+            continue;
+        }
+        let ff = CellId(index);
+        let Some(data_pin) = cell
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == "DI")
+        else {
+            continue;
+        };
+        let Some(lut) = lut_driver(design, data_pin) else {
+            continue;
+        };
+        if !is_carry_slice(design, lut) && !excluded_luts.contains(&lut) {
+            candidates.push(LutFfPair { lut, ff });
+        }
+    }
+    candidates
 }
 
 /// Packs an explicitly selected set of LUT/FF dedicated-path pairs.
@@ -3145,7 +3259,9 @@ mod tests {
         ArithmeticMapping, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
     };
     use texo_model::{BelId, CellId, Design, PinDirection, PipId, ResourceKind, UnifiedGraph};
-    use texo_pnr::{place_and_route_with_constraints, place_with_constraints};
+    use texo_pnr::{
+        place_and_route_with_constraints, place_with_constraints, swap_placement_cells,
+    };
     use texo_struo::{PrimitiveMetadata, import_ecp5};
 
     use super::{
@@ -3364,6 +3480,64 @@ mod tests {
         assert_eq!(
             packing.constraints().pin_name_bindings().get(&data_pins[0]),
             Some(&"M".to_owned())
+        );
+    }
+
+    #[test]
+    fn reassigns_a_dedicated_lut_ff_edge_atomically() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let lut = design.add_cell("lut", ResourceKind::Lut(4));
+        for name in ["A", "B", "C", "D"] {
+            design.add_pin(lut, name, PinDirection::Input).unwrap();
+        }
+        let lut_output = design.add_pin(lut, "F", PinDirection::Output).unwrap();
+        let old_ff = add_ff(&mut design, "old");
+        let new_ff = add_ff(&mut design, "new");
+        let data_pins = [old_ff, new_ff].map(|ff| {
+            design.cells()[ff.0]
+                .pins()
+                .iter()
+                .copied()
+                .find(|pin| design.pins()[pin.0].name == "DI")
+                .unwrap()
+        });
+        design.add_net("lut_to_ffs", lut_output, data_pins).unwrap();
+        let mut packing =
+            pack_lut_ffs_with_pairs(&design, &architecture, [LutFfPair { lut, ff: old_ff }])
+                .unwrap();
+        let placement =
+            place_with_constraints(&design, architecture.device(), packing.constraints()).unwrap();
+        let old_bel = placement.bel(old_ff).unwrap();
+        let new_bel = placement.bel(new_ff).unwrap();
+
+        assert_eq!(
+            packing.reassign_lut_ff_pair(&design, lut, new_ff),
+            Ok(old_ff)
+        );
+        let swapped = swap_placement_cells(
+            &design,
+            architecture.device(),
+            packing.constraints(),
+            &placement,
+            old_ff,
+            new_ff,
+        )
+        .unwrap();
+        assert_eq!(packing.lut_ff_pairs(), &[LutFfPair { lut, ff: new_ff }]);
+        assert_eq!(packing.general_routing_ffs(), &[old_ff]);
+        assert_eq!(packing.constraints().groups()[0].cells, [lut, new_ff]);
+        assert_eq!(swapped.bel(old_ff), Some(new_bel));
+        assert_eq!(swapped.bel(new_ff), Some(old_bel));
+        assert_eq!(
+            packing.constraints().pin_name_bindings().get(&data_pins[0]),
+            Some(&"M".to_owned())
+        );
+        assert!(
+            !packing
+                .constraints()
+                .pin_name_bindings()
+                .contains_key(&data_pins[1])
         );
     }
 

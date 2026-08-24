@@ -561,3 +561,40 @@ candidates on this benchmark converge in three to five iterations; the old
 The bounded run reproduced the exact -318/-397 ps, 25,734-PIP result. Its
 isolated gain was small here, but it prevents pathological failed candidates
 from consuming the search budget needed for future QoR work.
+
+## Routed-topology-aware dedicated-edge placement ECO (2026-08-24)
+
+HPWL is no longer used to choose among competing ordinary LUT-to-FF dedicated
+edges. After the first route and STA, the flow constructs the relevant part of
+the timing-aware placement graph from per-sink routed delay and propagated
+setup slack. A vertex is a placement unit; an edge is a logical sink arc with
+its current physical route. The most critical unselected LUT-to-FF edge is a
+bounded discrete proposal:
+
+1. transfer the LUT's dedicated `F -> DI` edge to that FF;
+2. move the displaced FF to the candidate's old BEL and rebind it to `M`;
+3. freeze unaffected sink arcs, preserving their actual occupied topology;
+4. reroute only nets incident to the two swapped FFs under timing costs; and
+5. keep the packing/placement mutation only if full setup/hold STA improves.
+
+This is intentionally one actual-routing trial, not a broad unloaded-shortest-
+path legalizer. The latter concentrated critical cells onto the same fast
+resources without modeling interference and was both slower and worse. The
+same-kind detailed-placement swap rebuilds only target pin bindings and checks
+the affected atomic group; it reduced the AXI4 proposal construction from
+about 3 seconds per candidate to about 16 ms after the first cached check.
+
+Measured on the identical 300 MHz AXI4 input:
+
+| flow | final WNS / WHS | PIPs | runtime |
+|---|---:|---:|---:|
+| density baseline | -318 / -397 ps | 25,734 | 70.76 s |
+| topology-aware dedicated-edge ECO | **-254 / -397 ps** | **25,660** | 84.00 s |
+
+The selected `lut251: ff2437 -> ff2439` transfer improved initial TNS by
+990 ps with unchanged initial WNS, then led timing closure to a 64 ps better
+setup endpoint and 74 fewer PIPs. The ECO trial itself cost about 1.05 seconds;
+the remaining runtime increase comes from the subsequent closure trajectory
+exploring the improved packing basin more deeply. A post-closure-only variant
+finished in 74.30 seconds but rejected all four candidates and retained
+-318/-397 ps, so it was not selected.

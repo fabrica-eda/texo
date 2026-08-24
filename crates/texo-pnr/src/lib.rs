@@ -230,6 +230,28 @@ impl PlacementConstraints {
         &self.groups
     }
 
+    /// Replaces one grouped cell while preserving the group's assignment
+    /// column. Returns false when the old cell is not grouped or the new cell
+    /// already belongs to any group.
+    pub fn replace_group_cell(&mut self, old: CellId, new: CellId) -> bool {
+        if self.groups.iter().any(|group| group.cells.contains(&new)) {
+            return false;
+        }
+        let Some((group_index, cell_index)) =
+            self.groups.iter().enumerate().find_map(|(g, group)| {
+                group
+                    .cells
+                    .iter()
+                    .position(|&cell| cell == old)
+                    .map(|c| (g, c))
+            })
+        else {
+            return false;
+        };
+        self.groups[group_index].cells[cell_index] = new;
+        true
+    }
+
     /// Overrides one logical pin's physical pin for a particular BEL choice.
     ///
     /// This models target packing transformations such as an ECP5 FF data
@@ -252,6 +274,11 @@ impl PlacementConstraints {
     /// binding per candidate.
     pub fn bind_pin_name(&mut self, pin: CellPinId, physical_name: impl Into<String>) {
         self.pin_name_bindings.insert(pin, physical_name.into());
+    }
+
+    /// Restores target-default physical pin selection for one logical pin.
+    pub fn unbind_pin_name(&mut self, pin: CellPinId) {
+        self.pin_name_bindings.remove(&pin);
     }
 
     /// BEL-independent physical pin-name overrides.
@@ -985,6 +1012,73 @@ pub fn placement_from_partial_bindings(
     }
 
     finish_placement(&graph, constraints, placed)
+}
+
+/// Swaps two same-kind cells in an otherwise unchanged legal placement and
+/// rebuilds target-selected physical pin bindings.
+///
+/// This is a constant-scope detailed-placement ECO. Atomic groups containing
+/// either cell are checked against their existing legal assignment tables;
+/// unrelated placement units are not regenerated or legalized.
+///
+/// # Errors
+///
+/// Returns an error for unknown/different-kind cells or an illegal resulting
+/// group assignment.
+pub fn swap_placement_cells(
+    design: &Design,
+    device: &Device,
+    constraints: &PlacementConstraints,
+    placement: &Placement,
+    left: CellId,
+    right: CellId,
+) -> Result<Placement, PnrError> {
+    let Some(left_cell) = design.cells().get(left.0) else {
+        return Err(PnrError::InvalidPlacement {
+            reason: format!("swap names unknown cell {}", left.0),
+        });
+    };
+    let Some(right_cell) = design.cells().get(right.0) else {
+        return Err(PnrError::InvalidPlacement {
+            reason: format!("swap names unknown cell {}", right.0),
+        });
+    };
+    if left_cell.kind != right_cell.kind {
+        return Err(PnrError::InvalidPlacement {
+            reason: "placement ECO cells have different resource kinds".into(),
+        });
+    }
+    if placement.bindings.len() != design.cells().len() {
+        return Err(PnrError::InvalidPlacement {
+            reason: "placement ECO input is incomplete".into(),
+        });
+    }
+    let mut bindings = placement.bindings.clone();
+    bindings.swap(left.0, right.0);
+    for group in constraints
+        .groups()
+        .iter()
+        .filter(|group| group.cells.contains(&left) || group.cells.contains(&right))
+    {
+        let assignment = group
+            .cells
+            .iter()
+            .map(|cell| bindings[cell.0])
+            .collect::<Vec<_>>();
+        if !group.assignments.contains(&assignment) {
+            return Err(PnrError::InvalidPlacement {
+                reason: format!(
+                    "placement ECO violates group beginning at cell {}",
+                    group.cells[0].0
+                ),
+            });
+        }
+    }
+    finish_placement(
+        &UnifiedGraph::new(design, device),
+        constraints,
+        bindings.into_iter().map(Some).collect(),
+    )
 }
 
 /// Refines an existing legal placement with deterministic per-net timing weights.
