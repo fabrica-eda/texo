@@ -56,6 +56,7 @@ pub struct RoutingCosts {
     sink_criticalities: BTreeMap<(NetId, CellPinId), u64>,
     detailed_timing_nets: BTreeSet<NetId>,
     detailed_delay_quantum_ps: u64,
+    max_iterations: u32,
 }
 
 impl RoutingCosts {
@@ -70,6 +71,7 @@ impl RoutingCosts {
             sink_criticalities: BTreeMap::new(),
             detailed_timing_nets: BTreeSet::new(),
             detailed_delay_quantum_ps: 1,
+            max_iterations: MAX_ROUTING_ITERATIONS,
         }
     }
 
@@ -88,6 +90,21 @@ impl RoutingCosts {
     #[must_use]
     pub fn pip_min_delays_ps(&self) -> &[u32] {
         &self.pip_min_delays_ps
+    }
+
+    /// Caps negotiated-congestion iterations for this routing trial.
+    ///
+    /// Full routing defaults to 32 iterations. Callers evaluating disposable
+    /// local ECO candidates can use a smaller cap so an infeasible move fails
+    /// quickly without weakening the final whole-design negotiation.
+    pub fn set_max_iterations(&mut self, max_iterations: u32) {
+        self.max_iterations = max_iterations.clamp(1, MAX_ROUTING_ITERATIONS);
+    }
+
+    /// Negotiated-congestion iteration limit for this routing trial.
+    #[must_use]
+    pub const fn max_iterations(&self) -> u32 {
+        self.max_iterations
     }
 
     /// Criticality weights indexed by logical net.
@@ -902,6 +919,72 @@ pub fn place_analytically_with_net_sink_weights(
         constraints,
         sink_weights,
     )
+}
+
+/// Completes and validates a legal placement from caller-selected bindings.
+///
+/// Bindings may omit cells that belong to an atomic placement group. The
+/// first legal group assignment consistent with every supplied binding is
+/// selected, which lets target adapters recover synthetic carry feed-in/out
+/// cells from the positions of the shared logical carry chain. Unconstrained
+/// omitted cells use their first compatible BEL. No placement optimization is
+/// performed.
+///
+/// # Errors
+///
+/// Returns an error when a cell/BEL ID is unknown, two completed units overlap,
+/// or no legal assignment agrees with the supplied bindings.
+pub fn placement_from_partial_bindings(
+    design: &Design,
+    device: &Device,
+    constraints: &PlacementConstraints,
+    bindings: &BTreeMap<CellId, BelId>,
+) -> Result<Placement, PnrError> {
+    let graph = UnifiedGraph::new(design, device);
+    let mut candidate_cache = BTreeMap::new();
+    let units = placement_units(&graph, constraints, &mut candidate_cache)?;
+    let mut placed = vec![None; design.cells().len()];
+    let mut occupied = BTreeSet::new();
+
+    for (&cell, &bel) in bindings {
+        if cell.0 >= design.cells().len() {
+            return Err(PnrError::InvalidPlacement {
+                reason: format!("binding names unknown cell {}", cell.0),
+            });
+        }
+        if bel.0 >= device.bels().len() {
+            return Err(PnrError::InvalidPlacement {
+                reason: format!("binding names unknown BEL {}", bel.0),
+            });
+        }
+    }
+
+    for unit in &units {
+        let assignment = (0..unit.choices.len())
+            .map(|index| unit.choices.assignment(index))
+            .find(|assignment| {
+                unit.cells
+                    .iter()
+                    .zip(*assignment)
+                    .all(|(&cell, &bel)| bindings.get(&cell).is_none_or(|wanted| *wanted == bel))
+            })
+            .ok_or_else(|| PnrError::InvalidPlacement {
+                reason: format!(
+                    "cell group beginning at {} has no assignment matching the supplied bindings",
+                    unit.cells[0].0
+                ),
+            })?;
+        for (&cell, &bel) in unit.cells.iter().zip(assignment) {
+            if !occupied.insert(bel) {
+                return Err(PnrError::InvalidPlacement {
+                    reason: format!("BEL {} is assigned more than once", bel.0),
+                });
+            }
+            placed[cell.0] = Some(bel);
+        }
+    }
+
+    finish_placement(&graph, constraints, placed)
 }
 
 /// Refines an existing legal placement with deterministic per-net timing weights.
@@ -1739,9 +1822,19 @@ fn analytical_place(
     let mut candidate_cache = BTreeMap::new();
     let units = placement_units(graph, constraints, &mut candidate_cache)?;
     let mut unit_by_cell = vec![usize::MAX; design.cells().len()];
+    let mut column_by_cell = vec![usize::MAX; design.cells().len()];
+    let mut macro_offset_by_cell = vec![(0.0, 0.0); design.cells().len()];
     for (unit_index, unit) in units.iter().enumerate() {
-        for &cell in &unit.cells {
+        let reference = unit.choices.assignment(0);
+        let origin = device.bels()[reference[0].0].point;
+        for (column, (&cell, &bel)) in unit.cells.iter().zip(reference).enumerate() {
             unit_by_cell[cell.0] = unit_index;
+            column_by_cell[cell.0] = column;
+            let point = device.bels()[bel.0].point;
+            macro_offset_by_cell[cell.0] = (
+                f64::from(point.x) - f64::from(origin.x),
+                f64::from(point.y) - f64::from(origin.y),
+            );
         }
     }
 
@@ -1751,42 +1844,49 @@ fn analytical_place(
             (unit.choices.len() == 1).then(|| device.bels()[unit.choices.assignment(0)[0].0].point)
         })
         .collect::<Vec<_>>();
-    let mut edge_weights = BTreeMap::<(usize, usize), f64>::new();
-    for (cell_index, edges) in neighbors.iter().enumerate() {
-        let unit = unit_by_cell[cell_index];
-        for edge in edges {
-            let other = unit_by_cell[edge.cell.0];
-            if unit >= other {
-                continue;
-            }
-            let weight = u32::try_from(edge.weight).expect("placement edge weight fits u32");
-            *edge_weights.entry((unit, other)).or_default() += f64::from(weight);
-        }
-    }
-
     let center = Point::new(device.width() / 2, device.height() / 2);
     let mut diagonal = vec![CENTER_WEIGHT; units.len()];
     let mut rhs_x = vec![CENTER_WEIGHT * f64::from(center.x); units.len()];
     let mut rhs_y = vec![CENTER_WEIGHT * f64::from(center.y); units.len()];
     let mut adjacency = vec![Vec::<(usize, f64)>::new(); units.len()];
-    for ((left, right), weight) in edge_weights {
-        match (fixed[left], fixed[right]) {
-            (Some(_), Some(_)) => {}
-            (Some(point), None) => {
-                diagonal[right] += weight;
-                rhs_x[right] += weight * f64::from(point.x);
-                rhs_y[right] += weight * f64::from(point.y);
+    for (cell_index, edges) in neighbors.iter().enumerate() {
+        let left = unit_by_cell[cell_index];
+        for edge in edges {
+            let right_cell = edge.cell.0;
+            let right = unit_by_cell[right_cell];
+            if left >= right {
+                continue;
             }
-            (None, Some(point)) => {
-                diagonal[left] += weight;
-                rhs_x[left] += weight * f64::from(point.x);
-                rhs_y[left] += weight * f64::from(point.y);
-            }
-            (None, None) => {
-                diagonal[left] += weight;
-                diagonal[right] += weight;
-                adjacency[left].push((right, weight));
-                adjacency[right].push((left, weight));
+            let weight =
+                f64::from(u32::try_from(edge.weight).expect("placement edge weight fits u32"));
+            let (left_offset_x, left_offset_y) = macro_offset_by_cell[cell_index];
+            let (right_offset_x, right_offset_y) = macro_offset_by_cell[right_cell];
+            match (fixed[left], fixed[right]) {
+                (Some(_), Some(_)) => {}
+                (Some(_), None) => {
+                    let left_bel = units[left].choices.assignment(0)[column_by_cell[cell_index]];
+                    let point = device.bels()[left_bel.0].point;
+                    diagonal[right] += weight;
+                    rhs_x[right] += weight * (f64::from(point.x) - right_offset_x);
+                    rhs_y[right] += weight * (f64::from(point.y) - right_offset_y);
+                }
+                (None, Some(_)) => {
+                    let right_bel = units[right].choices.assignment(0)[column_by_cell[right_cell]];
+                    let point = device.bels()[right_bel.0].point;
+                    diagonal[left] += weight;
+                    rhs_x[left] += weight * (f64::from(point.x) - left_offset_x);
+                    rhs_y[left] += weight * (f64::from(point.y) - left_offset_y);
+                }
+                (None, None) => {
+                    diagonal[left] += weight;
+                    diagonal[right] += weight;
+                    adjacency[left].push((right, weight));
+                    adjacency[right].push((left, weight));
+                    rhs_x[left] += weight * (right_offset_x - left_offset_x);
+                    rhs_x[right] += weight * (left_offset_x - right_offset_x);
+                    rhs_y[left] += weight * (right_offset_y - left_offset_y);
+                    rhs_y[right] += weight * (left_offset_y - right_offset_y);
+                }
             }
         }
     }
@@ -1926,9 +2026,12 @@ fn analytic_spread_targets(
         return (x, y);
     }
     let count = u32::try_from(movable.len()).expect("placement unit count fits u32");
+    let units_per_point = analytic_spread_units_per_point(units, &movable, device);
+    let occupied_points = count.div_ceil(units_per_point);
     let aspect = f64::from(device.width()) / f64::from(device.height());
-    let columns = ceil_coordinate((f64::from(count) * aspect).sqrt()).clamp(1, device.width());
-    let rows = count.div_ceil(columns).clamp(1, device.height());
+    let columns =
+        ceil_coordinate((f64::from(occupied_points) * aspect).sqrt()).clamp(1, device.width());
+    let rows = occupied_points.div_ceil(columns).clamp(1, device.height());
     let mean_x = movable.iter().map(|&index| x[index]).sum::<f64>() / f64::from(count);
     let mean_y = movable.iter().map(|&index| y[index]).sum::<f64>() / f64::from(count);
     let start_x = rounded_coordinate(mean_x - f64::from(columns) / 2.0, device.width())
@@ -1941,21 +2044,54 @@ fn analytic_spread_targets(
             .then_with(|| y[left].total_cmp(&y[right]))
             .then_with(|| units[left].cells[0].cmp(&units[right].cells[0]))
     });
-    for (column, chunk) in movable.chunks_mut(rows as usize).enumerate() {
+    let units_per_column =
+        usize::try_from(rows * units_per_point).expect("spread column capacity fits usize");
+    for (column, chunk) in movable.chunks_mut(units_per_column).enumerate() {
         chunk.sort_by(|&left, &right| {
             y[left]
                 .total_cmp(&y[right])
                 .then_with(|| x[left].total_cmp(&x[right]))
                 .then_with(|| units[left].cells[0].cmp(&units[right].cells[0]))
         });
-        for (row, &index) in chunk.iter().enumerate() {
+        for (slot, &index) in chunk.iter().enumerate() {
             let column = u32::try_from(column).expect("spread column fits u32");
-            let row = u32::try_from(row).expect("spread row fits u32");
+            let row = u32::try_from(slot).expect("spread slot fits u32") / units_per_point;
             x[index] = f64::from(start_x + column);
             y[index] = f64::from(start_y + row);
         }
     }
     (x, y)
+}
+
+fn analytic_spread_units_per_point(
+    units: &[PlacementUnit],
+    movable: &[usize],
+    device: &Device,
+) -> u32 {
+    let mut capacity_by_choices = BTreeMap::new();
+    let mut capacities = movable
+        .iter()
+        .map(|&index| {
+            let choices = &units[index].choices;
+            *capacity_by_choices
+                .entry(choices.cache_key())
+                .or_insert_with(|| {
+                    let mut by_point = BTreeMap::<Point, u32>::new();
+                    for choice in 0..choices.len() {
+                        let point = device.bels()[choices.assignment(choice)[0].0].point;
+                        *by_point.entry(point).or_default() += 1;
+                    }
+                    by_point.values().copied().max().unwrap_or(1)
+                })
+        })
+        .collect::<Vec<_>>();
+    capacities.sort_unstable();
+    let physical_capacity = capacities[capacities.len() / 2].clamp(1, 32);
+    // Leave ample whitespace for legalization and routing, but model that a
+    // physical tile can host more than one independently placed unit. The old
+    // one-unit-per-coordinate spread expanded sparse ECP5 designs to roughly
+    // three times nextpnr's placement area before legalization even began.
+    physical_capacity.saturating_mul(3).div_ceil(8).max(1)
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -2520,7 +2656,12 @@ fn nearest_legal_assignments_impl(
                 }
             }
         }
-        if nearest.len() >= PLACEMENT_REFINEMENT_CANDIDATES {
+        let enough = if point_usage.is_some() {
+            !nearest.is_empty()
+        } else {
+            nearest.len() >= PLACEMENT_REFINEMENT_CANDIDATES
+        };
+        if enough {
             nearest.sort_unstable();
             nearest.truncate(PLACEMENT_REFINEMENT_CANDIDATES);
             break;
@@ -3247,7 +3388,8 @@ fn route(
             }
         }
     }
-    for iteration in 0..MAX_ROUTING_ITERATIONS {
+    let max_iterations = costs.map_or(MAX_ROUTING_ITERATIONS, RoutingCosts::max_iterations);
+    for iteration in 0..max_iterations {
         let present_factor = 1_u32 << iteration.min(12);
         progress(RoutingProgress::Iteration {
             iteration,
@@ -3380,7 +3522,7 @@ fn route(
     }
 
     Err(PnrError::CongestionNotResolved {
-        iterations: MAX_ROUTING_ITERATIONS,
+        iterations: max_iterations,
         overused_wires: overuse.wires.len(),
         overused_pips: overuse.pips.len(),
     })
@@ -4432,15 +4574,15 @@ mod tests {
     };
 
     use super::{
-        NetRoute, PinWireCache, Placement, PlacementConstraints, PlacementNeighbor, PnrError,
-        RouteArc, RouteSearch, RoutingConstraints, RoutingCosts, RoutingResourceMetadata,
-        RoutingWorkspace, congested_route_arcs, place_analytically_with_net_sink_weights,
-        place_and_route, place_with_constraints, placement_neighbors,
-        refine_placement_with_net_sink_weights_limited, refine_placement_with_net_weights,
-        refinement_edge_cost, retain_route_for_sinks, route_reaches_all_sinks,
-        route_with_placement_and_progress, route_with_timing_costs_and_progress,
-        route_with_workspace_and_progress, routing_corridor, routing_step_cost,
-        routing_transition_cost, timing_tree_cost,
+        MAX_ROUTING_ITERATIONS, NetRoute, PinWireCache, Placement, PlacementConstraints,
+        PlacementNeighbor, PnrError, RouteArc, RouteSearch, RoutingConstraints, RoutingCosts,
+        RoutingResourceMetadata, RoutingWorkspace, congested_route_arcs,
+        place_analytically_with_net_sink_weights, place_and_route, place_with_constraints,
+        placement_neighbors, refine_placement_with_net_sink_weights_limited,
+        refine_placement_with_net_weights, refinement_edge_cost, retain_route_for_sinks,
+        route_reaches_all_sinks, route_with_placement_and_progress,
+        route_with_timing_costs_and_progress, route_with_workspace_and_progress, routing_corridor,
+        routing_step_cost, routing_transition_cost, timing_tree_cost,
     };
 
     fn two_cell_design() -> Design {
@@ -4495,6 +4637,37 @@ mod tests {
 
         assert_eq!(first, second);
         assert_ne!(first.bindings()[0], first.bindings()[1]);
+    }
+
+    #[test]
+    fn analytical_placement_accounts_for_group_member_offsets() {
+        let mut design = Design::new();
+        let macro_root = design.add_cell("macro_root", ResourceKind::Logic);
+        let macro_far = design.add_cell("macro_far", ResourceKind::Logic);
+        let far_out = design
+            .add_pin(macro_far, "out", PinDirection::Output)
+            .unwrap();
+        let sink = design.add_cell("sink", ResourceKind::Logic);
+        let sink_in = design.add_pin(sink, "in", PinDirection::Input).unwrap();
+        design.add_net("far_to_sink", far_out, [sink_in]).unwrap();
+        let device = Device::rectangular_logic(9, 1).unwrap();
+        let mut constraints = PlacementConstraints::new();
+        constraints.add_group(
+            [macro_root, macro_far],
+            (0..6).map(|root| vec![BelId(root), BelId(root + 3)]),
+        );
+
+        let placement = place_analytically_with_net_sink_weights(
+            &design,
+            &device,
+            &constraints,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let far = device.bels()[placement.bel(macro_far).unwrap().0].point;
+        let sink = device.bels()[placement.bel(sink).unwrap().0].point;
+
+        assert!(far.manhattan(sink) <= 1, "far={far:?}, sink={sink:?}");
     }
 
     #[test]
@@ -4768,6 +4941,18 @@ mod tests {
         assert_eq!(routing_step_cost(200, 32, 0, 50), 3);
         assert_eq!(routing_step_cost(200, 64, 2, 50), 6);
         assert_eq!(timing_tree_cost(200, 64, 50), 4);
+    }
+
+    #[test]
+    fn local_routing_iteration_limit_stays_within_negotiator_bounds() {
+        let mut costs = RoutingCosts::new(Vec::new(), BTreeMap::new());
+        assert_eq!(costs.max_iterations(), MAX_ROUTING_ITERATIONS);
+        costs.set_max_iterations(8);
+        assert_eq!(costs.max_iterations(), 8);
+        costs.set_max_iterations(0);
+        assert_eq!(costs.max_iterations(), 1);
+        costs.set_max_iterations(MAX_ROUTING_ITERATIONS + 1);
+        assert_eq!(costs.max_iterations(), MAX_ROUTING_ITERATIONS);
     }
 
     #[test]

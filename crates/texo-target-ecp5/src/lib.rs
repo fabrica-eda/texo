@@ -1852,6 +1852,136 @@ pub fn pack_lut_ffs_excluding(
     })
 }
 
+/// Packs an explicitly selected set of LUT/FF dedicated-path pairs.
+///
+/// This is primarily useful when importing a placement produced by another
+/// ECP5 packer: the physical locations are only comparable if both tools agree
+/// which FF inputs use the local `F → DI` path and which use general routing.
+/// Every requested pair must be a real logical LUT-to-FF data connection.
+///
+/// # Errors
+///
+/// Returns an error for unknown, duplicate, or disconnected pair members, or
+/// when the physical FF surface lacks the required local/general data pins.
+#[allow(clippy::too_many_lines)]
+pub fn pack_lut_ffs_with_pairs(
+    design: &Design,
+    architecture: &Ecp5Architecture,
+    pairs: impl IntoIterator<Item = LutFfPair>,
+) -> Result<Ecp5Packing, PackingError> {
+    let mut constraints = PlacementConstraints::new();
+    let mut paired_luts = BTreeSet::new();
+    let mut paired_ffs = BTreeSet::new();
+    let mut lut_ff_pairs = Vec::new();
+    let mut ff_data_pins = BTreeMap::new();
+    let lut_ff_assignments: Arc<[Vec<BelId>]> = lut_ff_assignments(architecture).into();
+    let has_general_data_pin = architecture
+        .device()
+        .bels_of_kind(ResourceKind::Register)
+        .iter()
+        .copied()
+        .any(|bel| {
+            architecture.bel_metadata(bel).bel_type == "TRELLIS_FF"
+                && find_bel_pin(architecture.device(), bel, "M").is_some()
+        });
+
+    for (index, cell) in design.cells().iter().enumerate() {
+        if cell.kind != ResourceKind::Register {
+            continue;
+        }
+        let ff = CellId(index);
+        let data_pin = cell
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == "DI")
+            .ok_or_else(|| PackingError::MissingFfDataPin {
+                cell: cell.name.clone(),
+            })?;
+        ff_data_pins.insert(ff, data_pin);
+    }
+
+    for pair in pairs {
+        let lut_name = design
+            .cells()
+            .get(pair.lut.0)
+            .map_or_else(|| format!("cell#{}", pair.lut.0), |cell| cell.name.clone());
+        let ff_name = design
+            .cells()
+            .get(pair.ff.0)
+            .map_or_else(|| format!("cell#{}", pair.ff.0), |cell| cell.name.clone());
+        let Some(&data_pin) = ff_data_pins.get(&pair.ff) else {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: lut_name,
+                ff: ff_name,
+                reason: "pair member is not a register with a DI pin".into(),
+            });
+        };
+        if lut_driver(design, data_pin) != Some(pair.lut) {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: lut_name,
+                ff: ff_name,
+                reason: "LUT does not directly drive the FF data input".into(),
+            });
+        }
+        if is_carry_slice(design, pair.lut) {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: lut_name,
+                ff: ff_name,
+                reason: "carry slices cannot use the ordinary LUT/FF pair".into(),
+            });
+        }
+        if !paired_luts.insert(pair.lut) || !paired_ffs.insert(pair.ff) {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: lut_name,
+                ff: ff_name,
+                reason: "LUT or FF occurs in more than one pair".into(),
+            });
+        }
+        if lut_ff_assignments.is_empty() {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: lut_name,
+                ff: ff_name,
+                reason: "architecture has no compatible dedicated-path BEL pairs".into(),
+            });
+        }
+        constraints.add_group_with_shared_assignments(
+            [pair.lut, pair.ff],
+            Arc::clone(&lut_ff_assignments),
+        );
+        lut_ff_pairs.push(pair);
+    }
+
+    let mut general_routing_ffs = Vec::new();
+    for (ff, data_pin) in ff_data_pins {
+        if paired_ffs.contains(&ff) {
+            continue;
+        }
+        if !has_general_data_pin {
+            return Err(PackingError::MissingGeneralDataPin {
+                cell: design.cells()[ff.0].name.clone(),
+            });
+        }
+        constraints.bind_pin_name(data_pin, "M");
+        general_routing_ffs.push(ff);
+    }
+
+    Ok(Ecp5Packing {
+        constraints,
+        carry_pairs: Vec::new(),
+        carry_pairs_packed: false,
+        lut_ff_pairs,
+        general_routing_ffs,
+        block_rams: Vec::new(),
+        block_rams_packed: false,
+        global_clocks: Vec::new(),
+        global_clocks_packed: false,
+        io_attributes: BTreeMap::new(),
+        clock_frequencies_hz: BTreeMap::new(),
+        unsupported_lpf_commands: Vec::new(),
+    })
+}
+
 fn is_carry_slice(design: &Design, cell: CellId) -> bool {
     design.cells()[cell.0]
         .pins()
@@ -1915,6 +2045,15 @@ pub enum PackingError {
     MissingGeneralDataPin {
         /// Register cell name.
         cell: String,
+    },
+    /// An explicitly selected local LUT/FF pair is structurally invalid.
+    InvalidLutFfPair {
+        /// Requested LUT cell name.
+        lut: String,
+        /// Requested FF cell name.
+        ff: String,
+        /// Structural reason.
+        reason: String,
     },
     /// Carry-pair packing was invoked more than once.
     CarryPairsAlreadyPacked,
@@ -2079,6 +2218,9 @@ impl fmt::Display for PackingError {
                     "register `{cell}` has no compatible general-routing M pin"
                 )
             }
+            Self::InvalidLutFfPair { lut, ff, reason } => {
+                write!(f, "invalid LUT/FF pair `{lut}` -> `{ff}`: {reason}")
+            }
             Self::CarryPairsAlreadyPacked => write!(f, "carry pairs were already packed"),
             Self::UnknownCarryCell(cell) => write!(f, "unknown carry cell ID {}", cell.0),
             Self::CellIsNotCarrySlice { cell } => {
@@ -2187,6 +2329,7 @@ impl Error for PackingError {
             Self::Model(error) => Some(error),
             Self::MissingFfDataPin { .. }
             | Self::MissingGeneralDataPin { .. }
+            | Self::InvalidLutFfPair { .. }
             | Self::CarryPairsAlreadyPacked
             | Self::UnknownCarryCell(_)
             | Self::CellIsNotCarrySlice { .. }
@@ -3007,10 +3150,10 @@ mod tests {
 
     use super::{
         ArchitectureFile, BlockRamRequirement, GlobalClockRequirement, ImportError, LogicalPort,
-        PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, expand, find_bel_pin,
-        find_global_clock_requirements, pack_lut_ffs, pack_lut_ffs_excluding, parse_lpf,
-        read_architecture, read_architecture_cache, resolve_lpf_port_cells, resolve_lpf_ports,
-        write_architecture_cache,
+        LutFfPair, PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, expand,
+        find_bel_pin, find_global_clock_requirements, pack_lut_ffs, pack_lut_ffs_excluding,
+        pack_lut_ffs_with_pairs, parse_lpf, read_architecture, read_architecture_cache,
+        resolve_lpf_port_cells, resolve_lpf_ports, write_architecture_cache,
     };
 
     const FIXTURE: &str = include_str!("../fixtures/minimal-ecp5.json");
@@ -3187,6 +3330,39 @@ mod tests {
         assert_eq!(packing.general_routing_ffs(), &[ff]);
         assert_eq!(
             packing.constraints().pin_name_bindings().get(&ff_data),
+            Some(&"M".to_owned())
+        );
+    }
+
+    #[test]
+    fn explicit_lut_ff_pair_selects_one_fanout_sink() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let lut = design.add_cell("lut", ResourceKind::Lut(4));
+        for name in ["A", "B", "C", "D"] {
+            design.add_pin(lut, name, PinDirection::Input).unwrap();
+        }
+        let lut_output = design.add_pin(lut, "F", PinDirection::Output).unwrap();
+        let first = add_ff(&mut design, "first");
+        let selected = add_ff(&mut design, "selected");
+        let data_pins = [first, selected].map(|ff| {
+            design.cells()[ff.0]
+                .pins()
+                .iter()
+                .copied()
+                .find(|pin| design.pins()[pin.0].name == "DI")
+                .unwrap()
+        });
+        design.add_net("lut_to_ffs", lut_output, data_pins).unwrap();
+
+        let packing =
+            pack_lut_ffs_with_pairs(&design, &architecture, [LutFfPair { lut, ff: selected }])
+                .unwrap();
+
+        assert_eq!(packing.lut_ff_pairs(), &[LutFfPair { lut, ff: selected }]);
+        assert_eq!(packing.general_routing_ffs(), &[first]);
+        assert_eq!(
+            packing.constraints().pin_name_bindings().get(&data_pins[0]),
             Some(&"M".to_owned())
         );
     }

@@ -13,15 +13,15 @@ pub use texo_pnr::RoutingProgress;
 use texo_pnr::{
     NetRoute, Placement, PlacementConstraints, PlacementRefiner, PnrError, PnrResult,
     RoutingConstraints, RoutingCosts, RoutingWorkspace, place_analytically_with_net_sink_weights,
-    place_and_route_with_constraints, retain_route_for_sinks,
+    place_and_route_with_constraints, placement_from_partial_bindings, retain_route_for_sinks,
     route_with_timing_costs_workspace_and_progress, route_with_workspace_and_progress,
 };
 use texo_struo::{ImportedEcp5Design, PrimitiveMetadata};
 use texo_target_ecp5::{
     BlockRamRequirement, DEFAULT_GLOBAL_CLOCK_FANOUT, DelayRangeRecord, Ecp5Architecture,
-    Ecp5GlobalRoutingCache, Ecp5Packing, LpfConstraints, LpfError, PackingError,
+    Ecp5GlobalRoutingCache, Ecp5Packing, LpfConstraints, LpfError, LutFfPair, PackingError,
     PipClassTimingRecord, SpeedGradeRecord, find_global_clock_requirements, pack_lut_ffs_excluding,
-    resolve_lpf_port_cells,
+    pack_lut_ffs_with_pairs, resolve_lpf_port_cells,
 };
 use texo_timing::{
     DelayRange, PICOSECONDS_PER_SECOND, TimingConstraints, TimingError, TimingModel, TimingReport,
@@ -162,6 +162,19 @@ pub struct Ecp5FlowOptions<'a> {
     /// the contrast around critical paths and select a different placement
     /// basin. Recorded in checkpoints so artifacts remain reproducible.
     pub placement_weight_exponent: u32,
+    /// Optional cell-name to BEL-name bindings used instead of native initial
+    /// placement. Missing synthetic cells are completed from packing groups.
+    pub initial_placement: Option<&'a BTreeMap<String, String>>,
+    /// Optional explicit dedicated-path LUT-to-FF pairs, named as
+    /// `LUT -> FF`. This must accompany placements imported after packing.
+    pub lut_ff_pairs: Option<&'a BTreeMap<String, String>>,
+    /// Run one characterized timing-driven full reroute before any placement
+    /// refinement. Useful for separating placement quality from the
+    /// connectivity-only bootstrap route.
+    pub initial_timing_reroute: bool,
+    /// Whether post-route timing closure may change the initial placement and
+    /// routing. Disable this for placement A/B measurements.
+    pub optimize_timing: bool,
 }
 
 impl Default for Ecp5FlowOptions<'_> {
@@ -173,6 +186,10 @@ impl Default for Ecp5FlowOptions<'_> {
             allow_unconstrained_io: false,
             global_clock_fanout: DEFAULT_GLOBAL_CLOCK_FANOUT,
             placement_weight_exponent: 1,
+            initial_placement: None,
+            lut_ff_pairs: None,
+            initial_timing_reroute: false,
+            optimize_timing: true,
         }
     }
 }
@@ -279,6 +296,7 @@ pub fn implement_struo_ecp5(
 /// # Errors
 ///
 /// Returns the same errors as [`implement_struo_ecp5`].
+#[allow(clippy::too_many_lines)]
 pub fn implement_struo_ecp5_with_progress(
     imported: &ImportedEcp5Design,
     architecture: &Ecp5Architecture,
@@ -301,7 +319,12 @@ pub fn implement_struo_ecp5_with_progress(
     let constant_luts = imported.metadata().iter().filter_map(|(&cell, metadata)| {
         matches!(metadata, PrimitiveMetadata::Constant { .. }).then_some(cell)
     });
-    let mut packing = pack_lut_ffs_excluding(&design, architecture, constant_luts)?;
+    let mut packing = match options.lut_ff_pairs {
+        Some(pairs) => {
+            pack_lut_ffs_with_pairs(&design, architecture, named_lut_ff_pairs(&design, pairs)?)?
+        }
+        None => pack_lut_ffs_excluding(&design, architecture, constant_luts)?,
+    };
     packing.pack_carry_pairs(
         &design,
         architecture,
@@ -328,7 +351,10 @@ pub fn implement_struo_ecp5_with_progress(
 
     let mut staged_evidence = evidence.clone();
     staged_evidence.record(Gate::MappedNetlistComplete);
-    let placement = initial_analytical_placement(&design, architecture, &packing)?;
+    let placement = match options.initial_placement {
+        Some(bindings) => named_initial_placement(&design, architecture, &packing, bindings)?,
+        None => initial_analytical_placement(&design, architecture, &packing)?,
+    };
     progress(Ecp5FlowStage::Placed);
     let mut global_routing_cache = architecture.global_routing_cache();
     let routing = packing.global_routing_constraints_cached(
@@ -339,7 +365,7 @@ pub fn implement_struo_ecp5_with_progress(
     )?;
     progress(Ecp5FlowStage::GlobalClocksRouted);
     let mut routing_workspace = RoutingWorkspace::new(architecture.device());
-    let initial_implementation = route_with_workspace_and_progress(
+    let mut initial_implementation = route_with_workspace_and_progress(
         &design,
         architecture.device(),
         placement,
@@ -350,7 +376,7 @@ pub fn implement_struo_ecp5_with_progress(
     progress(Ecp5FlowStage::Routed);
     let timing_model = ecp5_timing_model(&design, &packing, speed_grade)?;
     let timing_constraints = ecp5_timing_constraints(&design, &packing)?;
-    let initial_timing = analyze_ecp5_implementation(
+    let mut initial_timing = analyze_ecp5_implementation(
         &design,
         architecture,
         speed_grade,
@@ -360,18 +386,50 @@ pub fn implement_struo_ecp5_with_progress(
     )?;
     progress(timing_snapshot(&initial_timing));
 
-    let (implementation, timing) = TimingDrivenContext {
-        design: &design,
-        architecture,
-        packing: &packing,
-        global_routing_cache: &mut global_routing_cache,
-        speed_grade,
-        timing_model: &timing_model,
-        timing_constraints: &timing_constraints,
-        routing_workspace: &mut routing_workspace,
-        stalled_ripup_wns_ps: None,
+    if options.initial_timing_reroute && !initial_timing.met_timing() {
+        let mut costs = ecp5_routing_costs(
+            architecture,
+            speed_grade,
+            timing_net_weights(&initial_timing, &timing_constraints),
+        )?;
+        costs.set_sink_criticalities(timing_arc_weights(&initial_timing, &timing_constraints));
+        initial_implementation = route_with_timing_costs_workspace_and_progress(
+            &design,
+            architecture.device(),
+            initial_implementation.placement.clone(),
+            &routing,
+            &costs,
+            &mut routing_workspace,
+            |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
+        )?;
+        progress(Ecp5FlowStage::TimingDrivenRouted);
+        initial_timing = analyze_ecp5_implementation(
+            &design,
+            architecture,
+            speed_grade,
+            &initial_implementation,
+            &timing_model,
+            &timing_constraints,
+        )?;
+        progress(timing_snapshot(&initial_timing));
     }
-    .optimize(initial_implementation, initial_timing, &mut progress)?;
+
+    let (implementation, timing) = if options.optimize_timing {
+        TimingDrivenContext {
+            design: &design,
+            architecture,
+            packing: &packing,
+            global_routing_cache: &mut global_routing_cache,
+            speed_grade,
+            timing_model: &timing_model,
+            timing_constraints: &timing_constraints,
+            routing_workspace: &mut routing_workspace,
+            stalled_ripup_wns_ps: None,
+        }
+        .optimize(initial_implementation, initial_timing, &mut progress)?
+    } else {
+        (initial_implementation, initial_timing)
+    };
     progress(Ecp5FlowStage::Timed);
     staged_evidence.record(Gate::PhysicalImplementation);
     if timing.met_timing() {
@@ -919,10 +977,10 @@ impl TimingDrivenContext<'_> {
         routing_costs.set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
         routing_costs.set_sink_criticalities(timing_arc_weights(timing, self.timing_constraints));
         routing_costs.set_sink_min_delays_ps(minimums);
-        match self.route_and_analyze(
+        match self.route_local_trial_and_analyze(
             implementation.placement.clone(),
             &frozen,
-            Some(routing_costs),
+            routing_costs,
             progress,
         ) {
             Ok(repaired) => Ok(Some(repaired)),
@@ -979,13 +1037,16 @@ impl TimingDrivenContext<'_> {
         routing_costs.set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
         routing_costs.set_sink_criticalities(timing_arc_weights(timing, self.timing_constraints));
         routing_costs.set_sink_min_delays_ps(BTreeMap::new());
-        self.route_and_analyze(
+        match self.route_local_trial_and_analyze(
             refined_placement,
             &incremental_routing,
-            Some(routing_costs),
+            routing_costs,
             progress,
-        )
-        .map(Some)
+        ) {
+            Ok(candidate) => Ok(Some(candidate)),
+            Err(Ecp5FlowError::Pnr(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn refine_local_connections(
@@ -1053,7 +1114,7 @@ impl TimingDrivenContext<'_> {
                 .set_sink_criticalities(timing_arc_weights(timing, self.timing_constraints));
             routing_costs.set_sink_min_delays_ps(BTreeMap::new());
             if let Ok(candidate) =
-                self.route_and_analyze(placement, &frozen, Some(routing_costs), progress)
+                self.route_local_trial_and_analyze(placement, &frozen, routing_costs, progress)
             {
                 progress(Ecp5FlowStage::TimingTrialDecision {
                     improves_objective: timing_score(&candidate.1) > timing_score(timing),
@@ -1113,7 +1174,6 @@ impl TimingDrivenContext<'_> {
             .iter()
             .map(|(net, _, sink)| (*net, *sink))
             .collect::<BTreeSet<_>>();
-        let released = critical_sinks;
         let prescreen_weights = timing_net_weights(timing, self.timing_constraints);
         let mut placement = implementation.placement.clone();
         let mut candidates = Vec::new();
@@ -1154,20 +1214,21 @@ impl TimingDrivenContext<'_> {
                     implementation,
                     &refined,
                     &base,
-                    &released,
+                    &critical_sinks,
                 );
                 routing_costs
                     .set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
                 routing_costs
                     .set_sink_criticalities(timing_arc_weights(timing, self.timing_constraints));
                 routing_costs.set_sink_min_delays_ps(BTreeMap::new());
-                routing_costs.set_detailed_timing_nets(released_net_ids(&released));
+                routing_costs.set_detailed_timing_nets(released_net_ids(&critical_sinks));
                 // Measured: the finest quantum left WNS and hold untouched while slowing
                 // small-trial routing by ~27%, so detailed searches here run at the
                 // default granularity and only the multiresolution ripup keeps a
                 // fine quantum.
                 routing_costs.set_detailed_delay_quantum_ps(texo_pnr::ROUTING_DELAY_QUANTUM_PS);
-                let trial = self.route_and_analyze(refined, &frozen, Some(routing_costs), progress);
+                let trial =
+                    self.route_local_trial_and_analyze(refined, &frozen, routing_costs, progress);
                 routing_costs.set_detailed_timing_nets(BTreeSet::new());
                 if let Ok(candidate) = trial {
                     let improves_objective = timing_score(&candidate.1) > timing_score(timing);
@@ -1250,6 +1311,18 @@ impl TimingDrivenContext<'_> {
         progress(timing_snapshot(&timing));
         Ok((implementation, timing))
     }
+
+    fn route_local_trial_and_analyze(
+        &mut self,
+        placement: Placement,
+        routing: &RoutingConstraints,
+        costs: &RoutingCosts,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<(PnrResult, TimingReport), Ecp5FlowError> {
+        let mut bounded = costs.clone();
+        bounded.set_max_iterations(LOCAL_TRIAL_ROUTING_ITERATIONS);
+        self.route_and_analyze(placement, routing, Some(&bounded), progress)
+    }
 }
 
 fn worst_setup_connections(
@@ -1266,6 +1339,7 @@ fn worst_setup_connections(
 }
 
 const MAX_INCREMENTAL_REFINEMENTS: usize = 8;
+const LOCAL_TRIAL_ROUTING_ITERATIONS: u32 = 8;
 // Geometry delay model for pre-screening route trials. Calibrated loosely
 // against the measured AXI4 hops: same-tile LUT-to-FF edges land near 300 ps,
 // multi-tile general-routing hops near 250 ps per tile. A proposal whose
@@ -1759,6 +1833,88 @@ fn initial_analytical_placement(
         None,
     );
     Ok(placement)
+}
+
+fn named_initial_placement(
+    design: &Design,
+    architecture: &Ecp5Architecture,
+    packing: &Ecp5Packing,
+    named_bindings: &BTreeMap<String, String>,
+) -> Result<Placement, Ecp5FlowError> {
+    let cells = design
+        .cells()
+        .iter()
+        .enumerate()
+        .map(|(index, cell)| (cell.name.as_str(), CellId(index)))
+        .collect::<BTreeMap<_, _>>();
+    let bels = architecture
+        .device()
+        .bels()
+        .iter()
+        .enumerate()
+        .map(|(index, bel)| (bel.name.as_str(), BelId(index)))
+        .collect::<BTreeMap<_, _>>();
+    let mut bindings = BTreeMap::new();
+    for (cell_name, bel_name) in named_bindings {
+        let cell =
+            cells
+                .get(cell_name.as_str())
+                .copied()
+                .ok_or_else(|| PnrError::InvalidPlacement {
+                    reason: format!("binding names unknown cell `{cell_name}`"),
+                })?;
+        let bel =
+            bels.get(bel_name.as_str())
+                .copied()
+                .ok_or_else(|| PnrError::InvalidPlacement {
+                    reason: format!("binding names unknown BEL `{bel_name}`"),
+                })?;
+        bindings.insert(cell, bel);
+    }
+    let placement = placement_from_partial_bindings(
+        design,
+        architecture.device(),
+        packing.constraints(),
+        &bindings,
+    )?;
+    emit_placement_metric(
+        "external_initial_place",
+        design,
+        architecture.device(),
+        &placement,
+        None,
+    );
+    Ok(placement)
+}
+
+fn named_lut_ff_pairs(
+    design: &Design,
+    named_pairs: &BTreeMap<String, String>,
+) -> Result<Vec<LutFfPair>, PnrError> {
+    let cells = design
+        .cells()
+        .iter()
+        .enumerate()
+        .map(|(index, cell)| (cell.name.as_str(), CellId(index)))
+        .collect::<BTreeMap<_, _>>();
+    named_pairs
+        .iter()
+        .map(|(lut_name, ff_name)| {
+            let lut = cells.get(lut_name.as_str()).copied().ok_or_else(|| {
+                PnrError::InvalidPlacement {
+                    reason: format!("LUT/FF packing names unknown LUT `{lut_name}`"),
+                }
+            })?;
+            let ff =
+                cells
+                    .get(ff_name.as_str())
+                    .copied()
+                    .ok_or_else(|| PnrError::InvalidPlacement {
+                        reason: format!("LUT/FF packing names unknown FF `{ff_name}`"),
+                    })?;
+            Ok(LutFfPair { lut, ff })
+        })
+        .collect()
 }
 
 fn timing_snapshot(timing: &TimingReport) -> Ecp5FlowStage {

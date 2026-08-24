@@ -36,6 +36,8 @@ Usage:
                                     run a verified Struo/Celox ECP5 XOR flow
   texo axi4-pnr <architecture> <package> <speed-grade> <constraints.lpf> [checkpoint.json] [weight-exponent]
                                     run the Struo AXI4 self-test through native Texo PnR
+  texo axi4-route-nextpnr-placement <architecture> <package> <speed-grade> <constraints.lpf> <nextpnr-placed.json> [checkpoint.json]
+                                    route and time a fixed nextpnr placement without closure
   texo axi4-json <design.json>      export the same mapped AXI4 design for nextpnr
   texo target-info <architecture>   inspect an ECP5 architecture snapshot
   texo cache-architecture <architecture.json> <architecture.txdb>
@@ -63,6 +65,41 @@ fn parse_weight_exponent(args: &mut impl Iterator<Item = String>) -> Result<u32,
         }),
         None => Ok(1),
     }
+}
+
+fn parse_axi4_route_nextpnr_placement(
+    mut args: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let architecture = args.next().ok_or_else(|| {
+        format!("axi4-route-nextpnr-placement requires an architecture path\n\n{USAGE}")
+    })?;
+    let package = args.next().ok_or_else(|| {
+        format!("axi4-route-nextpnr-placement requires a package name\n\n{USAGE}")
+    })?;
+    let speed_grade = args
+        .next()
+        .ok_or_else(|| format!("axi4-route-nextpnr-placement requires a speed grade\n\n{USAGE}"))?;
+    let lpf = args
+        .next()
+        .ok_or_else(|| format!("axi4-route-nextpnr-placement requires an LPF path\n\n{USAGE}"))?;
+    let placement = args.next().ok_or_else(|| {
+        format!("axi4-route-nextpnr-placement requires a nextpnr JSON path\n\n{USAGE}")
+    })?;
+    let checkpoint = args.next();
+    if args.next().is_some() {
+        return Err(format!(
+            "axi4-route-nextpnr-placement accepts at most six arguments\n\n{USAGE}"
+        )
+        .into());
+    }
+    axi4_route_nextpnr_placement(
+        &architecture,
+        &package,
+        &speed_grade,
+        &lpf,
+        &placement,
+        checkpoint.as_deref(),
+    )
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
@@ -121,6 +158,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 exponent,
             )
         }
+        Some("axi4-route-nextpnr-placement") => parse_axi4_route_nextpnr_placement(args),
         Some("axi4-json") => parse_axi4_json(args),
         Some("target-info") => {
             let path = args
@@ -453,6 +491,58 @@ fn axi4_pnr(
     checkpoint_path: Option<&str>,
     placement_weight_exponent: u32,
 ) -> Result<(), Box<dyn Error>> {
+    axi4_pnr_with_initial_placement(
+        architecture_path,
+        package,
+        speed_grade,
+        lpf_path,
+        checkpoint_path,
+        placement_weight_exponent,
+        None,
+        None,
+        true,
+    )
+}
+
+fn axi4_route_nextpnr_placement(
+    architecture_path: &str,
+    package: &str,
+    speed_grade: &str,
+    lpf_path: &str,
+    placement_path: &str,
+    checkpoint_path: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let placement = read_nextpnr_placement(placement_path)?;
+    println!(
+        "nextpnr placement: {} shared logical cells, {} dedicated LUT/FF pairs (synthetic carry cells inferred by Texo)",
+        placement.bindings.len(),
+        placement.lut_ff_pairs.len()
+    );
+    axi4_pnr_with_initial_placement(
+        architecture_path,
+        package,
+        speed_grade,
+        lpf_path,
+        checkpoint_path,
+        1,
+        Some(&placement.bindings),
+        Some(&placement.lut_ff_pairs),
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn axi4_pnr_with_initial_placement(
+    architecture_path: &str,
+    package: &str,
+    speed_grade: &str,
+    lpf_path: &str,
+    checkpoint_path: Option<&str>,
+    placement_weight_exponent: u32,
+    initial_placement: Option<&BTreeMap<String, String>>,
+    lut_ff_pairs: Option<&BTreeMap<String, String>>,
+    optimize_timing: bool,
+) -> Result<(), Box<dyn Error>> {
     let rtl = axi4_crossbar_self_test()?;
     let mut evidence = Evidence::new();
     verify_axi4_rtl(&mut evidence)?;
@@ -507,6 +597,10 @@ fn axi4_pnr(
             package: Some(package),
             lpf: Some(&lpf),
             placement_weight_exponent,
+            initial_placement,
+            lut_ff_pairs,
+            initial_timing_reroute: initial_placement.is_some(),
+            optimize_timing,
             ..Ecp5FlowOptions::default()
         },
         &mut evidence,
@@ -543,6 +637,128 @@ fn axi4_pnr(
         println!("checkpoint: {path}");
     }
     Ok(())
+}
+
+struct NextpnrPlacement {
+    bindings: BTreeMap<String, String>,
+    lut_ff_pairs: BTreeMap<String, String>,
+}
+
+fn read_nextpnr_placement(path: &str) -> Result<NextpnrPlacement, Box<dyn Error>> {
+    let document: Value = serde_json::from_reader(BufReader::new(File::open(path)?))?;
+    let modules = document["modules"]
+        .as_object()
+        .ok_or("nextpnr placement JSON omitted its module map")?;
+    if modules.len() != 1 {
+        return Err(format!(
+            "nextpnr placement JSON contains {} modules, expected one",
+            modules.len()
+        )
+        .into());
+    }
+    let cells = modules
+        .values()
+        .next()
+        .and_then(|module| module["cells"].as_object())
+        .ok_or("nextpnr placement JSON omitted its cell map")?;
+    let mut comb_by_bel = BTreeMap::new();
+    for (name, cell) in cells {
+        if cell["type"] == "TRELLIS_COMB" {
+            let bel = cell["attributes"]["NEXTPNR_BEL"]
+                .as_str()
+                .ok_or_else(|| format!("nextpnr cell `{name}` has no NEXTPNR_BEL"))?;
+            comb_by_bel.insert(bel, name.as_str());
+        }
+    }
+    let mut bindings = BTreeMap::new();
+    let mut lut_ff_pairs = BTreeMap::new();
+    for (nextpnr_name, cell) in cells {
+        let cell_type = cell["type"]
+            .as_str()
+            .ok_or_else(|| format!("nextpnr cell `{nextpnr_name}` has no type"))?;
+        if nextpnr_name.starts_with("$nextpnr_CCU2C_") || cell_type == "DCCA" {
+            continue;
+        }
+        let nextpnr_bel = cell["attributes"]["NEXTPNR_BEL"]
+            .as_str()
+            .ok_or_else(|| format!("nextpnr cell `{nextpnr_name}` has no NEXTPNR_BEL"))?;
+        let texo_name = nextpnr_cell_to_texo(nextpnr_name, cell_type)?;
+        let texo_bel = nextpnr_bel_to_texo(nextpnr_bel)?;
+        if bindings.insert(texo_name.clone(), texo_bel).is_some() {
+            return Err(format!("nextpnr placement maps Texo cell `{texo_name}` twice").into());
+        }
+        if cell_type == "TRELLIS_FF"
+            && cell["parameters"]["SD"]
+                .as_str()
+                .is_some_and(|value| value.trim() == "1")
+        {
+            let local_lut_bel = nextpnr_bel
+                .strip_suffix(".FF0")
+                .map(|site| format!("{site}.K0"))
+                .or_else(|| {
+                    nextpnr_bel
+                        .strip_suffix(".FF1")
+                        .map(|site| format!("{site}.K1"))
+                })
+                .ok_or_else(|| {
+                    format!("paired nextpnr FF `{nextpnr_name}` has invalid BEL `{nextpnr_bel}`")
+                })?;
+            let nextpnr_lut = comb_by_bel.get(local_lut_bel.as_str()).ok_or_else(|| {
+                format!("paired nextpnr FF `{nextpnr_name}` has no LUT at `{local_lut_bel}`")
+            })?;
+            if nextpnr_lut.contains("$CCU2_COMB") {
+                // Texo's carry chain group currently has no third column for
+                // the colocated FF. Keep this small subset on general routing;
+                // the external BEL remains exact, so the placement comparison
+                // is still valid while the reported timing is conservative.
+                continue;
+            }
+            let texo_lut = nextpnr_cell_to_texo(nextpnr_lut, "TRELLIS_COMB")?;
+            if lut_ff_pairs
+                .insert(texo_lut.clone(), texo_name.clone())
+                .is_some()
+            {
+                return Err(format!("nextpnr pairs Texo LUT `{texo_lut}` twice").into());
+            }
+        }
+    }
+    Ok(NextpnrPlacement {
+        bindings,
+        lut_ff_pairs,
+    })
+}
+
+fn nextpnr_cell_to_texo(name: &str, cell_type: &str) -> Result<String, Box<dyn Error>> {
+    if let Some(base) = name.strip_suffix("$CCU2_COMB0") {
+        return Ok(format!("{base}$slice0"));
+    }
+    if let Some(base) = name.strip_suffix("$CCU2_COMB1") {
+        return Ok(format!("{base}$slice1"));
+    }
+    if cell_type == "TRELLIS_IO" {
+        let port = name
+            .strip_suffix("$tr_io")
+            .ok_or_else(|| format!("nextpnr IO cell `{name}` lacks the `$tr_io` suffix"))?;
+        return Ok(format!("${port}[0]"));
+    }
+    Ok(name.to_owned())
+}
+
+fn nextpnr_bel_to_texo(name: &str) -> Result<String, Box<dyn Error>> {
+    let (x, rest) = name
+        .strip_prefix('X')
+        .and_then(|name| name.split_once("/Y"))
+        .ok_or_else(|| format!("nextpnr BEL `{name}` does not begin with X#/Y#"))?;
+    let (y, bel) = rest
+        .split_once('/')
+        .ok_or_else(|| format!("nextpnr BEL `{name}` has no site name"))?;
+    let column = x
+        .parse::<u32>()
+        .map_err(|_| format!("nextpnr BEL `{name}` has an invalid X coordinate"))?;
+    let row = y
+        .parse::<u32>()
+        .map_err(|_| format!("nextpnr BEL `{name}` has an invalid Y coordinate"))?;
+    Ok(format!("R{row}C{column}/{bel}"))
 }
 
 fn verify_axi4_rtl(evidence: &mut Evidence) -> Result<(), Box<dyn Error>> {

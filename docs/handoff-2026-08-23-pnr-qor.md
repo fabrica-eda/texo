@@ -502,3 +502,62 @@ TEXO_METRICS=1 target/release/texo axi4-pnr /tmp/texo-LFE5UM5G-85F-final.txdb \
 
 `/tmp/opencode/lpf-300.lpf` is the 250 MHz LPF with the frequency edited to
 300 MHZ. Regenerate it from examples/axi4-self-test/ if missing.
+
+## Initial-placement A/B and density correction (2026-08-24)
+
+The nextpnr ECP5 default remains the flat `router1`; hierarchy is not the
+explanation for its roughly 3.1 s result. Its no-route run places this design
+in about 1.7 s with an estimated 386.25 MHz result, so placement was isolated
+from routing directly instead of inferred from end-to-end timings.
+
+`axi4-route-nextpnr-placement` now imports `NEXTPNR_BEL` assignments from a
+nextpnr placed JSON, translates ECP5 coordinates and split carry names, imports
+its selected dedicated LUT/FF pairs, completes Texo-only synthetic carry
+members, and routes the fixed placement without placement closure. This is an
+A/B diagnostic command rather than a production dependency on nextpnr.
+
+On the same AXI4 design:
+
+| Placement routed by Texo | HPWL | initial WNS | timing-rerouted WNS |
+|---|---:|---:|---:|
+| old native analytical placement | 262,967 | -5,808 ps | -3,196 ps |
+| fixed nextpnr placement | 233,107 | -2,809 ps | -1,022 ps |
+
+Thus weak initial placement accounts for roughly 2.17 ns of the initial
+timing-route gap. It is not the whole QoR gap: even with nextpnr's placement,
+Texo still leaves same-tile connections on 999--1,292 ps routes in some
+trials, so route-topology choice and architecture timing remain independently
+material.
+
+The concrete placer defect was that analytical spreading treated one
+placement unit as a complete physical coordinate. An ECP5 logic tile has
+multiple compatible LUT/FF slots. The new spread derives per-coordinate
+capacity from legal assignments and targets 3/8 occupancy, while legalization
+stops after the first legal distance ring. The quadratic equations now also
+retain every atomic macro member's offset; carry chains no longer collapse to
+the representative cell during the solve.
+
+Measured density sweep (all use the macro-offset correction):
+
+| target units/tile | initial HPWL | final WNS / WHS | PIPs | runtime |
+|---:|---:|---:|---:|---:|
+| 1 | 254,656 | -461 / -524 ps | 29,720 | ~100 s |
+| 2 | 242,588 | -372 / -375 ps | 26,700 | slower than 3 |
+| **3 (selected)** | **236,937** | **-318 / -397 ps** | **25,734** | **70.76 s** |
+| 4 | 233,432 | -456 / -562 ps | 24,594 | ~50 s |
+| 6 | 230,761 | -598 / -544 ps | 23,820 | ~40--50 s |
+
+The selected density reduces runtime about 31% and route size about 13%
+relative to the arc-router baseline (102.28 s, 29,651 PIPs), while setup WNS
+regresses 52 ps from -266 ps. This is therefore a speed/structure improvement,
+not yet the requested setup-QoR win. More compaction monotonically improves
+HPWL but worsens routed WNS, proving HPWL is not a sufficient placement graph
+objective.
+
+Finally, disposable local ECO route trials now stop after eight negotiated
+iterations while whole-design routing keeps the 32-iteration budget. Accepted
+candidates on this benchmark converge in three to five iterations; the old
+32-iteration tails were infeasible candidates that were rejected afterward.
+The bounded run reproduced the exact -318/-397 ps, 25,734-PIP result. Its
+isolated gain was small here, but it prevents pathological failed candidates
+from consuming the search budget needed for future QoR work.
