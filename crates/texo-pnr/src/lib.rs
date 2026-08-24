@@ -1796,6 +1796,7 @@ impl<'a> PlacementRefiner<'a> {
             .position(|&cell| cell == moving_cell)
             .expect("the selected unit contains its moving cell");
         let broad_path_move = max_move_distance > 2;
+        let mut local_delay_cache = HashMap::new();
         // Local moves score by the routed-delay excess over the per-connection
         // allowance targets so already-satisfied connections stop absorbing
         // moves. Broad path moves stay span-ranked: measuring excess on every
@@ -1815,6 +1816,7 @@ impl<'a> PlacementRefiner<'a> {
                 targets_ps,
                 &placed,
                 pip_delays_ps,
+                &mut local_delay_cache,
             )
             .map(|(excess, _)| excess)
         };
@@ -1909,6 +1911,7 @@ impl<'a> PlacementRefiner<'a> {
                     targets_ps,
                     &placed,
                     pip_delays_ps,
+                    &mut local_delay_cache,
                 ) else {
                     continue;
                 };
@@ -2162,6 +2165,7 @@ fn assignment_connection_excess(
     targets_ps: &[u64],
     placed: &[Option<BelId>],
     pip_delays_ps: &[u32],
+    local_delay_cache: &mut HashMap<(WireId, WireId), Option<u64>>,
 ) -> Option<(u64, u64)> {
     let design = graph.design();
     let mut total = 0_u64;
@@ -2176,7 +2180,13 @@ fn assignment_connection_excess(
         let sink_bel = assignment_bel(unit, assignment, sink_cell, placed)?;
         let driver_wire = candidate_pin_wire(graph, constraints, driver_pin, driver_bel)?;
         let sink_wire = candidate_pin_wire(graph, constraints, sink_pin, sink_bel)?;
-        let delay = local_connection_delay(graph, driver_wire, sink_wire, pip_delays_ps)?;
+        let delay = if let Some(delay) = local_delay_cache.get(&(driver_wire, sink_wire)) {
+            *delay
+        } else {
+            let delay = local_connection_delay(graph, driver_wire, sink_wire, pip_delays_ps);
+            local_delay_cache.insert((driver_wire, sink_wire), delay);
+            delay
+        }?;
         total = total.saturating_add(delay);
         excess = excess.saturating_add(delay.saturating_sub(target_ps));
     }

@@ -895,3 +895,15 @@ improved from -4325 to **-3905 ps**. The selected implementation uses 25,675
 PIPs, ten more than the baseline. This demonstrates that the route graph and
 the timing placement graph are complementary: pruning is safe only when a
 candidate is dominated in both.
+
+The radius-1/2 placement scorer also repeated the same bounded 16-hop A*
+delay query for multiple legal assignments that resolve to identical physical
+pin-wire endpoints. A transaction-local `(driver wire, sink wire)` cache now
+reuses those exact results while evaluating one cell's candidates. Extending
+the cache across the complete refiner lifetime was measured and rejected: the
+larger hash table and delay-table identity checks made critical closure slower.
+
+Adjacent saved-binary A/B runs measured 44.79 s wall / 34.93 s user without
+the local cache and **44.08 s wall / 34.30 s user** with it. Both produced
+-214/-399 ps and 25,675 PIPs exactly. The cache lifetime therefore matches the
+placement-graph transaction rather than the architecture or closure lifetime.
