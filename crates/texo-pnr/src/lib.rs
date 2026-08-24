@@ -349,6 +349,58 @@ pub struct NetRoute {
     pip_refs: Vec<(PipId, u32)>,
 }
 
+/// Sparse incumbent-route occupancy used to rank placement moves before a
+/// negotiated-routing trial.
+///
+/// Every resource owner carries the greatest criticality of the owner's arcs
+/// that use that resource.  A critical shared trunk is therefore protected,
+/// while a resource used only by a noncritical branch remains a cheap victim.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RouteCapacityProjection {
+    wire_owners: HashMap<WireId, Vec<(NetId, u64)>>,
+    pip_owners: HashMap<PipId, Vec<(NetId, u64)>>,
+}
+
+impl RouteCapacityProjection {
+    /// Projects routed arcs onto the resources they occupy.
+    #[must_use]
+    pub fn new(routes: &[NetRoute], costs: &RoutingCosts) -> Self {
+        let mut projection = Self::default();
+        for route in routes {
+            for arc in &route.arcs {
+                let criticality = arc
+                    .sink
+                    .and_then(|sink| costs.sink_criticalities.get(&(route.net, sink)).copied())
+                    .or_else(|| costs.net_criticalities.get(&route.net).copied())
+                    .unwrap_or(0);
+                for &wire in &arc.wires {
+                    update_projected_owner(
+                        projection.wire_owners.entry(wire).or_default(),
+                        route.net,
+                        criticality,
+                    );
+                }
+                for &pip in &arc.pips {
+                    update_projected_owner(
+                        projection.pip_owners.entry(pip).or_default(),
+                        route.net,
+                        criticality,
+                    );
+                }
+            }
+        }
+        projection
+    }
+}
+
+fn update_projected_owner(owners: &mut Vec<(NetId, u64)>, net: NetId, criticality: u64) {
+    if let Some((_, known)) = owners.iter_mut().find(|(owner, _)| *owner == net) {
+        *known = (*known).max(criticality);
+    } else {
+        owners.push((net, criticality));
+    }
+}
+
 impl NetRoute {
     /// Builds a route and derives its shared-resource reference counts.
     #[must_use]
@@ -1589,6 +1641,7 @@ impl<'a> PlacementRefiner<'a> {
         connections: &[(CellPinId, CellPinId)],
         targets_ps: &[u64],
         pip_delays_ps: &[u32],
+        capacity_projection: Option<&RouteCapacityProjection>,
         max_move_distance: u64,
         max_candidates: usize,
     ) -> Result<Vec<Placement>, PnrError> {
@@ -1757,7 +1810,52 @@ impl<'a> PlacementRefiner<'a> {
             (left.0, left.1, left.2.as_slice()).cmp(&(right.0, right.1, right.2.as_slice()))
         });
         best.dedup_by(|left, right| left.2 == right.2);
+        if broad_path_move && let Some(projection) = capacity_projection {
+            // Physical span is only a cheap coarse index.  Project a small
+            // neighborhood through the incumbent route topology, including
+            // which lower-criticality arcs would have to retreat, before
+            // paying for a complete negotiated route and STA trial.
+            const PROJECTION_SHORTLIST: usize = 16;
+            best.truncate(PROJECTION_SHORTLIST.max(max_candidates));
+            let fallback = best.clone();
+            let mut projected = best
+                .into_iter()
+                .filter_map(|(span, _, assignment)| {
+                    assignment_connection_projected_cost(
+                        &self.graph,
+                        self.constraints,
+                        unit,
+                        &assignment,
+                        moving_cell,
+                        connections,
+                        &placed,
+                        pip_delays_ps,
+                        projection,
+                    )
+                    .map(|cost| (cost, span, assignment))
+                })
+                .collect::<Vec<_>>();
+            if projected.is_empty() {
+                best = fallback;
+            } else {
+                projected.sort_unstable_by(|left, right| {
+                    (left.0, left.1, left.2.as_slice()).cmp(&(right.0, right.1, right.2.as_slice()))
+                });
+                best = projected;
+            }
+        }
         best.truncate(max_candidates.max(1));
+        if broad_path_move {
+            // Broad topology search operates on physical tile nodes.  BEL
+            // slots inside one tile are a lower hierarchy level and produced
+            // nearly identical negotiated routes; detailed local refinement
+            // still resolves those slots later.  Do not spend multiple full
+            // route+STA trials on the same coarse node.
+            let mut seen_points = BTreeSet::new();
+            best.retain(|(_, _, assignment)| {
+                seen_points.insert(device.bels()[assignment[moving_column].0].point)
+            });
+        }
         let mut proposals = Vec::with_capacity(best.len());
         for (_, _, selected) in best {
             let mut proposed = placed.clone();
@@ -1768,6 +1866,130 @@ impl<'a> PlacementRefiner<'a> {
         }
         Ok(proposals)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assignment_connection_projected_cost(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    unit: &PlacementUnit,
+    assignment: &[BelId],
+    moving_cell: CellId,
+    connections: &[(CellPinId, CellPinId)],
+    placed: &[Option<BelId>],
+    pip_delays_ps: &[u32],
+    projection: &RouteCapacityProjection,
+) -> Option<u64> {
+    let design = graph.design();
+    let mut total = 0_u64;
+    for &(driver_pin, sink_pin) in connections {
+        let driver = design.pins().get(driver_pin.0)?;
+        let sink = design.pins().get(sink_pin.0)?;
+        if driver.cell != moving_cell && sink.cell != moving_cell {
+            return None;
+        }
+        let net = driver.net()?;
+        let driver_bel = assignment_bel(unit, assignment, driver.cell, placed)?;
+        let sink_bel = assignment_bel(unit, assignment, sink.cell, placed)?;
+        let driver_wire = candidate_pin_wire(graph, constraints, driver_pin, driver_bel)?;
+        let sink_wire = candidate_pin_wire(graph, constraints, sink_pin, sink_bel)?;
+        total = total.saturating_add(local_connection_projected_cost(
+            graph,
+            driver_wire,
+            sink_wire,
+            pip_delays_ps,
+            net,
+            projection,
+        )?);
+    }
+    Some(total)
+}
+
+fn local_connection_projected_cost(
+    graph: &UnifiedGraph<'_>,
+    start: WireId,
+    goal: WireId,
+    pip_delays_ps: &[u32],
+    net: NetId,
+    projection: &RouteCapacityProjection,
+) -> Option<u64> {
+    const MAX_LOCAL_HOPS: u8 = 16;
+    const LOCAL_MARGIN: u32 = 1;
+    let device = graph.device();
+    let corridor = routing_corridor(
+        device.wires()[start.0].point,
+        device.wires()[goal.0].point,
+        device,
+        LOCAL_MARGIN,
+    );
+    let mut queue = BinaryHeap::from([Reverse((0_u64, 0_u8, start))]);
+    let mut best = HashMap::from([((start, 0_u8), 0_u64)]);
+    while let Some(Reverse((cost, hops, wire))) = queue.pop() {
+        if wire == goal {
+            return Some(cost);
+        }
+        if hops == MAX_LOCAL_HOPS || best.get(&(wire, hops)).is_some_and(|known| *known < cost) {
+            continue;
+        }
+        for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
+            if !point_inside_corridor(device.wires()[neighbor.0].point, corridor) {
+                continue;
+            }
+            let next_hops = hops + 1;
+            let conflict = projected_resource_penalty(
+                projection.wire_owners.get(&neighbor),
+                net,
+                device.wires()[neighbor.0].capacity,
+            )
+            .saturating_add(projected_resource_penalty(
+                projection.pip_owners.get(&pip),
+                net,
+                device.pips()[pip.0].capacity(),
+            ));
+            let next_cost = cost
+                .saturating_add(u64::from(pip_delays_ps[pip.0]))
+                .saturating_add(conflict);
+            let key = (neighbor, next_hops);
+            if best.get(&key).is_none_or(|known| next_cost < *known) {
+                best.insert(key, next_cost);
+                queue.push(Reverse((next_cost, next_hops, neighbor)));
+            }
+        }
+    }
+    None
+}
+
+fn projected_resource_penalty(
+    owners: Option<&Vec<(NetId, u64)>>,
+    moving_net: NetId,
+    capacity: u16,
+) -> u64 {
+    const RIPUP_BASE_PS: u64 = 150;
+    const CRITICALITY_PENALTY_PS: u64 = 10;
+    let Some(owners) = owners else {
+        return 0;
+    };
+    let mut victims = owners
+        .iter()
+        .filter(|(net, _)| *net != moving_net)
+        .map(|&(_, criticality)| criticality)
+        .collect::<Vec<_>>();
+    let required = victims
+        .len()
+        .saturating_add(1)
+        .saturating_sub(usize::from(capacity));
+    if required == 0 {
+        return 0;
+    }
+    victims.sort_unstable();
+    victims
+        .into_iter()
+        .take(required)
+        .fold(0, |total, criticality| {
+            total.saturating_add(
+                RIPUP_BASE_PS.saturating_add(criticality.saturating_mul(CRITICALITY_PENALTY_PS)),
+            )
+        })
 }
 
 fn assignment_connection_span(
@@ -4843,14 +5065,15 @@ mod tests {
 
     use super::{
         MAX_ROUTING_ITERATIONS, NetRoute, PinWireCache, Placement, PlacementConstraints,
-        PlacementNeighbor, PnrError, RouteArc, RouteSearch, RoutingConstraints, RoutingCosts,
-        RoutingResourceMetadata, RoutingWorkspace, congested_route_arcs,
-        place_analytically_with_net_sink_weights, place_and_route, place_with_constraints,
-        placement_neighbors, refine_placement_with_net_sink_weights_limited,
-        refine_placement_with_net_weights, refinement_edge_cost, retain_route_for_sinks,
-        route_reaches_all_sinks, route_with_placement_and_progress,
-        route_with_timing_costs_and_progress, route_with_workspace_and_progress, routing_corridor,
-        routing_step_cost, routing_transition_cost, timing_tree_cost,
+        PlacementNeighbor, PnrError, RouteArc, RouteCapacityProjection, RouteSearch,
+        RoutingConstraints, RoutingCosts, RoutingResourceMetadata, RoutingWorkspace,
+        congested_route_arcs, place_analytically_with_net_sink_weights, place_and_route,
+        place_with_constraints, placement_neighbors, projected_resource_penalty,
+        refine_placement_with_net_sink_weights_limited, refine_placement_with_net_weights,
+        refinement_edge_cost, retain_route_for_sinks, route_reaches_all_sinks,
+        route_with_placement_and_progress, route_with_timing_costs_and_progress,
+        route_with_workspace_and_progress, routing_corridor, routing_step_cost,
+        routing_transition_cost, timing_tree_cost,
     };
 
     fn two_cell_design() -> Design {
@@ -5674,5 +5897,58 @@ mod tests {
             BTreeMap::from([(NetId(1).0, BTreeSet::from([conflicting_sink]))])
         );
         assert!(!dirty[&NetId(1).0].contains(&retained_sink));
+    }
+
+    #[test]
+    fn capacity_projection_prices_the_arc_using_each_resource() {
+        let low_sink = texo_model::CellPinId(0);
+        let critical_sink = texo_model::CellPinId(1);
+        let owner = NetId(1);
+        let moving = NetId(2);
+        let low_only = WireId(0);
+        let critical_only = WireId(1);
+        let shared = WireId(2);
+        let route = NetRoute::new(
+            owner,
+            vec![
+                RouteArc {
+                    sink: Some(low_sink),
+                    wires: vec![low_only, shared],
+                    pips: vec![],
+                },
+                RouteArc {
+                    sink: Some(critical_sink),
+                    wires: vec![critical_only, shared],
+                    pips: vec![],
+                },
+            ],
+        );
+        let mut costs = RoutingCosts::new(vec![], BTreeMap::new());
+        costs.set_sink_criticalities(BTreeMap::from([
+            ((owner, low_sink), 1),
+            ((owner, critical_sink), 64),
+        ]));
+        let projection = RouteCapacityProjection::new(&[route], &costs);
+
+        assert_eq!(
+            projected_resource_penalty(projection.wire_owners.get(&low_only), moving, 1),
+            160
+        );
+        assert_eq!(
+            projected_resource_penalty(projection.wire_owners.get(&critical_only), moving, 1),
+            790
+        );
+        assert_eq!(
+            projected_resource_penalty(projection.wire_owners.get(&shared), moving, 1),
+            790
+        );
+        assert_eq!(
+            projected_resource_penalty(projection.wire_owners.get(&shared), moving, 2),
+            0
+        );
+        assert_eq!(
+            projected_resource_penalty(projection.wire_owners.get(&shared), owner, 1),
+            0
+        );
     }
 }

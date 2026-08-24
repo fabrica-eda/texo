@@ -679,3 +679,48 @@ copying nextpnr's small residual-delay formula finished near 57 seconds but
 regressed WNS to -481 ps, while the fully realized `300 + 250 ps/tile` model
 finished in 60.50 seconds at -377 ps. Both over-constrained Texo's differently
 normalized route graph and were reverted.
+
+## Arc-critical capacity projection and hierarchical placement nodes (2026-08-24)
+
+Broad critical-path placement no longer sends the four smallest-HPWL moves
+directly to negotiated routing. The incumbent route is projected into sparse
+`wire/PIP -> [(net, arc criticality)]` ownership. Shared resources carry the
+maximum criticality of the sink arcs that actually use them, rather than one
+net-wide value. A local bounded A* then ranks the best 16 geometric moves by
+characterized PIP delay plus the cost of the weakest conflicting owner that
+would have to retreat. Capacity greater than current occupancy costs nothing;
+an actual conflict costs `150 ps + 10 ps * victim criticality`. The moving
+net's own incumbent tree is excluded.
+
+This is the placement-level version of "pass the critical arc and retreat only
+the conflicting noncritical arc." It is a projection, not a substitute for
+negotiated routing: trying only its first candidate was fast but discarded a
+better topology basin.
+
+Broad search now also has an explicit first hierarchy. Physical tile
+coordinates are the coarse graph nodes; BEL slots inside a tile are retained
+for packing and local refinement but equivalent coarse candidates are routed
+only once. Logs showed that the old flat candidate list repeatedly routed
+different slots in one tile and received nearly identical STA results.
+
+Measured on the same AXI4 300 MHz input:
+
+| broad candidate policy | final WNS / WHS | PIPs | runtime |
+|---|---:|---:|---:|
+| architecture-scaled A* baseline | -240 / -397 ps | 25,667 | 66.51 s |
+| projection, first candidate only | -508 / -399 ps | 25,650 | 43.32 s |
+| projection, first two candidates | -404 / -399 ps | 25,589 | 49.64 s |
+| projection, four flat candidates | **-214 / -399 ps** | 25,645 | 68.21 s |
+| **projection, four candidates then tile collapse** | **-214 / -399 ps** | **25,665** | **59.78 s** |
+
+The selected form improves setup WNS by 26 ps and removes two PIPs while
+cutting 6.73 seconds (10.1%) from the preceding baseline. Hold WNS moves by
+2 ps in the wrong direction and is effectively unchanged. The one- and
+two-candidate results are important: the projection graph is useful for
+shortlisting, but it is not accurate enough to replace real route topology
+selection yet.
+
+The next structural waste visible in the trace is round-level duplication:
+when a closure seed does not change, the same cell/BEL move is routed and
+analyzed again in later rounds. Candidate identity plus seed route identity
+should become a transposition table before widening the projected search.

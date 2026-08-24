@@ -12,8 +12,9 @@ use texo_model::{
 pub use texo_pnr::RoutingProgress;
 use texo_pnr::{
     NetRoute, Placement, PlacementConstraints, PlacementRefiner, PnrError, PnrResult,
-    RoutingConstraints, RoutingCosts, RoutingWorkspace, place_analytically_with_net_sink_weights,
-    place_and_route_with_constraints, placement_from_partial_bindings, retain_route_for_sinks,
+    RouteCapacityProjection, RoutingConstraints, RoutingCosts, RoutingWorkspace,
+    place_analytically_with_net_sink_weights, place_and_route_with_constraints,
+    placement_from_partial_bindings, retain_route_for_sinks,
     route_with_timing_costs_workspace_and_progress, route_with_workspace_and_progress,
     swap_placement_cells,
 };
@@ -1394,6 +1395,11 @@ impl TimingDrivenContext<'_, '_> {
             .map(|(net, _, sink)| (*net, *sink))
             .collect::<BTreeSet<_>>();
         let prescreen_weights = timing_net_weights(timing, self.timing_constraints);
+        let route_arc_weights = timing_arc_weights(timing, self.timing_constraints);
+        routing_costs.set_net_criticalities(prescreen_weights.clone());
+        routing_costs.set_sink_criticalities(route_arc_weights.clone());
+        let capacity_projection =
+            RouteCapacityProjection::new(&implementation.routes, routing_costs);
         let mut placement = implementation.placement.clone();
         let mut candidates = Vec::new();
         for (cell, (_, connections, targets)) in cells.into_iter().take(MAX_CRITICAL_PATH_CELLS) {
@@ -1403,9 +1409,10 @@ impl TimingDrivenContext<'_, '_> {
                 &connections,
                 &targets,
                 routing_costs.pip_delays_ps(),
+                Some(&capacity_projection),
                 max_move_distance,
                 if max_move_distance > 2 {
-                    MAX_CRITICAL_PATH_CELL_CANDIDATES
+                    MAX_PROJECTED_PATH_CELL_CANDIDATES
                 } else {
                     1
                 },
@@ -1435,10 +1442,8 @@ impl TimingDrivenContext<'_, '_> {
                     &base,
                     &critical_sinks,
                 );
-                routing_costs
-                    .set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
-                routing_costs
-                    .set_sink_criticalities(timing_arc_weights(timing, self.timing_constraints));
+                routing_costs.set_net_criticalities(prescreen_weights.clone());
+                routing_costs.set_sink_criticalities(route_arc_weights.clone());
                 routing_costs.set_sink_min_delays_ps(BTreeMap::new());
                 routing_costs.set_detailed_timing_nets(released_net_ids(&critical_sinks));
                 // Measured: the finest quantum left WNS and hold untouched while slowing
@@ -1581,7 +1586,7 @@ const GLOBAL_RIPUP_REARM_SLACK_PS: i128 = 250;
 // AXI4 self-test: final WNS and placement were bit-identical without it while
 // each multiresolution round paid one more ~30 s global ripup.
 const MAX_CRITICAL_PATH_CELLS: usize = 6;
-const MAX_CRITICAL_PATH_CELL_CANDIDATES: usize = 4;
+const MAX_PROJECTED_PATH_CELL_CANDIDATES: usize = 4;
 const MAX_CRITICAL_CLOSURE_ROUNDS: usize = 4;
 const MAX_CRITICAL_PATH_VERTEX_REFINEMENTS: usize = 4;
 // Basin-escape budget for designs that stall with negative setup slack after
