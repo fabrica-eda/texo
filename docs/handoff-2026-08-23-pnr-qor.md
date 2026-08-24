@@ -869,3 +869,29 @@ seconds. The remaining dominant phase is still critical-vertex refinement at
 29.74 seconds; its 37 proposal passes now total 4.64 seconds, so most of that
 phase is the deliberate route-and-STA portfolio rather than graph membership
 or projection construction.
+
+## Pareto-filtered topology trials (2026-08-24)
+
+Stage-wise archive metrics exposed an important non-monotonic dependency. The
+7.67-second setup refinement moves the initial -3119 ps / -519139 ps TNS seed
+to -1139 ps / -40688 ps TNS before critical closure. Removing that apparent
+detour expanded critical-vertex refinement from 28.7 to 46.9 seconds and ended
+at -524 ps WNS. It is therefore a basin-conditioning pass, not removable
+overhead.
+
+The broad critical-cell search had a different redundancy. Its route-topology
+projection ranks the failing path, but up to four placements were then routed
+even when a deeper placement was worse both on that topology score and on the
+criticality-weighted estimate over every net moved with the cell. The flow now
+keeps the topology winner and routes a deeper candidate only when it establishes
+a new lower whole-cell timing estimate. This is the Pareto frontier of two
+independent graph views; it does not impose a fixed candidate-rank cutoff.
+
+A fixed two-candidate experiment was faster but regressed to -490 ps WNS and
+was rejected. The Pareto filter completed the identical 300 MHz case in
+**44.34 seconds** (34.55 s user, 10.10 s system), down from the best 48.59-second
+baseline. Setup WNS and hold WHS remain **-214/-399 ps**, while setup TNS
+improved from -4325 to **-3905 ps**. The selected implementation uses 25,675
+PIPs, ten more than the baseline. This demonstrates that the route graph and
+the timing placement graph are complementary: pruning is safe only when a
+candidate is dominated in both.

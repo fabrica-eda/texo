@@ -776,6 +776,7 @@ impl TimingDrivenContext<'_, '_> {
         archive =
             self.refine_setup_monotonically(archive, placement_refiner, routing_costs, progress)?;
         report_metric_phase("closure_monotonic_refinement", &mut phase_started);
+        emit_archive_metric("closure_monotonic", self, &archive);
         for _ in 0..MAX_LOCAL_CONNECTION_REFINEMENTS {
             let seed = archive
                 .iter()
@@ -800,9 +801,11 @@ impl TimingDrivenContext<'_, '_> {
             archive = select_timing_frontier(archive);
         }
         report_metric_phase("closure_local_connections", &mut phase_started);
+        emit_archive_metric("closure_local", self, &archive);
         archive =
             self.close_setup_critically(archive, placement_refiner, routing_costs, progress)?;
         report_metric_phase("closure_critical_vertices", &mut phase_started);
+        emit_archive_metric("closure_critical", self, &archive);
         if !archive
             .iter()
             .any(|(_, timing)| timing.worst_slack_ps.is_some_and(|slack| slack >= 0))
@@ -811,6 +814,7 @@ impl TimingDrivenContext<'_, '_> {
                 self.escape_placement_basin(archive, placement_refiner, routing_costs, progress)?;
         }
         report_metric_phase("closure_basin_escape", &mut phase_started);
+        emit_archive_metric("closure_escape", self, &archive);
         let mut hold_repairs = Vec::new();
         for (implementation, timing) in &archive {
             if timing.worst_slack_ps.is_none_or(|slack| slack < 0) {
@@ -1399,6 +1403,8 @@ impl TimingDrivenContext<'_, '_> {
         let mut prescreen_time = Duration::ZERO;
         let mut constraint_time = Duration::ZERO;
         let mut routed_trials = 0_usize;
+        let profile = metrics_enabled();
+        let mut best_trial = None::<(TimingScore, CellId, usize)>;
         let seed_fingerprint = implementation_topology_fingerprint(self.design, implementation);
         let Some(worst_slack_ps) = timing.worst_slack_ps else {
             return Ok(Vec::new());
@@ -1465,16 +1471,49 @@ impl TimingDrivenContext<'_, '_> {
                     1
                 },
             )?;
+            // The topology projection ranks the failing path itself. Before
+            // paying for negotiated routing, score its small shortlist by
+            // every moved net as a second, independent objective. Route the
+            // Pareto frontier in projection order: the topology winner is
+            // always retained, while a deeper alternative survives only when
+            // it establishes a lower collateral timing estimate.
+            let mut proposals = proposals
+                .into_iter()
+                .enumerate()
+                .map(|(projected_rank, proposal)| {
+                    let nets = self
+                        .moved_nets(&placement, &proposal)
+                        .collect::<BTreeSet<_>>();
+                    let estimate = self
+                        .weighted_net_estimate(&proposal, &nets, &prescreen_weights)
+                        .unwrap_or(u64::MAX);
+                    (estimate, projected_rank, proposal)
+                })
+                .collect::<Vec<_>>();
+            if max_move_distance > 2 {
+                retain_projection_timing_frontier(&mut proposals);
+            }
+            let proposals = proposals
+                .into_iter()
+                .map(|(_, projected_rank, proposal)| (projected_rank, proposal))
+                .collect::<Vec<_>>();
             proposal_time += proposal_started.elapsed();
             if proposals.is_empty() {
                 continue;
             }
             let from = placement.bindings()[cell.0];
             let mut best_for_cell = None;
-            for refined in proposals {
+            for (proposal_rank, refined) in proposals {
                 let prescreen_started = Instant::now();
                 if self.estimate_rejects(&placement, &refined, &prescreen_weights) {
                     prescreen_time += prescreen_started.elapsed();
+                    if profile {
+                        eprintln!(
+                            "[metrics] critical_trial distance={max_move_distance} cell={} rank={} rejected=prescreen",
+                            cell.0,
+                            proposal_rank + 1,
+                        );
+                    }
                     continue;
                 }
                 let trial_key = (
@@ -1483,6 +1522,13 @@ impl TimingDrivenContext<'_, '_> {
                 );
                 if !self.critical_move_trials.insert(trial_key) {
                     prescreen_time += prescreen_started.elapsed();
+                    if profile {
+                        eprintln!(
+                            "[metrics] critical_trial distance={max_move_distance} cell={} rank={} rejected=duplicate",
+                            cell.0,
+                            proposal_rank + 1,
+                        );
+                    }
                     continue;
                 }
                 prescreen_time += prescreen_started.elapsed();
@@ -1530,11 +1576,30 @@ impl TimingDrivenContext<'_, '_> {
                 routed_trials += 1;
                 routing_costs.set_detailed_timing_nets(BTreeSet::new());
                 if let Ok(candidate) = trial {
-                    let improves_objective = timing_score(&candidate.1) > timing_score(timing);
+                    let score = timing_score(&candidate.1);
+                    let improves_objective = score > timing_score(timing);
                     let closes_setup = candidate
                         .1
                         .worst_slack_ps
                         .is_some_and(|slack_ps| slack_ps >= 0);
+                    if best_trial
+                        .as_ref()
+                        .is_none_or(|(best_score, _, _)| score > *best_score)
+                    {
+                        best_trial = Some((score, cell, proposal_rank));
+                    }
+                    if profile {
+                        eprintln!(
+                            "[metrics] critical_trial distance={max_move_distance} cell={} rank={} wns={:?} tns={} improves={improves_objective}",
+                            cell.0,
+                            proposal_rank + 1,
+                            candidate.1.worst_slack_ps,
+                            slack_violations(
+                                candidate.1.setup_checks.iter().map(|check| check.slack_ps)
+                            )
+                            .total_negative_slack_ps(),
+                        );
+                    }
                     progress(Ecp5FlowStage::TimingTrialDecision { improves_objective });
                     if best_for_cell.as_ref().is_none_or(|(_, best_timing)| {
                         timing_score(&candidate.1) > timing_score(best_timing)
@@ -1549,6 +1614,12 @@ impl TimingDrivenContext<'_, '_> {
                         // already feasible.
                         return Ok(candidates);
                     }
+                } else if profile {
+                    eprintln!(
+                        "[metrics] critical_trial distance={max_move_distance} cell={} rank={} rejected=routing",
+                        cell.0,
+                        proposal_rank + 1,
+                    );
                 }
             }
             if let Some((best_implementation, best_timing)) = best_for_cell
@@ -1557,9 +1628,13 @@ impl TimingDrivenContext<'_, '_> {
                 placement = best_implementation.placement;
             }
         }
-        if metrics_enabled() {
+        if profile {
+            let winner = best_trial.map_or_else(
+                || "none".to_owned(),
+                |(_, cell, proposal_rank)| format!("{}:{}", cell.0, proposal_rank + 1),
+            );
             eprintln!(
-                "[metrics] critical_cells distance={max_move_distance} total={:?} proposals={proposal_time:?} prescreen={prescreen_time:?} constraints={constraint_time:?} trials={routed_trials}",
+                "[metrics] critical_cells distance={max_move_distance} total={:?} proposals={proposal_time:?} prescreen={prescreen_time:?} constraints={constraint_time:?} trials={routed_trials} winner={winner}",
                 profile_started.elapsed(),
             );
         }
@@ -1628,6 +1703,42 @@ impl TimingDrivenContext<'_, '_> {
         bounded.set_max_iterations(LOCAL_TRIAL_ROUTING_ITERATIONS);
         self.route_and_analyze(placement, routing, Some(&bounded), progress)
     }
+}
+
+fn emit_archive_metric(
+    stage: &str,
+    context: &TimingDrivenContext<'_, '_>,
+    archive: &[TimingCandidate],
+) {
+    if !metrics_enabled() {
+        return;
+    }
+    if let Some((implementation, timing)) = archive.iter().max_by_key(|(implementation, timing)| {
+        (timing_score(timing), Reverse(implementation.total_pips))
+    }) {
+        eprintln!(
+            "[metrics] closure_stage={stage} wns={:?} tns={} whs={:?} pips={} hpwl={}",
+            timing.worst_slack_ps,
+            slack_violations(timing.setup_checks.iter().map(|check| check.slack_ps))
+                .total_negative_slack_ps(),
+            timing.worst_hold_slack_ps,
+            implementation.total_pips,
+            placement_hpwl(
+                context.design,
+                context.architecture.device(),
+                &implementation.placement,
+            ),
+        );
+    }
+}
+
+fn retain_projection_timing_frontier<T>(candidates: &mut Vec<(u64, usize, T)>) {
+    let mut best_estimate = u64::MAX;
+    candidates.retain(|(estimate, projected_rank, _)| {
+        let keep = *projected_rank == 0 || *estimate < best_estimate;
+        best_estimate = best_estimate.min(*estimate);
+        keep
+    });
 }
 
 fn worst_setup_connections(
@@ -2757,8 +2868,8 @@ mod tests {
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, criticality_weight,
         delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, find_cell_pin,
         freeze_route_sinks_except, implement, implement_struo_ecp5, implement_with_constraints,
-        pip_class_delay, should_retry_global_ripup, slack_violations, staged_timing_score,
-        verify_post_map_with_celox,
+        pip_class_delay, retain_projection_timing_frontier, should_retry_global_ripup,
+        slack_violations, staged_timing_score, verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -2777,6 +2888,23 @@ mod tests {
         assert_eq!(delay_weighted_criticality(64, 500, 4_000), 32);
         assert_eq!(delay_weighted_criticality(64, 1_000, 4_000), 64);
         assert_eq!(delay_weighted_criticality(64, 2_000, 4_000), 64);
+    }
+
+    #[test]
+    fn topology_trial_frontier_keeps_only_new_timing_records() {
+        let mut candidates = vec![
+            (50, 0, "topology winner"),
+            (60, 1, "dominated"),
+            (40, 2, "timing record"),
+            (45, 3, "dominated later"),
+        ];
+
+        retain_projection_timing_frontier(&mut candidates);
+
+        assert_eq!(
+            candidates,
+            vec![(50, 0, "topology winner"), (40, 2, "timing record")]
+        );
     }
 
     #[test]
