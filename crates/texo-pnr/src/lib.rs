@@ -361,6 +361,7 @@ pub struct NetRoute {
 pub struct RouteCapacityProjection {
     wire_owners: HashMap<WireId, Vec<(NetId, u64)>>,
     pip_owners: HashMap<PipId, Vec<(NetId, u64)>>,
+    routes: BTreeMap<NetId, Arc<NetRoute>>,
 }
 
 impl RouteCapacityProjection {
@@ -369,6 +370,7 @@ impl RouteCapacityProjection {
     pub fn new(routes: &[Arc<NetRoute>], costs: &RoutingCosts) -> Self {
         let mut projection = Self::default();
         for route in routes {
+            projection.routes.insert(route.net, route.clone());
             for arc in &route.arcs {
                 let criticality = arc
                     .sink
@@ -2016,9 +2018,21 @@ fn assignment_connection_projected_cost(
         let sink_bel = assignment_bel(unit, assignment, sink.cell, placed)?;
         let driver_wire = candidate_pin_wire(graph, constraints, driver_pin, driver_bel)?;
         let sink_wire = candidate_pin_wire(graph, constraints, sink_pin, sink_bel)?;
-        total = total.saturating_add(local_connection_projected_cost(
+        let mut starts = BTreeSet::from([driver_wire]);
+        if sink.cell == moving_cell
+            && let Some(route) = projection.routes.get(&net)
+        {
+            starts.extend(
+                route
+                    .arcs
+                    .iter()
+                    .filter(|arc| arc.sink != Some(sink_pin))
+                    .flat_map(|arc| arc.wires.iter().copied()),
+            );
+        }
+        total = total.saturating_add(local_connection_projected_cost_from_starts(
             graph,
-            driver_wire,
+            &starts,
             sink_wire,
             pip_delays_ps,
             net,
@@ -2028,9 +2042,9 @@ fn assignment_connection_projected_cost(
     Some(total)
 }
 
-fn local_connection_projected_cost(
+fn local_connection_projected_cost_from_starts(
     graph: &UnifiedGraph<'_>,
-    start: WireId,
+    starts: &BTreeSet<WireId>,
     goal: WireId,
     pip_delays_ps: &[u32],
     net: NetId,
@@ -2039,14 +2053,24 @@ fn local_connection_projected_cost(
     const MAX_LOCAL_HOPS: u8 = 16;
     const LOCAL_MARGIN: u32 = 1;
     let device = graph.device();
+    let start_point = starts
+        .iter()
+        .map(|wire| device.wires()[wire.0].point)
+        .min_by_key(|point| (point.manhattan(device.wires()[goal.0].point), *point))?;
     let corridor = routing_corridor(
-        device.wires()[start.0].point,
+        start_point,
         device.wires()[goal.0].point,
         device,
         LOCAL_MARGIN,
     );
-    let mut queue = BinaryHeap::from([Reverse((0_u64, 0_u8, start))]);
-    let mut best = HashMap::from([((start, 0_u8), 0_u64)]);
+    let mut queue = BinaryHeap::new();
+    let mut best = HashMap::new();
+    for &start in starts {
+        if point_inside_corridor(device.wires()[start.0].point, corridor) {
+            queue.push(Reverse((0_u64, 0_u8, start)));
+            best.insert((start, 0_u8), 0_u64);
+        }
+    }
     while let Some(Reverse((cost, hops, wire))) = queue.pop() {
         if wire == goal {
             return Some(cost);
@@ -2055,6 +2079,9 @@ fn local_connection_projected_cost(
             continue;
         }
         for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
+            if starts.contains(&neighbor) {
+                continue;
+            }
             if !point_inside_corridor(device.wires()[neighbor.0].point, corridor) {
                 continue;
             }
@@ -5288,8 +5315,8 @@ mod tests {
         PlacementNeighbor, PlacementRefinementWorkspace, PlacementRefiner, PnrError, RouteArc,
         RouteCapacityProjection, RouteQueueEntry, RouteSearch, RoutingConstraints, RoutingCosts,
         RoutingResourceMetadata, RoutingWorkspace, congested_route_arcs,
-        place_analytically_with_net_sink_weights, place_and_route, place_with_constraints,
-        placement_neighbors, projected_resource_penalty,
+        local_connection_projected_cost_from_starts, place_analytically_with_net_sink_weights,
+        place_and_route, place_with_constraints, placement_neighbors, projected_resource_penalty,
         refine_placement_with_net_sink_weights_limited, refine_placement_with_net_weights,
         refinement_edge_cost, retain_route_for_sinks, route_reaches_all_sinks,
         route_with_placement_and_progress, route_with_timing_costs_and_progress,
@@ -6210,6 +6237,30 @@ mod tests {
         assert_eq!(
             projected_resource_penalty(projection.wire_owners.get(&shared), owner, 1),
             0
+        );
+    }
+
+    #[test]
+    fn projected_connection_grows_from_the_retained_route_tree() {
+        let design = Design::new();
+        let mut device = Device::new("projected-tree", 1, 1).unwrap();
+        let driver = device.add_wire("driver", Point::new(0, 0), 1).unwrap();
+        let retained = device.add_wire("retained", Point::new(0, 0), 1).unwrap();
+        let goal = device.add_wire("goal", Point::new(0, 0), 1).unwrap();
+        device.add_pip(driver, goal, false, 1).unwrap();
+        device.add_pip(retained, goal, false, 1).unwrap();
+        let graph = UnifiedGraph::new(&design, &device);
+
+        assert_eq!(
+            local_connection_projected_cost_from_starts(
+                &graph,
+                &BTreeSet::from([driver, retained]),
+                goal,
+                &[100, 10],
+                NetId(0),
+                &RouteCapacityProjection::default(),
+            ),
+            Some(10),
         );
     }
 }

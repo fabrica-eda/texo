@@ -1011,3 +1011,37 @@ wire metadata on every expanded node. Removing that second lookup kept QoR
 identical and reduced the next metrics run to **26.954 seconds** of flow,
 **15.502 seconds** of critical refinement, **32.83 seconds** wall, and 31.12
 seconds user CPU.
+
+## Retained-tree topology in the placement projection (2026-08-25)
+
+The broad placement projection previously evaluated every moved sink as an
+independent driver-to-sink route. That did not match the incremental router:
+when one fanout sink moves, all other sink arcs remain frozen and their shared
+tree is a legal set of connection sources. The resulting projection both
+double-counted shared trunks and preferred placements that looked cheap only
+after discarding useful incumbent topology.
+
+`RouteCapacityProjection` now retains the incumbent net trees. For a moved
+sink, its bounded capacity-aware search is seeded from every wire belonging to
+the other sink arcs; a moved driver still receives a complete driver-to-sink
+projection. A regression test verifies that the projected connection grows
+from the cheaper retained-tree source. The local radius-1/2 hierarchy keeps
+its routed-delay-excess ordering: applying even the improved projection there
+still changed the final result to -266 ps WNS, so topology projection remains
+the broad-search layer rather than replacing the allowance objective.
+
+On AXI4, the broad shared-tree projection preserved **-214 ps WNS, -3905 ps
+setup TNS, and -399 ps WHS**, while reducing the selected implementation from
+25,675 to **25,655 PIPs**. Critical refinement fell from 15.502 to **15.179
+seconds**, flow time from 26.954 to **26.494 seconds**, wall time from 32.83 to
+**32.32 seconds**, and user CPU from 31.12 to **30.78 seconds**. This is a QoR
+and runtime gain from increasing placement-graph topology fidelity, not from
+reducing the candidate portfolio.
+
+Three related shortcuts were measured and rejected. Immediate arc-victim
+removal lost the shared present-congestion price and ended at -325 ps; fixed
+timing corridors of 6 tiles ran faster but ended at -474 ps (10 tiles restored
+QoR but was slower than 12); and old-route soft upper bounds reached 8.92
+seconds of critical refinement but trapped closure at -379 ps or worse. The
+remaining router redesign must preserve shared-tree state and shared conflict
+prices while allowing critical topology to change.
