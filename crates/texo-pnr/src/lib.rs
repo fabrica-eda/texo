@@ -1151,11 +1151,7 @@ pub fn place_analytically_with_net_sink_weights(
     constraints: &PlacementConstraints,
     sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
 ) -> Result<Placement, PnrError> {
-    analytical_place(
-        &UnifiedGraph::new(design, device),
-        constraints,
-        sink_weights,
-    )
+    PlacementRefiner::new(design, device, constraints)?.place_analytically(sink_weights)
 }
 
 /// Completes and validates a legal placement from caller-selected bindings.
@@ -1399,7 +1395,33 @@ pub struct PlacementRefiner<'a> {
     graph: UnifiedGraph<'a>,
     constraints: &'a PlacementConstraints,
     units: Vec<PlacementUnit>,
-    spatial_indexes: BTreeMap<(u8, usize), SpatialChoiceIndex>,
+    spatial_indexes: BTreeMap<(u8, usize), Arc<SpatialChoiceIndex>>,
+}
+
+/// Reusable architecture-level tables for rebuilding placement refiners after
+/// a packing change.
+#[derive(Default)]
+pub struct PlacementRefinementWorkspace {
+    candidate_cache: BTreeMap<PlacementCandidateKey, Arc<[BelId]>>,
+    spatial_indexes: BTreeMap<(u8, usize), Arc<SpatialChoiceIndex>>,
+    validated_group_shapes: Vec<ValidatedGroupShape>,
+}
+
+struct ValidatedGroupShape {
+    assignments: Arc<[Vec<BelId>]>,
+    candidate_sets: Vec<Arc<[BelId]>>,
+}
+
+impl PlacementRefinementWorkspace {
+    /// Creates an empty placement-graph cache.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            candidate_cache: BTreeMap::new(),
+            spatial_indexes: BTreeMap::new(),
+            validated_group_shapes: Vec::new(),
+        }
+    }
 }
 
 impl<'a> PlacementRefiner<'a> {
@@ -1413,14 +1435,36 @@ impl<'a> PlacementRefiner<'a> {
         device: &'a Device,
         constraints: &'a PlacementConstraints,
     ) -> Result<Self, PnrError> {
+        let mut workspace = PlacementRefinementWorkspace::new();
+        Self::new_with_workspace(design, device, constraints, &mut workspace)
+    }
+
+    /// Builds a refiner while reusing architecture-level candidate tables and
+    /// spatial indexes retained across packing generations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a placement group or candidate binding is invalid.
+    pub fn new_with_workspace(
+        design: &'a Design,
+        device: &'a Device,
+        constraints: &'a PlacementConstraints,
+        workspace: &mut PlacementRefinementWorkspace,
+    ) -> Result<Self, PnrError> {
         let graph = UnifiedGraph::new(design, device);
-        let mut candidate_cache = BTreeMap::new();
-        let units = placement_units(&graph, constraints, &mut candidate_cache)?;
+        let units = placement_units_cached(
+            &graph,
+            constraints,
+            &mut workspace.candidate_cache,
+            &mut workspace.validated_group_shapes,
+        )?;
         let mut spatial_indexes = BTreeMap::new();
         for unit in &units {
-            spatial_indexes
+            let index = workspace
+                .spatial_indexes
                 .entry(unit.choices.cache_key())
-                .or_insert_with(|| SpatialChoiceIndex::new(&unit.choices, device));
+                .or_insert_with(|| Arc::new(SpatialChoiceIndex::new(&unit.choices, device)));
+            spatial_indexes.insert(unit.choices.cache_key(), Arc::clone(index));
         }
         Ok(Self {
             graph,
@@ -1428,6 +1472,25 @@ impl<'a> PlacementRefiner<'a> {
             units,
             spatial_indexes,
         })
+    }
+
+    /// Solves analytical placement on this refiner's cached legal-assignment
+    /// graph and spatial hierarchy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cached placement problem cannot be legalized.
+    pub fn place_analytically(
+        &self,
+        sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
+    ) -> Result<Placement, PnrError> {
+        analytical_place(
+            &self.graph,
+            self.constraints,
+            &self.units,
+            &self.spatial_indexes,
+            sink_weights,
+        )
     }
 
     /// Refines a legal placement while moving at most the requested units.
@@ -2330,14 +2393,14 @@ fn place(
 fn analytical_place(
     graph: &UnifiedGraph<'_>,
     constraints: &PlacementConstraints,
+    units: &[PlacementUnit],
+    spatial_indexes: &BTreeMap<(u8, usize), Arc<SpatialChoiceIndex>>,
     sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
 ) -> Result<Placement, PnrError> {
     const CENTER_WEIGHT: f64 = 0.01;
     let design = graph.design();
     let device = graph.device();
     let (_, neighbors) = placement_neighbors(design, None, Some(sink_weights), None);
-    let mut candidate_cache = BTreeMap::new();
-    let units = placement_units(graph, constraints, &mut candidate_cache)?;
     let mut unit_by_cell = vec![usize::MAX; design.cells().len()];
     let mut column_by_cell = vec![usize::MAX; design.cells().len()];
     let mut macro_offset_by_cell = vec![(0.0, 0.0); design.cells().len()];
@@ -2413,7 +2476,7 @@ fn analytical_place(
     let mut solved_y = solve_quadratic(&diagonal, &adjacency, &rhs_y, initial_y);
     for density_weight in [0.05, 0.10, 0.20, 0.40] {
         let (target_x, target_y) =
-            analytic_spread_targets(&units, &fixed, device, solved_x.clone(), solved_y.clone());
+            analytic_spread_targets(units, &fixed, device, solved_x.clone(), solved_y.clone());
         let mut spread_diagonal = diagonal.clone();
         let mut spread_rhs_x = rhs_x.clone();
         let mut spread_rhs_y = rhs_y.clone();
@@ -2479,16 +2542,13 @@ fn analytical_place(
         })
         .collect::<Vec<_>>();
     order.sort_by_key(|&(_, criticality, cell)| (criticality, cell));
-    let mut spatial_indexes = BTreeMap::new();
     for (index, _, _) in order {
         let unit = &units[index];
         let target = Point::new(
             rounded_coordinate(solved_x[index], device.width()),
             rounded_coordinate(solved_y[index], device.height()),
         );
-        let spatial_index = spatial_indexes
-            .entry(unit.choices.cache_key())
-            .or_insert_with(|| SpatialChoiceIndex::new(&unit.choices, device));
+        let spatial_index = &spatial_indexes[&unit.choices.cache_key()];
         let assignment_index = nearest_legal_assignments_with_density(
             unit,
             spatial_index,
@@ -2891,7 +2951,7 @@ fn refine_placement(
     placed: &mut [Option<BelId>],
     occupied: &mut BTreeSet<BelId>,
     move_limit: Option<usize>,
-    cached_spatial_indexes: Option<&BTreeMap<(u8, usize), SpatialChoiceIndex>>,
+    cached_spatial_indexes: Option<&BTreeMap<(u8, usize), Arc<SpatialChoiceIndex>>>,
 ) {
     let device = graph.device();
     let mut pin_usage = HashMap::new();
@@ -2970,7 +3030,7 @@ fn refine_placement(
                 &pin_usage,
             );
             let spatial_index = if let Some(cached) = cached_spatial_indexes {
-                &cached[&unit.choices.cache_key()]
+                cached[&unit.choices.cache_key()].as_ref()
             } else {
                 spatial_indexes
                     .entry(unit.choices.cache_key())
@@ -3363,6 +3423,15 @@ fn placement_units(
     constraints: &PlacementConstraints,
     candidate_cache: &mut BTreeMap<PlacementCandidateKey, Arc<[BelId]>>,
 ) -> Result<Vec<PlacementUnit>, PnrError> {
+    placement_units_cached(graph, constraints, candidate_cache, &mut Vec::new())
+}
+
+fn placement_units_cached(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    candidate_cache: &mut BTreeMap<PlacementCandidateKey, Arc<[BelId]>>,
+    validated_group_shapes: &mut Vec<ValidatedGroupShape>,
+) -> Result<Vec<PlacementUnit>, PnrError> {
     validate_pin_bindings(graph, constraints)?;
     let mut constrained = BTreeSet::new();
     let mut units = Vec::new();
@@ -3392,30 +3461,48 @@ fn placement_units(
             .iter()
             .map(|&cell| cached_placement_candidates(graph, constraints, cell, candidate_cache))
             .collect::<Result<Vec<_>, _>>()?;
-        for assignment in group.assignments.iter() {
-            if assignment.len() != group.cells.len() {
-                return Err(PnrError::InvalidPlacementConstraint {
-                    group: group_index,
-                    reason: "assignment width does not match group width".into(),
-                });
-            }
-            let mut unique_bels = BTreeSet::new();
-            for ((&cell, candidates), &bel) in
-                group.cells.iter().zip(&candidate_sets).zip(assignment)
-            {
-                if !unique_bels.insert(bel) {
+        let shape_is_validated = validated_group_shapes.iter().any(|shape| {
+            Arc::ptr_eq(&shape.assignments, &group.assignments)
+                && shape.candidate_sets.len() == candidate_sets.len()
+                && shape
+                    .candidate_sets
+                    .iter()
+                    .zip(&candidate_sets)
+                    .all(|(known, candidate)| Arc::ptr_eq(known, candidate))
+        });
+        if !shape_is_validated {
+            for assignment in group.assignments.iter() {
+                if assignment.len() != group.cells.len() {
                     return Err(PnrError::InvalidPlacementConstraint {
                         group: group_index,
-                        reason: format!("BEL ID {} is assigned more than once", bel.0),
+                        reason: "assignment width does not match group width".into(),
                     });
                 }
-                if candidates.binary_search(&bel).is_err() {
-                    return Err(PnrError::InvalidPlacementConstraint {
-                        group: group_index,
-                        reason: format!("BEL ID {} is incompatible with cell ID {}", bel.0, cell.0),
-                    });
+                let mut unique_bels = BTreeSet::new();
+                for ((&cell, candidates), &bel) in
+                    group.cells.iter().zip(&candidate_sets).zip(assignment)
+                {
+                    if !unique_bels.insert(bel) {
+                        return Err(PnrError::InvalidPlacementConstraint {
+                            group: group_index,
+                            reason: format!("BEL ID {} is assigned more than once", bel.0),
+                        });
+                    }
+                    if candidates.binary_search(&bel).is_err() {
+                        return Err(PnrError::InvalidPlacementConstraint {
+                            group: group_index,
+                            reason: format!(
+                                "BEL ID {} is incompatible with cell ID {}",
+                                bel.0, cell.0
+                            ),
+                        });
+                    }
                 }
             }
+            validated_group_shapes.push(ValidatedGroupShape {
+                assignments: Arc::clone(&group.assignments),
+                candidate_sets: candidate_sets.clone(),
+            });
         }
         units.push(PlacementUnit {
             cells: group.cells.clone(),
@@ -5135,10 +5222,11 @@ mod tests {
 
     use super::{
         MAX_ROUTING_ITERATIONS, NetRoute, PinWireCache, Placement, PlacementConstraints,
-        PlacementNeighbor, PnrError, RouteArc, RouteCapacityProjection, RouteSearch,
-        RoutingConstraints, RoutingCosts, RoutingResourceMetadata, RoutingWorkspace,
-        congested_route_arcs, place_analytically_with_net_sink_weights, place_and_route,
-        place_with_constraints, placement_neighbors, projected_resource_penalty,
+        PlacementNeighbor, PlacementRefinementWorkspace, PlacementRefiner, PnrError, RouteArc,
+        RouteCapacityProjection, RouteSearch, RoutingConstraints, RoutingCosts,
+        RoutingResourceMetadata, RoutingWorkspace, congested_route_arcs,
+        place_analytically_with_net_sink_weights, place_and_route, place_with_constraints,
+        placement_neighbors, projected_resource_penalty,
         refine_placement_with_net_sink_weights_limited, refine_placement_with_net_weights,
         refinement_edge_cost, retain_route_for_sinks, route_reaches_all_sinks,
         route_with_placement_and_progress, route_with_timing_costs_and_progress,
@@ -5229,6 +5317,32 @@ mod tests {
         let sink = device.bels()[placement.bel(sink).unwrap().0].point;
 
         assert!(far.manhattan(sink) <= 1, "far={far:?}, sink={sink:?}");
+    }
+
+    #[test]
+    fn placement_workspace_reuses_validated_group_shapes() {
+        let design = two_cell_design();
+        let device = Device::rectangular_logic(2, 1).unwrap();
+        let assignments: Arc<[Vec<BelId>]> = vec![vec![BelId(0), BelId(1)]].into();
+        let mut constraints = PlacementConstraints::new();
+        constraints
+            .add_group_with_shared_assignments([CellId(0), CellId(1)], Arc::clone(&assignments));
+        let mut workspace = PlacementRefinementWorkspace::new();
+
+        let first =
+            PlacementRefiner::new_with_workspace(&design, &device, &constraints, &mut workspace)
+                .unwrap();
+        let first_placement = first.place_analytically(&BTreeMap::new()).unwrap();
+        drop(first);
+        assert_eq!(workspace.validated_group_shapes.len(), 1);
+
+        let second =
+            PlacementRefiner::new_with_workspace(&design, &device, &constraints, &mut workspace)
+                .unwrap();
+        let second_placement = second.place_analytically(&BTreeMap::new()).unwrap();
+
+        assert_eq!(workspace.validated_group_shapes.len(), 1);
+        assert_eq!(first_placement, second_placement);
     }
 
     #[test]

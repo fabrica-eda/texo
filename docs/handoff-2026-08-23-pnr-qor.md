@@ -822,3 +822,34 @@ projection version at **62.10 s wall / 51.27 s user CPU**. Both produced
 **-214/-399 ps and 25,665 PIPs**. The 4.32-second wall and 3.07-second user-CPU
 reductions confirm that graph construction scope, not just A* implementation,
 was a material part of the remaining runtime.
+
+## Packing-generation placement graph workspace (2026-08-24)
+
+The analytical placer and timing-closure refiner used to validate the complete
+legal-assignment table independently. More importantly, a shared physical
+assignment table was traversed once for every logical packing group even when
+all groups had the same candidate domains. On AXI4 this repeated the device-wide
+LUT/FF legality proof thousands of times.
+
+`PlacementRefinementWorkspace` now survives packing generations and owns three
+architecture-level caches:
+
+- compatible BEL tables keyed by logical cell shape;
+- spatial indexes keyed by the shared assignment table; and
+- validated group shapes keyed by strong `Arc` identities for the assignment
+  table and each column's candidate table.
+
+The strong references make the identity proof safe against allocator address
+reuse. Candidate-specific pin bindings produce distinct candidate tables and
+therefore still receive their own complete validation. A failed validation is
+never entered into the cache. The initial analytical solve and the refiner
+rebuilt after the dedicated-edge packing ECO share this workspace, while each
+still receives the correct current `PlacementConstraints`.
+
+In adjacent metrics runs, initial placement fell from 2.59 s to 0.41 s and the
+post-packing closure-refiner build from 2.26 s to 0.00048 s. Total flow time
+fell from 52.31 s to 45.72 s; wall time fell from 58.51 s to **51.86 s**. A
+second non-metrics run completed in **51.98 s**. Both reproduced **-214/-399
+ps and 25,665 PIPs** exactly. This is the clearest evidence so far that graph
+construction lifetime and hierarchy were a larger problem than the low-level
+search implementation.

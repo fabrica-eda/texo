@@ -14,9 +14,9 @@ use texo_model::{
 };
 pub use texo_pnr::RoutingProgress;
 use texo_pnr::{
-    NetRoute, Placement, PlacementConstraints, PlacementRefiner, PnrError, PnrResult,
-    RouteCapacityProjection, RoutingConstraints, RoutingCosts, RoutingWorkspace,
-    place_analytically_with_net_sink_weights, place_and_route_with_constraints,
+    NetRoute, Placement, PlacementConstraints, PlacementRefinementWorkspace, PlacementRefiner,
+    PnrError, PnrResult, RouteCapacityProjection, RoutingConstraints, RoutingCosts,
+    RoutingWorkspace, place_analytically_with_net_sink_weights, place_and_route_with_constraints,
     placement_from_partial_bindings, retain_route_for_sinks,
     route_with_timing_costs_workspace_and_progress, route_with_workspace_and_progress,
     swap_placement_cells,
@@ -357,11 +357,20 @@ pub fn implement_struo_ecp5_with_progress(
     progress(Ecp5FlowStage::Packed);
     report_metric_phase("packing", &mut phase_started);
 
+    let mut placement_refinement_workspace = PlacementRefinementWorkspace::new();
+
     let mut staged_evidence = evidence.clone();
     staged_evidence.record(Gate::MappedNetlistComplete);
-    let placement = match options.initial_placement {
-        Some(bindings) => named_initial_placement(&design, architecture, &packing, bindings)?,
-        None => initial_analytical_placement(&design, architecture, &packing)?,
+    let placement = if let Some(bindings) = options.initial_placement {
+        named_initial_placement(&design, architecture, &packing, bindings)?
+    } else {
+        let placement_refiner = PlacementRefiner::new_with_workspace(
+            &design,
+            architecture.device(),
+            packing.constraints(),
+            &mut placement_refinement_workspace,
+        )?;
+        initial_analytical_placement(&design, architecture, &placement_refiner)?
     };
     progress(Ecp5FlowStage::Placed);
     report_metric_phase("initial_placement", &mut phase_started);
@@ -466,10 +475,18 @@ pub fn implement_struo_ecp5_with_progress(
     report_metric_phase("dedicated_edge_search", &mut phase_started);
 
     let (implementation, timing) = if let Some(costs) = closure_routing_costs.as_mut() {
+        let placement_refiner = PlacementRefiner::new_with_workspace(
+            &design,
+            architecture.device(),
+            packing.constraints(),
+            &mut placement_refinement_workspace,
+        )?;
+        report_metric_phase("closure_refiner_build", &mut phase_started);
         TimingDrivenContext {
             design: &design,
             architecture,
             packing: &packing,
+            placement_refiner: &placement_refiner,
             global_routing_cache: &mut global_routing_cache,
             speed_grade,
             timing_model: &timing_model,
@@ -719,6 +736,7 @@ struct TimingDrivenContext<'a, 'work> {
     design: &'a Design,
     architecture: &'a Ecp5Architecture,
     packing: &'a Ecp5Packing,
+    placement_refiner: &'work PlacementRefiner<'a>,
     global_routing_cache: &'work mut Ecp5GlobalRoutingCache<'a>,
     speed_grade: &'a SpeedGradeRecord,
     timing_model: &'a TimingModel,
@@ -754,14 +772,9 @@ impl TimingDrivenContext<'_, '_> {
         routing_costs
             .set_sink_criticalities(timing_arc_weights(&initial_timing, self.timing_constraints));
         let mut archive = vec![(initial_implementation, initial_timing)];
-        let placement_refiner = PlacementRefiner::new(
-            self.design,
-            self.architecture.device(),
-            self.packing.constraints(),
-        )?;
-        report_metric_phase("closure_refiner_build", &mut phase_started);
+        let placement_refiner = self.placement_refiner;
         archive =
-            self.refine_setup_monotonically(archive, &placement_refiner, routing_costs, progress)?;
+            self.refine_setup_monotonically(archive, placement_refiner, routing_costs, progress)?;
         report_metric_phase("closure_monotonic_refinement", &mut phase_started);
         for _ in 0..MAX_LOCAL_CONNECTION_REFINEMENTS {
             let seed = archive
@@ -772,7 +785,7 @@ impl TimingDrivenContext<'_, '_> {
             let refinements = self.refine_local_connections(
                 &seed.0,
                 &seed.1,
-                &placement_refiner,
+                placement_refiner,
                 routing_costs,
                 progress,
             )?;
@@ -788,14 +801,14 @@ impl TimingDrivenContext<'_, '_> {
         }
         report_metric_phase("closure_local_connections", &mut phase_started);
         archive =
-            self.close_setup_critically(archive, &placement_refiner, routing_costs, progress)?;
+            self.close_setup_critically(archive, placement_refiner, routing_costs, progress)?;
         report_metric_phase("closure_critical_vertices", &mut phase_started);
         if !archive
             .iter()
             .any(|(_, timing)| timing.worst_slack_ps.is_some_and(|slack| slack >= 0))
         {
             archive =
-                self.escape_placement_basin(archive, &placement_refiner, routing_costs, progress)?;
+                self.escape_placement_basin(archive, placement_refiner, routing_costs, progress)?;
         }
         report_metric_phase("closure_basin_escape", &mut phase_started);
         let mut hold_repairs = Vec::new();
@@ -2120,14 +2133,9 @@ impl SlackViolations {
 fn initial_analytical_placement(
     design: &Design,
     architecture: &Ecp5Architecture,
-    packing: &Ecp5Packing,
+    placement_refiner: &PlacementRefiner<'_>,
 ) -> Result<Placement, Ecp5FlowError> {
-    let placement = place_analytically_with_net_sink_weights(
-        design,
-        architecture.device(),
-        packing.constraints(),
-        &BTreeMap::new(),
-    )?;
+    let placement = placement_refiner.place_analytically(&BTreeMap::new())?;
     emit_placement_metric(
         "initial_place",
         design,
