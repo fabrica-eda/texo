@@ -648,3 +648,34 @@ A*/negotiation cost and a cheap topology/capacity projection capable of
 screening thousands of placement moves; persistent transactions remove the
 state-reconstruction tax but do not yet provide that candidate-generation
 layer.
+
+## Architecture-scaled A* estimate (2026-08-24)
+
+The router previously added raw Manhattan tile distance to a path score whose
+units are a criticality blend of quantized picosecond delay and congestion.
+That dimensional mismatch made the heuristic too weak for nearby critical
+arcs and inconsistently strong for long-line hops. nextpnr instead converts an
+architecture delay prediction into the same units as its accumulated route
+score.
+
+Texo now predicts the remaining critical-route delay as `100 ps + 100
+ps/tile`, converts it through the existing criticality/quantum function, and
+adds only the noncritical hop fraction. Congestion-only routing retains raw
+Manhattan distance, so the fast initial route is unchanged. The coefficients
+are intentionally larger than nextpnr's ECP5 formula because Texo folds wire
+delay into PIP timing classes whereas nextpnr accounts for wire and PIP delay
+separately.
+
+Measured on the same AXI4 300 MHz input:
+
+| flow | final WNS / WHS | PIPs | runtime |
+|---|---:|---:|---:|
+| persistent-route baseline | -254 / -397 ps | 25,660 | 78.90 s |
+| architecture-scaled A* | **-240 / -397 ps** | 25,667 | **66.51 s** |
+
+This improves setup by 14 ps while reducing wall time by 12.39 seconds
+(15.7%). Two rejected calibrations established the useful range: directly
+copying nextpnr's small residual-delay formula finished near 57 seconds but
+regressed WNS to -481 ps, while the fully realized `300 + 250 ps/tile` model
+finished in 60.50 seconds at -377 ps. Both over-constrained Texo's differently
+normalized route graph and were reverted.

@@ -4229,6 +4229,9 @@ type RouteQueueEntry = (u64, u64, u64, WireId);
 type HoldRouteState = (WireId, u32);
 type HoldRouteVisit = (u64, u64, Option<(HoldRouteState, PipId)>);
 
+const ROUTING_ESTIMATE_BASE_DELAY_PS: u64 = 100;
+const ROUTING_ESTIMATE_DELAY_PER_TILE_PS: u64 = 100;
+
 impl RouteSearch {
     fn new(wire_count: usize) -> Self {
         Self {
@@ -4241,6 +4244,31 @@ impl RouteSearch {
             previous_pip: vec![usize::MAX; wire_count],
             queue: BinaryHeap::new(),
         }
+    }
+
+    /// Architecture-scaled remaining cost for timing-driven A*.
+    ///
+    /// Raw Manhattan distance is in tiles while the accumulated path score
+    /// blends picosecond delay with congestion. Converting a lightweight
+    /// geometry delay prediction into that same score keeps the heuristic
+    /// strong without overwhelming detours onto fast long-line resources.
+    fn remaining_cost_estimate(
+        point: Point,
+        goal: Point,
+        criticality: u64,
+        delay_quantum_ps: u64,
+    ) -> u64 {
+        let distance = point.manhattan(goal);
+        if criticality == 0 {
+            return distance;
+        }
+        let predicted_delay_ps = ROUTING_ESTIMATE_BASE_DELAY_PS
+            .saturating_add(distance.saturating_mul(ROUTING_ESTIMATE_DELAY_PER_TILE_PS));
+        let timing = timing_tree_cost(predicted_delay_ps, criticality, delay_quantum_ps);
+        let hop_bias = distance
+            .saturating_mul(ROUTING_CRITICALITY_SCALE - criticality)
+            .div_ceil(ROUTING_CRITICALITY_SCALE);
+        timing.saturating_add(hop_bias)
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -4306,7 +4334,12 @@ impl RouteSearch {
             self.previous_wire[start.0] = usize::MAX;
             self.previous_pip[start.0] = usize::MAX;
             self.queue.push(Reverse((
-                distance.saturating_add(metadata.wire_points[start.0].manhattan(goal_point)),
+                distance.saturating_add(Self::remaining_cost_estimate(
+                    metadata.wire_points[start.0],
+                    goal_point,
+                    criticality,
+                    delay_quantum_ps,
+                )),
                 distance,
                 arrival_ps,
                 start,
@@ -4379,8 +4412,12 @@ impl RouteSearch {
                 self.arrival_ps[neighbor.0] = next_arrival_ps;
                 self.previous_wire[neighbor.0] = wire.0;
                 self.previous_pip[neighbor.0] = pip.0;
-                let estimate = next_distance
-                    .saturating_add(metadata.wire_points[neighbor.0].manhattan(goal_point));
+                let estimate = next_distance.saturating_add(Self::remaining_cost_estimate(
+                    metadata.wire_points[neighbor.0],
+                    goal_point,
+                    criticality,
+                    delay_quantum_ps,
+                ));
                 self.queue.push(Reverse((
                     estimate,
                     next_distance,
@@ -4908,6 +4945,22 @@ mod tests {
         assert_eq!(
             routing_corridor(Point::new(1, 1), Point::new(6, 4), &device, 3),
             (0, 7, 0, 5),
+        );
+    }
+
+    #[test]
+    fn timing_route_estimate_uses_the_path_cost_scale() {
+        let source = Point::new(1, 1);
+        let sink = Point::new(6, 1);
+
+        assert_eq!(RouteSearch::remaining_cost_estimate(source, sink, 0, 50), 5);
+        assert_eq!(
+            RouteSearch::remaining_cost_estimate(source, sink, 32, 50),
+            9
+        );
+        assert_eq!(
+            RouteSearch::remaining_cost_estimate(source, sink, 64, 50),
+            12
         );
     }
 
