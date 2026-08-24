@@ -1279,3 +1279,15 @@ rolling-route preflight perfectly predicted the measured rebase accept/reject
 decisions, but the difficult preflights themselves took 150--200 ms, nearly
 doubling the relevant routing work. These results keep rebase policy fixed and
 move optimization into the retained-tree graph traversal itself.
+
+The same high-fanout path also checked whether each logical sink was already
+routed with a linear scan of every retained arc. For the reset net this was a
+quadratic scan of roughly 1,361 sinks per routing iteration. Canonical
+`NetRoute` objects now use their existing sink ordering for binary lookup;
+the mutable arc list inside `route_net` uses a separate `BTreeSet` because new
+arcs are appended in criticality order until the completed route is
+canonicalized again.
+
+This second exact indexing change again retained **-214 ps WNS, -399 ps WHS,
+and 25,649 PIPs**. Two runs measured **11.868/11.848 seconds** of critical
+closure, **20.069/19.741 seconds** of flow, and **25.88/25.59 seconds** wall.

@@ -577,7 +577,10 @@ impl NetRoute {
     /// Finds the route arc for one logical sink.
     #[must_use]
     pub fn arc(&self, sink: CellPinId) -> Option<&RouteArc> {
-        self.arcs.iter().find(|arc| arc.sink == Some(sink))
+        self.arcs
+            .binary_search_by_key(&Some(sink), |arc| arc.sink)
+            .ok()
+            .map(|index| &self.arcs[index])
     }
 }
 
@@ -4664,6 +4667,10 @@ fn route_net(
         .ok_or(PnrError::MissingPlacement { cell: driver_cell })?;
     let driver_wire = pin_wires.resolve(graph, placement, net.driver, driver_bel)?;
     let mut arcs = fixed.map_or_else(Vec::new, |route| route.arcs.clone());
+    let mut routed_sinks = arcs
+        .iter()
+        .filter_map(|arc| arc.sink)
+        .collect::<BTreeSet<_>>();
     let mut tree_wires = fixed.map_or_else(BTreeSet::new, |route| route.wires().collect());
     tree_wires.insert(driver_wire);
     let mut parent = BTreeMap::<WireId, (WireId, PipId)>::new();
@@ -4714,7 +4721,7 @@ fn route_net(
             .copied()
             .unwrap_or(0);
         let criticality = routing_arc_criticality(costs, net_id, *sink_pin);
-        if arcs.iter().any(|arc| arc.sink == Some(*sink_pin)) {
+        if routed_sinks.contains(sink_pin) {
             if tree_arrival_ps[sink_wire.0] >= minimum_arrival_ps {
                 continue;
             }
@@ -4744,6 +4751,7 @@ fn route_net(
                         },
                     )?,
                 );
+                routed_sinks.insert(*sink_pin);
                 continue;
             }
             return Err(PnrError::Unroutable {
@@ -4821,6 +4829,7 @@ fn route_net(
                 }
             })?,
         );
+        routed_sinks.insert(*sink_pin);
     }
     for &wire in &tree_wires {
         tree_arrival_ps[wire.0] = UNROUTED_ARRIVAL_PS;
