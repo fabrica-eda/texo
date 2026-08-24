@@ -170,6 +170,14 @@ def merge_range(current, incoming):
     }
 
 
+def subtract_range(total, prefix):
+    """Remove an already-accounted-for serial delay from a timing range."""
+    return {
+        "min_ps": total["min_ps"] - prefix["min_ps"],
+        "max_ps": total["max_ps"] - prefix["max_ps"],
+    }
+
+
 def timing_corners(samples, scale=1.0):
     return {
         "min_ps": int(samples[0] * scale),
@@ -182,7 +190,7 @@ def export_cell_timings(cell_database):
     slogic = cell_database["SLOGICB"]
     carry = cell_database["SCCU2C"]
     lut_arcs = {}
-    carry_arcs = [{}, {}]
+    raw_carry_arcs = {}
     ff_arcs = {}
     ff_checks = {}
     for entry in slogic:
@@ -214,24 +222,29 @@ def export_cell_timings(cell_database):
             continue
         source = entry["from_pin"]
         destination = entry["to_pin"]
-        for slice_index in range(2):
-            suffix = str(slice_index)
-            if source in {f"A{suffix}", f"B{suffix}", f"C{suffix}", f"D{suffix}"}:
-                normalized_source = source[0]
-            elif source == "FCI":
-                normalized_source = "FCI"
-            else:
-                continue
-            if destination == f"F{suffix}":
-                normalized_destination = "F"
-            elif destination == "FCO":
-                normalized_destination = "FCO"
-            else:
-                continue
-            key = (normalized_source, normalized_destination)
-            carry_arcs[slice_index][key] = merge_range(
-                carry_arcs[slice_index].get(key), delay_range(entry)
-            )
+        raw_carry_arcs[(source, destination)] = delay_range(entry)
+
+    carry_arcs = [{}, {}]
+    for slice_index in range(2):
+        suffix = str(slice_index)
+        for source in "ABCD":
+            for destination in ("F", "FCO"):
+                carry_arcs[slice_index][(source, destination)] = raw_carry_arcs[
+                    (f"{source}{suffix}", f"F{suffix}" if destination == "F" else "FCO")
+                ]
+
+    # Project Trellis characterizes SCCU2C as one two-LUT primitive. In the
+    # split-slice graph, the first half owns the primitive FCI->FCO delay. The
+    # second half must therefore contain only the remainder of FCI->F1 and a
+    # zero-delay FCI->FCO arc. This is the same decomposition used by nextpnr's
+    # ECP5 chipdb generator.
+    carry_through = raw_carry_arcs[("FCI", "FCO")]
+    carry_arcs[0][("FCI", "F")] = raw_carry_arcs[("FCI", "F0")]
+    carry_arcs[0][("FCI", "FCO")] = carry_through
+    carry_arcs[1][("FCI", "F")] = subtract_range(
+        raw_carry_arcs[("FCI", "F1")], carry_through
+    )
+    carry_arcs[1][("FCI", "FCO")] = {"min_ps": 0, "max_ps": 0}
 
     def arcs(records):
         return [

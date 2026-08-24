@@ -116,8 +116,9 @@ logical `DI` terminal to the general-routing `M` pin. Package constraints use
 the same mechanism as a one-cell group with one PIO BEL assignment.
 The two cells from a split CCU2C form another atomic group: K0 and K1 share one
 physical slice and their `TRELLIS_COMB` z values differ by four. Their FCI/FCO
-arcs use speed-grade `SCCU2C` characterization imported as conservative
-per-slice timing arcs.
+arcs use the speed-grade `SCCU2C` characterization split the same way as the
+nextpnr ECP5 chip database: K0 owns the characterized FCI-to-FCO delay, while
+K1 has a zero-delay continuation and only the remaining FCI-to-F1 delay.
 
 Each logical memory must also supply its Struo-derived depth, logical word
 width, and physical port width. The ECP5 packer accepts only DP16KD modes

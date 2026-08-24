@@ -426,8 +426,8 @@
             { "from_pin": "B", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
             { "from_pin": "C", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
             { "from_pin": "D", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
-            { "from_pin": "FCI", "to_pin": "F", "delay": { "min_ps": 357, "max_ps": 474 } },
-            { "from_pin": "FCI", "to_pin": "FCO", "delay": { "min_ps": 62, "max_ps": 71 } }
+            { "from_pin": "FCI", "to_pin": "F", "delay": { "min_ps": 295, "max_ps": 403 } },
+            { "from_pin": "FCI", "to_pin": "FCO", "delay": { "min_ps": 0, "max_ps": 0 } }
           ],
           "setup_holds": []
         },

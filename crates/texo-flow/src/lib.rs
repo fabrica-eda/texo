@@ -314,9 +314,15 @@ pub fn implement_struo_ecp5_with_progress(
     if !evidence.contains(Gate::PostMapSimulation) {
         return Err(Ecp5FlowError::MissingPostMapSimulation);
     }
-    let speed_grade_name = options
+    let requested_speed_grade = options
         .speed_grade
         .ok_or(Ecp5FlowError::MissingSpeedGrade)?;
+    // LFE5UM5G's externally visible speed grade is `8`, but Project Trellis
+    // stores its distinct characterization in the `8_5G` timing table. Match
+    // nextpnr's target selection instead of silently timing a 5G part with the
+    // ordinary LFE5U/M speed-8 model.
+    let speed_grade_name =
+        project_trellis_speed_grade(architecture.device().name(), requested_speed_grade);
     let speed_grade = architecture
         .speed_grades()
         .get(speed_grade_name)
@@ -520,6 +526,14 @@ pub fn implement_struo_ecp5_with_progress(
         timing,
         placement_weight_exponent: options.placement_weight_exponent,
     })
+}
+
+fn project_trellis_speed_grade<'a>(device: &str, requested: &'a str) -> &'a str {
+    if requested == "8" && device.starts_with("LFE5UM5G") {
+        "8_5G"
+    } else {
+        requested
+    }
 }
 
 fn block_ram_requirements(imported: &ImportedEcp5Design) -> Vec<BlockRamRequirement> {
@@ -3074,11 +3088,19 @@ mod tests {
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, criticality_weight,
         delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, find_cell_pin,
         freeze_route_sinks_except, implement, implement_struo_ecp5, implement_with_constraints,
-        next_wns_regression_streak, pip_class_delay, retain_projection_timing_frontier,
-        slack_violations, staged_timing_score, verify_post_map_with_celox,
+        next_wns_regression_streak, pip_class_delay, project_trellis_speed_grade,
+        retain_projection_timing_frontier, slack_violations, staged_timing_score,
+        verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
+
+    #[test]
+    fn selects_the_5g_characterization_for_a_um5g_speed_8_part() {
+        assert_eq!(project_trellis_speed_grade("LFE5UM5G-85F", "8"), "8_5G");
+        assert_eq!(project_trellis_speed_grade("LFE5UM-85F", "8"), "8");
+        assert_eq!(project_trellis_speed_grade("LFE5UM5G-85F", "7"), "7");
+    }
 
     #[test]
     fn timing_criticality_concentrates_on_the_worst_paths() {
@@ -3500,12 +3522,32 @@ mod tests {
         .unwrap();
         let pair = imported.carry_pairs()[0];
         let first_a = find_cell_pin(imported.design(), pair[0], "A").unwrap();
-        let first_fco = find_cell_pin(imported.design(), pair[0], "FCO").unwrap();
-        let second_fci = find_cell_pin(imported.design(), pair[1], "FCI").unwrap();
+        let first_carry = (
+            find_cell_pin(imported.design(), pair[0], "FCI").unwrap(),
+            find_cell_pin(imported.design(), pair[0], "FCO").unwrap(),
+        );
+        let second_carry = (
+            find_cell_pin(imported.design(), pair[1], "FCI").unwrap(),
+            find_cell_pin(imported.design(), pair[1], "FCO").unwrap(),
+        );
         let second_f = find_cell_pin(imported.design(), pair[1], "F").unwrap();
 
-        assert_eq!(model.cell_arc(first_a, first_fco).unwrap().max_ps, 447);
-        assert_eq!(model.cell_arc(second_fci, second_f).unwrap().max_ps, 474);
+        assert_eq!(model.cell_arc(first_a, first_carry.1).unwrap().max_ps, 447);
+        assert_eq!(
+            model.cell_arc(first_carry.0, first_carry.1).unwrap().max_ps,
+            71
+        );
+        assert_eq!(
+            model.cell_arc(second_carry.0, second_f).unwrap().max_ps,
+            403
+        );
+        assert_eq!(
+            model
+                .cell_arc(second_carry.0, second_carry.1)
+                .unwrap()
+                .max_ps,
+            0
+        );
     }
 
     #[test]
