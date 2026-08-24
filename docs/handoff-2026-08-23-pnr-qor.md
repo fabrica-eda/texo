@@ -1115,3 +1115,26 @@ source *set*. The next coarse placement layer should expose a distance field
 to that complete set, then let the physical graph projection choose the exact
 source for a shortlist; collapsing the set to one point loses necessary
 topology freedom.
+
+## Placement-hierarchy transition on WNS regressions (2026-08-25)
+
+Per-trial metrics exposed a deterministic 2.805-second tail in monotonic
+placement. The first four accepted global refinements produced the winning
+seed at -1139 ps WNS / -40688 ps TNS. A fifth round then routed 256-, 128-,
+64-, and 32-unit portfolios (997, 972, 529, and 307 ms) solely to reject all
+four; critical refinement subsequently started from exactly the round-four
+seed.
+
+The last two accepted global moves both improved aggregate timing while
+worsening WNS (-930 to -1044 to -1139 ps). That is a hierarchy boundary: the
+global placer is still reducing TNS, but it is now fighting the worst path
+that the next critical-vertex layer is designed to repair. Monotonic placement
+now transitions after two consecutive accepted WNS regressions instead of
+routing another complete large-move portfolio to discover the same boundary.
+
+The AXI4 monotonic result stayed bit-for-bit at -1139/-40688 ps, 25,754 PIPs,
+and 236,661 HPWL. Final output also remained exactly **-214 ps WNS, -3905 ps
+setup TNS, -399 ps WHS, and 25,655 PIPs**. Monotonic refinement fell from
+6.351 to **3.414 seconds**, complete timing closure to **19.143 seconds**, flow
+to **23.209 seconds**, wall to **29.31 seconds**, and user CPU to **27.68
+seconds**.

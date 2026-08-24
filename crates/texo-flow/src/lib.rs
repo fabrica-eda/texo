@@ -964,7 +964,8 @@ impl TimingDrivenContext<'_, '_> {
         routing_costs: &mut RoutingCosts,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
-        for _ in 0..MAX_INCREMENTAL_REFINEMENTS {
+        let mut consecutive_wns_regressions = 0_usize;
+        for refinement_round in 0..MAX_INCREMENTAL_REFINEMENTS {
             if archive.iter().any(|(_, timing)| timing.met_timing()) {
                 break;
             }
@@ -977,15 +978,30 @@ impl TimingDrivenContext<'_, '_> {
                 .clone();
             let mut improved = None;
             for max_units in REFINED_PLACEMENT_UNIT_LIMITS {
-                let Some(child) = self.refine_candidate(
+                let trial_started = Instant::now();
+                let candidate = self.refine_candidate(
                     &seed.0,
                     &seed.1,
                     placement_refiner,
                     routing_costs,
                     max_units,
                     progress,
-                )?
-                else {
+                )?;
+                if metrics_enabled() {
+                    eprintln!(
+                        "[metrics] monotonic_trial round={} units={max_units} elapsed={:?} wns={:?} tns={:?}",
+                        refinement_round + 1,
+                        trial_started.elapsed(),
+                        candidate
+                            .as_ref()
+                            .and_then(|candidate| candidate.1.worst_slack_ps),
+                        candidate.as_ref().map(|candidate| slack_violations(
+                            candidate.1.setup_checks.iter().map(|check| check.slack_ps)
+                        )
+                        .total_negative_slack_ps()),
+                    );
+                }
+                let Some(child) = candidate else {
                     progress(Ecp5FlowStage::TimingTrialDecision {
                         improves_objective: false,
                     });
@@ -1001,8 +1017,26 @@ impl TimingDrivenContext<'_, '_> {
             let Some(improved) = improved else {
                 break;
             };
+            consecutive_wns_regressions = next_wns_regression_streak(
+                consecutive_wns_regressions,
+                seed.1.worst_slack_ps,
+                improved.1.worst_slack_ps,
+            );
             archive.push(improved);
             archive = select_timing_frontier(archive);
+            // Once two accepted global moves improve the aggregate objective
+            // only by sacrificing the worst path, another large displacement
+            // portfolio is the wrong hierarchy. Hand the unchanged winning
+            // seed to the critical-vertex layer instead of routing four more
+            // global candidates merely to prove that none wins.
+            if consecutive_wns_regressions >= MAX_CONSECUTIVE_MONOTONIC_WNS_REGRESSIONS {
+                if metrics_enabled() {
+                    eprintln!(
+                        "[metrics] monotonic_transition reason=wns_regression_streak streak={consecutive_wns_regressions}"
+                    );
+                }
+                break;
+            }
         }
         Ok(archive)
     }
@@ -1855,6 +1889,7 @@ fn worst_setup_connections(
 }
 
 const MAX_INCREMENTAL_REFINEMENTS: usize = 8;
+const MAX_CONSECUTIVE_MONOTONIC_WNS_REGRESSIONS: usize = 2;
 const LOCAL_TRIAL_ROUTING_ITERATIONS: u32 = 5;
 const MAX_DEDICATED_EDGE_TRIALS: usize = 4;
 // Geometry delay model for pre-screening route trials. Calibrated loosely
@@ -1896,6 +1931,21 @@ const BASIN_ESCAPE_WEIGHT_EXPONENT: u32 = 4;
 // it is not a random restart or a whole-design perturbation.
 const CRITICAL_PATH_MOVE_DISTANCES: [u64; 3] = [1, 2, 16];
 const MAX_RELEASED_CRITICAL_NETS: usize = 64;
+
+fn next_wns_regression_streak(
+    current: usize,
+    parent_wns_ps: Option<i128>,
+    child_wns_ps: Option<i128>,
+) -> usize {
+    if child_wns_ps
+        .zip(parent_wns_ps)
+        .is_some_and(|(child, parent)| child <= parent)
+    {
+        current + 1
+    } else {
+        0
+    }
+}
 
 fn should_retry_global_ripup(last_failed_wns_ps: Option<i128>, seed_wns_ps: i128) -> bool {
     last_failed_wns_ps.is_none_or(|failed_wns_ps| {
@@ -2971,8 +3021,9 @@ mod tests {
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, criticality_weight,
         delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, find_cell_pin,
         freeze_route_sinks_except, implement, implement_struo_ecp5, implement_with_constraints,
-        pip_class_delay, retain_projection_timing_frontier, should_retry_global_ripup,
-        slack_violations, staged_timing_score, verify_post_map_with_celox,
+        next_wns_regression_streak, pip_class_delay, retain_projection_timing_frontier,
+        should_retry_global_ripup, slack_violations, staged_timing_score,
+        verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -2991,6 +3042,15 @@ mod tests {
         assert_eq!(delay_weighted_criticality(64, 500, 4_000), 32);
         assert_eq!(delay_weighted_criticality(64, 1_000, 4_000), 64);
         assert_eq!(delay_weighted_criticality(64, 2_000, 4_000), 64);
+    }
+
+    #[test]
+    fn monotonic_hierarchy_transitions_after_consecutive_wns_regressions() {
+        assert_eq!(next_wns_regression_streak(0, Some(-100), Some(-80)), 0);
+        assert_eq!(next_wns_regression_streak(0, Some(-80), Some(-90)), 1);
+        assert_eq!(next_wns_regression_streak(1, Some(-90), Some(-90)), 2);
+        assert_eq!(next_wns_regression_streak(2, Some(-90), Some(-70)), 0);
+        assert_eq!(next_wns_regression_streak(1, None, Some(-70)), 0);
     }
 
     #[test]
