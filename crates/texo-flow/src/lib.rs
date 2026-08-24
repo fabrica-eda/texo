@@ -492,7 +492,7 @@ pub fn implement_struo_ecp5_with_progress(
             timing_model: &timing_model,
             timing_constraints: &timing_constraints,
             routing_workspace: &mut routing_workspace,
-            stalled_ripup_wns_ps: None,
+            global_ripup_attempted: false,
             critical_move_trials: BTreeSet::new(),
         }
         .optimize(initial_implementation, initial_timing, costs, &mut progress)?
@@ -742,11 +742,10 @@ struct TimingDrivenContext<'a, 'work> {
     timing_model: &'a TimingModel,
     timing_constraints: &'a TimingConstraints,
     routing_workspace: &'work mut RoutingWorkspace,
-    /// Setup slack at which a full data-route ripup last failed. Re-arm only
-    /// after placement improves WNS by roughly one general-routing tile; tiny
-    /// local changes otherwise trigger the same expensive failed search in
-    /// every closure round.
-    stalled_ripup_wns_ps: Option<i128>,
+    /// Whether the post-global-placement data routes have already received
+    /// their one full-chip timing renegotiation. Later critical moves reroute
+    /// every affected net incrementally and must not reopen the entire chip.
+    global_ripup_attempted: bool,
     /// Exact seed-route/proposed-placement pairs already sent through a local
     /// negotiated route and STA. Closure rounds often rediscover the same
     /// move; only a changed route topology makes it worth evaluating again.
@@ -1099,11 +1098,10 @@ impl TimingDrivenContext<'_, '_> {
             if seed.1.worst_slack_ps.is_none() {
                 break;
             }
-            let seed_wns_ps = seed.1.worst_slack_ps.expect("checked above");
-            if !should_retry_global_ripup(self.stalled_ripup_wns_ps, seed_wns_ps) {
-                // A previous global renegotiation failed, and intervening
-                // placement refinement has not shifted the timing basin far
-                // enough to justify scanning every data net again.
+            if self.global_ripup_attempted {
+                if metrics_enabled() {
+                    eprintln!("[metrics] global_ripup_transition reason=already_attempted");
+                }
                 break;
             }
             // Timing-driven ripup: lift every data-net route so the whole
@@ -1137,6 +1135,7 @@ impl TimingDrivenContext<'_, '_> {
             routing_costs.set_sink_min_delays_ps(BTreeMap::new());
             routing_costs.set_detailed_timing_nets(detailed_nets);
             routing_costs.set_detailed_delay_quantum_ps(delay_quantum_ps);
+            self.global_ripup_attempted = true;
             let trial = self.route_and_analyze(
                 seed.0.placement.clone(),
                 &frozen,
@@ -1152,7 +1151,6 @@ impl TimingDrivenContext<'_, '_> {
             let improves_objective = timing_score(&trial.1) > timing_score(&seed.1);
             progress(Ecp5FlowStage::TimingTrialDecision { improves_objective });
             if !improves_objective {
-                self.stalled_ripup_wns_ps = Some(seed_wns_ps);
                 break;
             }
             archive.push(trial);
@@ -1905,10 +1903,6 @@ const MAX_LOCAL_CONNECTION_CANDIDATES: usize = 8;
 const TIMING_FRONTIER_WIDTH: usize = 1;
 const REFINED_PLACEMENT_UNIT_LIMITS: [usize; 4] = [256, 128, 64, 32];
 const DETAILED_ROUTING_QUANTA_PS: [u64; 1] = [10];
-// A failed full-chip negotiation is retried only after placement has improved
-// setup by approximately one measured general-routing tile. This is a basin
-// change, unlike the small local moves between adjacent closure rounds.
-const GLOBAL_RIPUP_REARM_SLACK_PS: i128 = 250;
 // The second 1 ps quantum measured as a pure extra full renegotiation on the
 // AXI4 self-test: final WNS and placement were bit-identical without it while
 // each multiresolution round paid one more ~30 s global ripup.
@@ -1945,12 +1939,6 @@ fn next_wns_regression_streak(
     } else {
         0
     }
-}
-
-fn should_retry_global_ripup(last_failed_wns_ps: Option<i128>, seed_wns_ps: i128) -> bool {
-    last_failed_wns_ps.is_none_or(|failed_wns_ps| {
-        seed_wns_ps >= failed_wns_ps.saturating_add(GLOBAL_RIPUP_REARM_SLACK_PS)
-    })
 }
 
 fn ecp5_routing_costs(
@@ -3022,8 +3010,7 @@ mod tests {
         delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, find_cell_pin,
         freeze_route_sinks_except, implement, implement_struo_ecp5, implement_with_constraints,
         next_wns_regression_streak, pip_class_delay, retain_projection_timing_frontier,
-        should_retry_global_ripup, slack_violations, staged_timing_score,
-        verify_post_map_with_celox,
+        slack_violations, staged_timing_score, verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -3068,13 +3055,6 @@ mod tests {
             candidates,
             vec![(50, 0, "topology winner"), (40, 2, "timing record")]
         );
-    }
-
-    #[test]
-    fn failed_global_ripup_requires_a_material_wns_change_to_rearm() {
-        assert!(should_retry_global_ripup(None, -1_000));
-        assert!(!should_retry_global_ripup(Some(-500), -251));
-        assert!(should_retry_global_ripup(Some(-500), -250));
     }
 
     #[test]

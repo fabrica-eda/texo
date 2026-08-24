@@ -1138,3 +1138,25 @@ setup TNS, -399 ps WHS, and 25,655 PIPs**. Monotonic refinement fell from
 6.351 to **3.414 seconds**, complete timing closure to **19.143 seconds**, flow
 to **23.209 seconds**, wall to **29.31 seconds**, and user CPU to **27.68
 seconds**.
+
+## One global route layer per placement topology (2026-08-25)
+
+Critical closure still invoked full-chip multiresolution routing after every
+outer placement round. The first 2350-net renegotiation was useful: it took
+1.26 seconds and improved aggregate timing. The next full pass took 1.20
+seconds and was rejected. A moved-cell rearm prototype skipped that pass but
+eventually accumulated enough local moves to launch a third full route; it
+failed to resolve one conflict after all 32 iterations and invalidated the
+resident workspace, making the run slower.
+
+The routing hierarchy is now explicit. Global timing placement receives one
+full data-route renegotiation. Every later critical placement move freezes the
+unchanged topology and reroutes all affected nets, so reopening all 2350 nets
+cannot add information about untouched placement. The old WNS-based rearm
+state was removed rather than retained as a second, conflicting policy.
+
+Final AXI4 output remained exactly **-214 ps WNS, -3905 ps setup TNS, -399 ps
+WHS, and 25,655 PIPs**. Critical closure fell from 14.451 to **12.969
+seconds**, complete timing closure from 19.143 to **17.669 seconds**, flow from
+23.209 to **21.709 seconds**, wall from 29.31 to **27.84 seconds**, and user CPU
+from 27.68 to **26.12 seconds**.
