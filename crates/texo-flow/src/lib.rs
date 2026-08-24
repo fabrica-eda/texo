@@ -1408,6 +1408,8 @@ impl TimingDrivenContext<'_, '_> {
         let capacity_projection =
             RouteCapacityProjection::new(&implementation.routes, routing_costs);
         let seed_fingerprint = implementation_topology_fingerprint(self.design, implementation);
+        let incumbent_global_routing =
+            global_routes_from_implementation(self.packing, implementation);
         let mut placement = implementation.placement.clone();
         let mut candidates = Vec::new();
         for (cell, (_, connections, targets)) in cells.into_iter().take(MAX_CRITICAL_PATH_CELLS) {
@@ -1443,18 +1445,30 @@ impl TimingDrivenContext<'_, '_> {
                 }
                 let to = refined.bindings()[cell.0];
                 progress(Ecp5FlowStage::CriticalPathMove { cell, from, to });
-                let base = self.packing.global_routing_constraints_cached(
-                    self.design,
-                    self.architecture,
-                    &refined,
-                    self.global_routing_cache,
-                )?;
+                let recomputed_global_routing;
+                let base = if let Some(incumbent) = incumbent_global_routing.as_ref()
+                    && global_clock_endpoints_unchanged(
+                        self.design,
+                        self.packing,
+                        &implementation.placement,
+                        &refined,
+                    ) {
+                    incumbent
+                } else {
+                    recomputed_global_routing = self.packing.global_routing_constraints_cached(
+                        self.design,
+                        self.architecture,
+                        &refined,
+                        self.global_routing_cache,
+                    )?;
+                    &recomputed_global_routing
+                };
                 progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
                 let frozen = freeze_unchanged_routes(
                     self.design,
                     implementation,
                     &refined,
-                    &base,
+                    base,
                     &critical_sinks,
                 );
                 routing_costs.set_net_criticalities(prescreen_weights.clone());
@@ -1578,7 +1592,7 @@ fn worst_setup_connections(
 }
 
 const MAX_INCREMENTAL_REFINEMENTS: usize = 8;
-const LOCAL_TRIAL_ROUTING_ITERATIONS: u32 = 8;
+const LOCAL_TRIAL_ROUTING_ITERATIONS: u32 = 5;
 const MAX_DEDICATED_EDGE_TRIALS: usize = 4;
 // Geometry delay model for pre-screening route trials. Calibrated loosely
 // against the measured AXI4 hops: same-tile LUT-to-FF edges land near 300 ps,
@@ -2233,6 +2247,38 @@ fn implementation_topology_fingerprint(design: &Design, implementation: &PnrResu
         }
     }
     fingerprint.finish()
+}
+
+fn global_routes_from_implementation(
+    packing: &Ecp5Packing,
+    implementation: &PnrResult,
+) -> Option<RoutingConstraints> {
+    let mut constraints = RoutingConstraints::new();
+    for clock in packing.global_clocks() {
+        let route = implementation
+            .routes
+            .iter()
+            .find(|route| route.net == clock.global_net)?;
+        constraints.add_route(route.clone());
+    }
+    Some(constraints)
+}
+
+fn global_clock_endpoints_unchanged(
+    design: &Design,
+    packing: &Ecp5Packing,
+    old: &Placement,
+    new: &Placement,
+) -> bool {
+    packing.global_clocks().iter().all(|clock| {
+        let net = &design.nets()[clock.global_net.0];
+        std::iter::once(net.driver)
+            .chain(net.sinks.iter().copied())
+            .all(|pin| {
+                let cell = design.pins()[pin.0].cell;
+                old.bel(cell) == new.bel(cell) && old.pin_binding(pin) == new.pin_binding(pin)
+            })
+    })
 }
 
 fn select_timing_frontier(candidates: Vec<TimingCandidate>) -> Vec<TimingCandidate> {

@@ -1304,6 +1304,7 @@ pub fn refine_placement_with_net_weights(
         &mut placed,
         &mut occupied,
         None,
+        None,
     );
     finish_placement(&graph, constraints, placed)
 }
@@ -1338,6 +1339,7 @@ pub fn refine_placement_with_net_sink_weights(
         &neighbors,
         &mut placed,
         &mut occupied,
+        None,
         None,
     );
     finish_placement(&graph, constraints, placed)
@@ -1379,6 +1381,7 @@ pub struct PlacementRefiner<'a> {
     graph: UnifiedGraph<'a>,
     constraints: &'a PlacementConstraints,
     units: Vec<PlacementUnit>,
+    spatial_indexes: BTreeMap<(u8, usize), SpatialChoiceIndex>,
 }
 
 impl<'a> PlacementRefiner<'a> {
@@ -1395,10 +1398,17 @@ impl<'a> PlacementRefiner<'a> {
         let graph = UnifiedGraph::new(design, device);
         let mut candidate_cache = BTreeMap::new();
         let units = placement_units(&graph, constraints, &mut candidate_cache)?;
+        let mut spatial_indexes = BTreeMap::new();
+        for unit in &units {
+            spatial_indexes
+                .entry(unit.choices.cache_key())
+                .or_insert_with(|| SpatialChoiceIndex::new(&unit.choices, device));
+        }
         Ok(Self {
             graph,
             constraints,
             units,
+            spatial_indexes,
         })
     }
 
@@ -1427,6 +1437,7 @@ impl<'a> PlacementRefiner<'a> {
             &mut placed,
             &mut occupied,
             Some(max_moved_units),
+            Some(&self.spatial_indexes),
         );
         finish_placement(&self.graph, self.constraints, placed)
     }
@@ -1565,7 +1576,10 @@ impl<'a> PlacementRefiner<'a> {
         );
         let current_point = device.bels()[current[moving_column].0].point;
         let mut best: Option<(u64, Vec<BelId>)> = None;
-        for choice in 0..unit.choices.len() {
+        let index_point = device.bels()[current[0].0].point;
+        let spatial_index = &self.spatial_indexes[&unit.choices.cache_key()];
+        for choice in spatial_choices_within(spatial_index, index_point, max_move_distance, device)
+        {
             let assignment = unit.choices.assignment(choice);
             if assignment == current
                 || assignment.iter().any(|bel| occupied.contains(bel))
@@ -1752,7 +1766,10 @@ impl<'a> PlacementRefiner<'a> {
         );
         let current_point = device.bels()[current[moving_column].0].point;
         let mut best = Vec::<(u64, u64, Vec<BelId>)>::new();
-        for choice in 0..unit.choices.len() {
+        let index_point = device.bels()[current[0].0].point;
+        let spatial_index = &self.spatial_indexes[&unit.choices.cache_key()];
+        for choice in spatial_choices_within(spatial_index, index_point, max_move_distance, device)
+        {
             let assignment = unit.choices.assignment(choice);
             if assignment == current
                 || assignment.iter().any(|bel| occupied.contains(bel))
@@ -2174,6 +2191,31 @@ impl SpatialChoiceIndex {
     }
 }
 
+fn spatial_choices_within(
+    spatial_index: &SpatialChoiceIndex,
+    center: Point,
+    max_distance: u64,
+    device: &Device,
+) -> Vec<usize> {
+    let max_radius =
+        u32::try_from(max_distance.min(u64::from(device.width().saturating_add(device.height()))))
+            .expect("bounded device radius fits u32");
+    let mut choices = Vec::new();
+    for radius in 0..=max_radius {
+        for dy in 0..=radius {
+            let dx = radius - dy;
+            for y in ring_coordinates(center.y, dy, device.height()) {
+                for x in ring_coordinates(center.x, dx, device.width()) {
+                    choices.extend_from_slice(
+                        &spatial_index.by_point[(y * device.width() + x) as usize],
+                    );
+                }
+            }
+        }
+    }
+    choices
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PlacementCandidateKey {
     kind: texo_model::ResourceKind,
@@ -2259,6 +2301,7 @@ fn place(
         &neighbors,
         &mut placed,
         &mut occupied,
+        None,
         None,
     );
 
@@ -2821,6 +2864,7 @@ const MAX_PLACEMENT_REFINEMENT_PASSES: usize = 4;
 const PLACEMENT_REFINEMENT_CANDIDATES: usize = 64;
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn refine_placement(
     graph: &UnifiedGraph<'_>,
     constraints: &PlacementConstraints,
@@ -2829,6 +2873,7 @@ fn refine_placement(
     placed: &mut [Option<BelId>],
     occupied: &mut BTreeSet<BelId>,
     move_limit: Option<usize>,
+    cached_spatial_indexes: Option<&BTreeMap<(u8, usize), SpatialChoiceIndex>>,
 ) {
     let device = graph.device();
     let mut pin_usage = HashMap::new();
@@ -2906,9 +2951,13 @@ fn refine_placement(
                 &current,
                 &pin_usage,
             );
-            let spatial_index = spatial_indexes
-                .entry(unit.choices.cache_key())
-                .or_insert_with(|| SpatialChoiceIndex::new(&unit.choices, device));
+            let spatial_index = if let Some(cached) = cached_spatial_indexes {
+                &cached[&unit.choices.cache_key()]
+            } else {
+                spatial_indexes
+                    .entry(unit.choices.cache_key())
+                    .or_insert_with(|| SpatialChoiceIndex::new(&unit.choices, device))
+            };
             let Some(best) = choose_refined_assignment(
                 unit,
                 spatial_index,

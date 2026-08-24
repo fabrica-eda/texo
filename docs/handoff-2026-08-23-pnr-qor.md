@@ -737,3 +737,28 @@ The selected capacity-projection result is bit-identical at -214/-399 ps and
 25,665 PIPs. Runtime fell from 59.78 to 58.31 seconds, another 1.47 seconds
 (2.5%). This is a conservative transposition table rather than approximate
 memoization; it cannot reuse a result across genuinely different topologies.
+
+## Persistent placement hierarchy and bounded local transactions (2026-08-24)
+
+`PlacementRefiner` used to cache legal assignments but rebuild their spatial
+index on every timing refinement, then linearly scan every legal BEL choice
+for each critical cell. The index now lives with the reusable refiner. A move
+of radius 16 enumerates only the Manhattan rings around the current coarse
+tile (about 545 coordinates on this device) and then validates the indexed
+assignments exactly. Packing groups retain their atomic assignments; the
+coarse lookup does not weaken legality.
+
+Two smaller transaction changes are also exact:
+
+- a combinational-only placement move reuses the incumbent immutable global
+  clock routes when every global-net endpoint and pin binding is unchanged;
+- disposable local routing trials stop after five negotiated iterations,
+  while whole-design routing retains its 32-iteration budget. Selected local
+  candidates on this benchmark converge within five iterations.
+
+Each step reproduced -214/-399 ps and 25,665 PIPs. From the exact-move cache's
+58.31-second result, global-route reuse reached 57.91 seconds, the local trial
+cap reached 57.57 seconds, and persistent spatial indexing reached **56.45
+seconds**. Relative to the 66.51-second architecture-scaled A* baseline, the
+combined capacity/topology work is 10.06 seconds (15.1%) faster while setup
+WNS is 26 ps better.
