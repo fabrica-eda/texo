@@ -49,8 +49,8 @@ pub struct RoutingConstraints {
 /// Characterized costs used by timing-driven negotiated routing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoutingCosts {
-    pip_delays_ps: Vec<u32>,
-    pip_min_delays_ps: Vec<u32>,
+    pip_delays_ps: Arc<[u32]>,
+    pip_min_delays_ps: Arc<[u32]>,
     net_criticalities: BTreeMap<NetId, u64>,
     sink_min_delays_ps: BTreeMap<(NetId, CellPinId), u64>,
     sink_criticalities: BTreeMap<(NetId, CellPinId), u64>,
@@ -63,8 +63,9 @@ impl RoutingCosts {
     /// Creates costs indexed by stable PIP and logical net IDs.
     #[must_use]
     pub fn new(pip_delays_ps: Vec<u32>, net_criticalities: BTreeMap<NetId, u64>) -> Self {
+        let pip_delays_ps = Arc::<[u32]>::from(pip_delays_ps);
         Self {
-            pip_min_delays_ps: pip_delays_ps.clone(),
+            pip_min_delays_ps: Arc::clone(&pip_delays_ps),
             pip_delays_ps,
             net_criticalities,
             sink_min_delays_ps: BTreeMap::new(),
@@ -78,18 +79,18 @@ impl RoutingCosts {
     /// Estimated maximum delay for every physical PIP.
     #[must_use]
     pub fn pip_delays_ps(&self) -> &[u32] {
-        &self.pip_delays_ps
+        self.pip_delays_ps.as_ref()
     }
 
     /// Replaces minimum-corner PIP delays used for hold repair.
     pub fn set_pip_min_delays_ps(&mut self, pip_min_delays_ps: Vec<u32>) {
-        self.pip_min_delays_ps = pip_min_delays_ps;
+        self.pip_min_delays_ps = pip_min_delays_ps.into();
     }
 
     /// Estimated minimum delay for every physical PIP.
     #[must_use]
     pub fn pip_min_delays_ps(&self) -> &[u32] {
-        &self.pip_min_delays_ps
+        self.pip_min_delays_ps.as_ref()
     }
 
     /// Caps negotiated-congestion iterations for this routing trial.
@@ -5280,6 +5281,21 @@ mod tests {
             .add_net("source_to_sink", source_out, [sink_in])
             .unwrap();
         design
+    }
+
+    #[test]
+    fn routing_cost_clones_share_immutable_pip_tables() {
+        let mut costs = RoutingCosts::new(vec![10, 20], BTreeMap::new());
+        costs.set_pip_min_delays_ps(vec![4, 8]);
+        let clone = costs.clone();
+
+        assert!(Arc::ptr_eq(&costs.pip_delays_ps, &clone.pip_delays_ps));
+        assert!(Arc::ptr_eq(
+            &costs.pip_min_delays_ps,
+            &clone.pip_min_delays_ps
+        ));
+        assert_eq!(clone.pip_delays_ps(), [10, 20]);
+        assert_eq!(clone.pip_min_delays_ps(), [4, 8]);
     }
 
     #[test]

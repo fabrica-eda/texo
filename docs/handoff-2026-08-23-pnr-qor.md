@@ -933,3 +933,25 @@ from about 25.0 to 24.1 seconds. Adjacent non-metrics saved-binary runs measured
 34.07 s user** for the recovery checkpoint path. The modest wall reduction is
 primarily lower system work; treat the phase reduction as the stronger signal
 until more benchmarks exercise severe post-ripup recovery.
+
+## Shared immutable routing cost tables (2026-08-25)
+
+Every local route trial cloned `RoutingCosts` solely to lower its negotiation
+iteration limit. The clone also duplicated both device-wide PIP delay vectors,
+even though characterized maximum/minimum delays are immutable across every
+placement and routing trial. On the full ECP5 device this repeated a large
+allocation and copy for essentially every critical candidate.
+
+The maximum and minimum PIP tables are now `Arc<[u32]>`; a cost clone shares
+them while retaining independent criticality maps, hold constraints, detailed
+net selections, and iteration limits. Pointer-sharing has a unit test, and the
+router's indexed reads are unchanged.
+
+In adjacent saved-binary non-metrics runs, the `Vec` version measured 43.67 s
+wall / 33.97 s user / 10.02 s system with 3,208,944 KiB maximum RSS. The shared
+version measured **33.43 s wall / 32.00 s user / 1.72 s system** with 3,013,476
+KiB RSS. A metrics run placed critical refinement at 16.12 seconds and the flow
+itself at 27.92 seconds, down from approximately 24.1 and 40.1 seconds. Final
+QoR remains exactly **-214 ps WNS, -3905 ps setup TNS, -399 ps WHS, and 25,675
+PIPs**. Eliminating the map clone after this change had no measurable benefit
+and was reverted; the device-wide arrays were the structural problem.
