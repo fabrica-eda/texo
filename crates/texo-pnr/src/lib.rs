@@ -1308,7 +1308,7 @@ pub fn refine_placement_with_net_weights(
     let (_, neighbors) = placement_neighbors(design, Some(net_weights), None, None);
     let mut candidate_cache = BTreeMap::new();
     let units = placement_units(&graph, constraints, &mut candidate_cache)?;
-    let mut placed = validate_refinement_start(&graph, &units, placement)?;
+    let mut placed = validate_refinement_start(&graph, &units, placement, None)?;
     let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
     refine_placement(
         &graph,
@@ -1344,7 +1344,7 @@ pub fn refine_placement_with_net_sink_weights(
     let (_, neighbors) = placement_neighbors(design, None, Some(sink_weights), None);
     let mut candidate_cache = BTreeMap::new();
     let units = placement_units(&graph, constraints, &mut candidate_cache)?;
-    let mut placed = validate_refinement_start(&graph, &units, placement)?;
+    let mut placed = validate_refinement_start(&graph, &units, placement, None)?;
     let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
     refine_placement(
         &graph,
@@ -1508,7 +1508,12 @@ impl<'a> PlacementRefiner<'a> {
     ) -> Result<Placement, PnrError> {
         let (_, neighbors) =
             placement_neighbors(self.graph.design(), None, Some(sink_weights), sink_budgets);
-        let mut placed = validate_refinement_start(&self.graph, &self.units, placement)?;
+        let mut placed = validate_refinement_start(
+            &self.graph,
+            &self.units,
+            placement,
+            Some(&self.spatial_indexes),
+        )?;
         let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
         refine_placement(
             &self.graph,
@@ -1588,7 +1593,12 @@ impl<'a> PlacementRefiner<'a> {
         if unit.cells.contains(&fixed_cell) || unit.choices.len() <= 1 {
             return Ok(None);
         }
-        let mut placed = validate_refinement_start(&self.graph, &self.units, placement)?;
+        let mut placed = validate_refinement_start(
+            &self.graph,
+            &self.units,
+            placement,
+            Some(&self.spatial_indexes),
+        )?;
         let current = unit
             .cells
             .iter()
@@ -1769,7 +1779,12 @@ impl<'a> PlacementRefiner<'a> {
         if unit.choices.len() <= 1 || connections.is_empty() {
             return Ok(Vec::new());
         }
-        let placed = validate_refinement_start(&self.graph, &self.units, placement)?;
+        let placed = validate_refinement_start(
+            &self.graph,
+            &self.units,
+            placement,
+            Some(&self.spatial_indexes),
+        )?;
         let current = unit
             .cells
             .iter()
@@ -2250,7 +2265,7 @@ impl PlacementChoices {
         match self {
             Self::Shared(assignments) => assignments.iter().any(|known| known == assignment),
             Self::SingleCell(candidates) => {
-                assignment.len() == 1 && candidates.contains(&assignment[0])
+                assignment.len() == 1 && candidates.binary_search(&assignment[0]).is_ok()
             }
         }
     }
@@ -2798,6 +2813,7 @@ fn validate_refinement_start(
     graph: &UnifiedGraph<'_>,
     units: &[PlacementUnit],
     placement: Placement,
+    spatial_indexes: Option<&BTreeMap<(u8, usize), Arc<SpatialChoiceIndex>>>,
 ) -> Result<Vec<Option<BelId>>, PnrError> {
     if placement.bindings.len() != graph.design().cells().len() {
         return Err(PnrError::InvalidPlacement {
@@ -2827,7 +2843,17 @@ fn validate_refinement_start(
             .iter()
             .map(|cell| placement.bindings[cell.0])
             .collect::<Vec<_>>();
-        if !unit.choices.contains(&assignment) {
+        let assignment_is_known = spatial_indexes.map_or_else(
+            || unit.choices.contains(&assignment),
+            |indexes| {
+                let point = graph.device().bels()[assignment[0].0].point;
+                let spatial_index = &indexes[&unit.choices.cache_key()];
+                spatial_index.by_point[(point.y * graph.device().width() + point.x) as usize]
+                    .iter()
+                    .any(|&choice| unit.choices.assignment(choice) == assignment)
+            },
+        );
+        if !assignment_is_known {
             return Err(PnrError::InvalidPlacement {
                 reason: format!(
                     "cell group beginning at {} has an incompatible assignment",

@@ -853,3 +853,19 @@ second non-metrics run completed in **51.98 s**. Both reproduced **-214/-399
 ps and 25,665 PIPs** exactly. This is the clearest evidence so far that graph
 construction lifetime and hierarchy were a larger problem than the low-level
 search implementation.
+
+The same hierarchy is now used when validating the starting point of every
+refinement transaction. Previously each logical group linearly searched its
+entire shared assignment table on every proposal; single-cell units likewise
+linearly searched all compatible BELs. A grouped assignment now selects its
+physical-tile bucket from the cached spatial index and compares only entries in
+that bucket, while sorted single-cell BEL IDs use binary search. This is an
+exact membership test, not a geometric approximation.
+
+The next identical non-metrics run fell from 51.98 s to **48.59 s** (user CPU
+40.83 s to **37.96 s**) with unchanged -214/-399 ps and 25,665 PIPs. A metrics
+run put timing closure at 39.96 seconds and the whole implementation at 44.02
+seconds. The remaining dominant phase is still critical-vertex refinement at
+29.74 seconds; its 37 proposal passes now total 4.64 seconds, so most of that
+phase is the deliberate route-and-STA portfolio rather than graph membership
+or projection construction.
