@@ -955,3 +955,32 @@ itself at 27.92 seconds, down from approximately 24.1 and 40.1 seconds. Final
 QoR remains exactly **-214 ps WNS, -3905 ps setup TNS, -399 ps WHS, and 25,675
 PIPs**. Eliminating the map clone after this change had no measurable benefit
 and was reverted; the device-wide arrays were the structural problem.
+
+## Incremental congestion-cost workspace (2026-08-25)
+
+Route-trial instrumentation separated the reusable router transaction into
+pin-wire resolution, constraint/cost validation, occupancy synchronization,
+and negotiation. Across 112 AXI4 route trials, those stages totaled 0.045,
+0.425, 0.072, and **17.333 seconds** respectively: rebuilding pin and
+constraint views was only 3% of the transaction cost. Search counters then
+showed 137,371 sink searches expanding 520.8 million physical edges and
+pushing 374.9 million frontier entries. The remaining cost is inside repeated
+edge relaxation, not transaction setup.
+
+Each relaxation previously fetched occupancy, capacity, and history for both
+its destination wire and PIP, then recomputed the same prospective congestion
+penalty. `RoutingWorkspace` now stores dense `u32` wire/PIP congestion views.
+They are recomputed only for touched resources when the negotiation factor or
+history changes and updated immediately when occupancy changes. The A* and
+hold searches consume the cached values; their accumulated costs, ordering,
+and selected routes are unchanged. Although the full vectors represent about
+126 MiB virtually on the 85K device, zero pages remain uncommitted and the
+measured peak RSS rose by only about 7 MiB.
+
+The metrics run reduced total negotiation from 17.320 to **16.797 seconds**,
+critical-vertex closure from 15.925 to **15.625 seconds**, flow time from
+27.624 to **27.214 seconds**, and wall time from 33.57 to **33.03 seconds**.
+Final QoR stayed exactly **-214 ps WNS, -3905 ps setup TNS, -399 ps WHS, and
+25,675 PIPs**. Two exact-order hot-loop experiments were rejected alongside
+this result: delay/heuristic lookup tables were neutral (33.64 vs 33.70 s),
+and a four-way frontier heap slowed negotiation to 19.834 seconds.

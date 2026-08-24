@@ -589,6 +589,8 @@ pub struct RoutingWorkspace {
     pip_occupancy: Vec<u16>,
     wire_history: Vec<u32>,
     pip_history: Vec<u32>,
+    wire_congestion: Vec<u32>,
+    pip_congestion: Vec<u32>,
     touched_wires: Vec<usize>,
     touched_pips: Vec<usize>,
     search: RouteSearch,
@@ -613,6 +615,8 @@ impl RoutingWorkspace {
             pip_occupancy: vec![0; device.pips().len()],
             wire_history: vec![0; device.wires().len()],
             pip_history: vec![0; device.pips().len()],
+            wire_congestion: vec![0; device.wires().len()],
+            pip_congestion: vec![0; device.pips().len()],
             touched_wires: Vec::new(),
             touched_pips: Vec::new(),
             search: RouteSearch::new(device.wires().len()),
@@ -640,10 +644,12 @@ impl RoutingWorkspace {
         for index in self.touched_wires.drain(..) {
             self.wire_occupancy[index] = 0;
             self.wire_history[index] = 0;
+            self.wire_congestion[index] = 0;
         }
         for index in self.touched_pips.drain(..) {
             self.pip_occupancy[index] = 0;
             self.pip_history[index] = 0;
+            self.pip_congestion[index] = 0;
         }
         self.resident_routes.clear();
         self.resident_valid = false;
@@ -4004,6 +4010,8 @@ fn route(
     let pip_occupancy = &mut workspace.pip_occupancy;
     let wire_history = &mut workspace.wire_history;
     let pip_history = &mut workspace.pip_history;
+    let wire_congestion = &mut workspace.wire_congestion;
+    let pip_congestion = &mut workspace.pip_congestion;
     let mut overuse = OveruseTracker::default();
     for route in routes.iter().flatten() {
         for wire in route.wires() {
@@ -4079,6 +4087,22 @@ fn route(
                 routes[index] = Some(Arc::new(preserved));
             }
         }
+        for &index in &workspace.touched_wires {
+            wire_congestion[index] = cached_congestion_cost(
+                wire_occupancy[index],
+                metadata.wire_capacities[index],
+                wire_history[index],
+                present_factor,
+            );
+        }
+        for &index in &workspace.touched_pips {
+            pip_congestion[index] = cached_congestion_cost(
+                pip_occupancy[index],
+                metadata.pip_capacities[index],
+                pip_history[index],
+                present_factor,
+            );
+        }
         let mut ordinal = 0;
         for &(_, index) in &routing_order {
             if !dirty.contains_key(&index) {
@@ -4099,11 +4123,8 @@ fn route(
                 pin_wires,
                 preserved.as_deref(),
                 net_id,
-                wire_occupancy,
-                pip_occupancy,
-                wire_history,
-                pip_history,
-                present_factor,
+                wire_congestion,
+                pip_congestion,
                 costs,
                 &mut workspace.search,
                 &mut workspace.tree_arrival_ps,
@@ -4115,6 +4136,12 @@ fn route(
                     .is_none_or(|old| old.wire_ref_count(wire) == 0)
             }) {
                 increment_occupancy(wire_occupancy, &mut workspace.touched_wires, wire.0);
+                wire_congestion[wire.0] = cached_congestion_cost(
+                    wire_occupancy[wire.0],
+                    metadata.wire_capacities[wire.0],
+                    wire_history[wire.0],
+                    present_factor,
+                );
                 track_entry(
                     &mut overuse.wires,
                     wire_occupancy[wire.0],
@@ -4128,6 +4155,12 @@ fn route(
                     .is_none_or(|old| old.pip_ref_count(pip) == 0)
             }) {
                 increment_occupancy(pip_occupancy, &mut workspace.touched_pips, pip.0);
+                pip_congestion[pip.0] = cached_congestion_cost(
+                    pip_occupancy[pip.0],
+                    metadata.pip_capacities[pip.0],
+                    pip_history[pip.0],
+                    present_factor,
+                );
                 track_entry(
                     &mut overuse.pips,
                     pip_occupancy[pip.0],
@@ -4357,11 +4390,8 @@ fn route_net(
     pin_wires: &PinWireCache,
     fixed: Option<&NetRoute>,
     net_id: NetId,
-    wire_occupancy: &[u16],
-    pip_occupancy: &[u16],
-    wire_history: &[u32],
-    pip_history: &[u32],
-    present_factor: u32,
+    wire_congestion: &[u32],
+    pip_congestion: &[u32],
     costs: Option<&RoutingCosts>,
     search: &mut RouteSearch,
     tree_arrival_ps: &mut [u64],
@@ -4476,11 +4506,8 @@ fn route_net(
                 graph,
                 &tree_wires,
                 sink_wire,
-                wire_occupancy,
-                pip_occupancy,
-                wire_history,
-                pip_history,
-                present_factor,
+                wire_congestion,
+                pip_congestion,
                 costs,
                 criticality,
                 delay_quantum_ps,
@@ -4692,11 +4719,8 @@ impl RouteSearch {
         graph: &UnifiedGraph<'_>,
         starts: &BTreeSet<WireId>,
         goal: WireId,
-        wire_occupancy: &[u16],
-        pip_occupancy: &[u16],
-        wire_history: &[u32],
-        pip_history: &[u32],
-        present_factor: u32,
+        wire_congestion: &[u32],
+        pip_congestion: &[u32],
         costs: Option<&RoutingCosts>,
         criticality: u64,
         delay_quantum_ps: u64,
@@ -4709,11 +4733,8 @@ impl RouteSearch {
                 graph,
                 starts,
                 goal,
-                wire_occupancy,
-                pip_occupancy,
-                wire_history,
-                pip_history,
-                present_factor,
+                wire_congestion,
+                pip_congestion,
                 costs?,
                 criticality,
                 tree_delays_ps,
@@ -4788,17 +4809,8 @@ impl RouteSearch {
                 }) {
                     continue;
                 }
-                let congestion = congestion_cost(
-                    wire_occupancy[neighbor.0],
-                    metadata.wire_capacities[neighbor.0],
-                    wire_history[neighbor.0],
-                    present_factor,
-                ) + congestion_cost(
-                    pip_occupancy[pip.0],
-                    metadata.pip_capacities[pip.0],
-                    pip_history[pip.0],
-                    present_factor,
-                );
+                let congestion =
+                    u64::from(wire_congestion[neighbor.0]) + u64::from(pip_congestion[pip.0]);
                 let pip_delay_ps = costs.map_or(0, |costs| costs.pip_delays_ps[pip.0]);
                 let next_arrival_ps = arrival_ps.saturating_add(u64::from(pip_delay_ps));
                 let step = if delay_quantum_ps == ROUTING_DELAY_QUANTUM_PS {
@@ -4846,11 +4858,8 @@ impl RouteSearch {
                 graph,
                 starts,
                 goal,
-                wire_occupancy,
-                pip_occupancy,
-                wire_history,
-                pip_history,
-                present_factor,
+                wire_congestion,
+                pip_congestion,
                 None,
                 0,
                 ROUTING_DELAY_QUANTUM_PS,
@@ -4894,11 +4903,8 @@ fn shortest_hold_path(
     graph: &UnifiedGraph<'_>,
     starts: &BTreeSet<WireId>,
     goal: WireId,
-    wire_occupancy: &[u16],
-    pip_occupancy: &[u16],
-    wire_history: &[u32],
-    pip_history: &[u32],
-    present_factor: u32,
+    wire_congestion: &[u32],
+    pip_congestion: &[u32],
     costs: &RoutingCosts,
     criticality: u64,
     tree_delays_ps: &[u64],
@@ -4943,17 +4949,8 @@ fn shortest_hold_path(
             if starts.contains(&neighbor) {
                 continue;
             }
-            let congestion = congestion_cost(
-                wire_occupancy[neighbor.0],
-                metadata.wire_capacities[neighbor.0],
-                wire_history[neighbor.0],
-                present_factor,
-            ) + congestion_cost(
-                pip_occupancy[pip.0],
-                metadata.pip_capacities[pip.0],
-                pip_history[pip.0],
-                present_factor,
-            );
+            let congestion =
+                u64::from(wire_congestion[neighbor.0]) + u64::from(pip_congestion[pip.0]);
             let pip_delay_ps = costs.pip_min_delays_ps[pip.0];
             let next_distance = distance.saturating_add(routing_step_cost(
                 pip_delay_ps,
@@ -5083,6 +5080,15 @@ fn routing_transition_cost(
 fn congestion_cost(occupancy: u16, capacity: u16, history: u32, present: u32) -> u64 {
     let prospective_overuse = occupancy.saturating_add(1).saturating_sub(capacity);
     u64::from(history) + u64::from(present) * u64::from(prospective_overuse)
+}
+
+fn cached_congestion_cost(occupancy: u16, capacity: u16, history: u32, present: u32) -> u32 {
+    // `present` is capped at 4096 and history can grow for at most 32 routing
+    // iterations. Even the maximum u16 occupancy therefore remains below
+    // u32::MAX, while the search accumulator itself stays u64.
+    congestion_cost(occupancy, capacity, history, present)
+        .try_into()
+        .expect("negotiated congestion fits u32")
 }
 
 /// `PnR` failure with the responsible object identified.
@@ -5750,9 +5756,6 @@ mod tests {
                 goal,
                 &[0; 3],
                 &[0; 2],
-                &[0; 3],
-                &[0; 2],
-                1,
                 Some(&costs),
                 64,
                 50,
@@ -5809,9 +5812,6 @@ mod tests {
                 goal,
                 &[0; 4],
                 &[0; 4],
-                &[0; 4],
-                &[0; 4],
-                1,
                 Some(&costs),
                 0,
                 50,
