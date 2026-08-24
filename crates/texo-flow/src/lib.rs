@@ -1519,6 +1519,8 @@ impl TimingDrivenContext<'_, '_> {
         let incumbent_global_routing =
             global_routes_from_implementation(self.packing, implementation);
         let mut placement = implementation.placement.clone();
+        let mut rolling_implementation = implementation.clone();
+        let mut rolling_moves = 0_usize;
         let mut candidates = Vec::new();
         // A critical pass revisits many of the same physical endpoint pairs
         // while considering adjacent path cells. Their bounded local-route
@@ -1714,12 +1716,18 @@ impl TimingDrivenContext<'_, '_> {
                 let to = refined.bindings()[cell.0];
                 progress(Ecp5FlowStage::CriticalPathMove { cell, from, to });
                 let constraint_started = Instant::now();
+                let rebase_topology = rolling_moves >= MAX_ROLLING_CRITICAL_MOVES;
+                let route_incumbent = if rebase_topology {
+                    implementation
+                } else {
+                    &rolling_implementation
+                };
                 let recomputed_global_routing;
                 let base = if let Some(incumbent) = incumbent_global_routing.as_ref()
                     && global_clock_endpoints_unchanged(
                         self.design,
                         self.packing,
-                        &implementation.placement,
+                        &route_incumbent.placement,
                         &refined,
                     ) {
                     incumbent
@@ -1735,7 +1743,7 @@ impl TimingDrivenContext<'_, '_> {
                 progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
                 let frozen = freeze_unchanged_routes(
                     self.design,
-                    implementation,
+                    route_incumbent,
                     &refined,
                     base,
                     &critical_sinks,
@@ -1804,7 +1812,13 @@ impl TimingDrivenContext<'_, '_> {
             if let Some((best_implementation, best_timing)) = best_for_cell
                 && timing_score(&best_timing) > timing_score(timing)
             {
-                placement = best_implementation.placement;
+                placement = best_implementation.placement.clone();
+                rolling_implementation = best_implementation;
+                rolling_moves = if rolling_moves >= MAX_ROLLING_CRITICAL_MOVES {
+                    0
+                } else {
+                    rolling_moves + 1
+                };
             }
         }
         if profile {
@@ -1954,6 +1968,9 @@ const DETAILED_ROUTING_QUANTA_PS: [u64; 1] = [10];
 // AXI4 self-test: final WNS and placement were bit-identical without it while
 // each multiresolution round paid one more ~30 s global ripup.
 const MAX_CRITICAL_PATH_CELLS: usize = 6;
+// Retain one accepted local route in place, then rebase the next move onto the
+// pass seed so collateral nets periodically regain coarse topology freedom.
+const MAX_ROLLING_CRITICAL_MOVES: usize = 1;
 const LOCAL_CRITICAL_BATCH_SIZE: usize = 2;
 const LOCAL_CRITICAL_BATCH_MIN_WNS_GAIN_PS: i128 = 32;
 const LOCAL_BATCH_RECOVERY_WNS_PS: i128 = -800;

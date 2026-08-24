@@ -1227,3 +1227,23 @@ topology transaction. This graph-fidelity change preserved **-214 ps WNS,
 seconds** of flow, **12.293 seconds** of critical closure, **26.55 seconds**
 wall, and 24.85 seconds user CPU. The experimental final blocker/reroute pass
 is not retained; only the placement projection's transaction-size model is.
+
+## Alternating in-place critical routing (2026-08-25)
+
+Within one critical-cell pass, placement already advanced to the accepted
+candidate but the next trial still froze routes from the pass-start
+implementation. It therefore rerouted every previously moved cell again.
+Keeping the accepted `PnrResult` as a rolling incumbent reduced critical
+closure from about 12.3 to 7.85 seconds, but permanently froze collateral
+topology and regressed WNS to -431 ps. Rebasing only after two rolling moves
+had the same failure because most pass-local chains contain at most two moves.
+
+The retained policy alternates hierarchy levels: one accepted move routes
+in-place from the rolling implementation; the next starts from the pass seed
+and reopens the cumulative moved-net topology. This restores the exact final
+timing (**-214 ps WNS, -3905 ps TNS, -399 ps WHS**) while reducing the route
+from 25,658 to **25,649 PIPs**. Consecutive runs measured **12.077/12.098
+seconds** of critical closure, **20.227/19.953 seconds** of flow,
+**26.03/25.88 seconds** wall, and 24.70/24.53 seconds user CPU. The result is a
+two-level transaction rather than a fixed compatibility rule: local route
+state is reused once, then coarse topology freedom is deliberately restored.
