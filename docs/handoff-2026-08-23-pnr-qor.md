@@ -1247,3 +1247,35 @@ seconds** of critical closure, **20.227/19.953 seconds** of flow,
 **26.03/25.88 seconds** wall, and 24.70/24.53 seconds user CPU. The result is a
 two-level transaction rather than a fixed compatibility rule: local route
 state is reused once, then coarse topology freedom is deliberately restored.
+
+## Corridor-entry pruning for retained route trees (2026-08-25)
+
+The multi-source A* used every wire in a retained route tree as a heap seed.
+That is especially wasteful for a local edit to a high-fanout net: the AXI4
+reset tree contains about 2,671 wires, while the timing search is restricted
+to a small driver/sink corridor. A source outside the corridor whose outgoing
+neighbors are also all outside cannot relax any state in the permitted search
+graph, but it still paid a heap push and pop for every sink search and every
+negotiation iteration.
+
+`RouteSearch` now marks every retained source as a tree member, preserving the
+old cycle/tie behavior, but seeds only sources already in the corridor or with
+a direct edge into it. This is exact graph pruning: a removed source had no
+legal first transition under the existing corridor rule, so the reachable
+paths and route ordering are unchanged.
+
+Two AXI4 runs retained **-214 ps WNS, -399 ps WHS, and 25,649 PIPs**. Critical
+closure measured **11.965/11.989 seconds**, flow **20.079/19.743 seconds**, and
+wall **26.01/25.62 seconds**, compared with 12.077/12.098, 20.227/19.953, and
+26.03/25.88 seconds for the preceding alternating-rebase baseline.
+
+Three adjacent hierarchy experiments were rejected. Adding radius 32 to every
+critical-placement round ran faster but regressed WNS to -395 ps; running it
+only after normal closure generated no candidate and added about 0.17 seconds.
+An adaptive rebase threshold based on cumulative changed route arcs preserved
+QoR only at the eight-arc local-transaction bound and was still slower than
+fixed alternation; a 128-arc threshold regressed WNS to -298 ps. Finally, a
+rolling-route preflight perfectly predicted the measured rebase accept/reject
+decisions, but the difficult preflights themselves took 150--200 ms, nearly
+doubling the relevant routing work. These results keep rebase policy fixed and
+move optimization into the retained-tree graph traversal itself.

@@ -5030,6 +5030,23 @@ impl RouteSearch {
         self.queue.clear();
         for &start in starts {
             self.start_mark[start.0] = epoch;
+        }
+        for &start in starts {
+            // A retained high-fanout tree can contain thousands of legal
+            // sources while a local sink search is confined to a small timing
+            // corridor. An outside source with no direct edge into that
+            // corridor cannot relax any state in the search below, so putting
+            // it through the heap is pure work. Keep every source marked as a
+            // tree member, but seed only sources that can enter the allowed
+            // subgraph in zero or one hop.
+            if let Some(corridor) = corridor
+                && !point_inside_corridor(metadata.wire_points[start.0], corridor)
+                && !graph.routing_neighbors(start).ok()?.any(|(neighbor, _)| {
+                    point_inside_corridor(metadata.wire_points[neighbor.0], corridor)
+                })
+            {
+                continue;
+            }
             let arrival_ps = tree_delays_ps[start.0];
             let distance = timing_tree_cost(arrival_ps, criticality, delay_quantum_ps);
             let compact_arrival = compact_route_value(arrival_ps);
