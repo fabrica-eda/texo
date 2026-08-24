@@ -1045,3 +1045,20 @@ QoR but was slower than 12); and old-route soft upper bounds reached 8.92
 seconds of critical refinement but trapped closure at -379 ps or worse. The
 remaining router redesign must preserve shared-tree state and shared conflict
 prices while allowing critical topology to change.
+
+The retained source set depends only on the incumbent `(net, sink)` topology,
+not on a BEL candidate. It was initially rebuilt as a `BTreeSet` inside every
+projected candidate evaluation. The broad-placement transaction now builds
+each sorted source slice once and shares it across all candidate searches;
+membership is a binary search with no per-candidate tree allocation. Output
+remained exactly -214/-399 ps with -3905 ps setup TNS and 25,655 PIPs. Critical
+refinement fell to **15.074 seconds**, flow time to **26.197 seconds**, wall
+time to **31.99 seconds**, and user CPU to **30.47 seconds**.
+
+A subsequent two-layer owner/pricing-occupancy prototype confirmed that
+retaining conflict prices is necessary but not sufficient for in-place
+rip-up. Immediate eviction of every selected victim reached 26.006 seconds
+but ended at -301 ps WNS; mixing event-driven eviction only for
+criticality-1 arcs was worse at -457 ps and 31.107 seconds. Resource prices,
+arc ordering, and victim ownership must therefore be replaced coherently
+rather than mixed with the round-based negotiator.

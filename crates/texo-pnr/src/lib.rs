@@ -1943,6 +1943,12 @@ impl<'a> PlacementRefiner<'a> {
             const PROJECTION_SHORTLIST: usize = 16;
             best.truncate(PROJECTION_SHORTLIST.max(max_candidates));
             let fallback = best.clone();
+            let retained_starts = projected_retained_tree_starts(
+                self.graph.design(),
+                moving_cell,
+                connections,
+                projection,
+            );
             let mut projected = best
                 .into_iter()
                 .filter_map(|(span, _, assignment)| {
@@ -1956,6 +1962,7 @@ impl<'a> PlacementRefiner<'a> {
                         &placed,
                         pip_delays_ps,
                         projection,
+                        &retained_starts,
                     )
                     .map(|cost| (cost, span, assignment))
                 })
@@ -1993,6 +2000,44 @@ impl<'a> PlacementRefiner<'a> {
     }
 }
 
+fn projected_retained_tree_starts(
+    design: &Design,
+    moving_cell: CellId,
+    connections: &[(CellPinId, CellPinId)],
+    projection: &RouteCapacityProjection,
+) -> BTreeMap<(NetId, CellPinId), Arc<[WireId]>> {
+    let mut retained = BTreeMap::new();
+    for &(driver_pin, sink_pin) in connections {
+        let Some(driver) = design.pins().get(driver_pin.0) else {
+            continue;
+        };
+        let Some(sink) = design.pins().get(sink_pin.0) else {
+            continue;
+        };
+        if sink.cell != moving_cell {
+            continue;
+        }
+        let Some(net) = driver.net() else {
+            continue;
+        };
+        let Some(route) = projection.routes.get(&net) else {
+            continue;
+        };
+        let wires = route
+            .arcs
+            .iter()
+            .filter(|arc| arc.sink != Some(sink_pin))
+            .flat_map(|arc| arc.wires.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if !wires.is_empty() {
+            retained.insert((net, sink_pin), wires.into());
+        }
+    }
+    retained
+}
+
 #[allow(clippy::too_many_arguments)]
 fn assignment_connection_projected_cost(
     graph: &UnifiedGraph<'_>,
@@ -2004,6 +2049,7 @@ fn assignment_connection_projected_cost(
     placed: &[Option<BelId>],
     pip_delays_ps: &[u32],
     projection: &RouteCapacityProjection,
+    retained_starts: &BTreeMap<(NetId, CellPinId), Arc<[WireId]>>,
 ) -> Option<u64> {
     let design = graph.design();
     let mut total = 0_u64;
@@ -2018,21 +2064,13 @@ fn assignment_connection_projected_cost(
         let sink_bel = assignment_bel(unit, assignment, sink.cell, placed)?;
         let driver_wire = candidate_pin_wire(graph, constraints, driver_pin, driver_bel)?;
         let sink_wire = candidate_pin_wire(graph, constraints, sink_pin, sink_bel)?;
-        let mut starts = BTreeSet::from([driver_wire]);
-        if sink.cell == moving_cell
-            && let Some(route) = projection.routes.get(&net)
-        {
-            starts.extend(
-                route
-                    .arcs
-                    .iter()
-                    .filter(|arc| arc.sink != Some(sink_pin))
-                    .flat_map(|arc| arc.wires.iter().copied()),
-            );
-        }
+        let single_start = [driver_wire];
+        let starts = retained_starts
+            .get(&(net, sink_pin))
+            .map_or(&single_start[..], Arc::as_ref);
         total = total.saturating_add(local_connection_projected_cost_from_starts(
             graph,
-            &starts,
+            starts,
             sink_wire,
             pip_delays_ps,
             net,
@@ -2044,7 +2082,7 @@ fn assignment_connection_projected_cost(
 
 fn local_connection_projected_cost_from_starts(
     graph: &UnifiedGraph<'_>,
-    starts: &BTreeSet<WireId>,
+    starts: &[WireId],
     goal: WireId,
     pip_delays_ps: &[u32],
     net: NetId,
@@ -2079,7 +2117,7 @@ fn local_connection_projected_cost_from_starts(
             continue;
         }
         for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
-            if starts.contains(&neighbor) {
+            if starts.binary_search(&neighbor).is_ok() {
                 continue;
             }
             if !point_inside_corridor(device.wires()[neighbor.0].point, corridor) {
@@ -6254,7 +6292,7 @@ mod tests {
         assert_eq!(
             local_connection_projected_cost_from_starts(
                 &graph,
-                &BTreeSet::from([driver, retained]),
+                &[driver, retained],
                 goal,
                 &[100, 10],
                 NetId(0),
