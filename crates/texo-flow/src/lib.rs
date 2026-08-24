@@ -7,7 +7,7 @@ use std::error::Error;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use texo_model::{
     BelId, CellId, CellPinId, Design, Device, NetId, PinDirection, PipId, ResourceKind,
@@ -309,6 +309,8 @@ pub fn implement_struo_ecp5_with_progress(
     evidence: &mut Evidence,
     mut progress: impl FnMut(Ecp5FlowStage),
 ) -> Result<Ecp5FlowResult, Ecp5FlowError> {
+    let flow_started = Instant::now();
+    let mut phase_started = flow_started;
     if !evidence.contains(Gate::PostMapSimulation) {
         return Err(Ecp5FlowError::MissingPostMapSimulation);
     }
@@ -353,6 +355,7 @@ pub fn implement_struo_ecp5_with_progress(
         packing.apply_resolved_lpf(&design, architecture, package, &resolved)?;
     }
     progress(Ecp5FlowStage::Packed);
+    report_metric_phase("packing", &mut phase_started);
 
     let mut staged_evidence = evidence.clone();
     staged_evidence.record(Gate::MappedNetlistComplete);
@@ -361,6 +364,7 @@ pub fn implement_struo_ecp5_with_progress(
         None => initial_analytical_placement(&design, architecture, &packing)?,
     };
     progress(Ecp5FlowStage::Placed);
+    report_metric_phase("initial_placement", &mut phase_started);
     let mut global_routing_cache = architecture.global_routing_cache();
     let routing = packing.global_routing_constraints_cached(
         &design,
@@ -369,6 +373,7 @@ pub fn implement_struo_ecp5_with_progress(
         &mut global_routing_cache,
     )?;
     progress(Ecp5FlowStage::GlobalClocksRouted);
+    report_metric_phase("initial_global_routing", &mut phase_started);
     let mut routing_workspace = RoutingWorkspace::new(architecture.device());
     let mut initial_implementation = route_with_workspace_and_progress(
         &design,
@@ -417,6 +422,7 @@ pub fn implement_struo_ecp5_with_progress(
         )?;
         progress(timing_snapshot(&initial_timing));
     }
+    report_metric_phase("initial_route_and_timing", &mut phase_started);
     let mut closure_routing_costs = options
         .optimize_timing
         .then(|| {
@@ -457,6 +463,7 @@ pub fn implement_struo_ecp5_with_progress(
         costs.set_net_criticalities(timing_net_weights(&initial_timing, &timing_constraints));
         costs.set_sink_criticalities(timing_arc_weights(&initial_timing, &timing_constraints));
     }
+    report_metric_phase("dedicated_edge_search", &mut phase_started);
 
     let (implementation, timing) = if let Some(costs) = closure_routing_costs.as_mut() {
         TimingDrivenContext {
@@ -475,12 +482,16 @@ pub fn implement_struo_ecp5_with_progress(
     } else {
         (initial_implementation, initial_timing)
     };
+    report_metric_phase("timing_closure", &mut phase_started);
     progress(Ecp5FlowStage::Timed);
     staged_evidence.record(Gate::PhysicalImplementation);
     if timing.met_timing() {
         staged_evidence.record(Gate::TimingClosure);
     }
     *evidence = staged_evidence;
+    if metrics_enabled() {
+        eprintln!("[metrics] flow_total={:?}", flow_started.elapsed());
+    }
 
     Ok(Ecp5FlowResult {
         speed_grade: speed_grade_name.into(),
@@ -732,6 +743,7 @@ impl TimingDrivenContext<'_, '_> {
         routing_costs: &mut RoutingCosts,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<(PnrResult, TimingReport), Ecp5FlowError> {
+        let mut phase_started = Instant::now();
         if initial_timing.met_timing() {
             return Ok((initial_implementation, initial_timing));
         }
@@ -747,8 +759,10 @@ impl TimingDrivenContext<'_, '_> {
             self.architecture.device(),
             self.packing.constraints(),
         )?;
+        report_metric_phase("closure_refiner_build", &mut phase_started);
         archive =
             self.refine_setup_monotonically(archive, &placement_refiner, routing_costs, progress)?;
+        report_metric_phase("closure_monotonic_refinement", &mut phase_started);
         for _ in 0..MAX_LOCAL_CONNECTION_REFINEMENTS {
             let seed = archive
                 .iter()
@@ -772,8 +786,10 @@ impl TimingDrivenContext<'_, '_> {
             archive.push(improved);
             archive = select_timing_frontier(archive);
         }
+        report_metric_phase("closure_local_connections", &mut phase_started);
         archive =
             self.close_setup_critically(archive, &placement_refiner, routing_costs, progress)?;
+        report_metric_phase("closure_critical_vertices", &mut phase_started);
         if !archive
             .iter()
             .any(|(_, timing)| timing.worst_slack_ps.is_some_and(|slack| slack >= 0))
@@ -781,6 +797,7 @@ impl TimingDrivenContext<'_, '_> {
             archive =
                 self.escape_placement_basin(archive, &placement_refiner, routing_costs, progress)?;
         }
+        report_metric_phase("closure_basin_escape", &mut phase_started);
         let mut hold_repairs = Vec::new();
         for (implementation, timing) in &archive {
             if timing.worst_slack_ps.is_none_or(|slack| slack < 0) {
@@ -795,6 +812,7 @@ impl TimingDrivenContext<'_, '_> {
             }
         }
         archive.extend(hold_repairs);
+        report_metric_phase("closure_hold_repair", &mut phase_started);
         archive = select_timing_frontier(archive);
         let (final_implementation, final_timing) = archive
             .into_iter()
@@ -1363,6 +1381,12 @@ impl TimingDrivenContext<'_, '_> {
         max_move_distance: u64,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
+        let profile_started = Instant::now();
+        let mut proposal_time = Duration::ZERO;
+        let mut prescreen_time = Duration::ZERO;
+        let mut constraint_time = Duration::ZERO;
+        let mut routed_trials = 0_usize;
+        let seed_fingerprint = implementation_topology_fingerprint(self.design, implementation);
         let Some(worst_slack_ps) = timing.worst_slack_ps else {
             return Ok(Vec::new());
         };
@@ -1406,21 +1430,21 @@ impl TimingDrivenContext<'_, '_> {
         let route_arc_weights = timing_arc_weights(timing, self.timing_constraints);
         routing_costs.set_net_criticalities(prescreen_weights.clone());
         routing_costs.set_sink_criticalities(route_arc_weights.clone());
-        let capacity_projection =
-            RouteCapacityProjection::new(&implementation.routes, routing_costs);
-        let seed_fingerprint = implementation_topology_fingerprint(self.design, implementation);
+        let capacity_projection = (max_move_distance > 2)
+            .then(|| RouteCapacityProjection::new(&implementation.routes, routing_costs));
         let incumbent_global_routing =
             global_routes_from_implementation(self.packing, implementation);
         let mut placement = implementation.placement.clone();
         let mut candidates = Vec::new();
         for (cell, (_, connections, targets)) in cells.into_iter().take(MAX_CRITICAL_PATH_CELLS) {
+            let proposal_started = Instant::now();
             let proposals = placement_refiner.refine_cell_connection_delays(
                 placement.clone(),
                 cell,
                 &connections,
                 &targets,
                 routing_costs.pip_delays_ps(),
-                Some(&capacity_projection),
+                capacity_projection.as_ref(),
                 max_move_distance,
                 if max_move_distance > 2 {
                     MAX_PROJECTED_PATH_CELL_CANDIDATES
@@ -1428,13 +1452,16 @@ impl TimingDrivenContext<'_, '_> {
                     1
                 },
             )?;
+            proposal_time += proposal_started.elapsed();
             if proposals.is_empty() {
                 continue;
             }
             let from = placement.bindings()[cell.0];
             let mut best_for_cell = None;
             for refined in proposals {
+                let prescreen_started = Instant::now();
                 if self.estimate_rejects(&placement, &refined, &prescreen_weights) {
+                    prescreen_time += prescreen_started.elapsed();
                     continue;
                 }
                 let trial_key = (
@@ -1442,10 +1469,13 @@ impl TimingDrivenContext<'_, '_> {
                     placement_fingerprint(self.design, &refined),
                 );
                 if !self.critical_move_trials.insert(trial_key) {
+                    prescreen_time += prescreen_started.elapsed();
                     continue;
                 }
+                prescreen_time += prescreen_started.elapsed();
                 let to = refined.bindings()[cell.0];
                 progress(Ecp5FlowStage::CriticalPathMove { cell, from, to });
+                let constraint_started = Instant::now();
                 let recomputed_global_routing;
                 let base = if let Some(incumbent) = incumbent_global_routing.as_ref()
                     && global_clock_endpoints_unchanged(
@@ -1472,6 +1502,7 @@ impl TimingDrivenContext<'_, '_> {
                     base,
                     &critical_sinks,
                 );
+                constraint_time += constraint_started.elapsed();
                 routing_costs.set_net_criticalities(prescreen_weights.clone());
                 routing_costs.set_sink_criticalities(route_arc_weights.clone());
                 routing_costs.set_sink_min_delays_ps(BTreeMap::new());
@@ -1483,6 +1514,7 @@ impl TimingDrivenContext<'_, '_> {
                 routing_costs.set_detailed_delay_quantum_ps(texo_pnr::ROUTING_DELAY_QUANTUM_PS);
                 let trial =
                     self.route_local_trial_and_analyze(refined, &frozen, routing_costs, progress);
+                routed_trials += 1;
                 routing_costs.set_detailed_timing_nets(BTreeSet::new());
                 if let Ok(candidate) = trial {
                     let improves_objective = timing_score(&candidate.1) > timing_score(timing);
@@ -1511,6 +1543,12 @@ impl TimingDrivenContext<'_, '_> {
             {
                 placement = best_implementation.placement;
             }
+        }
+        if metrics_enabled() {
+            eprintln!(
+                "[metrics] critical_cells distance={max_move_distance} total={:?} proposals={proposal_time:?} prescreen={prescreen_time:?} constraints={constraint_time:?} trials={routed_trials}",
+                profile_started.elapsed(),
+            );
         }
         Ok(candidates)
     }
@@ -1711,6 +1749,16 @@ fn placement_hpwl(design: &Design, device: &Device, placement: &Placement) -> u6
 
 fn metrics_enabled() -> bool {
     std::env::var_os("TEXO_METRICS").is_some()
+}
+
+fn report_metric_phase(name: &str, started: &mut Instant) {
+    if metrics_enabled() {
+        eprintln!(
+            "[metrics] flow_phase={name} elapsed={:?}",
+            started.elapsed()
+        );
+    }
+    *started = Instant::now();
 }
 
 /// Emits one stage-wise placement quality line when `TEXO_METRICS` is set.

@@ -792,3 +792,33 @@ outside negotiated routing and STA. The next optimization target must therefore
 be split at whole-flow boundaries before further tuning A*: graph/packing,
 initial placement, and candidate construction are now more plausible dominant
 costs than the local router itself.
+
+## Phase-local capacity projection (2026-08-24)
+
+Whole-flow metrics now report packing, initial placement, initial global
+routing, initial route/timing, dedicated-edge search, and timing closure as
+separate durations. Closure further reports refiner construction, monotonic
+refinement, local connections, critical vertices, basin escape, and hold
+repair. On AXI4, the 51.33-second implementation split was:
+
+| phase | time |
+|---|---:|
+| packing | 0.19 s |
+| initial placement | 2.52 s |
+| initial global routing | 1.17 s |
+| initial route and timing | 0.62 s |
+| dedicated-edge search | 1.51 s |
+| timing closure | **45.32 s** |
+
+Inside closure, critical-vertex refinement alone took 30.56 seconds. The
+capacity projection over every routed arc and its 25,665 PIPs was being rebuilt
+for every radius-1 and radius-2 local move even though only the radius-16 broad
+topology search reads it. Projection construction is now conditional on the
+broad hierarchy level. This changes no candidate score or routing decision.
+
+With host load elevated, an adjacent saved-binary comparison measured the
+pre-change shared-route version at 66.42 s wall / 54.34 s user CPU and the lazy
+projection version at **62.10 s wall / 51.27 s user CPU**. Both produced
+**-214/-399 ps and 25,665 PIPs**. The 4.32-second wall and 3.07-second user-CPU
+reductions confirm that graph construction scope, not just A* implementation,
+was a material part of the remaining runtime.
