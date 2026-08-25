@@ -62,8 +62,7 @@ cargo fmt --all -- --check
 `texo pnr` accepts a project directory or `Veryl.toml`. It follows
 `[build].sources`, resolves the standard library and local/Git dependencies
 through `Veryl.lock`, analyzes all compilation units together, and uses
-`[synth].top` unless `--top` overrides it. A standalone `.veryl` remains
-available as a convenience and requires `--top`. Run `texo pnr --help` for
+`[synth].top` unless `--top` overrides it. Run `texo pnr --help` for
 synthesis-goal, placement-weight, unconstrained-IO, global-clock, and
 timing-closure controls. Without `--output`, project checkpoints go to
 `target/texo/<top>.json`.

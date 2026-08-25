@@ -4,26 +4,26 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 
-use struo_frontend_veryl::{analyze_and_lower, lower_analyzed_ir};
+use struo_frontend_veryl::lower_analyzed_ir;
 use struo_rtl::Design;
 use veryl_analyzer::ir::Ir;
 use veryl_analyzer::{Analyzer, AnalyzerError, Context};
 use veryl_metadata::Metadata;
 use veryl_parser::Parser;
 
-/// Fully analyzed and lowered Veryl input.
+/// Fully analyzed and lowered Veryl project.
 #[derive(Debug)]
-pub struct VerylDesign {
+pub struct VerylProject {
     /// Frontend-independent RTL selected for synthesis.
     pub design: Design,
     /// Resolved top module, including a `[synth].top` default when present.
     pub top: String,
     /// Project namespace used by the Veryl analyzer.
     pub project: String,
-    /// Project root, or the standalone source's parent directory.
+    /// Project root containing `Veryl.toml`.
     pub root: PathBuf,
-    /// `Veryl.toml` for project input; absent for standalone source input.
-    pub manifest: Option<PathBuf>,
+    /// Canonical path to the project's `Veryl.toml`.
+    pub manifest: PathBuf,
     /// Number of project-owned source compilation units.
     pub project_sources: usize,
     /// Number of analyzed units including dependencies and the standard library.
@@ -34,63 +34,28 @@ pub struct VerylDesign {
     pub warnings: Vec<String>,
 }
 
-/// Loads either a Veryl project directory/manifest or one standalone source.
+/// Loads a complete Veryl project from its directory or manifest.
 ///
 /// Project input expands `[build].sources`, the standard library, and all
 /// dependencies through Veryl's metadata and lockfile implementation. The top
-/// comes from `top_override` first and `[synth].top` second. A standalone source
-/// requires an explicit top.
+/// comes from `top_override` first and `[synth].top` second.
 ///
 /// # Errors
 ///
 /// Returns an error for an unsupported input path, missing project top,
 /// metadata/dependency resolution failure, source IO, parser/analyzer
 /// diagnostics, or unsupported Struo lowering.
-pub fn load_veryl_design(
+pub fn load_veryl_project(
     input: &Path,
     top_override: Option<&str>,
-) -> Result<VerylDesign, Box<dyn Error>> {
-    if input.is_dir() || input.file_name().is_some_and(|name| name == "Veryl.toml") {
-        load_project(input, top_override)
-    } else if input
-        .extension()
-        .is_some_and(|extension| extension == "veryl")
-    {
-        load_standalone(input, top_override)
-    } else {
-        Err(ProjectInputError(format!(
-            "Veryl input must be a project directory, Veryl.toml, or .veryl file: {}",
+) -> Result<VerylProject, Box<dyn Error>> {
+    if !input.is_dir() && input.file_name().is_none_or(|name| name != "Veryl.toml") {
+        return Err(ProjectInputError(format!(
+            "Veryl input must be a project directory or Veryl.toml: {}",
             input.display()
         ))
-        .into())
+        .into());
     }
-}
-
-fn load_standalone(
-    source_path: &Path,
-    top_override: Option<&str>,
-) -> Result<VerylDesign, Box<dyn Error>> {
-    let top = top_override.ok_or_else(|| {
-        ProjectInputError("--top is required for a standalone .veryl file".into())
-    })?;
-    let source = std::fs::read_to_string(source_path)?;
-    let root = source_path.parent().unwrap_or_else(|| Path::new("."));
-    let project = "standalone".to_owned();
-    let design = analyze_and_lower(&source, &project, top)?;
-    Ok(VerylDesign {
-        design,
-        top: top.into(),
-        project,
-        root: root.to_path_buf(),
-        manifest: None,
-        project_sources: 1,
-        total_sources: 1,
-        source_paths: vec![source_path.canonicalize()?],
-        warnings: Vec::new(),
-    })
-}
-
-fn load_project(input: &Path, top_override: Option<&str>) -> Result<VerylDesign, Box<dyn Error>> {
     clear_analyzer_tables();
     let manifest = if input.is_dir() {
         input.join("Veryl.toml")
@@ -156,12 +121,12 @@ fn load_project(input: &Path, top_override: Option<&str>) -> Result<VerylDesign,
     )?;
     let design = lower_analyzed_ir(&ir, &top)?;
 
-    Ok(VerylDesign {
+    Ok(VerylProject {
         design,
         top,
         project: metadata.project.name.clone(),
         root: metadata.project_path(),
-        manifest: Some(manifest.canonicalize()?),
+        manifest: manifest.canonicalize()?,
         project_sources,
         total_sources: paths.len(),
         source_paths,
@@ -210,7 +175,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::load_veryl_design;
+    use super::load_veryl_project;
 
     struct TemporaryProject(PathBuf);
 
@@ -281,13 +246,24 @@ module Top (
     #[test]
     fn loads_all_project_units_and_uses_manifest_top() {
         let project = TemporaryProject::new();
-        let loaded = load_veryl_design(&project.0, None).unwrap();
+        let loaded = load_veryl_project(&project.0, None).unwrap();
 
         assert_eq!(loaded.project, "multi_file");
         assert_eq!(loaded.top, "Top");
         assert_eq!(loaded.project_sources, 2);
         assert_eq!(loaded.total_sources, 2);
         assert!(loaded.design.top_module().is_some());
+    }
+
+    #[test]
+    fn rejects_standalone_source_input() {
+        let error =
+            load_veryl_project(PathBuf::from("design.veryl").as_path(), Some("Top")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("project directory or Veryl.toml")
+        );
     }
 
     #[test]
@@ -360,7 +336,7 @@ module Top (
         )
         .unwrap();
 
-        let loaded = load_veryl_design(&main, None).unwrap();
+        let loaded = load_veryl_project(&main, None).unwrap();
 
         assert_eq!(loaded.project_sources, 1);
         assert_eq!(loaded.total_sources, 2);

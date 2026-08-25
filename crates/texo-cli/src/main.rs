@@ -12,7 +12,7 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand};
 use struo_synth::synthesize;
 use struo_target_ecp5::{ECP5_QOR_TARGET_MHZ, MappingOptions, map_to_ecp5_with_options};
-use texo_cli::{VerylDesign, ecp5_checkpoint, load_veryl_design, write_checkpoint_visualizer};
+use texo_cli::{VerylProject, ecp5_checkpoint, load_veryl_project, write_checkpoint_visualizer};
 use texo_flow::{
     Ecp5FlowOptions, Ecp5FlowResult, Ecp5FlowStage, Evidence, Gate, PostMapSimulationPolicy,
     RoutingProgress, implement_struo_ecp5_with_progress,
@@ -64,9 +64,9 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct PnrArgs {
-    /// Project directory, `Veryl.toml`, or standalone `.veryl` source.
+    /// Project directory or `Veryl.toml`.
     input: PathBuf,
-    /// Top module; overrides `[synth].top` and is required for standalone input.
+    /// Top module; overrides `[synth].top`.
     #[arg(short, long)]
     top: Option<String>,
     /// ECP5 architecture JSON or `.txdb` cache.
@@ -229,16 +229,14 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn prepare_veryl_input(args: &PnrArgs) -> Result<(VerylDesign, PathBuf), Box<dyn Error>> {
-    let loaded = load_veryl_design(&args.input, args.top.as_deref())?;
+fn prepare_veryl_input(args: &PnrArgs) -> Result<(VerylProject, PathBuf), Box<dyn Error>> {
+    let loaded = load_veryl_project(&args.input, args.top.as_deref())?;
     let output = args
         .output
         .clone()
-        .unwrap_or_else(|| default_checkpoint_path(&args.input, &loaded));
+        .unwrap_or_else(|| default_checkpoint_path(&loaded));
     ensure_distinct_paths(&args.input, &output, "Veryl input", "checkpoint")?;
-    if let Some(manifest) = &loaded.manifest {
-        ensure_distinct_paths(manifest, &output, "Veryl.toml", "checkpoint")?;
-    }
+    ensure_distinct_paths(&loaded.manifest, &output, "Veryl.toml", "checkpoint")?;
     for source in &loaded.source_paths {
         ensure_distinct_paths(source, &output, "Veryl source", "checkpoint")?;
     }
@@ -450,18 +448,12 @@ fn lpf_info(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn default_checkpoint_path(input: &Path, loaded: &VerylDesign) -> PathBuf {
-    if loaded.manifest.is_some() {
-        loaded
-            .root
-            .join("target")
-            .join("texo")
-            .join(format!("{}.json", loaded.top))
-    } else {
-        let mut path = input.as_os_str().to_owned();
-        path.push(".texo.json");
-        path.into()
-    }
+fn default_checkpoint_path(loaded: &VerylProject) -> PathBuf {
+    loaded
+        .root
+        .join("target")
+        .join("texo")
+        .join(format!("{}.json", loaded.top))
 }
 
 fn checkpoint_html_path(checkpoint: &Path) -> PathBuf {
@@ -510,7 +502,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "texo",
             "pnr",
-            "design.veryl",
+            "project",
             "--top",
             "Top",
             "--architecture",
@@ -530,7 +522,7 @@ mod tests {
         let Command::Pnr(args) = cli.command else {
             panic!("expected pnr command");
         };
-        assert_eq!(args.input, Path::new("design.veryl"));
+        assert_eq!(args.input, Path::new("project"));
         assert_eq!(args.top.as_deref(), Some("Top"));
         assert_eq!(args.speed, "8_5G");
         assert_eq!(args.placement_weight_exponent.get(), 2);
@@ -563,7 +555,7 @@ mod tests {
         let common = [
             "texo",
             "pnr",
-            "design.veryl",
+            "project",
             "-t",
             "Top",
             "-a",
@@ -584,7 +576,7 @@ mod tests {
 
     #[test]
     fn rejects_an_output_that_overwrites_its_input() {
-        let path = Path::new("design.veryl");
+        let path = Path::new("Veryl.toml");
         assert!(ensure_distinct_paths(path, path, "source", "output").is_err());
     }
 }
