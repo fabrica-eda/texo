@@ -127,7 +127,11 @@ width, and physical port width. The ECP5 packer accepts only DP16KD modes
 `1/2/4/9/18`, checks the corresponding `16384/8192/4096/2048/1024` depth
 limits, constrains the cell to compatible `DP16KD` BELs, and assigns stable
 WID values from 3 in CellId order. Missing metadata and illegal geometries are
-reported before any packing constraint is mutated.
+reported before any packing constraint is mutated. Checkpoint schema v3 also
+records the fixed BEL-pin-to-CIB predecessor for every absorbed DP16KD input.
+The native configuration writer uses those records to emit CIB constants,
+clock/enable polarity, chip-select decode, WID, zero initialization, and the
+multi-tile EBR feature group without rebuilding the routing graph.
 Global-clock promotion uses the same graph instead of a separate clock model.
 The packer ranks nets by recognized FF/BRAM clock-pin fanout (five sinks by
 default), selects at most the 16 ECP5 primary clock networks, and inserts a

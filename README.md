@@ -115,14 +115,14 @@ tools/ecp5_bitstream.py \
   --bit artifacts/axi4.bit
 ```
 
-`ecp5_bitstream.py` consumes checkpoint schema v2 and writes Project Trellis
+`ecp5_bitstream.py` consumes checkpoint schema v3 and writes Project Trellis
 configuration features directly; nextpnr is not part of this flow. It selects
 the exact checkpoint device, configures every non-fixed Texo route edge and
 placed primitive, refuses release without all six functional, physical, and
 timing evidence gates, and byte-compares an `ecpunpack`/`ecppack` round trip.
 The command requires the `python3-pytrellis` module plus `ecppack` and
-`ecpunpack` on `PATH`. Native DP16KD configuration remains unsupported and is
-rejected explicitly rather than producing a partial bitstream.
+`ecpunpack` on `PATH`. LUT/carry, FF, single-ended IO, DCCA routing, and DP16KD
+configuration are emitted without reconstructing a second PnR context.
 
 See [docs/architecture.md](docs/architecture.md) for the integration boundary
 and [docs/roadmap.md](docs/roadmap.md) for the implementation sequence.

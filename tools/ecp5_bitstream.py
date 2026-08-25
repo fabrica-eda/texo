@@ -81,6 +81,14 @@ def integer_bits(value, width):
     return [(value & (1 << bit)) != 0 for bit in range(width)]
 
 
+def reverse_bits(value, width):
+    result = 0
+    for bit in range(width):
+        if value & (1 << bit):
+            result |= 1 << (width - bit - 1)
+    return result
+
+
 def fold_lut_input(initialization, input_index, value):
     folded = 0
     for output_index in range(16):
@@ -331,6 +339,142 @@ def write_io(pytrellis, config, chip, database, device, placement, configuration
         add_enum(pytrellis, config, bank_tiles[0], "BANK.VCCIO", io_voltage(io_type))
 
 
+def bram_tiles(chip, placement):
+    x, y, z = placement["x"], placement["y"], placement["bel_z"]
+    ebr0 = {"MIB_EBR0", "EBR_CMUX_UR", "EBR_CMUX_LR", "EBR_CMUX_LR_25K"}
+    ebr8 = {
+        "MIB_EBR8", "EBR_SPINE_UL1", "EBR_SPINE_UR1", "EBR_SPINE_LL1",
+        "EBR_CMUX_UL", "EBR_SPINE_LL0", "EBR_CMUX_LL", "EBR_SPINE_LR0",
+        "EBR_SPINE_LR1", "EBR_CMUX_LL_25K", "EBR_SPINE_UL2",
+        "EBR_SPINE_UL0", "EBR_SPINE_UR2", "EBR_SPINE_LL2",
+        "EBR_SPINE_LR2", "EBR_SPINE_UR0",
+    }
+    groups = {
+        0: ((0, ebr0), (1, "MIB_EBR1")),
+        1: ((0, "MIB_EBR2"), (1, "MIB_EBR3"), (2, "MIB_EBR4")),
+        2: ((0, "MIB_EBR4"), (1, "MIB_EBR5"), (2, "MIB_EBR6")),
+        3: ((0, "MIB_EBR6"), (1, "MIB_EBR7"), (2, ebr8)),
+    }
+    if z not in groups:
+        raise RuntimeError(f"DP16KD BEL has invalid z={z}: {placement['bel']}")
+    return [chip_tile(chip, y, x + offset, tile_type) for offset, tile_type in groups[z]]
+
+
+def add_cib_tie(pytrellis, config, tie, value):
+    mux = tie["mux"]
+    if mux.startswith("JCE") and not value:
+        raise RuntimeError(f"CIB {mux} can only provide a high constant")
+    output = value
+    if mux.startswith(("JCLK", "JLSR")):
+        if not value:
+            raise RuntimeError(f"CIB {mux} requires its inverted-zero encoding")
+        output = False
+    add_enum(pytrellis, config, tie["tile"], f"CIB.{mux}MUX", "1" if output else "0")
+
+
+def write_bram(
+    pytrellis,
+    config,
+    chip,
+    placement,
+    configuration,
+    packed,
+    absorbed_inputs,
+    tile_groups,
+    bram_data,
+):
+    width = configuration["physical_width"]
+    if width not in {1, 2, 4, 9, 18}:
+        raise RuntimeError(f"DP16KD has unsupported physical width {width}")
+    for field in ("depth", "word_width", "physical_width"):
+        if configuration[field] != packed[field]:
+            raise RuntimeError(f"DP16KD packing disagrees on {field}: {placement['cell']}")
+
+    group = pytrellis.TileConfig()
+    ebr = f"EBR{placement['bel_z']}"
+    group.add_enum(f"{ebr}.MODE", "DP16KD")
+    group.add_enum(f"{ebr}.DP16KD.DATA_WIDTH_A", str(width))
+    group.add_enum(f"{ebr}.DP16KD.DATA_WIDTH_B", str(width))
+    group.add_enum(f"{ebr}.DP16KD.WRITEMODE_A", "NORMAL")
+    group.add_enum(f"{ebr}.DP16KD.WRITEMODE_B", "NORMAL")
+    group.add_enum(f"{ebr}.REGMODE_A", "NOREG")
+    group.add_enum(f"{ebr}.REGMODE_B", "NOREG")
+    group.add_enum(f"{ebr}.RESETMODE", "SYNC")
+    group.add_enum(f"{ebr}.ASYNC_RESET_RELEASE", "SYNC")
+    group.add_enum(f"{ebr}.GSR", "DISABLED")
+    group.add_word(
+        f"{ebr}.WID",
+        bool_vector(pytrellis, integer_bits(reverse_bits(packed["wid"], 9), 9)),
+    )
+
+    for pin in placement["bel_pins"]:
+        name = pin["name"]
+        if name not in absorbed_inputs:
+            continue
+        tie = pin.get("cib_tie")
+        if tie is None:
+            raise RuntimeError(f"absorbed DP16KD pin {placement['bel']}/{name} has no CIB tie")
+        if name in {
+            "CLKA", "CLKB", "WEA", "WEB", "RSTA", "RSTB", "CEA", "CEB",
+            "OCEA", "OCEB", "CSA0", "CSA1", "CSA2", "CSB0", "CSB1", "CSB2",
+        }:
+            tie_value = True
+        else:
+            tie_value = absorbed_inputs[name]
+        add_cib_tie(pytrellis, config, tie, tie_value)
+
+    edge_mux = "CLKA" if configuration["edge"] == "rising" else "INV"
+    group.add_enum(f"{ebr}.CLKAMUX", edge_mux)
+    group.add_enum(
+        f"{ebr}.CLKBMUX", "CLKB" if configuration["edge"] == "rising" else "INV"
+    )
+    group.add_enum(f"{ebr}.RSTAMUX", "INV")
+    group.add_enum(f"{ebr}.RSTBMUX", "INV")
+    group.add_enum(
+        f"{ebr}.WEAMUX", "WEA" if configuration["write_enable"] == "high" else "INV"
+    )
+    group.add_enum(f"{ebr}.WEBMUX", "INV")
+    group.add_enum(f"{ebr}.CEAMUX", "CEA")
+    read_enable = configuration.get("read_enable")
+    group.add_enum(
+        f"{ebr}.CEBMUX",
+        "CEB" if read_enable in {None, "high"} else "INV",
+    )
+    group.add_enum(f"{ebr}.OCEAMUX", "OCEA")
+    group.add_enum(f"{ebr}.OCEBMUX", "OCEB")
+
+    for port in "AB":
+        decode = [False, False, False]
+        for bit in range(3):
+            name = f"CS{port}{bit}"
+            if name in absorbed_inputs and not absorbed_inputs[name]:
+                decode[bit] = not decode[bit]
+        group.add_word(
+            f"{ebr}.CSDECODE_{port}",
+            bool_vector(pytrellis, reversed(decode)),
+        )
+
+    wid = packed["wid"]
+    if wid in bram_data:
+        raise RuntimeError(f"duplicate DP16KD WID {wid}")
+    bram_data[wid] = [0] * 2048
+    tile_groups.append((bram_tiles(chip, placement), group))
+
+
+def serialize_config(config, tile_groups, bram_data):
+    sections = [config.to_string().rstrip(), ""]
+    for tiles, group in tile_groups:
+        sections.append(f".tile_group {' '.join(tiles)}")
+        sections.append(group.to_string().rstrip())
+        sections.append("")
+    for wid, values in sorted(bram_data.items()):
+        sections.append(f".bram_init {wid}")
+        for offset in range(0, len(values), 8):
+            sections.append(" ".join(f"{value:03x}" for value in values[offset : offset + 8]))
+        sections.append("")
+    return "\n".join(sections)
+
+
 def build_config(pytrellis, checkpoint, database, base_config):
     pytrellis.load_database(str(database))
     device = checkpoint["target"]["device"]
@@ -344,6 +488,9 @@ def build_config(pytrellis, checkpoint, database, base_config):
     attributes = {item["cell_id"]: item["attributes"] for item in checkpoint["packing"]["io_attributes"]}
     absorbed_inputs = {item["cell_id"]: item["pins"] for item in checkpoint["absorbed_inputs"]}
     dedicated_ffs = {item["ff"] for item in checkpoint["packing"]["lut_ff_pairs"]}
+    packed_rams = {item["cell"]: item for item in checkpoint["packing"]["block_rams"]}
+    tile_groups = []
+    bram_data = {}
     for placement in checkpoint["placement"]:
         configuration = metadata.get(placement["cell_id"])
         if placement["kind"] == "global_clock":
@@ -372,15 +519,28 @@ def build_config(pytrellis, checkpoint, database, base_config):
         elif kind == "port":
             write_io(pytrellis, config, chip, database, device, placement, configuration, attributes.get(placement["cell_id"], {}))
         elif kind == "block_ram":
-            raise RuntimeError("native DP16KD configuration is not implemented yet")
+            packed = packed_rams.get(placement["cell_id"])
+            if packed is None:
+                raise RuntimeError(f"DP16KD is absent from packing metadata: {placement['cell']}")
+            write_bram(
+                pytrellis,
+                config,
+                chip,
+                placement,
+                configuration,
+                packed,
+                absorbed_inputs.get(placement["cell_id"], {}),
+                tile_groups,
+                bram_data,
+            )
         else:
             raise RuntimeError(f"unsupported native configuration primitive: {kind}")
-    return config.to_string(), programmable, fixed
+    return serialize_config(config, tile_groups, bram_data), programmable, fixed
 
 
 def validate_checkpoint(checkpoint):
-    if checkpoint.get("schema_version") != 2:
-        raise RuntimeError("native bitgen requires checkpoint schema version 2")
+    if checkpoint.get("schema_version") != 3:
+        raise RuntimeError("native bitgen requires checkpoint schema version 3")
     missing = REQUIRED_EVIDENCE - set(checkpoint.get("evidence", []))
     if missing:
         raise RuntimeError(f"bitstream release is missing evidence: {', '.join(sorted(missing))}")

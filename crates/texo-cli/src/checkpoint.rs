@@ -1,8 +1,10 @@
 //! Stable JSON checkpoint serialization for implemented ECP5 designs.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde_json::{Value, json};
 use texo_flow::{Ecp5FlowResult, Evidence, Gate};
-use texo_model::{Design, ResourceKind};
+use texo_model::{BelId, Design, PinDirection, PipId, ResourceKind, WireId};
 use texo_struo::{ActiveLevel, ClockEdge, PortDirection, PrimitiveMetadata};
 use texo_target_ecp5::Ecp5Architecture;
 
@@ -17,7 +19,7 @@ pub fn ecp5_checkpoint(
 ) -> Value {
     let device = architecture.device();
     json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "design": design_name,
         "target": {
             "family": "ECP5",
@@ -47,6 +49,16 @@ pub fn ecp5_checkpoint(
 }
 
 fn checkpoint_placement(result: &Ecp5FlowResult, architecture: &Ecp5Architecture) -> Vec<Value> {
+    let memory_bels = result
+        .implementation
+        .placement
+        .bindings()
+        .iter()
+        .enumerate()
+        .filter_map(|(cell, bel)| {
+            (result.design.cells()[cell].kind == ResourceKind::Memory).then_some(*bel)
+        });
+    let cib_ties = cib_ties_for_bels(architecture, memory_bels);
     result
         .implementation
         .placement
@@ -71,6 +83,7 @@ fn checkpoint_placement(result: &Ecp5FlowResult, architecture: &Ecp5Architecture
                         },
                         "wire_id": pin.wire.0,
                         "wire": architecture.device().wires()[pin.wire.0].name,
+                        "cib_tie": cib_ties.get(&pin.wire),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -93,6 +106,68 @@ fn checkpoint_placement(result: &Ecp5FlowResult, architecture: &Ecp5Architecture
             })
         })
         .collect()
+}
+
+fn cib_ties_for_bels(
+    architecture: &Ecp5Architecture,
+    bels: impl IntoIterator<Item = BelId>,
+) -> BTreeMap<WireId, Value> {
+    let device = architecture.device();
+    let targets = bels
+        .into_iter()
+        .flat_map(|bel| device.bels()[bel.0].pins().iter().copied())
+        .filter_map(|pin| {
+            let pin = &device.bel_pins()[pin.0];
+            (pin.direction == PinDirection::Input).then_some(pin.wire)
+        })
+        .collect::<BTreeSet<_>>();
+    if targets.is_empty() {
+        return BTreeMap::new();
+    }
+    let mut ties = BTreeMap::new();
+    for (index, pip) in device.pips().iter().enumerate() {
+        if !targets.contains(&pip.to()) || !architecture.pip_metadata(PipId(index)).fixed {
+            continue;
+        }
+        let source = &device.wires()[pip.from().0];
+        let Some(mux) = source.name.rsplit_once('/').map(|(_, basename)| basename) else {
+            continue;
+        };
+        if !is_cib_tie_mux(mux) {
+            continue;
+        }
+        let mut configuration_tiles = architecture
+            .configuration_tiles(source.point)
+            .filter(|(_, tile_type)| tile_type.starts_with("CIB") || tile_type.starts_with("VCIB"));
+        let Some((tile, _)) = configuration_tiles.next() else {
+            continue;
+        };
+        if configuration_tiles.next().is_some() {
+            continue;
+        }
+        ties.insert(
+            pip.to(),
+            json!({
+                "tile": tile,
+                "mux": mux,
+            }),
+        );
+    }
+    ties
+}
+
+fn is_cib_tie_mux(name: &str) -> bool {
+    let Some(index) = name.as_bytes().last().copied() else {
+        return false;
+    };
+    index.is_ascii_digit()
+        && index <= b'7'
+        && ["JA", "JB", "JC", "JD", "JCE", "JLSR", "JCLK"]
+            .iter()
+            .any(|prefix| {
+                name.strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.len() == 1)
+            })
 }
 
 const fn checkpoint_resource_kind(kind: ResourceKind) -> &'static str {
@@ -441,5 +516,76 @@ const fn active_level_name(level: ActiveLevel) -> &'static str {
     match level {
         ActiveLevel::High => "high",
         ActiveLevel::Low => "low",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use texo_model::PinDirection;
+    use texo_target_ecp5::{
+        ArchitectureFile, PipRecord, RelativeRef, TileRecord, WireRecord, expand,
+    };
+
+    use super::cib_ties_for_bels;
+
+    const ARCHITECTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../texo-target-ecp5/fixtures/minimal-ecp5.json"
+    ));
+
+    #[test]
+    fn checkpoints_the_fixed_cib_tie_before_a_dp16kd_pin() {
+        let mut file: ArchitectureFile = serde_json::from_str(ARCHITECTURE).unwrap();
+        let source = file.location_types[0].wires.len();
+        file.location_types[0].wires.push(WireRecord {
+            name: "JCLK0".into(),
+        });
+        file.location_types[0].pips.push(PipRecord {
+            from: RelativeRef {
+                dx: 0,
+                dy: 0,
+                index: source,
+            },
+            to: RelativeRef {
+                dx: 0,
+                dy: 0,
+                index: 15,
+            },
+            fixed: true,
+            tile_type: "CIB_EBR".into(),
+            timing_class: "zero".into(),
+            lutperm_flags: 0,
+        });
+        file.locations[0].tiles.push(TileRecord {
+            name: "CIB_R0C0:CIB_EBR".into(),
+            tile_type: "CIB_EBR".into(),
+        });
+        let architecture = expand(file).unwrap();
+        let device = architecture.device();
+        let bel = device
+            .bels()
+            .iter()
+            .enumerate()
+            .find(|(index, bel)| {
+                architecture
+                    .bel_metadata(texo_model::BelId(*index))
+                    .bel_type
+                    == "DP16KD"
+                    && bel.point.x == 0
+            })
+            .map(|(index, _)| texo_model::BelId(index))
+            .unwrap();
+        let clock = device.bels()[bel.0]
+            .pins()
+            .iter()
+            .map(|pin| &device.bel_pins()[pin.0])
+            .find(|pin| pin.name == "CLKA" && pin.direction == PinDirection::Input)
+            .unwrap()
+            .wire;
+
+        let ties = cib_ties_for_bels(&architecture, [bel]);
+
+        assert_eq!(ties[&clock]["tile"], "CIB_R0C0:CIB_EBR");
+        assert_eq!(ties[&clock]["mux"], "JCLK0");
     }
 }
