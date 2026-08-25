@@ -20,8 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
-      contents: write
-      pull-requests: read
+      contents: read
     outputs:
       release_tag: ${{ steps.release-metadata.outputs.tag }}
     steps:
@@ -30,6 +29,15 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Create repository-scoped release token
+        id: app-token
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: read
 
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
@@ -40,7 +48,7 @@ jobs:
         with:
           command: release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
       - name: Select Texo release tag
         id: release-metadata
@@ -58,8 +66,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
     concurrency:
       group: release-plz-${{ github.ref }}
       cancel-in-progress: false
@@ -70,6 +77,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Create repository-scoped release token
+        id: app-token
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
 
@@ -78,7 +94,7 @@ jobs:
         with:
           command: release-pr
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
   upload-cli:
     name: CLI (${{ matrix.target }})
