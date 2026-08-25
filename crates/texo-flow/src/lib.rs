@@ -2379,25 +2379,32 @@ fn ecp5_routing_costs(
     speed_grade: &SpeedGradeRecord,
     net_criticalities: BTreeMap<NetId, u64>,
 ) -> Result<RoutingCosts, Ecp5FlowError> {
-    let class_delays = speed_grade
-        .pip_classes
-        .iter()
-        .map(|(name, class)| {
-            let delay = pip_class_delay(class, 1)?;
-            let minimum =
-                u32::try_from(delay.min_ps).map_err(|_| Ecp5FlowError::TimingDelayOverflow)?;
-            let maximum =
-                u32::try_from(delay.max_ps).map_err(|_| Ecp5FlowError::TimingDelayOverflow)?;
-            Ok((name.as_str(), (minimum, maximum)))
-        })
-        .collect::<Result<BTreeMap<_, _>, Ecp5FlowError>>()?;
+    let mut class_delays = vec![None; architecture.metadata_string_count()];
+    for (index, resolved) in class_delays.iter_mut().enumerate() {
+        let id = u32::try_from(index).expect("architecture metadata IDs fit u32");
+        let Some(name) = architecture.metadata_string_by_id(id) else {
+            continue;
+        };
+        let Some(class) = speed_grade.pip_classes.get(name) else {
+            continue;
+        };
+        let delay = pip_class_delay(class, 1)?;
+        let minimum =
+            u32::try_from(delay.min_ps).map_err(|_| Ecp5FlowError::TimingDelayOverflow)?;
+        let maximum =
+            u32::try_from(delay.max_ps).map_err(|_| Ecp5FlowError::TimingDelayOverflow)?;
+        *resolved = Some((minimum, maximum));
+    }
     let mut pip_min_delays_ps = Vec::with_capacity(architecture.device().pips().len());
     let mut pip_delays_ps = Vec::with_capacity(architecture.device().pips().len());
-    for (_, metadata) in architecture.pip_metadata_iter() {
-        let &(minimum, maximum) = class_delays.get(metadata.timing_class).ok_or_else(|| {
+    for class_id in architecture.pip_timing_class_ids() {
+        let (minimum, maximum) = class_delays[class_id as usize].ok_or_else(|| {
             Ecp5FlowError::MissingPipTimingClass {
                 speed_grade: speed_grade.name.clone(),
-                timing_class: metadata.timing_class.to_owned(),
+                timing_class: architecture
+                    .metadata_string_by_id(class_id)
+                    .unwrap_or("<invalid metadata ID>")
+                    .to_owned(),
             }
         })?;
         pip_min_delays_ps.push(minimum);

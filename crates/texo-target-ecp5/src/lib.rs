@@ -386,7 +386,7 @@ pub struct Ecp5Architecture {
 /// that evaluate multiple placements should retain one cache for the full run.
 #[derive(Debug)]
 pub struct Ecp5GlobalRoutingCache<'a> {
-    incoming: Vec<Vec<PipId>>,
+    incoming: CompactIncomingPips,
     wire_lookup: HashMap<(Point, &'a str), WireId>,
     unique_wires: HashMap<&'a str, Option<WireId>>,
     forward_routes: HashMap<(WireId, WireId), (Vec<WireId>, Vec<PipId>)>,
@@ -395,6 +395,39 @@ pub struct Ecp5GlobalRoutingCache<'a> {
 }
 
 type GlobalClockBranch = (WireId, Vec<WireId>, Vec<PipId>);
+
+/// Compressed sparse-row reverse PIP index. PIP IDs within each wire retain
+/// device order, matching the former `Vec<Vec<PipId>>` traversal exactly.
+#[derive(Debug)]
+struct CompactIncomingPips {
+    offsets: Vec<u32>,
+    pips: Vec<u32>,
+}
+
+impl CompactIncomingPips {
+    fn new(device: &Device) -> Self {
+        let mut offsets = vec![0_u32; device.wires().len() + 1];
+        for pip in device.pips() {
+            offsets[pip.to().0 + 1] += 1;
+        }
+        for index in 1..offsets.len() {
+            offsets[index] += offsets[index - 1];
+        }
+        let mut cursors = offsets.clone();
+        let mut pips = vec![0_u32; device.pips().len()];
+        for (index, pip) in device.pips().iter().enumerate() {
+            let cursor = &mut cursors[pip.to().0];
+            pips[*cursor as usize] =
+                u32::try_from(index).expect("ECP5 PIP IDs fit compact u32 storage");
+            *cursor += 1;
+        }
+        Self { offsets, pips }
+    }
+
+    fn for_wire(&self, wire: WireId) -> &[u32] {
+        &self.pips[self.offsets[wire.0] as usize..self.offsets[wire.0 + 1] as usize]
+    }
+}
 
 #[derive(Deserialize, Serialize)]
 struct ArchitectureCache {
@@ -465,6 +498,30 @@ impl Ecp5Architecture {
             let pip = PipId(index);
             (pip, self.pip_metadata(pip))
         })
+    }
+
+    /// Compact timing-class IDs in stable PIP ID order.
+    ///
+    /// IDs index this architecture's metadata dictionary and are intended for
+    /// dense per-speed-grade tables. They avoid resolving and comparing a
+    /// timing-class string for every one of the device's millions of PIPs.
+    #[must_use]
+    pub fn pip_timing_class_ids(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
+        self.pip_metadata
+            .iter()
+            .map(|metadata| metadata.timing_class)
+    }
+
+    /// Number of entries in the compact metadata string dictionary.
+    #[must_use]
+    pub const fn metadata_string_count(&self) -> usize {
+        self.metadata_strings.len()
+    }
+
+    /// Resolves one compact metadata string ID.
+    #[must_use]
+    pub fn metadata_string_by_id(&self, id: u32) -> Option<&str> {
+        self.metadata_strings.get(id as usize).map(String::as_str)
     }
 
     /// ECP5 global-clock topology at one device coordinate.
@@ -1301,7 +1358,7 @@ impl Ecp5Architecture {
     #[must_use]
     pub fn global_routing_cache(&self) -> Ecp5GlobalRoutingCache<'_> {
         let device = self.device();
-        let incoming = incoming_pips(device);
+        let incoming = CompactIncomingPips::new(device);
         let wire_lookup = device
             .wires()
             .iter()
@@ -1393,14 +1450,6 @@ fn placed_pin_wire(
     }
 }
 
-fn incoming_pips(device: &Device) -> Vec<Vec<PipId>> {
-    let mut incoming = vec![Vec::new(); device.wires().len()];
-    for (index, pip) in device.pips().iter().enumerate() {
-        incoming[pip.to().0].push(PipId(index));
-    }
-    incoming
-}
-
 fn forward_route(
     device: &Device,
     source: WireId,
@@ -1453,7 +1502,7 @@ impl GlobalReverseSearch {
     fn route(
         &mut self,
         device: &Device,
-        incoming: &[Vec<PipId>],
+        incoming: &CompactIncomingPips,
         sink: WireId,
         tree: &BTreeSet<WireId>,
         target_name: &str,
@@ -1480,7 +1529,8 @@ impl GlobalReverseSearch {
                 }
                 return Some((join, wires, pips));
             }
-            for &pip in &incoming[wire.0] {
+            for &pip in incoming.for_wire(wire) {
+                let pip = PipId(pip as usize);
                 let prior = device.pips()[pip.0].from();
                 if self.seen[prior.0] != epoch {
                     self.seen[prior.0] = epoch;
@@ -1557,12 +1607,13 @@ fn wire_at(
 
 fn only_original_incoming(
     architecture: &Ecp5Architecture,
-    incoming: &[Vec<PipId>],
+    incoming: &CompactIncomingPips,
     wire: WireId,
 ) -> Result<PipId, String> {
-    let candidates = incoming[wire.0]
+    let candidates = incoming
+        .for_wire(wire)
         .iter()
-        .copied()
+        .map(|&pip| PipId(pip as usize))
         .filter(|&pip| architecture.pip_metadata(pip).tile_type != "TEXO_GLOBAL_ALIAS")
         .collect::<Vec<_>>();
     match candidates.as_slice() {
@@ -3316,18 +3367,21 @@ mod tests {
     use struo_target_ecp5::{
         ArithmeticMapping, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
     };
-    use texo_model::{BelId, CellId, Design, PinDirection, PipId, ResourceKind, UnifiedGraph};
+    use texo_model::{
+        BelId, CellId, Design, PinDirection, PipId, ResourceKind, UnifiedGraph, WireId,
+    };
     use texo_pnr::{
         place_and_route_with_constraints, place_with_constraints, swap_placement_cells,
     };
     use texo_struo::{PrimitiveMetadata, import_ecp5};
 
     use super::{
-        ArchitectureFile, BlockRamRequirement, GlobalClockRequirement, ImportError, LogicalPort,
-        LutFfPair, PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, expand,
-        find_bel_pin, find_global_clock_requirements, pack_lut_ffs, pack_lut_ffs_excluding,
-        pack_lut_ffs_with_pairs, parse_lpf, read_architecture, read_architecture_cache,
-        resolve_lpf_port_cells, resolve_lpf_ports, write_architecture_cache,
+        ArchitectureFile, BlockRamRequirement, CompactIncomingPips, GlobalClockRequirement,
+        ImportError, LogicalPort, LutFfPair, PackagePinBinding, PackedBlockRam, PackingError,
+        PipMetadata, expand, find_bel_pin, find_global_clock_requirements, pack_lut_ffs,
+        pack_lut_ffs_excluding, pack_lut_ffs_with_pairs, parse_lpf, read_architecture,
+        read_architecture_cache, resolve_lpf_port_cells, resolve_lpf_ports,
+        write_architecture_cache,
     };
 
     const FIXTURE: &str = include_str!("../fixtures/minimal-ecp5.json");
@@ -3389,6 +3443,42 @@ mod tests {
             (timing.base.min_ps, timing.base.typ_ps, timing.base.max_ps),
             (59, 54, 48)
         );
+    }
+
+    #[test]
+    fn compact_pip_timing_class_ids_match_resolved_metadata() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let compact = architecture.pip_timing_class_ids().collect::<Vec<_>>();
+        let resolved = architecture
+            .pip_metadata_iter()
+            .map(|(_, metadata)| metadata.timing_class)
+            .collect::<Vec<_>>();
+
+        assert_eq!(compact.len(), resolved.len());
+        assert!(
+            compact
+                .iter()
+                .zip(resolved)
+                .all(|(&id, name)| { architecture.metadata_string_by_id(id) == Some(name) })
+        );
+    }
+
+    #[test]
+    fn compact_incoming_pips_preserve_stable_device_order() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let device = architecture.device();
+        let incoming = CompactIncomingPips::new(device);
+
+        for wire in 0..device.wires().len() {
+            let expected = device
+                .pips()
+                .iter()
+                .enumerate()
+                .filter(|(_, pip)| pip.to() == WireId(wire))
+                .map(|(index, _)| u32::try_from(index).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(incoming.for_wire(WireId(wire)), expected);
+        }
     }
 
     #[test]
