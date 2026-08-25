@@ -1,0 +1,26 @@
+[workspace]
+dependencies_update = false
+git_only = true
+git_release_enable = false
+git_tag_enable = false
+release = false
+release_always = false
+repo_url = "https://github.com/fabrica-eda/texo"
+semver_check = false
+
+[[package]]
+name = "texo-cli"
+changelog_include = [
+    "texo-flow",
+    "texo-model",
+    "texo-pnr",
+    "texo-struo",
+    "texo-target-ecp5",
+    "texo-timing",
+]
+changelog_path = "CHANGELOG.md"
+git_release_enable = true
+git_release_name = "Texo v{{ version }}"
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+release = true

@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_NET_RETRY: "10"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUSTUP_MAX_RETRIES: "10"
+
+jobs:
+  release:
+    name: Release-plz release
+    if: github.repository_owner == 'fabrica-eda'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      release_tag: ${{ steps.release-metadata.outputs.tag }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Create GitHub release
+        id: release-plz
+        uses: release-plz/action@v0.5.131
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Select Texo release tag
+        id: release-metadata
+        if: steps.release-plz.outputs.releases_created == 'true'
+        env:
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          release_tag="$(jq -r 'map(select(.package_name == "texo-cli")) | first | .tag // empty' <<<"${RELEASES}")"
+          test -n "${release_tag}"
+          echo "tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+
+  release-pr:
+    name: Release-plz PR
+    if: github.repository_owner == 'fabrica-eda'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Create or update release PR
+        uses: release-plz/action@v0.5.131
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-cli:
+    name: CLI (${{ matrix.target }})
+    needs: release
+    if: needs.release.outputs.release_tag != ''
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release.outputs.release_tag }}
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install musl linker
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
+      - name: Build and upload CLI archive
+        uses: taiki-e/upload-rust-binary-action@v1.30.2
+        with:
+          bin: texo
+          package: texo-cli
+          target: ${{ matrix.target }}
+          build-tool: cargo
+          locked: true
+          tar: unix
+          zip: windows
+          checksum: sha256
+          include: README.md
+          leading-dir: true
+          ref: refs/tags/${{ needs.release.outputs.release_tag }}
+          token: ${{ secrets.GITHUB_TOKEN }}
