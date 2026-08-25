@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DIRECTIONS = {0: "input", 1: "output", 2: "inout"}
 SPEED_GRADES = ["6", "7", "8", "8_5G"]
 
@@ -90,6 +90,16 @@ def export_global_info(chip, x, y):
         "tap_column": tap.col,
         "spine": spine,
     }
+
+
+def export_tiles(chip, x, y):
+    """Retain physical tile names needed to own configuration records."""
+    return [
+        {"name": tile.info.name, "tile_type": tile.info.type}
+        for tile in sorted(
+            chip.get_tiles_by_position(y, x), key=lambda item: item.info.name
+        )
+    ]
 
 
 def absolute_wire_name(pytrellis, graph, location, reference):
@@ -391,6 +401,7 @@ def main():
                     "x": x,
                     "y": y,
                     "location_type": location_type_keys.index(key),
+                    "tiles": export_tiles(chip, x, y),
                     "global": export_global_info(chip, x, y),
                 }
             )

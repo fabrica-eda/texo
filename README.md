@@ -68,9 +68,10 @@ timing-closure controls. Without `--output`, project checkpoints go to
 `target/texo/<top>.json`.
 
 `tools/export_ecp5.py` generates a deduplicated architecture snapshot from a
-local Project Trellis build and database. Schema v4 includes PIP timing classes
-with their independently fitted `min/typ/max` corners and the `6/7/8/8_5G`
-speed-grade cell/interconnect tables. Production device
+local Project Trellis build and database. Schema v5 includes exact physical
+configuration-tile ownership in addition to PIP timing classes with their
+independently fitted `min/typ/max` corners and the `6/7/8/8_5G` speed-grade
+cell/interconnect tables. Production device
 snapshots are generated artifacts; the repository keeps a small schema fixture
 for fast, deterministic tests.
 
@@ -98,33 +99,30 @@ and can isolate routes below a configurable setup/hold slack threshold. See
 [`docs/visualizer.md`](docs/visualizer.md) for controls and rendering details.
 
 The AXI4 self-test has a gated path from Struo through a Texo-owned placement
-and route to an ECP5 bitstream. Cache a production architecture snapshot, export
-the lossless mapped netlist, run PnR, and emit the bitstream as follows:
+and route to an ECP5 bitstream. Cache a production architecture snapshot, run
+PnR, and emit the bitstream as follows:
 
 ```sh
 cargo build --release --locked -p texo-cli
 /usr/bin/python3 tools/build_ecp5_txdb.py --device LFE5UM5G-85F
-cargo run --release -p texo-cli --example design-specific-flows -- axi4-json artifacts/axi4.json
 cargo run --release -p texo-cli --example design-specific-flows -- axi4-pnr \
-  artifacts/architecture/texo-LFE5UM5G-85F-schema4-cache2.txdb CABGA381 8 \
+  artifacts/architecture/texo-LFE5UM5G-85F-schema5-cache4.txdb CABGA381 8 \
   examples/axi4-self-test/lfe5um5g-85f-evn-250mhz.lpf \
   artifacts/axi4.checkpoint.json
-tools/axi4_bitstream.py \
+tools/ecp5_bitstream.py \
   --checkpoint artifacts/axi4.checkpoint.json \
-  --mapped-json artifacts/axi4.json \
-  --lpf examples/axi4-self-test/lfe5um5g-85f-evn-250mhz.lpf \
   --config artifacts/axi4.config \
   --bit artifacts/axi4.bit
 ```
 
-`axi4_bitstream.py` uses nextpnr only for ECP5 packing and configuration
-writing: it locks every Texo placement and route edge and does not invoke the
-nextpnr placer or router. It refuses checkpoints without all six functional,
-physical, and timing evidence gates, without nonnegative setup and hold slack,
-or with a route that is not a tree. It then requires every checkpoint edge to
-be represented in the configuration and byte-compares an `ecpunpack`/`ecppack`
-round trip. The command requires `nextpnr-ecp5`, `ecppack`, and `ecpunpack` on
-`PATH`.
+`ecp5_bitstream.py` consumes checkpoint schema v2 and writes Project Trellis
+configuration features directly; nextpnr is not part of this flow. It selects
+the exact checkpoint device, configures every non-fixed Texo route edge and
+placed primitive, refuses release without all six functional, physical, and
+timing evidence gates, and byte-compares an `ecpunpack`/`ecppack` round trip.
+The command requires the `python3-pytrellis` module plus `ecppack` and
+`ecpunpack` on `PATH`. Native DP16KD configuration remains unsupported and is
+rejected explicitly rather than producing a partial bitstream.
 
 See [docs/architecture.md](docs/architecture.md) for the integration boundary
 and [docs/roadmap.md](docs/roadmap.md) for the implementation sequence.

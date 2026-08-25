@@ -11,9 +11,9 @@ frontend at once:
    technology mapping, and Celox adapter.
 3. Texo owns physical architecture import, packing, placement, routing, static
    timing analysis, and implementation artifacts.
-4. Project Trellis is initially used to pack the routed configuration into a
-   bitstream. Native bitstream generation can be added after the PnR result is
-   stable and independently checked.
+4. Project Trellis supplies the configuration database and bitstream codec;
+   Texo translates its own placement and routing checkpoint directly into
+   Project Trellis features.
 
 The inspected upstream versions are:
 
@@ -54,14 +54,13 @@ including its compilation units and dependencies, without intermediate netlist
 serialization. Its schema-versioned JSON checkpoint is deterministic
 and records architecture/database provenance, verification evidence, mapped
 primitive configuration, absorbed inputs, target packing, final Cell-to-BEL
-bindings, selected speed grade, every routed Wire/PIP ID and name, and min/max
-timing checks. It is an implementation checkpoint for later configuration
-stages. The AXI4 release flow additionally records each net's driver wire and
-fixed/bidirectional edge attributes. `tools/axi4_bitstream.py` locks those
-placements and routes into nextpnr's packed ECP5 context, writes a Project
-Trellis configuration, invokes `ecppack`, and verifies an
-`ecpunpack`/`ecppack` byte-identical round trip. nextpnr does not place or route
-in this path. Design-specific Celox and AXI4 flows live in the
+bindings, selected speed grade, every routed Wire/PIP ID and name, exact
+configuration-tile ownership, and min/max timing checks. It is the complete
+input to the native configuration stage. `tools/ecp5_bitstream.py` translates
+those records directly into Project Trellis configuration features, invokes
+`ecppack`, and verifies an `ecpunpack`/`ecppack` byte-identical round trip. The
+release path has no nextpnr runtime or file-format dependency. Design-specific
+Celox and AXI4 flows live in the
 `design-specific-flows` Cargo example rather than the installed CLI.
 
 ## Boundaries

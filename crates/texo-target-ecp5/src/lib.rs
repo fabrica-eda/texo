@@ -25,10 +25,10 @@ use texo_model::{
 use texo_pnr::{NetRoute, Placement, PlacementConstraints, RoutingConstraints};
 
 /// Current on-disk architecture schema version.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Version of the expanded binary architecture cache.
-pub const ARCHITECTURE_CACHE_VERSION: u32 = 3;
+pub const ARCHITECTURE_CACHE_VERSION: u32 = 4;
 
 /// Provenance required for every generated architecture snapshot.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -135,8 +135,17 @@ pub struct LocationTypeRecord {
     pub pips: Vec<PipRecord>,
 }
 
+/// One physical Project Trellis configuration tile at a grid location.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TileRecord {
+    /// Exact config-file tile name.
+    pub name: String,
+    /// Tile database type used by routing arcs and feature settings.
+    pub tile_type: String,
+}
+
 /// One physical grid location and its deduplicated type.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LocationRecord {
     /// Horizontal device coordinate.
     pub x: u32,
@@ -144,6 +153,9 @@ pub struct LocationRecord {
     pub y: u32,
     /// Index into [`ArchitectureFile::location_types`].
     pub location_type: usize,
+    /// Configuration tiles physically present at this location.
+    #[serde(default)]
+    pub tiles: Vec<TileRecord>,
     /// ECP5 global-clock quadrant, tap, and spine mapping at this location.
     pub global: GlobalInfoRecord,
 }
@@ -337,6 +349,8 @@ pub struct PipMetadata<'a> {
     pub fixed: bool,
     /// Project Trellis tile type.
     pub tile_type: &'a str,
+    /// Exact Project Trellis tile receiving the configurable routing arc.
+    pub config_tile: Option<&'a str>,
     /// Interconnect timing class resolved through a speed-grade table.
     pub timing_class: &'a str,
     /// LUT permutation flags.
@@ -352,6 +366,7 @@ struct CompactBelMetadata {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct CompactPipMetadata {
     tile_type: u32,
+    config_tile: Option<u32>,
     timing_class: u32,
     lutperm_flags: u16,
     fixed: bool,
@@ -374,6 +389,7 @@ pub struct Ecp5Architecture {
     metadata_strings: Vec<String>,
     bel_metadata: Vec<CompactBelMetadata>,
     pip_metadata: Vec<CompactPipMetadata>,
+    configuration_tiles: Vec<Vec<(u32, u32)>>,
     global_info: Vec<GlobalInfoRecord>,
     packages: Vec<Package>,
     speed_grades: BTreeMap<String, SpeedGradeRecord>,
@@ -478,9 +494,20 @@ impl Ecp5Architecture {
         PipMetadata {
             fixed: metadata.fixed,
             tile_type: self.metadata_string(metadata.tile_type),
+            config_tile: metadata.config_tile.map(|id| self.metadata_string(id)),
             timing_class: self.metadata_string(metadata.timing_class),
             lutperm_flags: metadata.lutperm_flags,
         }
+    }
+
+    /// Configuration tile names and types at one device coordinate.
+    pub fn configuration_tiles(&self, point: Point) -> impl Iterator<Item = (&str, &str)> {
+        let index = (point.y * self.device.width() + point.x) as usize;
+        self.configuration_tiles
+            .get(index)
+            .into_iter()
+            .flatten()
+            .map(|&(name, tile_type)| (self.metadata_string(name), self.metadata_string(tile_type)))
     }
 
     /// BEL metadata in stable BEL ID order.
@@ -2631,6 +2658,34 @@ pub fn read_architecture_cache(reader: impl Read) -> Result<Ecp5Architecture, Im
     Ok(architecture)
 }
 
+type ConfigurationTileIds = Vec<Vec<(u32, u32)>>;
+
+fn expand_location_metadata(
+    file: &ArchitectureFile,
+    metadata_strings: &mut StringInterner,
+) -> Result<(Vec<GlobalInfoRecord>, ConfigurationTileIds), ImportError> {
+    let size = (file.width * file.height) as usize;
+    let mut global_info = vec![None; size];
+    let mut configuration_tiles = vec![Vec::new(); size];
+    for location in &file.locations {
+        let index = (location.y * file.width + location.x) as usize;
+        global_info[index] = Some(location.global);
+        for tile in &location.tiles {
+            configuration_tiles[index].push((
+                metadata_strings.intern(&tile.name)?,
+                metadata_strings.intern(&tile.tile_type)?,
+            ));
+        }
+    }
+    let global_info = global_info.into_iter().collect::<Option<Vec<_>>>().ok_or(
+        ImportError::IncompleteLocationGrid {
+            expected: size,
+            actual: file.locations.len(),
+        },
+    )?;
+    Ok((global_info, configuration_tiles))
+}
+
 /// Expands an already decoded architecture snapshot.
 ///
 /// # Errors
@@ -2645,16 +2700,8 @@ pub fn expand(file: ArchitectureFile) -> Result<Ecp5Architecture, ImportError> {
     let mut bel_metadata = Vec::new();
     let mut pip_metadata = Vec::new();
     let locations = indexed_locations(&file)?;
-    let mut global_info = vec![None; (file.width * file.height) as usize];
-    for location in &file.locations {
-        global_info[(location.y * file.width + location.x) as usize] = Some(location.global);
-    }
-    let global_info = global_info.into_iter().collect::<Option<Vec<_>>>().ok_or(
-        ImportError::IncompleteLocationGrid {
-            expected: (file.width * file.height) as usize,
-            actual: file.locations.len(),
-        },
-    )?;
+    let (global_info, configuration_tiles) =
+        expand_location_metadata(&file, &mut metadata_strings)?;
 
     for location in &file.locations {
         let location_type = &file.location_types[location.location_type];
@@ -2701,10 +2748,17 @@ pub fn expand(file: ArchitectureFile) -> Result<Ecp5Architecture, ImportError> {
             let from = resolve_wire(location, pip.from, &locations, &file, &wires)?;
             let to = resolve_wire(location, pip.to, &locations, &file, &wires)?;
             let id = device.add_pip(from, to, false, 1)?;
+            let config_tile = location
+                .tiles
+                .iter()
+                .find(|tile| tile.tile_type == pip.tile_type)
+                .map(|tile| metadata_strings.intern(&tile.name))
+                .transpose()?;
             debug_assert_eq!(id.0, pip_metadata.len());
             pip_metadata.push(CompactPipMetadata {
                 fixed: pip.fixed,
                 tile_type: metadata_strings.intern(&pip.tile_type)?,
+                config_tile,
                 timing_class: metadata_strings.intern(&pip.timing_class)?,
                 lutperm_flags: pip.lutperm_flags,
             });
@@ -2731,6 +2785,7 @@ pub fn expand(file: ArchitectureFile) -> Result<Ecp5Architecture, ImportError> {
         metadata_strings: metadata_strings.into_values(),
         bel_metadata,
         pip_metadata,
+        configuration_tiles,
         global_info,
         packages,
         speed_grades,
@@ -2828,6 +2883,7 @@ fn add_global_clock_aliases(
         pip_metadata.push(CompactPipMetadata {
             fixed: true,
             tile_type,
+            config_tile: None,
             timing_class,
             lutperm_flags: 0,
         });
@@ -3357,7 +3413,7 @@ mod tests {
         ArithmeticMapping, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
     };
     use texo_model::{
-        BelId, CellId, Design, PinDirection, PipId, ResourceKind, UnifiedGraph, WireId,
+        BelId, CellId, Design, PinDirection, PipId, Point, ResourceKind, UnifiedGraph, WireId,
     };
     use texo_pnr::{
         place_and_route_with_constraints, place_with_constraints, swap_placement_cells,
@@ -3367,9 +3423,9 @@ mod tests {
     use super::{
         ArchitectureFile, BlockRamRequirement, CompactIncomingPips, GlobalClockRequirement,
         ImportError, LogicalPort, LutFfPair, PackagePinBinding, PackedBlockRam, PackingError,
-        PipMetadata, expand, find_bel_pin, find_global_clock_requirements, pack_lut_ffs,
-        pack_lut_ffs_excluding, pack_lut_ffs_with_pairs, parse_lpf, read_architecture,
-        read_architecture_cache, resolve_lpf_port_cells, resolve_lpf_ports,
+        PipMetadata, TileRecord, expand, find_bel_pin, find_global_clock_requirements,
+        pack_lut_ffs, pack_lut_ffs_excluding, pack_lut_ffs_with_pairs, parse_lpf,
+        read_architecture, read_architecture_cache, resolve_lpf_port_cells, resolve_lpf_ports,
         write_architecture_cache,
     };
 
@@ -3389,11 +3445,34 @@ mod tests {
             PipMetadata {
                 fixed: false,
                 tile_type: "PLC2",
+                config_tile: None,
                 timing_class: "default",
                 lutperm_flags: 0,
             }
         );
         assert!(architecture.speed_grades().contains_key("6"));
+    }
+
+    #[test]
+    fn preserves_exact_configuration_tile_ownership() {
+        let mut file: ArchitectureFile = serde_json::from_str(FIXTURE).unwrap();
+        file.locations[0].tiles.push(TileRecord {
+            name: "R0C0:PLC2".into(),
+            tile_type: "PLC2".into(),
+        });
+
+        let architecture = expand(file).unwrap();
+
+        assert_eq!(
+            architecture.pip_metadata(PipId(0)).config_tile,
+            Some("R0C0:PLC2")
+        );
+        assert_eq!(
+            architecture
+                .configuration_tiles(Point::new(0, 0))
+                .collect::<Vec<_>>(),
+            vec![("R0C0:PLC2", "PLC2")]
+        );
     }
 
     #[test]

@@ -40,10 +40,10 @@ with `texo target-info`, and rejects it unless its byte size and SHA-256 match
 the tracked expected result. A successful build emits:
 
 ```text
-texo-LFE5UM5G-85F-schema4-cache2.txdb
-texo-LFE5UM5G-85F-schema4-cache2.txdb.zst
-texo-LFE5UM5G-85F-schema4-cache2.release.json
-texo-LFE5UM5G-85F-schema4-cache2.SHA256SUMS
+texo-LFE5UM5G-85F-schema5-cache4.txdb
+texo-LFE5UM5G-85F-schema5-cache4.txdb.zst
+texo-LFE5UM5G-85F-schema5-cache4.release.json
+texo-LFE5UM5G-85F-schema5-cache4.SHA256SUMS
 ```
 
 The release manifest records the uncompressed cache digest and size as well as
@@ -64,11 +64,11 @@ Download and verify a release in an empty directory:
 
 ```sh
 gh release download txdb-ecp5-v1 \
-  -p 'texo-LFE5UM5G-85F-schema4-cache2.*'
-sha256sum -c texo-LFE5UM5G-85F-schema4-cache2.SHA256SUMS
-zstd -d texo-LFE5UM5G-85F-schema4-cache2.txdb.zst
+  -p 'texo-LFE5UM5G-85F-schema5-cache4.*'
+sha256sum -c texo-LFE5UM5G-85F-schema5-cache4.SHA256SUMS
+zstd -d texo-LFE5UM5G-85F-schema5-cache4.txdb.zst
 cargo run --release -- target-info \
-  texo-LFE5UM5G-85F-schema4-cache2.txdb
+  texo-LFE5UM5G-85F-schema5-cache4.txdb
 ```
 
 Both checks matter: SHA-256 confirms that the downloaded bytes match the

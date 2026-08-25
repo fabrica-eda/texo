@@ -1034,7 +1034,7 @@ mod tests {
         let checkpoint: Value = serde_json::from_slice(&first_bytes).unwrap();
 
         assert_eq!(first_bytes, second_bytes);
-        assert_eq!(checkpoint["schema_version"], 1);
+        assert_eq!(checkpoint["schema_version"], 2);
         assert_eq!(checkpoint["target"]["package"], "CABGA381");
         assert_eq!(checkpoint["target"]["speed_grade"], "6");
         assert_eq!(checkpoint["metrics"]["cells"], 4);
@@ -1045,7 +1045,11 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|cell| cell["kind"].is_string())
+                .all(|cell| cell["kind"].is_string()
+                    && cell["bel_type"].is_string()
+                    && cell["bel_z"].is_number()
+                    && cell["bel_pins"].is_array()
+                    && cell["configuration_tiles"].is_array())
         );
         assert_eq!(checkpoint["routes"].as_array().unwrap().len(), 3);
         assert_eq!(

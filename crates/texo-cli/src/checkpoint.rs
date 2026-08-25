@@ -17,7 +17,7 @@ pub fn ecp5_checkpoint(
 ) -> Value {
     let device = architecture.device();
     json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "design": design_name,
         "target": {
             "family": "ECP5",
@@ -56,12 +56,38 @@ fn checkpoint_placement(result: &Ecp5FlowResult, architecture: &Ecp5Architecture
         .map(|(cell_id, bel_id)| {
             let cell = &result.design.cells()[cell_id];
             let bel = &architecture.device().bels()[bel_id.0];
+            let metadata = architecture.bel_metadata(*bel_id);
+            let bel_pins = bel
+                .pins()
+                .iter()
+                .map(|pin_id| {
+                    let pin = &architecture.device().bel_pins()[pin_id.0];
+                    json!({
+                        "name": pin.name,
+                        "direction": match pin.direction {
+                            texo_model::PinDirection::Input => "input",
+                            texo_model::PinDirection::Output => "output",
+                            texo_model::PinDirection::Inout => "inout",
+                        },
+                        "wire_id": pin.wire.0,
+                        "wire": architecture.device().wires()[pin.wire.0].name,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let configuration_tiles = architecture
+                .configuration_tiles(bel.point)
+                .map(|(name, tile_type)| json!({ "name": name, "tile_type": tile_type }))
+                .collect::<Vec<_>>();
             json!({
                 "cell_id": cell_id,
                 "cell": cell.name,
                 "kind": checkpoint_resource_kind(cell.kind),
                 "bel_id": bel_id.0,
                 "bel": bel.name,
+                "bel_type": metadata.bel_type,
+                "bel_z": metadata.z,
+                "bel_pins": bel_pins,
+                "configuration_tiles": configuration_tiles,
                 "x": bel.point.x,
                 "y": bel.point.y,
             })
@@ -117,6 +143,7 @@ fn checkpoint_routes(result: &Ecp5FlowResult, architecture: &Ecp5Architecture) -
                 .pips()
                 .map(|pip_id| {
                     let pip = &device.pips()[pip_id.0];
+                    let metadata = architecture.pip_metadata(pip_id);
                     json!({
                         "pip_id": pip_id.0,
                         "from_wire_id": pip.from().0,
@@ -124,7 +151,10 @@ fn checkpoint_routes(result: &Ecp5FlowResult, architecture: &Ecp5Architecture) -
                         "to_wire_id": pip.to().0,
                         "to": device.wires()[pip.to().0].name,
                         "bidirectional": pip.bidirectional(),
-                        "fixed": architecture.pip_metadata(pip_id).fixed,
+                        "fixed": metadata.fixed,
+                        "config_tile": metadata.config_tile,
+                        "tile_type": metadata.tile_type,
+                        "lutperm_flags": metadata.lutperm_flags,
                     })
                 })
                 .collect::<Vec<_>>();
