@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "7a9359dde73aadd28b364c19299bd57313ed46e9",
+  "bump-patch-for-minor-pre-major": true,
+  "include-component-in-tag": false,
+  "release-type": "rust",
+  "skip-github-release": true,
+  "packages": {
+    ".": {
+      "package-name": "texo-cli"
+    }
+  }
+}
