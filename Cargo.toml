@@ -1,3 +1,11 @@
+[package]
+name = "texo-release-metadata"
+description = "Release metadata anchor for the Texo workspace"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
 [workspace]
 members = [
     "crates/texo-cli",
