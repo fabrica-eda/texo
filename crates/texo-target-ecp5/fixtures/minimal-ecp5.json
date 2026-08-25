@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 6,
   "provenance": {
     "project_trellis_revision": "3afe7b52b30f4b4417ee98f03016767a502006e3",
     "database_revision": "015e0330630d7c238c0e4f2cdd9c8157eb78c54a",
@@ -388,6 +388,27 @@
             }
           ],
           "setup_holds": []
+        },
+        {
+          "cell_type": "DP16KD",
+          "arcs": [
+            { "from_pin": "CLKA", "to_pin": "DOA0", "delay": { "min_ps": 5784, "max_ps": 5820 } },
+            { "from_pin": "CLKB", "to_pin": "DOB0", "delay": { "min_ps": 5795, "max_ps": 5830 } }
+          ],
+          "setup_holds": [
+            {
+              "signal_pin": "DIA0",
+              "clock_pin": "CLKA",
+              "setup": { "min_ps": 220, "max_ps": 220 },
+              "hold": { "min_ps": 43, "max_ps": 43 }
+            },
+            {
+              "signal_pin": "ADB0",
+              "clock_pin": "CLKB",
+              "setup": { "min_ps": 251, "max_ps": 251 },
+              "hold": { "min_ps": 123, "max_ps": 123 }
+            }
+          ]
         },
         {
           "cell_type": "TRELLIS_COMB",

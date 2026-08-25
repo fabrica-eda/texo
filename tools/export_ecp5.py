@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 DIRECTIONS = {0: "input", 1: "output", 2: "inout"}
 SPEED_GRADES = ["6", "7", "8", "8_5G"]
 
@@ -90,6 +90,16 @@ def export_global_info(chip, x, y):
         "tap_column": tap.col,
         "spine": spine,
     }
+
+
+def export_tiles(chip, x, y):
+    """Retain physical tile names needed to own configuration records."""
+    return [
+        {"name": tile.info.name, "tile_type": tile.info.type}
+        for tile in sorted(
+            chip.get_tiles_by_position(y, x), key=lambda item: item.info.name
+        )
+    ]
 
 
 def absolute_wire_name(pytrellis, graph, location, reference):
@@ -189,6 +199,10 @@ def timing_corners(samples, scale=1.0):
 def export_cell_timings(cell_database):
     slogic = cell_database["SLOGICB"]
     carry = cell_database["SCCU2C"]
+    # Texo currently configures every inferred DP16KD with unregistered
+    # outputs. Project Trellis nevertheless characterizes those outputs as
+    # clock-launched ports, which is also how nextpnr models this primitive.
+    block_ram = cell_database["DP16KD:REGMODE_A=NOREG,REGMODE_B=NOREG"]
     lut_arcs = {}
     raw_carry_arcs = {}
     ff_arcs = {}
@@ -261,6 +275,36 @@ def export_cell_timings(cell_database):
         }
         for (signal, clock), values in sorted(ff_checks.items())
     ]
+    block_ram_arcs = []
+    block_ram_checks = []
+    for entry in block_ram:
+        if entry["type"] == "IOPath":
+            block_ram_arcs.append(
+                {
+                    "from_pin": entry["from_pin"],
+                    "to_pin": entry["to_pin"],
+                    "delay": delay_range(entry),
+                }
+            )
+        elif entry["type"] == "SetupHold" and not isinstance(entry["pin"], list):
+            block_ram_checks.append(
+                {
+                    "signal_pin": entry["pin"],
+                    "clock_pin": entry["clock"][1],
+                    "setup": {
+                        "min_ps": entry["setup"][0],
+                        "max_ps": entry["setup"][2],
+                    },
+                    "hold": {
+                        "min_ps": entry["hold"][0],
+                        "max_ps": entry["hold"][2],
+                    },
+                }
+            )
+    block_ram_arcs.sort(key=lambda arc: (arc["from_pin"], arc["to_pin"]))
+    block_ram_checks.sort(
+        key=lambda check: (check["clock_pin"], check["signal_pin"])
+    )
     return [
         {
             "cell_type": "DCCA",
@@ -272,6 +316,11 @@ def export_cell_timings(cell_database):
                 }
             ],
             "setup_holds": [],
+        },
+        {
+            "cell_type": "DP16KD",
+            "arcs": block_ram_arcs,
+            "setup_holds": block_ram_checks,
         },
         {
             "cell_type": "TRELLIS_COMB",
@@ -391,6 +440,7 @@ def main():
                     "x": x,
                     "y": y,
                     "location_type": location_type_keys.index(key),
+                    "tiles": export_tiles(chip, x, y),
                     "global": export_global_info(chip, x, y),
                 }
             )

@@ -103,8 +103,10 @@ the route can be imported into Project Trellis configuration tooling.
 - [x] Import speed-grade LUT arcs, FF clock-to-Q/setup/hold, and DCCA timing.
 - [x] Implement conservative early/late hold analysis.
 - [ ] Implement multicycle/false paths, generated clocks, and BRAM timing.
-- [x] Generate the Project Trellis textual configuration for the validated AXI4
-  path; use `ecppack` initially while locking Texo placement and routing.
+- [x] Generate the Project Trellis textual configuration directly from the
+  validated Texo checkpoint; use `ecppack` only as the bitstream codec.
+- [x] Emit native DP16KD tile groups, CIB constant ties, WID, port modes, and
+  zero-initialized BRAM data from checkpoint metadata.
 - [x] Require all functional, physical, and timing gates before AXI4 bitstream
   release and byte-check the configuration/bitstream round trip.
 - Add hardware smoke tests and nextpnr differential tests.
