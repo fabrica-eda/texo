@@ -3690,17 +3690,28 @@ fn assignment_pin_wires_are_legal(
     assignment: &[BelId],
     usage: &HashMap<WireId, HashMap<NetId, usize>>,
 ) -> bool {
-    let mut candidate = HashMap::<WireId, BTreeSet<NetId>>::new();
-    for (wire, net) in assignment_pin_resources(graph, constraints, cells, assignment) {
-        candidate.entry(wire).or_default().insert(net);
-    }
-    candidate.into_iter().all(|(wire, nets)| {
-        let mut distinct = nets;
-        if let Some(existing) = usage.get(&wire) {
-            distinct.extend(existing.keys().copied());
+    let mut candidate = assignment_pin_resources(graph, constraints, cells, assignment);
+    candidate.sort_unstable();
+    candidate.dedup();
+    let mut start = 0;
+    while start < candidate.len() {
+        let wire = candidate[start].0;
+        let mut end = start + 1;
+        while end < candidate.len() && candidate[end].0 == wire {
+            end += 1;
         }
-        distinct.len() <= usize::from(graph.device().wires()[wire.0].capacity)
-    })
+        let existing = usage.get(&wire);
+        let new_nets = candidate[start..end]
+            .iter()
+            .filter(|(_, net)| existing.is_none_or(|nets| !nets.contains_key(net)))
+            .count();
+        let distinct = existing.map_or(0, HashMap::len) + new_nets;
+        if distinct > usize::from(graph.device().wires()[wire.0].capacity) {
+            return false;
+        }
+        start = end;
+    }
+    true
 }
 
 fn update_pin_usage(
