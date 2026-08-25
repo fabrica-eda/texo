@@ -222,6 +222,10 @@ intended release gates are:
 
 Celox is a functional simulator, not a gate-level timing simulator. Static
 timing and post-route delay validation therefore remain Texo responsibilities.
+The general project CLI can generate a bitstream after gates 2, 3, 5, 6, and 7;
+gates 1 and 4 are optional functional sign-off supplied by API clients that
+have a testbench. `bitgen` must not require evidence that `texo pnr` cannot
+produce on its own.
 `texo-timing` computes early/minimum and late/maximum arrival ranges through the
 selected PIP tree and characterized cell arcs. ECP5 STA includes PIP timing
 class and enabled-source fanout, LUT input-to-output delay, DCCA propagation,
