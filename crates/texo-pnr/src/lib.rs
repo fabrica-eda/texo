@@ -1421,7 +1421,7 @@ pub fn refine_placement_with_net_weights(
     let mut candidate_cache = BTreeMap::new();
     let units = placement_units(&graph, constraints, &mut candidate_cache)?;
     let mut placed = validate_refinement_start(&graph, &units, placement, None)?;
-    let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
+    let mut occupied = dense_placement_occupancy(device, &placed);
     let _ = refine_placement(
         &graph,
         constraints,
@@ -1457,7 +1457,7 @@ pub fn refine_placement_with_net_sink_weights(
     let mut candidate_cache = BTreeMap::new();
     let units = placement_units(&graph, constraints, &mut candidate_cache)?;
     let mut placed = validate_refinement_start(&graph, &units, placement, None)?;
-    let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
+    let mut occupied = dense_placement_occupancy(device, &placed);
     let _ = refine_placement(
         &graph,
         constraints,
@@ -1703,7 +1703,7 @@ impl<'a> PlacementRefiner<'a> {
             placement,
             Some(&self.spatial_indexes),
         )?;
-        let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
+        let mut occupied = dense_placement_occupancy(self.graph.device(), &placed);
         let move_peak = refine_placement(
             &self.graph,
             self.constraints,
@@ -2685,6 +2685,12 @@ struct PlacementNeighbor {
     budget: u32,
 }
 
+#[derive(Default)]
+struct RefinementChoiceWorkspace {
+    nearest: Vec<usize>,
+    pin_resources: Vec<(WireId, NetId)>,
+}
+
 fn refinement_edge_cost(edge: PlacementNeighbor, distance: u64) -> u64 {
     let distance = distance.saturating_sub(u64::from(edge.budget));
     let distance = if edge.timing_driven {
@@ -2745,13 +2751,14 @@ fn place(
         }
     }
 
+    let mut refinement_occupied = dense_placement_occupancy(device, &placed);
     let _ = refine_placement(
         graph,
         constraints,
         &units,
         &neighbors,
         &mut placed,
-        &mut occupied,
+        &mut refinement_occupied,
         None,
         None,
     );
@@ -3220,6 +3227,14 @@ fn validate_refinement_start(
     Ok(placement.bindings.into_iter().map(Some).collect())
 }
 
+fn dense_placement_occupancy(device: &Device, placed: &[Option<BelId>]) -> Vec<bool> {
+    let mut occupied = vec![false; device.bels().len()];
+    for bel in placed.iter().flatten() {
+        occupied[bel.0] = true;
+    }
+    occupied
+}
+
 fn placement_neighbors(
     design: &Design,
     net_weights: Option<&BTreeMap<NetId, u64>>,
@@ -3330,7 +3345,7 @@ fn refine_placement(
     units: &[PlacementUnit],
     neighbors: &[Vec<PlacementNeighbor>],
     placed: &mut [Option<BelId>],
-    occupied: &mut BTreeSet<BelId>,
+    occupied: &mut [bool],
     move_limit: Option<usize>,
     cached_spatial_indexes: Option<&BTreeMap<(u8, usize), Arc<SpatialChoiceIndex>>>,
 ) -> usize {
@@ -3376,6 +3391,7 @@ fn refine_placement(
     });
 
     let mut move_peak = 0;
+    let mut choice_workspace = RefinementChoiceWorkspace::default();
     for _ in 0..MAX_PLACEMENT_REFINEMENT_PASSES {
         let mut moved = 0;
         for &index in &order {
@@ -3391,7 +3407,7 @@ fn refine_placement(
             let current_cost =
                 assignment_wirelength(&unit.cells, &current, device, neighbors, placed);
             for &bel in &current {
-                occupied.remove(&bel);
+                occupied[bel.0] = false;
             }
             for &cell in &unit.cells {
                 placed[cell.0] = None;
@@ -3427,9 +3443,10 @@ fn refine_placement(
                 placed,
                 occupied,
                 &pin_usage,
+                &mut choice_workspace,
             ) else {
                 for (&cell, &bel) in unit.cells.iter().zip(&current) {
-                    occupied.insert(bel);
+                    occupied[bel.0] = true;
                     placed[cell.0] = Some(bel);
                 }
                 update_pin_usage(
@@ -3450,7 +3467,7 @@ fn refine_placement(
                 current
             };
             for (&cell, &bel) in unit.cells.iter().zip(&selected) {
-                occupied.insert(bel);
+                occupied[bel.0] = true;
                 placed[cell.0] = Some(bel);
             }
             update_pin_usage(
@@ -3512,23 +3529,28 @@ fn choose_refined_assignment(
     constraints: &PlacementConstraints,
     neighbors: &[Vec<PlacementNeighbor>],
     placed: &[Option<BelId>],
-    occupied: &BTreeSet<BelId>,
+    occupied: &[bool],
     pin_usage: &HashMap<WireId, HashMap<NetId, usize>>,
+    workspace: &mut RefinementChoiceWorkspace,
 ) -> Option<Vec<BelId>> {
     let device = graph.device();
     let target = refinement_target(unit, device, neighbors, placed)?;
-    let nearest = nearest_legal_assignments(
+    nearest_legal_assignments_impl(
         unit,
         spatial_index,
         graph,
         constraints,
         target,
-        occupied,
+        |bel| occupied[bel.0],
         pin_usage,
+        None,
+        &mut workspace.nearest,
+        &mut workspace.pin_resources,
     );
-    nearest
-        .into_iter()
-        .map(|index| {
+    workspace
+        .nearest
+        .iter()
+        .map(|&index| {
             let assignment = unit.choices.assignment(index);
             (
                 assignment_wirelength(&unit.cells, assignment, device, neighbors, placed),
@@ -3537,27 +3559,6 @@ fn choose_refined_assignment(
         })
         .min()
         .map(|(_, index)| unit.choices.assignment(index).to_vec())
-}
-
-fn nearest_legal_assignments(
-    unit: &PlacementUnit,
-    spatial_index: &SpatialChoiceIndex,
-    graph: &UnifiedGraph<'_>,
-    constraints: &PlacementConstraints,
-    target: Point,
-    occupied: &BTreeSet<BelId>,
-    pin_usage: &HashMap<WireId, HashMap<NetId, usize>>,
-) -> Vec<usize> {
-    nearest_legal_assignments_impl(
-        unit,
-        spatial_index,
-        graph,
-        constraints,
-        target,
-        occupied,
-        pin_usage,
-        None,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3571,16 +3572,21 @@ fn nearest_legal_assignments_with_density(
     pin_usage: &HashMap<WireId, HashMap<NetId, usize>>,
     point_usage: &[usize],
 ) -> Vec<usize> {
+    let mut nearest = Vec::new();
+    let mut pin_resources = Vec::new();
     nearest_legal_assignments_impl(
         unit,
         spatial_index,
         graph,
         constraints,
         target,
-        occupied,
+        |bel| occupied.contains(&bel),
         pin_usage,
         Some(point_usage),
-    )
+        &mut nearest,
+        &mut pin_resources,
+    );
+    nearest
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3590,12 +3596,14 @@ fn nearest_legal_assignments_impl(
     graph: &UnifiedGraph<'_>,
     constraints: &PlacementConstraints,
     target: Point,
-    occupied: &BTreeSet<BelId>,
+    is_occupied: impl Fn(BelId) -> bool,
     pin_usage: &HashMap<WireId, HashMap<NetId, usize>>,
     point_usage: Option<&[usize]>,
-) -> Vec<usize> {
+    nearest: &mut Vec<usize>,
+    pin_resources: &mut Vec<(WireId, NetId)>,
+) {
     let device = graph.device();
-    let mut nearest = Vec::new();
+    nearest.clear();
     let max_radius = device.width() + device.height();
     for radius in 0..max_radius {
         for dy in 0..=radius {
@@ -3605,16 +3613,17 @@ fn nearest_legal_assignments_impl(
                     let bucket = &spatial_index.by_point[(y * device.width() + x) as usize];
                     for &index in bucket {
                         let assignment = unit.choices.assignment(index);
-                        if assignment.iter().all(|bel| !occupied.contains(bel))
+                        if assignment.iter().all(|&bel| !is_occupied(bel))
                             && point_usage.is_none_or(|usage| {
                                 density_allows_assignment(graph, unit, assignment, usage)
                             })
-                            && assignment_pin_wires_are_legal(
+                            && assignment_pin_wires_are_legal_with_workspace(
                                 graph,
                                 constraints,
                                 &unit.cells,
                                 assignment,
                                 pin_usage,
+                                pin_resources,
                             )
                         {
                             nearest.push(index);
@@ -3634,7 +3643,6 @@ fn nearest_legal_assignments_impl(
             break;
         }
     }
-    nearest
 }
 
 /// Coordinates exactly `offset` away from `center`, clipped to `extent`.
@@ -3690,7 +3698,29 @@ fn assignment_pin_wires_are_legal(
     assignment: &[BelId],
     usage: &HashMap<WireId, HashMap<NetId, usize>>,
 ) -> bool {
-    let mut candidate = assignment_pin_resources(graph, constraints, cells, assignment);
+    let mut candidate = Vec::new();
+    assignment_pin_wires_are_legal_with_workspace(
+        graph,
+        constraints,
+        cells,
+        assignment,
+        usage,
+        &mut candidate,
+    )
+}
+
+fn assignment_pin_wires_are_legal_with_workspace(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    cells: &[CellId],
+    assignment: &[BelId],
+    usage: &HashMap<WireId, HashMap<NetId, usize>>,
+    candidate: &mut Vec<(WireId, NetId)>,
+) -> bool {
+    candidate.clear();
+    visit_assignment_pin_resources(graph, constraints, cells, assignment, |wire, net| {
+        candidate.push((wire, net));
+    });
     candidate.sort_unstable();
     candidate.dedup();
     let mut start = 0;
@@ -3722,7 +3752,7 @@ fn update_pin_usage(
     usage: &mut HashMap<WireId, HashMap<NetId, usize>>,
     add: bool,
 ) {
-    for (wire, net) in assignment_pin_resources(graph, constraints, cells, assignment) {
+    visit_assignment_pin_resources(graph, constraints, cells, assignment, |wire, net| {
         if add {
             *usage.entry(wire).or_default().entry(net).or_default() += 1;
         } else {
@@ -3743,30 +3773,26 @@ fn update_pin_usage(
                 usage.remove(&wire);
             }
         }
-    }
+    });
 }
 
-fn assignment_pin_resources(
+fn visit_assignment_pin_resources(
     graph: &UnifiedGraph<'_>,
     constraints: &PlacementConstraints,
     cells: &[CellId],
     assignment: &[BelId],
-) -> Vec<(WireId, NetId)> {
-    cells
-        .iter()
-        .zip(assignment)
-        .flat_map(|(&cell, &bel)| {
-            graph.design().cells()[cell.0]
-                .pins()
-                .iter()
-                .filter_map(move |&pin| {
-                    let net = graph.design().pins()[pin.0].net()?;
-                    let wire = candidate_pin_wire(graph, constraints, pin, bel)
-                        .expect("placement candidate has every bound physical pin");
-                    Some((wire, net))
-                })
-        })
-        .collect()
+    mut visit: impl FnMut(WireId, NetId),
+) {
+    for (&cell, &bel) in cells.iter().zip(assignment) {
+        for &pin in graph.design().cells()[cell.0].pins() {
+            let Some(net) = graph.design().pins()[pin.0].net() else {
+                continue;
+            };
+            let wire = candidate_pin_wire(graph, constraints, pin, bel)
+                .expect("placement candidate has every bound physical pin");
+            visit(wire, net);
+        }
+    }
 }
 
 fn candidate_pin_wire(
