@@ -1320,3 +1320,32 @@ dense-index experiment used about 270 MiB more. Both implementations produced
 the identical checkpoint SHA-256
 `bd0c1eeccb196b93582ab1f04b204ffd1e24edb1d98d81c786095808d73371f8`:
 **+7 ps WNS, +57 ps WHS, and 21,822 PIPs**.
+
+## Timing-corridor frontier measurement (2026-08-25)
+
+The next profile ruled out several conventional micro-optimizations. Replacing
+only the persistent owner maps with `FxHashMap` changed cumulative routing from
+7408 to 7416 ms; replacing every general `HashMap` in `texo-pnr` measured 7596
+ms. The packed local-delay cache already has a dedicated integer hasher, while
+the main router uses dense epoch-stamped arrays. Neither FxHash experiment is
+retained. Critical trials also already reuse incumbent global-clock routes
+when all clock endpoints are unchanged. Extending that policy found six more
+reuse hits, but all 13 measured global-route operations together cost only
+19.5 ms, so the extra cache layer is not retained either.
+
+Temporary A* counters measured 72,865 sink searches across 60 router calls:
+21,875 timing-corridor searches, zero full-chip fallbacks, 35.4 million valid
+state expansions, and 186.0 million heap insertions. An indexed decrease-key
+heap preserved the exact route but regressed cumulative routing from about
+7.47 to 9.44 seconds; the standard duplicate-entry binary heap has better
+locality. Folding two exact ceil divisions in the step cost was also neutral,
+indicating that LLVM already reduces this arithmetic.
+
+The retained change reduces `TIMING_ROUTE_MARGIN` from 12 to **4**, pruning
+frontier expansion rather than changing its data structure. Two runs measured
+**7333.524/7353.609 ms** of cumulative routing versus an adjacent **7407.055
+ms** baseline, while retaining **+7 ps WNS and +57 ps WHS**. The tighter
+corridor uses **21,829 PIPs**, seven more than the baseline. Margin 3 and 2 are
+rejected: they ran fewer trials but failed closure at -48 ps and -241 ps WNS,
+respectively. Raising the geometric delay heuristic from 100 to 125 ps/tile
+also failed at -29 ps WNS.

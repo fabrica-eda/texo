@@ -5682,7 +5682,10 @@ impl RouteSearch {
 
 type RoutingCorridor = (u32, u32, u32, u32);
 
-const TIMING_ROUTE_MARGIN: u32 = 12;
+// The 85K AXI4 closure search reaches every timing sink without falling back
+// at this margin. Larger margins explore resources that never win; smaller
+// margins perturb the critical topology enough to lose timing closure.
+const TIMING_ROUTE_MARGIN: u32 = 4;
 
 fn routing_corridor(start: Point, goal: Point, device: &Device, margin: u32) -> RoutingCorridor {
     (
