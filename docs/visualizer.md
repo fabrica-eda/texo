@@ -15,8 +15,9 @@ The main view contains the placed cells and one SVG path per routed net. A
 route path is built from its checkpoint PIP endpoints, so it shows the actual
 routing-resource topology at tile resolution. Fixed PIPs have a white dashed
 overlay. Cell colors distinguish LUTs, flip-flops, carry logic, IO, and
-constants. Logic cells sharing a tile are separated by their `SLICE` and
-`K`/`FF` site names.
+constants, block RAMs, and global-clock buffers (`DCCA` cells placed at `TDCC`
+BELs). Logic cells sharing a tile are separated by their `SLICE` and `K`/`FF`
+site names.
 
 Ordinary route colors are stable hashes of net names: matching colors identify
 one net, but the hue itself has no timing meaning. A route with negative setup

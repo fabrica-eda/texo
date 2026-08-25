@@ -1008,6 +1008,7 @@ fn checkpoint_placement(result: &Ecp5FlowResult, architecture: &Ecp5Architecture
             json!({
                 "cell_id": cell_id,
                 "cell": cell.name,
+                "kind": checkpoint_resource_kind(cell.kind),
                 "bel_id": bel_id.0,
                 "bel": bel.name,
                 "x": bel.point.x,
@@ -1015,6 +1016,19 @@ fn checkpoint_placement(result: &Ecp5FlowResult, architecture: &Ecp5Architecture
             })
         })
         .collect()
+}
+
+const fn checkpoint_resource_kind(kind: ResourceKind) -> &'static str {
+    match kind {
+        ResourceKind::Logic => "logic",
+        ResourceKind::Lut(4) => "lut4",
+        ResourceKind::Lut(_) => "lut",
+        ResourceKind::Register => "flip_flop",
+        ResourceKind::Memory => "block_ram",
+        ResourceKind::Clock => "global_clock",
+        ResourceKind::Io => "port",
+        ResourceKind::Constant => "constant",
+    }
 }
 
 fn checkpoint_routes(result: &Ecp5FlowResult, architecture: &Ecp5Architecture) -> Vec<Value> {
@@ -1433,6 +1447,13 @@ mod tests {
         assert_eq!(checkpoint["metrics"]["cells"], 4);
         assert_eq!(checkpoint["metrics"]["routed_nets"], 3);
         assert_eq!(checkpoint["placement"].as_array().unwrap().len(), 4);
+        assert!(
+            checkpoint["placement"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|cell| cell["kind"].is_string())
+        );
         assert_eq!(checkpoint["routes"].as_array().unwrap().len(), 3);
         assert_eq!(
             checkpoint["timing"]["setup_checks"]

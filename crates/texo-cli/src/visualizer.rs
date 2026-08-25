@@ -42,7 +42,7 @@ button,input{font:inherit;color:var(--text);background:#151c28;border:1px solid 
     <svg id="canvas" aria-label="FPGA placement and routes"><g id="grid"></g><g id="routes"></g><g id="fixed"></g><g id="cells"></g></svg>
     <div id="tooltip"></div>
     <div class="legend">
-      <div class="legend-row"><span class="legend-label">CELLS</span><span class="key" style="background:#a78bfa"></span>LUT <span class="key" style="background:#67e8f9"></span>FF <span class="key" style="background:#fbbf24"></span>carry <span class="key" style="background:#4ade80"></span>IO</div>
+      <div class="legend-row"><span class="legend-label">CELLS</span><span class="key" style="background:#a78bfa"></span>LUT <span class="key" style="background:#67e8f9"></span>FF <span class="key" style="background:#fbbf24"></span>carry <span class="key" style="background:#4ade80"></span>IO <span class="key" style="background:#3b82f6"></span>clock <span class="key" style="background:#fb923c"></span>BRAM <span class="key" style="background:#94a3b8"></span>constant</div>
       <div class="legend-row"><span class="legend-label">ROUTES</span><span class="route-key net-key"></span>net identity <span class="route-key bad-key"></span>violation (&lt;0 ps) <span class="route-key selected-key"></span>selected <span class="route-key fixed-key"></span>fixed PIP</div>
     </div>
   </main>
@@ -62,7 +62,7 @@ const el=(name,attrs={})=>{const node=document.createElementNS(NS,name);for(cons
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
 const slack=v=>v===null?"—":`${v} ps`;
 const colorFor=name=>{let h=2166136261;for(const c of name){h^=c.charCodeAt(0);h=Math.imul(h,16777619)}return `hsl(${Math.abs(h)%360} 78% 63%)`};
-const kindColor=k=>({lut4:"#a78bfa",flip_flop:"#67e8f9",carry_slice:"#fbbf24",port:"#4ade80",constant:"#94a3b8"}[k]||"#fb7185");
+const kindColor=k=>({lut4:"#a78bfa",lut:"#a78bfa",flip_flop:"#67e8f9",carry_slice:"#fbbf24",port:"#4ade80",global_clock:"#3b82f6",block_ram:"#fb923c",constant:"#94a3b8"}[k]||"#fb7185");
 function setView(){svg.setAttribute("viewBox",`${view.x} ${view.y} ${view.w} ${view.h}`)}
 function segmentPath(segments,onlyFixed=false){let d="";for(const s of segments){if(onlyFixed&&!s[4])continue;d+=`M${s[0]*U+U/2} ${s[1]*U+U/2}L${s[2]*U+U/2} ${s[3]*U+U/2}` }return d}
 function labelSlack(item){const values=[item.setup_slack_ps,item.hold_slack_ps].filter(v=>v!==null);return values.length?Math.min(...values):null}
@@ -70,7 +70,7 @@ function showTip(text,event){tip.textContent=text;tip.style.display="block";cons
 function hideTip(){tip.style.display="none"}
 function clearSelection(){if(selected?.node)selected.node.classList.remove("selected");selected=null;detail.innerHTML='<span class="muted">Click a cell or route.</span>'}
 function selectItem(type,item,node){clearSelection();selected={type,item,node};node?.classList.add("selected");if(type==="route"){detail.innerHTML=`<h2>ROUTE</h2><dl><dt>net</dt><dd>${esc(item.name)}</dd><dt>net id</dt><dd>${item.id}</dd><dt>PIPs</dt><dd>${item.pip_count} (${item.segments.length} visible)</dd><dt>setup</dt><dd class="${item.setup_slack_ps<0?'bad':''}">${slack(item.setup_slack_ps)}</dd><dt>hold</dt><dd class="${item.hold_slack_ps<0?'bad':''}">${slack(item.hold_slack_ps)}</dd></dl>`}else{detail.innerHTML=`<h2>CELL</h2><dl><dt>cell</dt><dd>${esc(item.name)}</dd><dt>kind</dt><dd>${esc(item.kind)}</dd><dt>BEL</dt><dd>${esc(item.bel)}</dd><dt>location</dt><dd>R${item.y}C${item.x}</dd><dt>setup</dt><dd class="${item.setup_slack_ps<0?'bad':''}">${slack(item.setup_slack_ps)}</dd><dt>hold</dt><dd class="${item.hold_slack_ps<0?'bad':''}">${slack(item.hold_slack_ps)}</dd></dl>`}}
-function cellGeometry(cell){const logic=cell.bel.match(/SLICE([A-D])\.(K|FF)([01])/);if(logic){const column=logic[1].charCodeAt(0)-65,row=(logic[2]==="FF"?2:0)+Number(logic[3]);return [1+column*3,1+row*3,2.5,2.5]}const io=cell.bel.match(/PIO([A-D])/);if(io){const n=io[1].charCodeAt(0)-65;return [1+(n%2)*6,3+Math.floor(n/2)*6,5,5]}const n=cell.id%16;return [1+(n%4)*3,1+Math.floor(n/4)*3,2.5,2.5]}
+function cellGeometry(cell){if(cell.kind==="global_clock")return [3,3,8,8];if(cell.kind==="block_ram")return [2,2,10,10];const logic=cell.bel.match(/SLICE([A-D])\.(K|FF)([01])/);if(logic){const column=logic[1].charCodeAt(0)-65,row=(logic[2]==="FF"?2:0)+Number(logic[3]);return [1+column*3,1+row*3,2.5,2.5]}const io=cell.bel.match(/PIO([A-D])/);if(io){const n=io[1].charCodeAt(0)-65;return [1+(n%2)*6,3+Math.floor(n/2)*6,5,5]}const n=cell.id%16;return [1+(n%4)*3,1+Math.floor(n/4)*3,2.5,2.5]}
 function build(){
   for(let x=0;x<=DATA.extent.x+1;x++){gridLayer.append(el("line",{x1:x*U,y1:0,x2:x*U,y2:(DATA.extent.y+1)*U,class:"grid-line"}))}
   for(let y=0;y<=DATA.extent.y+1;y++){gridLayer.append(el("line",{x1:0,y1:y*U,x2:(DATA.extent.x+1)*U,y2:y*U,class:"grid-line"}))}
@@ -115,20 +115,7 @@ fn checkpoint_visualizer(checkpoint: &Value) -> Result<String, Box<dyn Error>> {
 fn visualization_data(checkpoint: &Value) -> Result<Value, Box<dyn Error>> {
     let placement = required_array(checkpoint, "placement")?;
     let routes = required_array(checkpoint, "routes")?;
-    let metadata = checkpoint
-        .get("primitive_metadata")
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
-
-    let mut kinds = BTreeMap::new();
-    for entry in metadata {
-        if let (Some(id), Some(kind)) = (
-            entry.get("cell_id").and_then(Value::as_u64),
-            entry.pointer("/configuration/kind").and_then(Value::as_str),
-        ) {
-            kinds.insert(id, kind);
-        }
-    }
+    let kinds = checkpoint_cell_kinds(checkpoint);
 
     let timing = checkpoint.get("timing").unwrap_or(&Value::Null);
     let setup_nets = minimum_slacks(timing.get("net_setup_slacks"), "net_id");
@@ -150,7 +137,17 @@ fn visualization_data(checkpoint: &Value) -> Result<Value, Box<dyn Error>> {
                 "id": id,
                 "name": cell.get("cell").and_then(Value::as_str).unwrap_or("?"),
                 "bel": cell.get("bel").and_then(Value::as_str).unwrap_or("?"),
-                "kind": kinds.get(&id).copied().unwrap_or("cell"),
+                "kind": kinds
+                    .get(&id)
+                    .copied()
+                    .or_else(|| cell.get("kind").and_then(Value::as_str))
+                    .or_else(|| {
+                        cell.get("bel")
+                            .and_then(Value::as_str)
+                            .filter(|bel| bel.contains("DCC"))
+                            .map(|_| "global_clock")
+                    })
+                    .unwrap_or("cell"),
                 "x": x,
                 "y": y,
                 "setup_slack_ps": setup_cells.get(&id),
@@ -215,6 +212,32 @@ fn visualization_data(checkpoint: &Value) -> Result<Value, Box<dyn Error>> {
         "cells": cells,
         "routes": route_data,
     }))
+}
+
+fn checkpoint_cell_kinds(checkpoint: &Value) -> BTreeMap<u64, &str> {
+    let mut kinds = BTreeMap::new();
+    for entry in checkpoint
+        .get("primitive_metadata")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+    {
+        if let (Some(id), Some(kind)) = (
+            entry.get("cell_id").and_then(Value::as_u64),
+            entry.pointer("/configuration/kind").and_then(Value::as_str),
+        ) {
+            kinds.insert(id, kind);
+        }
+    }
+    for clock in checkpoint
+        .pointer("/packing/global_clocks")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+    {
+        if let Some(id) = clock.get("buffer").and_then(Value::as_u64) {
+            kinds.insert(id, "global_clock");
+        }
+    }
+    kinds
 }
 
 fn required_array<'a>(value: &'a Value, name: &str) -> Result<&'a Vec<Value>, Box<dyn Error>> {
@@ -297,7 +320,7 @@ fn grid_point(wire: &str) -> Option<(u64, u64)> {
 mod tests {
     use serde_json::json;
 
-    use super::{checkpoint_visualizer, grid_point};
+    use super::{checkpoint_visualizer, grid_point, visualization_data};
 
     #[test]
     fn extracts_grid_coordinates() {
@@ -312,7 +335,11 @@ mod tests {
             "target": {"device": "LFE5U-25F", "package": "CABGA381", "speed_grade": "6"},
             "metrics": {"total_pips": 1},
             "primitive_metadata": [{"cell_id": 0, "configuration": {"kind": "lut4"}}],
-            "placement": [{"cell_id": 0, "cell": "lut", "bel": "R2C3/SLICEA", "x": 3, "y": 2}],
+            "placement": [
+                {"cell_id": 0, "cell": "lut", "bel": "R2C3/SLICEA", "x": 3, "y": 2},
+                {"cell_id": 1, "cell": "$gbuf$n", "bel": "R0C4/TDCC0", "x": 4, "y": 0}
+            ],
+            "packing": {"global_clocks": [{"buffer": 1}]},
             "routes": [{"net_id": 7, "net": "n", "pips": [{"from": "R2C3/A", "to": "R4C5/B", "fixed": false}]}],
             "timing": {
                 "worst_slack_ps": -8,
@@ -320,8 +347,10 @@ mod tests {
                 "net_setup_slacks": [{"net_id": 7, "slack_ps": -8}]
             }
         });
+        let data = visualization_data(&checkpoint).unwrap();
         let html = checkpoint_visualizer(&checkpoint).unwrap();
 
+        assert_eq!(data["cells"][1]["kind"], "global_clock");
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.contains("demo\\u003c/script\\u003e"));
         assert!(html.contains("\"segments\":[[3,2,5,4,false]]"));
