@@ -1,0 +1,12 @@
+/// Top compilation unit selected by `[synth].top` in Veryl.toml.
+module Xor (
+    lhs: input  logic,
+    rhs: input  logic,
+    value: output logic,
+) {
+    inst gate: XorGate (
+        lhs   : lhs,
+        rhs   : rhs,
+        result: value,
+    );
+}

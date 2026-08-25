@@ -4,7 +4,7 @@ Texo is an FPGA-first place-and-route project written in Rust. The initial
 target is Lattice ECP5. It is designed to complete this open EDA flow:
 
 ```text
-Veryl source
+Veryl project (`Veryl.toml`, sources, and dependencies)
     -> Struo analysis and synthesis
     -> Struo ECP5 technology-mapped netlist
     -> Texo packing, placement, routing, and timing
@@ -46,8 +46,7 @@ splitting each primitive into two atomically packed ECP5 carry slices.
 ## Try it
 
 ```sh
-cargo run --release -- pnr examples/xor/xor.veryl \
-  --top Xor \
+cargo run --release -- pnr examples/xor \
   --architecture crates/texo-target-ecp5/fixtures/minimal-ecp5.json \
   --package CABGA381 \
   --speed 6 \
@@ -60,10 +59,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-`texo pnr` accepts any path to one self-contained Veryl compilation unit. Run
-`texo pnr --help` for synthesis-goal, placement-weight, unconstrained-IO,
-global-clock, and timing-closure controls. If `--output` is omitted, the
-checkpoint is written beside the source as `<source>.texo.json`.
+`texo pnr` accepts a project directory or `Veryl.toml`. It follows
+`[build].sources`, resolves the standard library and local/Git dependencies
+through `Veryl.lock`, analyzes all compilation units together, and uses
+`[synth].top` unless `--top` overrides it. A standalone `.veryl` remains
+available as a convenience and requires `--top`. Run `texo pnr --help` for
+synthesis-goal, placement-weight, unconstrained-IO, global-clock, and
+timing-closure controls. Without `--output`, project checkpoints go to
+`target/texo/<top>.json`.
 
 `tools/export_ecp5.py` generates a deduplicated architecture snapshot from a
 local Project Trellis build and database. Schema v4 includes PIP timing classes

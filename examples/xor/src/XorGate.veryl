@@ -1,0 +1,10 @@
+/// Child compilation unit for the Texo project-input smoke test.
+module XorGate (
+    lhs: input  logic,
+    rhs: input  logic,
+    result: output logic,
+) {
+    always_comb {
+        result = lhs ^ rhs;
+    }
+}

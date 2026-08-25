@@ -3243,12 +3243,16 @@ dependencies = [
  "struo-example-axi4-smartconnect",
  "struo-frontend-veryl",
  "struo-ir",
+ "struo-rtl",
  "struo-synth",
  "struo-target-ecp5",
  "texo-flow",
  "texo-model",
  "texo-struo",
  "texo-target-ecp5",
+ "veryl-analyzer",
+ "veryl-metadata",
+ "veryl-parser",
 ]
 
 [[package]]

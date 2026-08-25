@@ -1,6 +1,7 @@
 # Design-specific CLI examples
 
-The installed `texo` binary accepts arbitrary self-contained Veryl input.
+The installed `texo` binary accepts a complete Veryl project rooted at
+`Veryl.toml`; `examples/xor` is a two-compilation-unit reference project.
 Historical hard-coded XOR and AXI4 experiments remain available only as a
 Cargo example so benchmark and interchange diagnostics do not become part of
 the user-facing CLI contract:

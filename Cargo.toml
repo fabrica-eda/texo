@@ -27,6 +27,7 @@ struo-celox = { git = "https://github.com/fabrica-eda/struo.git", rev = "6e7037c
 struo-example-axi4-smartconnect = { git = "https://github.com/fabrica-eda/struo.git", rev = "6e7037c93b501de7b4555a6688f87c2615e0ac1f" }
 struo-frontend-veryl = { git = "https://github.com/fabrica-eda/struo.git", rev = "6e7037c93b501de7b4555a6688f87c2615e0ac1f" }
 struo-ir = { git = "https://github.com/fabrica-eda/struo.git", rev = "6e7037c93b501de7b4555a6688f87c2615e0ac1f" }
+struo-rtl = { git = "https://github.com/fabrica-eda/struo.git", rev = "6e7037c93b501de7b4555a6688f87c2615e0ac1f" }
 struo-synth = { git = "https://github.com/fabrica-eda/struo.git", rev = "6e7037c93b501de7b4555a6688f87c2615e0ac1f" }
 struo-target-ecp5 = { git = "https://github.com/fabrica-eda/struo.git", rev = "6e7037c93b501de7b4555a6688f87c2615e0ac1f" }
 texo-flow = { path = "crates/texo-flow" }
@@ -35,6 +36,9 @@ texo-pnr = { path = "crates/texo-pnr" }
 texo-struo = { path = "crates/texo-struo" }
 texo-target-ecp5 = { path = "crates/texo-target-ecp5" }
 texo-timing = { path = "crates/texo-timing" }
+veryl-analyzer = "=0.20.3"
+veryl-metadata = "=0.20.3"
+veryl-parser = "=0.20.3"
 
 [workspace.lints.rust]
 missing_docs = "warn"

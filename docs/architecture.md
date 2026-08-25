@@ -49,8 +49,9 @@ absorbed configuration inputs, packing decisions, placement, and routes for
 later timing and bitstream stages; the original mapped object remains available
 for further Celox verification.
 
-The `texo pnr` command exercises that boundary for an arbitrary self-contained
-Veryl source without intermediate netlist serialization. Its schema-versioned JSON checkpoint is deterministic
+The `texo pnr` command exercises that boundary for a complete Veryl project,
+including its compilation units and dependencies, without intermediate netlist
+serialization. Its schema-versioned JSON checkpoint is deterministic
 and records architecture/database provenance, verification evidence, mapped
 primitive configuration, absorbed inputs, target packing, final Cell-to-BEL
 bindings, selected speed grade, every routed Wire/PIP ID and name, and min/max
