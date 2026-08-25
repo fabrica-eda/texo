@@ -1,5 +1,7 @@
 //! Texo command-line entry point.
 
+mod visualizer;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
@@ -42,6 +44,8 @@ Usage:
   texo target-info <architecture>   inspect an ECP5 architecture snapshot
   texo cache-architecture <architecture.json> <architecture.txdb>
                                     cache the expanded routing graph for fast reuse
+  texo visualize <checkpoint.json> [output.html]
+                                    render placement and routes as interactive HTML/SVG
   texo lpf-info <constraints.lpf>   inspect ECP5 pin, IO, and clock constraints
   texo help                         show this help
 ";
@@ -100,6 +104,21 @@ fn parse_axi4_route_nextpnr_placement(
         &placement,
         checkpoint.as_deref(),
     )
+}
+
+fn parse_visualize(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let checkpoint = args
+        .next()
+        .ok_or_else(|| format!("visualize requires a checkpoint path\n\n{USAGE}"))?;
+    let output = args.next().unwrap_or_else(|| format!("{checkpoint}.html"));
+    if args.next().is_some() {
+        return Err(
+            format!("visualize accepts a checkpoint and optional output path\n\n{USAGE}").into(),
+        );
+    }
+    visualizer::write_checkpoint_visualizer(&checkpoint, &output)?;
+    println!("visualizer: {output}");
+    Ok(())
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
@@ -184,6 +203,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             cache_architecture(&source, &destination)
         }
+        Some("visualize") => parse_visualize(args),
         Some("lpf-info") => {
             let path = args
                 .next()

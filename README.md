@@ -78,6 +78,17 @@ contains provenance, evidence, primitive configuration, absorbed constants,
 packing decisions, IO/clock constraints, placement, Wire/PIP routes, and the
 post-route timing report.
 
+Render any such checkpoint as a self-contained interactive physical-design
+view (no server or architecture database is required):
+
+```sh
+cargo run --release -- visualize artifacts/axi4.checkpoint.json artifacts/axi4.html
+```
+
+The viewer draws cells and per-net PIP topology, supports pan/zoom and search,
+and can isolate routes below a configurable setup/hold slack threshold. See
+[`docs/visualizer.md`](docs/visualizer.md) for controls and rendering details.
+
 The AXI4 self-test has a gated path from Struo through a Texo-owned placement
 and route to an ECP5 bitstream. Cache a production architecture snapshot, export
 the lossless mapped netlist, run PnR, and emit the bitstream as follows:
