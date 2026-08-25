@@ -1198,6 +1198,9 @@ impl TimingDrivenContext<'_, '_, '_> {
             self.close_setup_critically(archive, placement_refiner, routing_costs, progress)?;
         report_metric_phase("closure_critical_vertices", &mut phase_started);
         emit_archive_metric("closure_critical", self, &archive);
+        archive = self.repair_setup_archive(archive, routing_costs, progress)?;
+        report_metric_phase("closure_setup_eco", &mut phase_started);
+        emit_archive_metric("closure_setup_eco", self, &archive);
         if !archive
             .iter()
             .any(|(_, timing)| timing.worst_slack_ps.is_some_and(|slack| slack >= 0))
@@ -1469,6 +1472,7 @@ impl TimingDrivenContext<'_, '_, '_> {
         routing_costs: &mut RoutingCosts,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
+        let mut setup_eco_attempted = false;
         for move_distance in CRITICAL_PATH_MOVE_DISTANCES {
             for refinement_round in 0..MAX_CRITICAL_PATH_VERTEX_REFINEMENTS {
                 if archive
@@ -1482,6 +1486,29 @@ impl TimingDrivenContext<'_, '_, '_> {
                     .max_by_key(|(_, timing)| timing_score(timing))
                     .expect("the timing archive is non-empty")
                     .clone();
+                if !setup_eco_attempted
+                    && seed
+                        .1
+                        .worst_slack_ps
+                        .is_some_and(|slack| (-LOCAL_SETUP_ECO_TRIGGER_PS..0).contains(&slack))
+                {
+                    setup_eco_attempted = true;
+                    if let Some(repaired) =
+                        self.repair_setup_locally(&seed.0, &seed.1, routing_costs, progress)?
+                    {
+                        let improves_objective = timing_score(&repaired.1) > timing_score(&seed.1);
+                        progress(Ecp5FlowStage::TimingTrialDecision { improves_objective });
+                        if improves_objective {
+                            let setup_closed =
+                                repaired.1.worst_slack_ps.is_some_and(|slack| slack >= 0);
+                            archive.push(repaired);
+                            archive = select_timing_frontier(archive);
+                            if setup_closed {
+                                return Ok(archive);
+                            }
+                        }
+                    }
+                }
                 let trial_started = Instant::now();
                 let refinement = self
                     .refine_critical_path_cells(
@@ -1719,6 +1746,77 @@ impl TimingDrivenContext<'_, '_, '_> {
             Err(Ecp5FlowError::Pnr(_)) => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    fn repair_setup_locally(
+        &mut self,
+        implementation: &PnrResult,
+        timing: &TimingReport,
+        routing_costs: &mut RoutingCosts,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<Option<TimingCandidate>, Ecp5FlowError> {
+        let repair_sinks = timing
+            .net_setup_slacks
+            .iter()
+            .filter_map(|edge| (edge.slack_ps < 0).then_some((edge.net, edge.sink)))
+            .collect::<BTreeSet<_>>();
+        if repair_sinks.is_empty() {
+            return Ok(None);
+        }
+        let frozen = freeze_route_sinks_except(
+            self.design,
+            self.architecture.device(),
+            &implementation.placement,
+            &implementation.routes,
+            &repair_sinks,
+        )?;
+        routing_costs.set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
+        routing_costs.set_sink_criticalities(timing_arc_weights(timing, self.timing_constraints));
+        routing_costs.set_sink_min_delays_ps(BTreeMap::new());
+        routing_costs.set_detailed_timing_nets(released_net_ids(&repair_sinks));
+        let repaired = self.route_local_trial_and_analyze(
+            implementation.placement.clone(),
+            &frozen,
+            routing_costs,
+            progress,
+        );
+        routing_costs.set_detailed_timing_nets(BTreeSet::new());
+        match repaired {
+            Ok(repaired) => Ok(Some(repaired)),
+            Err(Ecp5FlowError::Pnr(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn repair_setup_archive(
+        &mut self,
+        mut archive: Vec<TimingCandidate>,
+        routing_costs: &mut RoutingCosts,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
+        for _ in 0..MAX_LOCAL_SETUP_REPAIRS {
+            let seed = archive
+                .iter()
+                .max_by_key(|(_, timing)| timing_score(timing))
+                .expect("the timing archive is non-empty")
+                .clone();
+            if seed.1.worst_slack_ps.is_none_or(|slack| slack >= 0) {
+                break;
+            }
+            let Some(repaired) =
+                self.repair_setup_locally(&seed.0, &seed.1, routing_costs, progress)?
+            else {
+                break;
+            };
+            let improves_objective = timing_score(&repaired.1) > timing_score(&seed.1);
+            progress(Ecp5FlowStage::TimingTrialDecision { improves_objective });
+            if !improves_objective {
+                break;
+            }
+            archive.push(repaired);
+            archive = select_timing_frontier(archive);
+        }
+        Ok(archive)
     }
 
     fn refine_candidate(
@@ -2357,6 +2455,8 @@ const MAX_INCREMENTAL_REFINEMENTS: usize = 8;
 const MAX_CONSECUTIVE_MONOTONIC_WNS_REGRESSIONS: usize = 2;
 const LOCAL_TRIAL_ROUTING_ITERATIONS: u32 = 5;
 const MAX_HOLD_ROUTE_FEEDBACKS: usize = 2;
+const LOCAL_SETUP_ECO_TRIGGER_PS: i128 = 12;
+const MAX_LOCAL_SETUP_REPAIRS: usize = 2;
 const MAX_GENERAL_HOLD_REPAIRS: usize = 6;
 const MAX_HOLD_SETUP_RECOVERY_PS: i128 = 100;
 const MAX_DEDICATED_EDGE_TRIALS: usize = 1;
