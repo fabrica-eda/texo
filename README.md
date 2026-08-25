@@ -8,7 +8,7 @@ Veryl project (`Veryl.toml`, sources, and dependencies)
     -> Struo analysis and synthesis
     -> Struo ECP5 technology-mapped netlist
     -> Texo packing, placement, routing, and timing
-    -> Project Trellis configuration/bitstream tooling
+    -> Texo-native configuration generation + bundled ECP5 bitstream codec
 ```
 
 Celox functional and post-map verification can be attached by API clients that
@@ -76,7 +76,7 @@ static-musl x86-64 Linux, Apple Silicon and Intel macOS, and x86-64 Windows. It
 uploads a platform archive and SHA-256 checksum for every binary.
 
 `tools/export_ecp5.py` generates a deduplicated architecture snapshot from a
-local Project Trellis build and database. Schema v5 includes exact physical
+local Project Trellis build and database. Schema v6 includes exact physical
 configuration-tile ownership in addition to PIP timing classes with their
 independently fitted `min/typ/max` corners and the `6/7/8/8_5G` speed-grade
 cell/interconnect tables. Production device
@@ -106,9 +106,28 @@ The viewer draws cells and per-net PIP topology, supports pan/zoom and search,
 and can isolate routes below a configurable setup/hold slack threshold. See
 [`docs/visualizer.md`](docs/visualizer.md) for controls and rendering details.
 
-The AXI4 self-test has a gated path from Struo through a Texo-owned placement
-and route to an ECP5 bitstream. Cache a production architecture snapshot, run
-PnR, and emit the bitstream as follows:
+Normal users do not install Project Trellis or manage an architecture file.
+The first `pnr` or `bitgen` for a device downloads one pinned, checksummed
+target pack into the platform cache; later runs are offline. A pack contains
+the Texo architecture database and the small Trellis codec/runtime subset
+needed to serialize an ECP5 bitstream. It does not contain Python.
+
+```sh
+texo target fetch LFE5UM5G-85F                 # optional eager download
+texo pnr path/to/veryl-project --package CABGA381 --speed 8 \
+  --lpf board.lpf --output design.checkpoint.json
+```
+
+For an air-gapped machine, download the release `.txpkg.zst` elsewhere and run
+`texo target install <pack.txpkg.zst>`. `TEXO_TARGET_DIR` overrides the cache
+location. Supplying individual architecture/database/codec paths remains a
+developer diagnostic mode, not a user prerequisite.
+
+`bitgen` intentionally accepts only a checkpoint carrying all functional,
+physical, and timing release gates; the general project CLI does not invent
+simulation evidence when no testbench was provided. The AXI4 self-test has a
+release-gated path from Struo through Texo-owned
+placement, routing, configuration generation, and bitstream emission:
 
 ```sh
 cargo build --release --locked -p texo-cli
@@ -117,20 +136,17 @@ cargo run --release -p texo-cli --example design-specific-flows -- axi4-pnr \
   artifacts/architecture/texo-LFE5UM5G-85F-schema6-cache5.txdb CABGA381 8 \
   examples/axi4-self-test/lfe5um5g-85f-evn-250mhz.lpf \
   artifacts/axi4.checkpoint.json
-tools/ecp5_bitstream.py \
-  --checkpoint artifacts/axi4.checkpoint.json \
-  --config artifacts/axi4.config \
+cargo run --release -- bitgen artifacts/axi4.checkpoint.json \
   --bit artifacts/axi4.bit
 ```
 
-`ecp5_bitstream.py` consumes checkpoint schema v3 and writes Project Trellis
-configuration features directly; nextpnr is not part of this flow. It selects
-the exact checkpoint device, configures every non-fixed Texo route edge and
-placed primitive, refuses release without all six functional, physical, and
-timing evidence gates, and byte-compares an `ecpunpack`/`ecppack` round trip.
-The command requires the `python3-pytrellis` module plus `ecppack` and
-`ecpunpack` on `PATH`. LUT/carry, FF, single-ended IO, DCCA routing, and DP16KD
-configuration are emitted without reconstructing a second PnR context.
+`texo bitgen` consumes checkpoint schema v3 and writes Trellis configuration
+features in Rust; neither nextpnr nor pytrellis is a runtime dependency. It
+selects the exact checkpoint device, configures every non-fixed Texo route edge
+and placed primitive, and refuses release without all six functional,
+physical, and timing evidence gates. LUT/carry, FF, single-ended IO, DCCA
+routing, and DP16KD configuration are emitted without reconstructing a second
+PnR context. The bundled `ecppack` is only the final binary codec.
 
 See [docs/architecture.md](docs/architecture.md) for the integration boundary
 and [docs/roadmap.md](docs/roadmap.md) for the implementation sequence.

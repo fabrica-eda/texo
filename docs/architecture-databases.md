@@ -29,11 +29,16 @@ packages:
 
 ```sh
 sudo apt-get install \
+  fpga-trellis=1.4-2build4 \
   fpga-trellis-database=1.4-2build4 \
   python3-pytrellis=1.4-2build4 \
+  libboost-filesystem1.83.0=1.83.0-2.1ubuntu3.2 \
+  libboost-program-options1.83.0=1.83.0-2.1ubuntu3.2 \
+  libboost-thread1.83.0=1.83.0-2.1ubuntu3.2 \
   zstd
 cargo build --release --locked -p texo-cli
 /usr/bin/python3 tools/build_ecp5_txdb.py --device LFE5UM5G-85F
+/usr/bin/python3 tools/build_ecp5_target_pack.py --device LFE5UM5G-85F
 ```
 
 The builder checks the installed package versions and checks that the schema
@@ -47,6 +52,7 @@ texo-LFE5UM5G-85F-schema6-cache5.txdb
 texo-LFE5UM5G-85F-schema6-cache5.txdb.zst
 texo-LFE5UM5G-85F-schema6-cache5.release.json
 texo-LFE5UM5G-85F-schema6-cache5.SHA256SUMS
+texo-LFE5UM5G-85F-schema6-cache5-x86_64-unknown-linux-gnu.txpkg.zst
 ```
 
 The release manifest records the uncompressed cache digest and size as well as
@@ -59,9 +65,12 @@ made with it must not be published.
 
 Pushing a `txdb-ecp5-v*` tag runs the architecture release workflow.
 The workflow builds in the pinned environment, uploads an Actions artifact,
-and creates a GitHub Release containing the compressed cache, release manifest,
-and checksums. The workflow refuses to replace an existing release or its
-assets.
+and creates a GitHub Release containing the compressed cache, target pack,
+release manifest, and checksums. The workflow refuses to replace an existing
+release or its assets. Runtime `texo pnr` and `texo bitgen` resolve the target
+pack from the embedded catalog, verify its release SHA-256, safely unpack it
+once, and use the cache thereafter. Project Trellis is a release-build input,
+not something an end user installs.
 
 Download and verify a release in an empty directory:
 
@@ -77,3 +86,8 @@ cargo run --release -- target-info \
 Both checks matter: SHA-256 confirms that the downloaded bytes match the
 release checksums, while `target-info` rejects an unsupported binary cache
 version and displays the embedded device and source provenance.
+
+Normal users instead run `texo target fetch LFE5UM5G-85F`, or simply let the
+first `texo pnr`/`texo bitgen` fetch it. For offline installation use
+`texo target install <archive.txpkg.zst>`. Set `TEXO_TARGET_DIR` to override the
+platform cache root.

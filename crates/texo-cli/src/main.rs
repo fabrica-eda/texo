@@ -6,13 +6,16 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
 use struo_synth::synthesize;
 use struo_target_ecp5::{ECP5_QOR_TARGET_MHZ, MappingOptions, map_to_ecp5_with_options};
-use texo_cli::{VerylProject, ecp5_checkpoint, load_veryl_project, write_checkpoint_visualizer};
+use texo_cli::{
+    Ecp5TargetPack, VerylProject, ecp5_checkpoint, generate_ecp5_config, install_ecp5_target_pack,
+    load_veryl_project, resolve_ecp5_target, write_checkpoint_visualizer,
+};
 use texo_flow::{
     Ecp5FlowOptions, Ecp5FlowResult, Ecp5FlowStage, Evidence, Gate, PostMapSimulationPolicy,
     RoutingProgress, implement_struo_ecp5_with_progress,
@@ -52,6 +55,10 @@ enum Command {
         /// LPF constraint file.
         constraints: PathBuf,
     },
+    /// Generate an ECP5 bitstream from a release-gated checkpoint.
+    Bitgen(BitgenArgs),
+    /// Install or fetch architecture and bitstream-codec target packs.
+    Target(TargetArgs),
     /// Render a Texo checkpoint as self-contained interactive HTML/SVG.
     Visualize {
         /// P&R checkpoint written by `texo pnr`.
@@ -59,6 +66,57 @@ enum Command {
         /// HTML destination; defaults to `<checkpoint>.html`.
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Args)]
+struct BitgenArgs {
+    /// Timing-closed checkpoint schema v3.
+    checkpoint: PathBuf,
+    /// ECP5 architecture `.txdb` used by the checkpoint.
+    #[arg(short, long)]
+    architecture: Option<PathBuf>,
+    /// Target-pack Project Trellis database root.
+    #[arg(long)]
+    database: Option<PathBuf>,
+    /// Decompressed empty-device Project Trellis configuration.
+    #[arg(long)]
+    base_config: Option<PathBuf>,
+    /// Already installed target-pack directory.
+    #[arg(long)]
+    target_pack: Option<PathBuf>,
+    /// Target-pack `ecppack` executable.
+    #[arg(long)]
+    ecppack: Option<PathBuf>,
+    /// Text configuration destination; defaults beside the bitstream.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// ECP5 bitstream destination.
+    #[arg(short, long)]
+    bit: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct TargetArgs {
+    #[command(subcommand)]
+    command: TargetCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TargetCommand {
+    /// Install and verify a downloaded `.txpkg.zst`.
+    Install {
+        /// Target-pack archive.
+        archive: PathBuf,
+        /// Override the target cache root.
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+    },
+    /// Download a pinned target pack when it is not cached.
+    Fetch {
+        /// Exact FPGA device name.
+        #[arg(default_value = "LFE5UM5G-85F")]
+        device: String,
     },
 }
 
@@ -71,7 +129,10 @@ struct PnrArgs {
     top: Option<String>,
     /// ECP5 architecture JSON or `.txdb` cache.
     #[arg(short, long)]
-    architecture: PathBuf,
+    architecture: Option<PathBuf>,
+    /// Exact FPGA device used to resolve an installed target pack.
+    #[arg(long, default_value = "LFE5UM5G-85F")]
+    device: String,
     /// Exact package name from the architecture database.
     #[arg(short, long)]
     package: String,
@@ -124,6 +185,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         } => cache_architecture(&source, &destination),
         Command::TargetInfo { architecture } => target_info(&architecture),
         Command::LpfInfo { constraints } => lpf_info(&constraints),
+        Command::Bitgen(args) => bitgen(&args),
+        Command::Target(args) => target(&args),
         Command::Visualize { checkpoint, output } => {
             let output = output.unwrap_or_else(|| checkpoint_html_path(&checkpoint));
             ensure_distinct_paths(&checkpoint, &output, "checkpoint", "HTML output")?;
@@ -132,6 +195,159 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             Ok(())
         }
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn bitgen(args: &BitgenArgs) -> Result<(), Box<dyn Error>> {
+    let checkpoint: serde_json::Value =
+        serde_json::from_reader(BufReader::new(File::open(&args.checkpoint)?))?;
+    let device = checkpoint
+        .get("target")
+        .and_then(|target| target.get("device"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("checkpoint target device is absent")?;
+    let explicit = args.architecture.is_some()
+        || args.database.is_some()
+        || args.base_config.is_some()
+        || args.ecppack.is_some();
+    if explicit
+        && (args.architecture.is_none()
+            || args.database.is_none()
+            || args.base_config.is_none()
+            || args.ecppack.is_none())
+    {
+        return Err(
+            "--architecture, --database, --base-config, and --ecppack must be supplied together"
+                .into(),
+        );
+    }
+    if args.target_pack.is_some() && explicit {
+        return Err("--target-pack cannot be combined with individual runtime paths".into());
+    }
+    let pack = if let Some(root) = &args.target_pack {
+        Some(Ecp5TargetPack::open(root.clone())?)
+    } else if explicit {
+        None
+    } else {
+        Some(resolve_ecp5_target(device)?)
+    };
+    if let Some(pack) = &pack
+        && pack.device()? != device
+    {
+        return Err(format!(
+            "target pack device {} does not match checkpoint {device}",
+            pack.device()?
+        )
+        .into());
+    }
+    let architecture_path = args
+        .architecture
+        .as_ref()
+        .or_else(|| pack.as_ref().map(|pack| &pack.architecture))
+        .expect("explicit paths or a pack were resolved");
+    let database = args
+        .database
+        .as_ref()
+        .or_else(|| pack.as_ref().map(|pack| &pack.database))
+        .expect("explicit paths or a pack were resolved");
+    let base_config_path = args
+        .base_config
+        .as_ref()
+        .or_else(|| pack.as_ref().map(|pack| &pack.base_config))
+        .expect("explicit paths or a pack were resolved");
+    let ecppack = args
+        .ecppack
+        .as_ref()
+        .or_else(|| pack.as_ref().map(|pack| &pack.ecppack))
+        .expect("explicit paths or a pack were resolved");
+    let architecture = load_architecture(architecture_path)?;
+    let base_config = std::fs::read_to_string(base_config_path)?;
+    let iodb_path = pack.as_ref().map_or_else(
+        || database.join("ECP5").join(device).join("iodb.json"),
+        |pack| pack.iodb.clone(),
+    );
+    let iodb: serde_json::Value = serde_json::from_reader(BufReader::new(File::open(&iodb_path)?))?;
+    let generated = generate_ecp5_config(&checkpoint, &architecture, &base_config, &iodb)?;
+    let expected_pips = checkpoint
+        .get("metrics")
+        .and_then(|metrics| metrics.get("total_pips"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("checkpoint total PIP count is absent")?;
+    if u64::try_from(generated.programmable_pips + generated.fixed_edges)? != expected_pips {
+        return Err(format!(
+            "configuration accounted for {} of {expected_pips} PIPs",
+            generated.programmable_pips + generated.fixed_edges
+        )
+        .into());
+    }
+    let config = args
+        .config
+        .clone()
+        .unwrap_or_else(|| bitstream_config_path(&args.bit));
+    for (input, output, input_label, output_label) in [
+        (&args.checkpoint, &config, "checkpoint", "configuration"),
+        (&args.checkpoint, &args.bit, "checkpoint", "bitstream"),
+        (architecture_path, &config, "architecture", "configuration"),
+        (architecture_path, &args.bit, "architecture", "bitstream"),
+    ] {
+        ensure_distinct_paths(input, output, input_label, output_label)?;
+    }
+    if config == args.bit {
+        return Err("configuration and bitstream outputs must differ".into());
+    }
+    for output in [&config, &args.bit] {
+        if let Some(parent) = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(&config, generated.text)?;
+    let mut command = ProcessCommand::new(ecppack);
+    if let Some(pack) = &pack {
+        configure_pack_libraries(&mut command, pack)?;
+    }
+    let status = command
+        .arg(&config)
+        .arg(&args.bit)
+        .arg("--db")
+        .arg(database)
+        .status()?;
+    if !status.success() {
+        return Err(format!("ecppack exited with {status}").into());
+    }
+    println!(
+        "Texo native bitgen: {} programmable PIPs, {} fixed edges",
+        generated.programmable_pips, generated.fixed_edges
+    );
+    println!("configuration: {}", config.display());
+    println!("bitstream: {}", args.bit.display());
+    Ok(())
+}
+
+fn target(args: &TargetArgs) -> Result<(), Box<dyn Error>> {
+    let pack = match &args.command {
+        TargetCommand::Install { archive, cache_dir } => {
+            install_ecp5_target_pack(archive, cache_dir.as_deref())?
+        }
+        TargetCommand::Fetch { device } => resolve_ecp5_target(device)?,
+    };
+    println!("target: {}", pack.device()?);
+    println!("installed: {}", pack.root.display());
+    Ok(())
+}
+
+fn configure_pack_libraries(
+    command: &mut ProcessCommand,
+    pack: &Ecp5TargetPack,
+) -> Result<(), Box<dyn Error>> {
+    let mut paths = vec![pack.root.join("lib")];
+    if let Some(existing) = env::var_os("LD_LIBRARY_PATH") {
+        paths.extend(env::split_paths(&existing));
+    }
+    command.env("LD_LIBRARY_PATH", env::join_paths(paths)?);
+    Ok(())
 }
 
 fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
@@ -164,7 +380,17 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
 
     let imported = import_ecp5(&mapped)?;
     let architecture_started = Instant::now();
-    let architecture = load_architecture(&args.architecture)?;
+    let pack = args
+        .architecture
+        .is_none()
+        .then(|| resolve_ecp5_target(&args.device))
+        .transpose()?;
+    let architecture_path = args
+        .architecture
+        .as_deref()
+        .or_else(|| pack.as_ref().map(|pack| pack.architecture.as_path()))
+        .expect("an explicit architecture or target pack was resolved");
+    let architecture = load_architecture(architecture_path)?;
     println!(
         "architecture loaded in {:.2?}",
         architecture_started.elapsed()
@@ -462,6 +688,12 @@ fn checkpoint_html_path(checkpoint: &Path) -> PathBuf {
     path.into()
 }
 
+fn bitstream_config_path(bitstream: &Path) -> PathBuf {
+    let mut path = bitstream.as_os_str().to_owned();
+    path.push(".config");
+    path.into()
+}
+
 fn path_text(path: &Path) -> Result<&str, Box<dyn Error>> {
     path.to_str()
         .ok_or_else(|| format!("path is not valid UTF-8: {}", path.display()).into())
@@ -548,6 +780,44 @@ mod tests {
         };
         assert_eq!(args.input, Path::new("project"));
         assert_eq!(args.top, None);
+    }
+
+    #[test]
+    fn pnr_resolves_the_default_target_pack_without_an_architecture_argument() {
+        let cli = Cli::try_parse_from([
+            "texo",
+            "pnr",
+            "project",
+            "--package",
+            "CABGA381",
+            "--speed",
+            "8",
+        ])
+        .unwrap();
+        let Command::Pnr(args) = cli.command else {
+            panic!("expected pnr command");
+        };
+        assert_eq!(args.architecture, None);
+        assert_eq!(args.device, "LFE5UM5G-85F");
+    }
+
+    #[test]
+    fn parses_target_pack_bitgen_command() {
+        let cli = Cli::try_parse_from([
+            "texo",
+            "bitgen",
+            "closed.checkpoint.json",
+            "--bit",
+            "design.bit",
+        ])
+        .unwrap();
+        let Command::Bitgen(args) = cli.command else {
+            panic!("expected bitgen command");
+        };
+        assert_eq!(args.checkpoint, Path::new("closed.checkpoint.json"));
+        assert_eq!(args.bit, Path::new("design.bit"));
+        assert_eq!(args.architecture, None);
+        assert_eq!(args.target_pack, None);
     }
 
     #[test]

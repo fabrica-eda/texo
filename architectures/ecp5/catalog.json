@@ -1,0 +1,13 @@
+{
+  "catalog_version": 1,
+  "targets": [
+    {
+      "device": "LFE5UM5G-85F",
+      "platform": "x86_64-unknown-linux-gnu",
+      "release_tag": "txdb-ecp5-v2",
+      "asset": "texo-LFE5UM5G-85F-schema6-cache5-x86_64-unknown-linux-gnu.txpkg.zst",
+      "bytes": 184982866,
+      "sha256": "0fb21c2c67807a0da6ead7aa78210fd2d72a9b26f39a2c4b0cb0eb8e9b4cdd52"
+    }
+  ]
+}

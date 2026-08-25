@@ -11,9 +11,9 @@ frontend at once:
    technology mapping, and Celox adapter.
 3. Texo owns physical architecture import, packing, placement, routing, static
    timing analysis, and implementation artifacts.
-4. Project Trellis supplies the configuration database and bitstream codec;
-   Texo translates its own placement and routing checkpoint directly into
-   Project Trellis features.
+4. Texo generates configuration features natively. A versioned target pack
+   supplies the imported configuration database and bundled final ECP5 codec;
+   users do not install Project Trellis.
 
 The inspected upstream versions are:
 
@@ -56,10 +56,11 @@ and records architecture/database provenance, verification evidence, mapped
 primitive configuration, absorbed inputs, target packing, final Cell-to-BEL
 bindings, selected speed grade, every routed Wire/PIP ID and name, exact
 configuration-tile ownership, and min/max timing checks. It is the complete
-input to the native configuration stage. `tools/ecp5_bitstream.py` translates
-those records directly into Project Trellis configuration features, invokes
-`ecppack`, and verifies an `ecpunpack`/`ecppack` byte-identical round trip. The
-release path has no nextpnr runtime or file-format dependency. Design-specific
+input to the native configuration stage. `texo bitgen` translates those
+records directly into configuration features in Rust and invokes the
+target-pack-local `ecppack` only as the final binary codec. The release path
+has no nextpnr, Python, pytrellis, or system Project Trellis dependency.
+Design-specific
 Celox and AXI4 flows live in the
 `design-specific-flows` Cargo example rather than the installed CLI.
 

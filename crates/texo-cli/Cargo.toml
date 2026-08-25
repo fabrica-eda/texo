@@ -11,7 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 struo-frontend-veryl.workspace = true
 struo-rtl.workspace = true
 struo-synth.workspace = true
@@ -20,9 +22,11 @@ texo-flow.workspace = true
 texo-model.workspace = true
 texo-struo.workspace = true
 texo-target-ecp5.workspace = true
+ureq.workspace = true
 veryl-analyzer.workspace = true
 veryl-metadata.workspace = true
 veryl-parser.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 celox.workspace = true
