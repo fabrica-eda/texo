@@ -21,7 +21,7 @@ button,input{font:inherit;color:var(--text);background:#151c28;border:1px solid 
 #stage{position:relative;min-width:0;min-height:0;background:radial-gradient(circle at 50% 30%,#111827,#070a10 70%)}svg{display:block;width:100%;height:100%;touch-action:none;cursor:grab}svg.dragging{cursor:grabbing}.grid-line{stroke:#253044;stroke-width:.45;vector-effect:non-scaling-stroke}.route{fill:none;stroke-linecap:round;stroke-linejoin:round;stroke-width:1.15;opacity:.18;vector-effect:non-scaling-stroke;cursor:pointer}.route:hover{opacity:.72;stroke-width:2}.route.selected{opacity:1!important;stroke:#fff!important;stroke-width:3.2!important;filter:drop-shadow(0 0 3px #6ee7ff)}.route.violating{opacity:.48}.route.filtered,.fixed-route.filtered{display:none}.fixed-route{fill:none;stroke:#fff;stroke-width:.65;stroke-dasharray:1.5 2;opacity:.28;vector-effect:non-scaling-stroke;pointer-events:none}.cell{stroke:#08101a;stroke-width:.65;vector-effect:non-scaling-stroke;cursor:pointer}.cell:hover,.cell.selected{stroke:#fff;stroke-width:2;filter:drop-shadow(0 0 3px #fff)}.cell.filtered{display:none}
 .side{min-height:0;background:var(--panel);border-left:1px solid var(--line);display:grid;grid-template-rows:auto auto 1fr;overflow:hidden}.summary,.detail{padding:14px;border-bottom:1px solid var(--line)}.summary h1{font:700 16px/1.3 inherit;margin:0 0 8px;overflow-wrap:anywhere}.muted{color:var(--muted)}.stats{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:10px}.stat{background:#151c28;padding:7px;border-radius:4px}.stat b{display:block;font-size:15px;color:#fff}.detail{min-height:116px;overflow-wrap:anywhere}.detail h2{font:700 13px/1.3 inherit;margin:0 0 8px;color:var(--accent)}.detail dl{display:grid;grid-template-columns:auto 1fr;margin:0;gap:3px 9px}.detail dt{color:var(--muted)}.detail dd{margin:0;text-align:right;overflow-wrap:anywhere}
 #matches{overflow:auto;padding:8px}.match{width:100%;display:grid;grid-template-columns:52px 1fr auto;gap:7px;text-align:left;border:0;background:transparent;padding:7px}.match:hover{background:#182131}.match .type{color:var(--muted)}.match .name{overflow:hidden;text-overflow:ellipsis}.bad{color:var(--danger)}
-#tooltip{position:absolute;display:none;pointer-events:none;z-index:5;max-width:460px;padding:7px 9px;border:1px solid #46566f;border-radius:5px;background:#0a0e16ee;box-shadow:0 5px 25px #000b;white-space:pre-line;overflow-wrap:anywhere}.legend{position:absolute;left:12px;bottom:12px;padding:8px 10px;background:#0a0e16dd;border:1px solid var(--line);border-radius:5px;color:var(--muted);pointer-events:none}.key{display:inline-block;width:9px;height:9px;margin:0 4px 0 9px;border-radius:2px}.key:first-child{margin-left:0}
+#tooltip{position:absolute;display:none;pointer-events:none;z-index:5;max-width:460px;padding:7px 9px;border:1px solid #46566f;border-radius:5px;background:#0a0e16ee;box-shadow:0 5px 25px #000b;white-space:pre-line;overflow-wrap:anywhere}.legend{position:absolute;left:12px;bottom:12px;display:grid;gap:5px;padding:8px 10px;background:#0a0e16dd;border:1px solid var(--line);border-radius:5px;color:var(--muted);pointer-events:none}.legend-row{display:flex;align-items:center;flex-wrap:wrap;gap:0}.legend-label{width:54px;color:var(--text);font-weight:700;font-size:11px;letter-spacing:.06em}.key{display:inline-block;width:9px;height:9px;margin:0 4px 0 9px;border-radius:2px}.legend-label+.key{margin-left:0}.route-key{display:inline-block;width:25px;height:3px;margin:0 5px 0 11px;border-radius:2px;background:#fff}.legend-label+.route-key{margin-left:0}.net-key{background:linear-gradient(90deg,#67e8f9,#a78bfa,#fbbf24)}.bad-key{background:#ff627d}.selected-key{background:#fff;box-shadow:0 0 4px #6ee7ff}.fixed-key{height:0;border-top:2px dashed #fff;background:none}
 @media(max-width:800px){#app{grid-template-columns:1fr;grid-template-rows:auto 1fr 190px}.toolbar{gap:7px;overflow-x:auto}.side{border-left:0;border-top:1px solid var(--line);grid-template-columns:220px 1fr 1fr;grid-template-rows:1fr}.summary,.detail{border-bottom:0;border-right:1px solid var(--line);overflow:auto}.legend{display:none}}
 </style>
 </head>
@@ -41,7 +41,10 @@ button,input{font:inherit;color:var(--text);background:#151c28;border:1px solid 
   <main id="stage">
     <svg id="canvas" aria-label="FPGA placement and routes"><g id="grid"></g><g id="routes"></g><g id="fixed"></g><g id="cells"></g></svg>
     <div id="tooltip"></div>
-    <div class="legend"><span class="key" style="background:#a78bfa"></span>LUT <span class="key" style="background:#67e8f9"></span>FF <span class="key" style="background:#fbbf24"></span>carry <span class="key" style="background:#4ade80"></span>IO <span class="key" style="background:#ff627d"></span>violating route</div>
+    <div class="legend">
+      <div class="legend-row"><span class="legend-label">CELLS</span><span class="key" style="background:#a78bfa"></span>LUT <span class="key" style="background:#67e8f9"></span>FF <span class="key" style="background:#fbbf24"></span>carry <span class="key" style="background:#4ade80"></span>IO</div>
+      <div class="legend-row"><span class="legend-label">ROUTES</span><span class="route-key net-key"></span>net identity <span class="route-key bad-key"></span>violation (&lt;0 ps) <span class="route-key selected-key"></span>selected <span class="route-key fixed-key"></span>fixed PIP</div>
+    </div>
   </main>
   <aside class="side">
     <section class="summary"><h1 id="design"></h1><div id="target" class="muted"></div><div class="stats" id="stats"></div></section>
@@ -322,6 +325,8 @@ mod tests {
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.contains("demo\\u003c/script\\u003e"));
         assert!(html.contains("\"segments\":[[3,2,5,4,false]]"));
+        assert!(html.contains("net identity"));
+        assert!(html.contains("violation (&lt;0 ps)"));
         assert!(!html.contains("__TEXO_DATA__"));
         assert!(!html.contains("https://"));
     }

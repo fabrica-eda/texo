@@ -18,6 +18,13 @@ overlay. Cell colors distinguish LUTs, flip-flops, carry logic, IO, and
 constants. Logic cells sharing a tile are separated by their `SLICE` and
 `K`/`FF` site names.
 
+Ordinary route colors are stable hashes of net names: matching colors identify
+one net, but the hue itself has no timing meaning. A route with negative setup
+or hold slack overrides that color with red, the selected route becomes a
+glowing white line, and fixed PIPs retain their white dashed overlay. These
+meanings are shown separately from the cell-color legend in the lower-left
+corner.
+
 Controls:
 
 - Drag to pan and use the wheel or trackpad to zoom. `Fit` restores the whole
