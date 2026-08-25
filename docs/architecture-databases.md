@@ -5,6 +5,9 @@ caches. They contain the expanded routing graph and timing tables, so the
 inputs and the cache format must be identifiable before a file can be used or
 distributed.
 
+Schema 6 includes the Project Trellis `DP16KD` `REGMODE_A/B=NOREG`
+clock-to-output and setup/hold characterization used by Texo's block-RAM STA.
+
 ## Source of truth
 
 [`architectures/ecp5/manifest.json`](../architectures/ecp5/manifest.json) pins:
@@ -40,10 +43,10 @@ with `texo target-info`, and rejects it unless its byte size and SHA-256 match
 the tracked expected result. A successful build emits:
 
 ```text
-texo-LFE5UM5G-85F-schema5-cache4.txdb
-texo-LFE5UM5G-85F-schema5-cache4.txdb.zst
-texo-LFE5UM5G-85F-schema5-cache4.release.json
-texo-LFE5UM5G-85F-schema5-cache4.SHA256SUMS
+texo-LFE5UM5G-85F-schema6-cache5.txdb
+texo-LFE5UM5G-85F-schema6-cache5.txdb.zst
+texo-LFE5UM5G-85F-schema6-cache5.release.json
+texo-LFE5UM5G-85F-schema6-cache5.SHA256SUMS
 ```
 
 The release manifest records the uncompressed cache digest and size as well as
@@ -64,11 +67,11 @@ Download and verify a release in an empty directory:
 
 ```sh
 gh release download txdb-ecp5-v1 \
-  -p 'texo-LFE5UM5G-85F-schema5-cache4.*'
-sha256sum -c texo-LFE5UM5G-85F-schema5-cache4.SHA256SUMS
-zstd -d texo-LFE5UM5G-85F-schema5-cache4.txdb.zst
+  -p 'texo-LFE5UM5G-85F-schema6-cache5.*'
+sha256sum -c texo-LFE5UM5G-85F-schema6-cache5.SHA256SUMS
+zstd -d texo-LFE5UM5G-85F-schema6-cache5.txdb.zst
 cargo run --release -- target-info \
-  texo-LFE5UM5G-85F-schema5-cache4.txdb
+  texo-LFE5UM5G-85F-schema6-cache5.txdb
 ```
 
 Both checks matter: SHA-256 confirms that the downloaded bytes match the

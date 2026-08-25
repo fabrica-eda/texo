@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
-  "architecture_schema_version": 5,
-  "cache_format_version": 4,
+  "architecture_schema_version": 6,
+  "cache_format_version": 5,
   "source": {
     "distribution": "Ubuntu 24.04 (noble, amd64)",
     "database_root": "/usr/share/trellis/database",
@@ -20,9 +20,9 @@
   "devices": [
     {
       "device": "LFE5UM5G-85F",
-      "artifact_stem": "texo-LFE5UM5G-85F-schema5-cache4",
-      "expected_txdb_bytes": 853893841,
-      "expected_txdb_sha256": "7f4977ae51927c8e5d7dec666a25857dcec65d416efebe04e17b35a92f84a931"
+      "artifact_stem": "texo-LFE5UM5G-85F-schema6-cache5",
+      "expected_txdb_bytes": 853900985,
+      "expected_txdb_sha256": "198fd14bff6eb370ccfcf519feb3b6e4fb9b0f1ee57f27dad241f2c7ece57097"
     }
   ]
 }

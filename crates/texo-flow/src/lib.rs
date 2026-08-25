@@ -3353,6 +3353,7 @@ fn ecp5_timing_model(
             match cell.kind {
                 ResourceKind::Lut(4) => "TRELLIS_COMB",
                 ResourceKind::Register => "TRELLIS_FF",
+                ResourceKind::Memory => "DP16KD",
                 ResourceKind::Clock => "DCCA",
                 _ => continue,
             }
@@ -3373,7 +3374,10 @@ fn ecp5_timing_model(
                 continue;
             };
             let delay = timing_delay(arc.delay)?;
-            if cell.kind == ResourceKind::Register && arc.from_pin == "CLK" && arc.to_pin == "Q" {
+            if (cell.kind == ResourceKind::Register && arc.from_pin == "CLK" && arc.to_pin == "Q")
+                || (cell.kind == ResourceKind::Memory
+                    && matches!(arc.from_pin.as_str(), "CLKA" | "CLKB"))
+            {
                 model.add_clock_to_q(from, to, delay)?;
             } else {
                 model.add_cell_arc(from, to, delay)?;
@@ -3632,8 +3636,8 @@ mod tests {
     use texo_pnr::{PlacementConstraints, place_and_route};
     use texo_struo::{PrimitiveMetadata, import_ecp5};
     use texo_target_ecp5::{
-        PipClassTimingRecord, TimingCornersRecord, find_global_clock_requirements, pack_lut_ffs,
-        pack_lut_ffs_excluding, parse_lpf, read_architecture, resolve_lpf_port_cells,
+        Ecp5Packing, PipClassTimingRecord, TimingCornersRecord, find_global_clock_requirements,
+        pack_lut_ffs, pack_lut_ffs_excluding, parse_lpf, read_architecture, resolve_lpf_port_cells,
     };
 
     use super::{
@@ -4118,6 +4122,38 @@ mod tests {
         let data_pin = find_cell_pin(imported.design(), register, "DI").unwrap();
 
         assert!(model.setup_hold(data_pin).is_none());
+    }
+
+    #[test]
+    fn applies_characterized_dp16kd_clock_to_output_and_input_checks() {
+        let architecture = read_architecture(ECP5_FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let memory = design.add_cell("memory", ResourceKind::Memory);
+        for name in ["CLKA", "CLKB", "DIA0", "ADB0"] {
+            design.add_pin(memory, name, PinDirection::Input).unwrap();
+        }
+        design
+            .add_pin(memory, "DOB0", PinDirection::Output)
+            .unwrap();
+        let model = ecp5_timing_model(
+            &design,
+            &Ecp5Packing::default(),
+            &architecture.speed_grades()["6"],
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let clkb = find_cell_pin(&design, memory, "CLKB").unwrap();
+        let output = find_cell_pin(&design, memory, "DOB0").unwrap();
+        let write_data = find_cell_pin(&design, memory, "DIA0").unwrap();
+        let read_address = find_cell_pin(&design, memory, "ADB0").unwrap();
+
+        assert_eq!(model.clock_to_q(output).unwrap().0, clkb);
+        assert_eq!(model.clock_to_q(output).unwrap().1.max_ps, 5830);
+        assert_eq!(model.setup_hold(write_data).unwrap().1.max_ps, 220);
+        assert_eq!(model.setup_hold(write_data).unwrap().2.max_ps, 43);
+        assert_eq!(model.setup_hold(read_address).unwrap().0, clkb);
+        assert_eq!(model.setup_hold(read_address).unwrap().1.max_ps, 251);
+        assert_eq!(model.setup_hold(read_address).unwrap().2.max_ps, 123);
     }
 
     #[test]
