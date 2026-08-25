@@ -25,6 +25,7 @@ jobs:
           boost_filesystem_version=$(/usr/bin/python3 -c 'import json; print(json.load(open("architectures/ecp5/manifest.json"))["source"]["packages"]["libboost-filesystem1.83.0"])')
           boost_program_options_version=$(/usr/bin/python3 -c 'import json; print(json.load(open("architectures/ecp5/manifest.json"))["source"]["packages"]["libboost-program-options1.83.0"])')
           boost_thread_version=$(/usr/bin/python3 -c 'import json; print(json.load(open("architectures/ecp5/manifest.json"))["source"]["packages"]["libboost-thread1.83.0"])')
+          zstd_version=$(/usr/bin/python3 -c 'import json; print(json.load(open("architectures/ecp5/manifest.json"))["source"]["packages"]["zstd"])')
           sudo apt-get update
           sudo apt-get install --yes \
             "fpga-trellis-database=${db_version}" \
@@ -33,7 +34,19 @@ jobs:
             "libboost-filesystem1.83.0=${boost_filesystem_version}" \
             "libboost-program-options1.83.0=${boost_program_options_version}" \
             "libboost-thread1.83.0=${boost_thread_version}" \
-            zstd
+            "zstd=${zstd_version}"
+
+      - name: Cache Cargo data
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Build release assets
         run: |
