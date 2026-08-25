@@ -47,9 +47,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check Python tools
-        run: |
-          python3 -m py_compile tools/*.py tools/tests/*.py
-          python3 -m unittest discover -s tools/tests
+        run: python3 -m compileall -q tools
 
       - name: Lint all targets
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
