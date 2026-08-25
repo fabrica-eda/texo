@@ -657,6 +657,10 @@ pub struct Device {
     pips: Vec<Pip>,
     bels_by_kind: BTreeMap<ResourceKind, Vec<BelId>>,
     routing_neighbors: Vec<Vec<CompactRoutingNeighbor>>,
+    #[serde(skip)]
+    routing_neighbor_offsets: Vec<u32>,
+    #[serde(skip)]
+    compact_routing_neighbors: Vec<CompactRoutingNeighbor>,
 }
 
 impl Device {
@@ -679,6 +683,8 @@ impl Device {
             pips: Vec::new(),
             bels_by_kind: BTreeMap::new(),
             routing_neighbors: Vec::new(),
+            routing_neighbor_offsets: Vec::new(),
+            compact_routing_neighbors: Vec::new(),
         })
     }
 
@@ -731,6 +737,7 @@ impl Device {
         point: Point,
         capacity: u16,
     ) -> Result<WireId, ModelError> {
+        self.decompact_routing_graph();
         self.validate_point(point)?;
         if capacity == 0 {
             return Err(ModelError::ZeroCapacity);
@@ -742,6 +749,8 @@ impl Device {
             capacity,
         });
         self.routing_neighbors.push(Vec::new());
+        self.routing_neighbor_offsets.clear();
+        self.compact_routing_neighbors.clear();
         Ok(id)
     }
 
@@ -813,6 +822,7 @@ impl Device {
         bidirectional: bool,
         capacity: u16,
     ) -> Result<PipId, ModelError> {
+        self.decompact_routing_graph();
         self.wire(from)?;
         self.wire(to)?;
         if capacity == 0 {
@@ -824,6 +834,8 @@ impl Device {
             .then(|| CompactRoutingNeighbor::new(from, id))
             .transpose()?;
         self.pips.push(Pip::new(from, to, bidirectional, capacity)?);
+        self.routing_neighbor_offsets.clear();
+        self.compact_routing_neighbors.clear();
         insert_routing_neighbor(&mut self.routing_neighbors[from.0], forward);
         if let Some(reverse) = reverse {
             insert_routing_neighbor(&mut self.routing_neighbors[to.0], reverse);
@@ -885,13 +897,71 @@ impl Device {
     ///
     /// Returns an error for an unknown wire ID.
     pub fn routing_neighbors(&self, wire: WireId) -> Result<RoutingNeighbors<'_>, ModelError> {
-        let entries = self
-            .routing_neighbors
-            .get(wire.0)
-            .ok_or(ModelError::UnknownWire(wire))?;
+        if wire.0 >= self.wires.len() {
+            return Err(ModelError::UnknownWire(wire));
+        }
+        let entries = if self.routing_neighbor_offsets.len() == self.wires.len() + 1 {
+            let start = self.routing_neighbor_offsets[wire.0] as usize;
+            let end = self.routing_neighbor_offsets[wire.0 + 1] as usize;
+            &self.compact_routing_neighbors[start..end]
+        } else {
+            &self.routing_neighbors[wire.0]
+        };
         Ok(RoutingNeighbors {
             entries: entries.iter(),
         })
+    }
+
+    /// Compacts the outgoing routing graph into one contiguous CSR table.
+    ///
+    /// Neighbor order is preserved exactly. Builders may continue adding
+    /// wires or PIPs afterward; the compact table is then invalidated and
+    /// rebuilt only when this method is called again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the total directed adjacency count exceeds the
+    /// compact 32-bit index range.
+    pub fn compact_routing_graph(&mut self) -> Result<(), ModelError> {
+        if self.routing_neighbors.is_empty()
+            && self.routing_neighbor_offsets.len() == self.wires.len() + 1
+        {
+            return Ok(());
+        }
+        let mut offsets = Vec::with_capacity(self.routing_neighbors.len() + 1);
+        let mut entries =
+            Vec::with_capacity(self.routing_neighbors.iter().map(Vec::len).sum::<usize>());
+        offsets.push(0);
+        for neighbors in &self.routing_neighbors {
+            entries.extend_from_slice(neighbors);
+            offsets
+                .push(u32::try_from(entries.len()).map_err(|_| ModelError::RoutingIndexOverflow)?);
+        }
+        self.routing_neighbor_offsets = offsets;
+        self.compact_routing_neighbors = entries;
+        self.routing_neighbors.clear();
+        self.routing_neighbors.shrink_to_fit();
+        Ok(())
+    }
+
+    /// Restores the builder-oriented per-wire adjacency lists.
+    ///
+    /// This is intended for architecture serialization and for the uncommon
+    /// case where a compacted device is mutated. Routing should use the
+    /// compact representation produced by [`Self::compact_routing_graph`].
+    pub fn decompact_routing_graph(&mut self) {
+        if !self.routing_neighbors.is_empty()
+            || self.routing_neighbor_offsets.len() != self.wires.len() + 1
+        {
+            return;
+        }
+        self.routing_neighbors = self
+            .routing_neighbor_offsets
+            .windows(2)
+            .map(|range| {
+                self.compact_routing_neighbors[range[0] as usize..range[1] as usize].to_vec()
+            })
+            .collect();
     }
 
     fn validate_point(&self, point: Point) -> Result<(), ModelError> {
@@ -1476,5 +1546,24 @@ mod tests {
             vec![(first, bidirectional)]
         );
         assert!(device.routing_neighbors(second).unwrap().is_empty());
+
+        let expected = (0..device.wires().len())
+            .map(|wire| {
+                device
+                    .routing_neighbors(super::WireId(wire))
+                    .unwrap()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        device.compact_routing_graph().unwrap();
+        let compact = (0..device.wires().len())
+            .map(|wire| {
+                device
+                    .routing_neighbors(super::WireId(wire))
+                    .unwrap()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(compact, expected);
     }
 }

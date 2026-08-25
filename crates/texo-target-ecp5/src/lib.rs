@@ -2602,10 +2602,12 @@ pub fn write_architecture_cache(
     writer: impl Write,
     architecture: &Ecp5Architecture,
 ) -> Result<(), ImportError> {
+    let mut serialized = architecture.clone();
+    serialized.device.decompact_routing_graph();
     postcard::to_io(
         &ArchitectureCacheRef {
             version: ARCHITECTURE_CACHE_VERSION,
-            architecture,
+            architecture: &serialized,
         },
         writer,
     )?;
@@ -2622,11 +2624,12 @@ pub fn read_architecture_cache(reader: impl Read) -> Result<Ecp5Architecture, Im
     let (cache, _) = postcard::from_io((reader, &mut scratch))?;
     let ArchitectureCache {
         version,
-        architecture,
+        mut architecture,
     } = cache;
     if version != ARCHITECTURE_CACHE_VERSION {
         return Err(ImportError::UnsupportedCacheVersion(version));
     }
+    architecture.device.compact_routing_graph()?;
     Ok(architecture)
 }
 
@@ -2716,6 +2719,7 @@ pub fn expand(file: ArchitectureFile) -> Result<Ecp5Architecture, ImportError> {
         &mut metadata_strings,
         &mut pip_metadata,
     )?;
+    device.compact_routing_graph()?;
 
     let packages = resolve_packages(&file.packages, &bels, &device)?;
     let speed_grades = file
