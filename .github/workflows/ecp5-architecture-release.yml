@@ -21,16 +21,25 @@ jobs:
           rustup override set 1.97.1
           db_version=$(/usr/bin/python3 -c 'import json; print(json.load(open("architectures/ecp5/manifest.json"))["source"]["packages"]["fpga-trellis-database"])')
           pytrellis_version=$(/usr/bin/python3 -c 'import json; print(json.load(open("architectures/ecp5/manifest.json"))["source"]["packages"]["python3-pytrellis"])')
+          trellis_version=$(/usr/bin/python3 -c 'import json; print(json.load(open("architectures/ecp5/manifest.json"))["source"]["packages"]["fpga-trellis"])')
+          boost_filesystem_version=$(/usr/bin/python3 -c 'import json; print(json.load(open("architectures/ecp5/manifest.json"))["source"]["packages"]["libboost-filesystem1.83.0"])')
+          boost_program_options_version=$(/usr/bin/python3 -c 'import json; print(json.load(open("architectures/ecp5/manifest.json"))["source"]["packages"]["libboost-program-options1.83.0"])')
+          boost_thread_version=$(/usr/bin/python3 -c 'import json; print(json.load(open("architectures/ecp5/manifest.json"))["source"]["packages"]["libboost-thread1.83.0"])')
           sudo apt-get update
           sudo apt-get install --yes \
             "fpga-trellis-database=${db_version}" \
             "python3-pytrellis=${pytrellis_version}" \
+            "fpga-trellis=${trellis_version}" \
+            "libboost-filesystem1.83.0=${boost_filesystem_version}" \
+            "libboost-program-options1.83.0=${boost_program_options_version}" \
+            "libboost-thread1.83.0=${boost_thread_version}" \
             zstd
 
       - name: Build release assets
         run: |
           cargo build --release --locked -p texo-cli
           /usr/bin/python3 tools/build_ecp5_txdb.py
+          /usr/bin/python3 tools/build_ecp5_target_pack.py
 
       - name: Preserve workflow artifact
         uses: actions/upload-artifact@v4
@@ -41,6 +50,7 @@ jobs:
             artifacts/architecture/*.txdb.zst
             artifacts/architecture/*.release.json
             artifacts/architecture/*.SHA256SUMS
+            artifacts/architecture/*.txpkg.zst
 
       - name: Publish non-overwriting tagged release
         if: startsWith(github.ref, 'refs/tags/txdb-ecp5-v')
@@ -52,4 +62,5 @@ jobs:
             --generate-notes \
             artifacts/architecture/*.txdb.zst \
             artifacts/architecture/*.release.json \
-            artifacts/architecture/*.SHA256SUMS
+            artifacts/architecture/*.SHA256SUMS \
+            artifacts/architecture/*.txpkg.zst

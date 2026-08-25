@@ -105,6 +105,8 @@ the route can be imported into Project Trellis configuration tooling.
 - [ ] Implement multicycle/false paths, generated clocks, and BRAM timing.
 - [x] Generate the Project Trellis textual configuration directly from the
   validated Texo checkpoint; use `ecppack` only as the bitstream codec.
+- [x] Port configuration generation from pytrellis/Python to Rust and ship the
+  pinned architecture/database/codec runtime as an auto-fetched target pack.
 - [x] Emit native DP16KD tile groups, CIB constant ties, WID, port modes, and
   zero-initialized BRAM data from checkpoint metadata.
 - [x] Require all functional, physical, and timing gates before AXI4 bitstream
