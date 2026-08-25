@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2](https://github.com/fabrica-eda/texo/compare/v0.1.1...v0.1.2) (2026-08-25)
+
+
+### Bug Fixes
+
+* **bitgen:** accept project CLI checkpoints ([c0f2cc8](https://github.com/fabrica-eda/texo/commit/c0f2cc8be2a612bedf11819f885a8baf9412cf4d))
+* **bitgen:** accept project CLI checkpoints ([a565ee4](https://github.com/fabrica-eda/texo/commit/a565ee4375bd5fb1f42ad7e8d6edddbc4ec7214e))
+
 ## [0.1.1](https://github.com/fabrica-eda/texo/compare/v0.1.0...v0.1.1) (2026-08-25)
 
 
