@@ -5,8 +5,7 @@ git_release_enable = false
 git_tag_enable = false
 publish = false
 release = false
-# Recovery PR branches must start with `release-plz-` when this is false.
-release_always = false
+release_always = true
 repo_url = "https://github.com/fabrica-eda/texo"
 semver_check = false
 

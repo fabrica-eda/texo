@@ -3284,6 +3284,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "texo-release-metadata"
+version = "0.1.0"
+
+[[package]]
 name = "texo-struo"
 version = "0.1.0"
 dependencies = [
