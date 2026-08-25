@@ -7,6 +7,12 @@
   "skip-github-release": true,
   "packages": {
     ".": {
+      "exclude-paths": [
+        ".github",
+        ".release-please-manifest.json",
+        "release-please-config.json",
+        "release-plz.toml"
+      ],
       "package-name": "texo-cli"
     }
   }
