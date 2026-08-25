@@ -387,8 +387,7 @@ pub struct Ecp5Architecture {
 #[derive(Debug)]
 pub struct Ecp5GlobalRoutingCache<'a> {
     incoming: CompactIncomingPips,
-    wire_lookup: HashMap<(Point, &'a str), WireId>,
-    unique_wires: HashMap<&'a str, Option<WireId>>,
+    unique_roots: HashMap<&'a str, Option<WireId>>,
     forward_routes: HashMap<(WireId, WireId), (Vec<WireId>, Vec<PipId>)>,
     reverse_routes: HashMap<(usize, WireId), GlobalClockBranch>,
     reverse_search: GlobalReverseSearch,
@@ -1359,23 +1358,19 @@ impl Ecp5Architecture {
     pub fn global_routing_cache(&self) -> Ecp5GlobalRoutingCache<'_> {
         let device = self.device();
         let incoming = CompactIncomingPips::new(device);
-        let wire_lookup = device
-            .wires()
-            .iter()
-            .enumerate()
-            .map(|(index, wire)| ((wire.point, wire_basename(&wire.name)), WireId(index)))
-            .collect::<HashMap<_, _>>();
-        let mut unique_wires = HashMap::new();
+        let mut unique_roots = HashMap::new();
         for (index, wire) in device.wires().iter().enumerate() {
-            unique_wires
-                .entry(wire_basename(&wire.name))
-                .and_modify(|known| *known = None)
-                .or_insert(Some(WireId(index)));
+            let name = wire_basename(&wire.name);
+            if is_global_root_name(name) {
+                unique_roots
+                    .entry(name)
+                    .and_modify(|known| *known = None)
+                    .or_insert(Some(WireId(index)));
+            }
         }
         Ecp5GlobalRoutingCache {
             incoming,
-            wire_lookup,
-            unique_wires,
+            unique_roots,
             forward_routes: HashMap::new(),
             reverse_routes: HashMap::new(),
             reverse_search: GlobalReverseSearch::new(device.wires().len()),
@@ -1385,7 +1380,7 @@ impl Ecp5Architecture {
 
 impl Ecp5GlobalRoutingCache<'_> {
     fn unique_wire(&self, name: &str) -> Option<WireId> {
-        self.unique_wires.get(name).copied().flatten()
+        self.unique_roots.get(name).copied().flatten()
     }
 
     fn forward_route(
@@ -1553,22 +1548,9 @@ fn add_global_trunk(
     pips: &mut BTreeSet<PipId>,
 ) -> Result<(), String> {
     let device = architecture.device();
-    let point = device.wires()[tile.0].point;
-    let info = architecture
-        .global_info(point)
-        .ok_or_else(|| "tile has no global metadata".to_owned())?;
-    let side = match info.tap_direction {
-        GlobalTapDirection::Left => 'L',
-        GlobalTapDirection::Right => 'R',
-    };
-    let tap_name = format!("{side}_HPBX{network:02}00");
-    let tap = wire_at(
-        &cache.wire_lookup,
-        Point::new(info.tap_column, point.y),
-        &tap_name,
-    )
-    .ok_or_else(|| format!("missing tap wire `{tap_name}`"))?;
-    add_exact_pip(device, tap, tile, wires, pips)?;
+    let tap_alias = only_global_alias_incoming(architecture, &cache.incoming, tile)?;
+    add_pip_to_tree(device, tap_alias, wires, pips);
+    let tap = device.pips()[tap_alias.0].from();
 
     let tap_pip = only_original_incoming(architecture, &cache.incoming, tap)?;
     add_pip_to_tree(device, tap_pip, wires, pips);
@@ -1579,30 +1561,47 @@ fn add_global_trunk(
     let spine_point = tap_info
         .spine
         .ok_or_else(|| "tap source has no spine coordinate".to_owned())?;
-    let spine_name = wire_basename(&device.wires()[tap_source.0].name);
-    let spine = wire_at(&cache.wire_lookup, spine_point, spine_name)
-        .ok_or_else(|| format!("missing spine wire `{spine_name}`"))?;
-    add_exact_pip(device, spine, tap_source, wires, pips)?;
+    let spine_alias = only_global_alias_incoming(architecture, &cache.incoming, tap_source)?;
+    let spine = device.pips()[spine_alias.0].from();
+    if device.wires()[spine.0].point != spine_point {
+        return Err("global spine alias has the wrong coordinate".to_owned());
+    }
+    add_pip_to_tree(device, spine_alias, wires, pips);
 
     let spine_pip = only_original_incoming(architecture, &cache.incoming, spine)?;
     add_pip_to_tree(device, spine_pip, wires, pips);
     let spine_source = device.pips()[spine_pip.0].from();
     let root_name = format!("G_{}PCLK{network}", tap_info.quadrant.wire_prefix());
-    let root = cache
-        .unique_wires
+    let expected_root = cache
+        .unique_roots
         .get(root_name.as_str())
         .copied()
         .flatten()
         .ok_or_else(|| format!("missing unique quadrant root `{root_name}`"))?;
-    add_exact_pip(device, root, spine_source, wires, pips)
+    let root_alias = only_global_alias_incoming(architecture, &cache.incoming, spine_source)?;
+    if device.pips()[root_alias.0].from() != expected_root {
+        return Err(format!("global spine does not connect to `{root_name}`"));
+    }
+    add_pip_to_tree(device, root_alias, wires, pips);
+    Ok(())
 }
 
-fn wire_at(
-    wire_lookup: &HashMap<(Point, &str), WireId>,
-    point: Point,
-    name: &str,
-) -> Option<WireId> {
-    wire_lookup.get(&(point, name)).copied()
+fn is_global_root_name(name: &str) -> bool {
+    ["G_ULPCLK", "G_URPCLK", "G_LLPCLK", "G_LRPCLK"]
+        .iter()
+        .any(|prefix| {
+            name.strip_prefix(prefix)
+                .and_then(|network| network.parse::<usize>().ok())
+                .is_some_and(|network| network < ECP5_GLOBAL_CLOCK_COUNT)
+        })
+}
+
+fn only_global_alias_incoming(
+    architecture: &Ecp5Architecture,
+    incoming: &CompactIncomingPips,
+    wire: WireId,
+) -> Result<PipId, String> {
+    only_incoming_by_alias_kind(architecture, incoming, wire, true)
 }
 
 fn only_original_incoming(
@@ -1610,42 +1609,30 @@ fn only_original_incoming(
     incoming: &CompactIncomingPips,
     wire: WireId,
 ) -> Result<PipId, String> {
+    only_incoming_by_alias_kind(architecture, incoming, wire, false)
+}
+
+fn only_incoming_by_alias_kind(
+    architecture: &Ecp5Architecture,
+    incoming: &CompactIncomingPips,
+    wire: WireId,
+    alias: bool,
+) -> Result<PipId, String> {
     let candidates = incoming
         .for_wire(wire)
         .iter()
         .map(|&pip| PipId(pip as usize))
-        .filter(|&pip| architecture.pip_metadata(pip).tile_type != "TEXO_GLOBAL_ALIAS")
+        .filter(|&pip| (architecture.pip_metadata(pip).tile_type == "TEXO_GLOBAL_ALIAS") == alias)
         .collect::<Vec<_>>();
     match candidates.as_slice() {
         [pip] => Ok(*pip),
         _ => Err(format!(
-            "wire `{}` has {} physical incoming PIPs instead of one",
+            "wire `{}` has {} {} incoming PIPs instead of one",
             architecture.device().wires()[wire.0].name,
-            candidates.len()
+            candidates.len(),
+            if alias { "global-alias" } else { "physical" },
         )),
     }
-}
-
-fn add_exact_pip(
-    device: &Device,
-    from: WireId,
-    to: WireId,
-    wires: &mut BTreeSet<WireId>,
-    pips: &mut BTreeSet<PipId>,
-) -> Result<(), String> {
-    let pip = device
-        .routing_neighbors(from)
-        .map_err(|error| error.to_string())?
-        .find_map(|(neighbor, pip)| (neighbor == to).then_some(pip))
-        .ok_or_else(|| {
-            format!(
-                "missing fixed connection `{}` -> `{}`",
-                device.wires()[from.0].name,
-                device.wires()[to.0].name
-            )
-        })?;
-    add_pip_to_tree(device, pip, wires, pips);
-    Ok(())
 }
 
 fn add_pip_to_tree(
