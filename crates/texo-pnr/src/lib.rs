@@ -703,6 +703,12 @@ pub struct RoutingWorkspace {
     wire_points: Vec<Point>,
     wire_capacities: Vec<u16>,
     pip_capacities: Vec<u16>,
+    /// Flat connection-owner records reused when selecting congestion
+    /// victims. Only overused resources enter these vectors.
+    connection_owners: ConnectionOwnerScratch,
+    /// Sparse resource-to-net ownership rebuilt from the resident connection
+    /// trees and updated as dirty connections are routed.
+    resource_owners: ResourceOwnerIndex,
     /// Routes whose resource usage is currently reflected by occupancy.
     /// A failed negotiation invalidates this snapshot; the next call then
     /// falls back to a full sparse reset.
@@ -733,6 +739,8 @@ impl RoutingWorkspace {
                 .iter()
                 .map(texo_model::Pip::capacity)
                 .collect(),
+            connection_owners: ConnectionOwnerScratch::default(),
+            resource_owners: ResourceOwnerIndex::default(),
             resident_routes: Vec::new(),
             resident_valid: false,
         }
@@ -4390,6 +4398,8 @@ fn route(
     let pip_history = &mut workspace.pip_history;
     let wire_congestion = &mut workspace.wire_congestion;
     let pip_congestion = &mut workspace.pip_congestion;
+    let connection_owners = &mut workspace.connection_owners;
+    let resource_owners = &mut workspace.resource_owners;
     let mut overuse = OveruseTracker::default();
     for route in routes.iter().flatten() {
         for wire in route.wires() {
@@ -4420,6 +4430,7 @@ fn route(
             }
         }
     }
+    resource_owners.prepare(&routes, metadata);
     let max_iterations = costs.map_or(MAX_ROUTING_ITERATIONS, RoutingCosts::max_iterations);
     for iteration in 0..max_iterations {
         let present_factor = 1_u32 << iteration.min(12);
@@ -4443,6 +4454,12 @@ fn route(
                     .filter(|&wire| preserved.wire_ref_count(wire) == 0)
                 {
                     wire_occupancy[wire.0] -= 1;
+                    resource_owners.release_wire(
+                        wire,
+                        previous.net,
+                        metadata.wire_capacities[wire.0],
+                        wire_occupancy[wire.0],
+                    );
                     track_entry(
                         &mut overuse.wires,
                         wire_occupancy[wire.0],
@@ -4455,6 +4472,12 @@ fn route(
                     .filter(|&pip| preserved.pip_ref_count(pip) == 0)
                 {
                     pip_occupancy[pip.0] -= 1;
+                    resource_owners.release_pip(
+                        pip,
+                        previous.net,
+                        metadata.pip_capacities[pip.0],
+                        pip_occupancy[pip.0],
+                    );
                     track_entry(
                         &mut overuse.pips,
                         pip_occupancy[pip.0],
@@ -4465,6 +4488,7 @@ fn route(
                 routes[index] = Some(Arc::new(preserved));
             }
         }
+        resource_owners.repair_stale(&routes);
         for &index in &workspace.touched_wires {
             wire_congestion[index] = cached_congestion_cost(
                 wire_occupancy[index],
@@ -4526,6 +4550,7 @@ fn route(
                     metadata.wire_capacities[wire.0],
                     wire.0,
                 );
+                resource_owners.claim_wire(wire, net_id, metadata.wire_capacities[wire.0]);
             }
             for pip in route.pips().filter(|&pip| {
                 preserved
@@ -4545,6 +4570,7 @@ fn route(
                     metadata.pip_capacities[pip.0],
                     pip.0,
                 );
+                resource_owners.claim_pip(pip, net_id, metadata.pip_capacities[pip.0]);
             }
             routes[index] = Some(Arc::new(route));
         }
@@ -4568,14 +4594,35 @@ fn route(
                 .map(|route| route.expect("every net was routed in this iteration"))
                 .collect());
         }
-        dirty = congested_route_arcs(
-            metadata,
-            &routes,
-            constraints,
-            costs,
-            wire_occupancy,
-            pip_occupancy,
-        );
+        dirty = if overuse
+            .wires
+            .iter()
+            .all(|&wire| metadata.wire_capacities[wire] == 1)
+            && overuse
+                .pips
+                .iter()
+                .all(|&pip| metadata.pip_capacities[pip] == 1)
+        {
+            congested_route_arcs_indexed(
+                metadata,
+                &routes,
+                constraints,
+                costs,
+                resource_owners,
+                connection_owners,
+            )
+        } else {
+            congested_route_arcs(
+                metadata,
+                &routes,
+                constraints,
+                costs,
+                wire_occupancy,
+                pip_occupancy,
+                connection_owners,
+            )
+        };
+        resource_owners.resolve_conflicts(&routes, &dirty);
     }
 
     Err(PnrError::CongestionNotResolved {
@@ -4645,47 +4692,298 @@ fn routing_order_key(
     )
 }
 
-#[derive(Default)]
-struct ArcOwnerIndex {
-    wires: HashMap<WireId, BTreeMap<NetId, BTreeSet<Option<CellPinId>>>>,
-    pips: HashMap<PipId, BTreeMap<NetId, BTreeSet<Option<CellPinId>>>>,
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ConnectionOwner {
+    resource: usize,
+    net: NetId,
+    sink: Option<CellPinId>,
 }
 
-impl ArcOwnerIndex {
-    fn build(
+#[derive(Debug, Default)]
+struct ConnectionOwnerScratch {
+    wires: Vec<ConnectionOwner>,
+    pips: Vec<ConnectionOwner>,
+    ranked: Vec<RankedConnectionOwner>,
+}
+
+#[derive(Debug, Default)]
+struct ResourceOwnerIndex {
+    wire_owners: HashMap<WireId, NetId>,
+    pip_owners: HashMap<PipId, NetId>,
+    stale_wires: Vec<WireId>,
+    stale_pips: Vec<PipId>,
+    wire_conflicts: Vec<(WireId, NetId)>,
+    pip_conflicts: Vec<(PipId, NetId)>,
+}
+
+impl ResourceOwnerIndex {
+    fn prepare(&mut self, routes: &[Option<Arc<NetRoute>>], metadata: RoutingResourceMetadata<'_>) {
+        self.wire_owners.clear();
+        self.pip_owners.clear();
+        self.stale_wires.clear();
+        self.stale_pips.clear();
+        self.wire_conflicts.clear();
+        self.pip_conflicts.clear();
+        for route in routes.iter().flatten() {
+            for wire in route.wires() {
+                self.claim_wire(wire, route.net, metadata.wire_capacities[wire.0]);
+            }
+            for pip in route.pips() {
+                self.claim_pip(pip, route.net, metadata.pip_capacities[pip.0]);
+            }
+        }
+    }
+
+    fn claim_wire(&mut self, wire: WireId, net: NetId, capacity: u16) {
+        if capacity != 1 {
+            return;
+        }
+        if let Some(&owner) = self.wire_owners.get(&wire) {
+            if owner == net {
+                return;
+            }
+            self.wire_conflicts.push((wire, owner));
+            self.wire_conflicts.push((wire, net));
+        } else {
+            self.wire_owners.insert(wire, net);
+        }
+    }
+
+    fn claim_pip(&mut self, pip: PipId, net: NetId, capacity: u16) {
+        if capacity != 1 {
+            return;
+        }
+        if let Some(&owner) = self.pip_owners.get(&pip) {
+            if owner == net {
+                return;
+            }
+            self.pip_conflicts.push((pip, owner));
+            self.pip_conflicts.push((pip, net));
+        } else {
+            self.pip_owners.insert(pip, net);
+        }
+    }
+
+    fn release_wire(&mut self, wire: WireId, net: NetId, capacity: u16, occupancy: u16) {
+        if capacity == 1 && self.wire_owners.get(&wire) == Some(&net) {
+            self.wire_owners.remove(&wire);
+            if occupancy != 0 {
+                self.stale_wires.push(wire);
+            }
+        }
+    }
+
+    fn release_pip(&mut self, pip: PipId, net: NetId, capacity: u16, occupancy: u16) {
+        if capacity == 1 && self.pip_owners.get(&pip) == Some(&net) {
+            self.pip_owners.remove(&pip);
+            if occupancy != 0 {
+                self.stale_pips.push(pip);
+            }
+        }
+    }
+
+    fn repair_stale(&mut self, routes: &[Option<Arc<NetRoute>>]) {
+        self.stale_wires.sort_unstable();
+        self.stale_wires.dedup();
+        for wire in self.stale_wires.drain(..) {
+            if let Some(net) = routes
+                .iter()
+                .flatten()
+                .find(|route| route.wire_ref_count(wire) != 0)
+                .map(|route| route.net)
+            {
+                self.wire_owners.insert(wire, net);
+            }
+        }
+        self.stale_pips.sort_unstable();
+        self.stale_pips.dedup();
+        for pip in self.stale_pips.drain(..) {
+            if let Some(net) = routes
+                .iter()
+                .flatten()
+                .find(|route| route.pip_ref_count(pip) != 0)
+                .map(|route| route.net)
+            {
+                self.pip_owners.insert(pip, net);
+            }
+        }
+    }
+
+    fn resolve_conflicts(
+        &mut self,
+        routes: &[Option<Arc<NetRoute>>],
+        dirty: &BTreeMap<usize, BTreeSet<CellPinId>>,
+    ) {
+        self.wire_conflicts.sort_unstable();
+        self.wire_conflicts.dedup();
+        let mut start = 0;
+        while start < self.wire_conflicts.len() {
+            let wire = self.wire_conflicts[start].0;
+            let end = self.wire_conflicts[start..].partition_point(|entry| entry.0 == wire) + start;
+            if let Some(net) =
+                surviving_wire_owner(&self.wire_conflicts[start..end], routes, dirty, wire)
+            {
+                self.wire_owners.insert(wire, net);
+            } else {
+                self.wire_owners.remove(&wire);
+            }
+            start = end;
+        }
+        self.wire_conflicts.clear();
+
+        self.pip_conflicts.sort_unstable();
+        self.pip_conflicts.dedup();
+        let mut start = 0;
+        while start < self.pip_conflicts.len() {
+            let pip = self.pip_conflicts[start].0;
+            let end = self.pip_conflicts[start..].partition_point(|entry| entry.0 == pip) + start;
+            if let Some(net) =
+                surviving_pip_owner(&self.pip_conflicts[start..end], routes, dirty, pip)
+            {
+                self.pip_owners.insert(pip, net);
+            } else {
+                self.pip_owners.remove(&pip);
+            }
+            start = end;
+        }
+        self.pip_conflicts.clear();
+    }
+}
+
+fn surviving_wire_owner(
+    contenders: &[(WireId, NetId)],
+    routes: &[Option<Arc<NetRoute>>],
+    dirty: &BTreeMap<usize, BTreeSet<CellPinId>>,
+    wire: WireId,
+) -> Option<NetId> {
+    contenders.iter().find_map(|&(_, net)| {
+        routes
+            .get(net.0)
+            .and_then(Option::as_deref)
+            .filter(|route| {
+                route.arcs.iter().any(|arc| {
+                    arc.wires.contains(&wire)
+                        && arc.sink.is_none_or(|sink| {
+                            dirty.get(&net.0).is_none_or(|set| !set.contains(&sink))
+                        })
+                })
+            })
+            .map(|_| net)
+    })
+}
+
+fn surviving_pip_owner(
+    contenders: &[(PipId, NetId)],
+    routes: &[Option<Arc<NetRoute>>],
+    dirty: &BTreeMap<usize, BTreeSet<CellPinId>>,
+    pip: PipId,
+) -> Option<NetId> {
+    contenders.iter().find_map(|&(_, net)| {
+        routes
+            .get(net.0)
+            .and_then(Option::as_deref)
+            .filter(|route| {
+                route.arcs.iter().any(|arc| {
+                    arc.pips.contains(&pip)
+                        && arc.sink.is_none_or(|sink| {
+                            dirty.get(&net.0).is_none_or(|set| !set.contains(&sink))
+                        })
+                })
+            })
+            .map(|_| net)
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RankedConnectionOwner {
+    net: NetId,
+    first: usize,
+    end: usize,
+    locked: bool,
+    criticality: u64,
+}
+
+impl ConnectionOwnerScratch {
+    fn rebuild(
+        &mut self,
         routes: &[Option<Arc<NetRoute>>],
         metadata: RoutingResourceMetadata<'_>,
         wire_occupancy: &[u16],
         pip_occupancy: &[u16],
-    ) -> Self {
-        let mut owners = Self::default();
+    ) {
+        self.wires.clear();
+        self.pips.clear();
         for route in routes.iter().flatten() {
             for arc in &route.arcs {
                 for &wire in &arc.wires {
                     if wire_occupancy[wire.0] > metadata.wire_capacities[wire.0] {
-                        owners
-                            .wires
-                            .entry(wire)
-                            .or_default()
-                            .entry(route.net)
-                            .or_default()
-                            .insert(arc.sink);
+                        self.wires.push(ConnectionOwner {
+                            resource: wire.0,
+                            net: route.net,
+                            sink: arc.sink,
+                        });
                     }
                 }
                 for &pip in &arc.pips {
                     if pip_occupancy[pip.0] > metadata.pip_capacities[pip.0] {
-                        owners
-                            .pips
-                            .entry(pip)
-                            .or_default()
-                            .entry(route.net)
-                            .or_default()
-                            .insert(arc.sink);
+                        self.pips.push(ConnectionOwner {
+                            resource: pip.0,
+                            net: route.net,
+                            sink: arc.sink,
+                        });
                     }
                 }
             }
         }
-        owners
+        self.wires.sort_unstable();
+        self.wires.dedup();
+        self.pips.sort_unstable();
+        self.pips.dedup();
+    }
+
+    fn rebuild_indexed(
+        &mut self,
+        routes: &[Option<Arc<NetRoute>>],
+        index: &mut ResourceOwnerIndex,
+    ) {
+        self.wires.clear();
+        self.pips.clear();
+        index.wire_conflicts.sort_unstable();
+        index.wire_conflicts.dedup();
+        index.pip_conflicts.sort_unstable();
+        index.pip_conflicts.dedup();
+        for &(wire, net) in &index.wire_conflicts {
+            let Some(route) = routes.get(net.0).and_then(Option::as_deref) else {
+                continue;
+            };
+            for arc in &route.arcs {
+                if arc.wires.contains(&wire) {
+                    self.wires.push(ConnectionOwner {
+                        resource: wire.0,
+                        net,
+                        sink: arc.sink,
+                    });
+                }
+            }
+        }
+        for &(pip, net) in &index.pip_conflicts {
+            let Some(route) = routes.get(net.0).and_then(Option::as_deref) else {
+                continue;
+            };
+            for arc in &route.arcs {
+                if arc.pips.contains(&pip) {
+                    self.pips.push(ConnectionOwner {
+                        resource: pip.0,
+                        net,
+                        sink: arc.sink,
+                    });
+                }
+            }
+        }
+        self.wires.sort_unstable();
+        self.wires.dedup();
+        self.pips.sort_unstable();
+        self.pips.dedup();
     }
 }
 
@@ -4696,68 +4994,123 @@ fn congested_route_arcs(
     costs: Option<&RoutingCosts>,
     wire_occupancy: &[u16],
     pip_occupancy: &[u16],
+    owner_scratch: &mut ConnectionOwnerScratch,
 ) -> BTreeMap<usize, BTreeSet<CellPinId>> {
-    let owners = ArcOwnerIndex::build(routes, metadata, wire_occupancy, pip_occupancy);
+    owner_scratch.rebuild(routes, metadata, wire_occupancy, pip_occupancy);
     let mut dirty = BTreeMap::<usize, BTreeSet<CellPinId>>::new();
-    for (wire, resource_owners) in owners.wires {
-        select_arc_victims(
-            &resource_owners,
-            usize::from(metadata.wire_capacities[wire.0]),
-            constraints,
-            costs,
-            &mut dirty,
-        );
-    }
-    for (pip, resource_owners) in owners.pips {
-        select_arc_victims(
-            &resource_owners,
-            usize::from(metadata.pip_capacities[pip.0]),
-            constraints,
-            costs,
-            &mut dirty,
-        );
-    }
+    select_connection_victims(
+        &owner_scratch.wires,
+        &mut owner_scratch.ranked,
+        metadata.wire_capacities,
+        constraints,
+        costs,
+        &mut dirty,
+    );
+    select_connection_victims(
+        &owner_scratch.pips,
+        &mut owner_scratch.ranked,
+        metadata.pip_capacities,
+        constraints,
+        costs,
+        &mut dirty,
+    );
     dirty
 }
 
-fn select_arc_victims(
-    owners: &BTreeMap<NetId, BTreeSet<Option<CellPinId>>>,
-    capacity: usize,
+fn congested_route_arcs_indexed(
+    metadata: RoutingResourceMetadata<'_>,
+    routes: &[Option<Arc<NetRoute>>],
+    constraints: &RoutingConstraints,
+    costs: Option<&RoutingCosts>,
+    resource_index: &mut ResourceOwnerIndex,
+    owner_scratch: &mut ConnectionOwnerScratch,
+) -> BTreeMap<usize, BTreeSet<CellPinId>> {
+    owner_scratch.rebuild_indexed(routes, resource_index);
+    let mut dirty = BTreeMap::<usize, BTreeSet<CellPinId>>::new();
+    select_connection_victims(
+        &owner_scratch.wires,
+        &mut owner_scratch.ranked,
+        metadata.wire_capacities,
+        constraints,
+        costs,
+        &mut dirty,
+    );
+    select_connection_victims(
+        &owner_scratch.pips,
+        &mut owner_scratch.ranked,
+        metadata.pip_capacities,
+        constraints,
+        costs,
+        &mut dirty,
+    );
+    dirty
+}
+
+fn select_connection_victims(
+    records: &[ConnectionOwner],
+    ranked: &mut Vec<RankedConnectionOwner>,
+    capacities: &[u16],
     constraints: &RoutingConstraints,
     costs: Option<&RoutingCosts>,
     dirty: &mut BTreeMap<usize, BTreeSet<CellPinId>>,
 ) {
-    if owners.len() <= capacity {
-        return;
-    }
-    let mut ranked = owners
-        .iter()
-        .map(|(&net, sinks)| {
-            let locked = sinks.iter().any(|sink| {
+    let mut resource_start = 0;
+    while resource_start < records.len() {
+        let resource = records[resource_start].resource;
+        let resource_end = records[resource_start..]
+            .partition_point(|record| record.resource == resource)
+            + resource_start;
+        ranked.clear();
+        let mut owner_start = resource_start;
+        while owner_start < resource_end {
+            let net = records[owner_start].net;
+            let owner_end = records[owner_start..resource_end]
+                .partition_point(|record| record.net == net)
+                + owner_start;
+            let sinks = &records[owner_start..owner_end];
+            let locked = sinks.iter().any(|owner| {
                 constraints
                     .routes()
                     .get(&net)
-                    .is_some_and(|route| route.arcs.iter().any(|arc| arc.sink == *sink))
+                    .is_some_and(|route| route.arcs.iter().any(|arc| arc.sink == owner.sink))
             });
             let criticality = sinks
                 .iter()
-                .filter_map(|sink| sink.map(|sink| routing_arc_criticality(costs, net, sink)))
+                .filter_map(|owner| {
+                    owner
+                        .sink
+                        .map(|sink| routing_arc_criticality(costs, net, sink))
+                })
                 .max()
                 .unwrap_or(u64::MAX);
-            ((Reverse(locked), Reverse(criticality), net), net, sinks)
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by_key(|(key, _, _)| *key);
-    for &(_, net, sinks) in ranked.iter().skip(capacity) {
-        for &sink in sinks.iter().flatten() {
-            if constraints
-                .routes()
-                .get(&net)
-                .is_none_or(|route| route.arc(sink).is_none())
-            {
-                dirty.entry(net.0).or_default().insert(sink);
+            ranked.push(RankedConnectionOwner {
+                net,
+                first: owner_start,
+                end: owner_end,
+                locked,
+                criticality,
+            });
+            owner_start = owner_end;
+        }
+        let capacity = usize::from(capacities[resource]);
+        if ranked.len() > capacity {
+            ranked.sort_unstable_by_key(|owner| {
+                (Reverse(owner.locked), Reverse(owner.criticality), owner.net)
+            });
+            for owner in ranked.iter().skip(capacity) {
+                for record in &records[owner.first..owner.end] {
+                    if let Some(sink) = record.sink
+                        && constraints
+                            .routes()
+                            .get(&owner.net)
+                            .is_none_or(|route| route.arc(sink).is_none())
+                    {
+                        dirty.entry(owner.net.0).or_default().insert(sink);
+                    }
+                }
             }
         }
+        resource_start = resource_end;
     }
 }
 
@@ -5741,10 +6094,11 @@ mod tests {
     };
 
     use super::{
-        MAX_ROUTING_ITERATIONS, NetRoute, PinWireCache, Placement, PlacementConstraints,
-        PlacementNeighbor, PlacementRefinementWorkspace, PlacementRefiner, PnrError, RouteArc,
-        RouteCapacityProjection, RouteQueueEntry, RouteSearch, RoutingConstraints, RoutingCosts,
-        RoutingResourceMetadata, RoutingWorkspace, congested_route_arcs,
+        ConnectionOwnerScratch, MAX_ROUTING_ITERATIONS, NetRoute, PinWireCache, Placement,
+        PlacementConstraints, PlacementNeighbor, PlacementRefinementWorkspace, PlacementRefiner,
+        PnrError, ResourceOwnerIndex, RouteArc, RouteCapacityProjection, RouteQueueEntry,
+        RouteSearch, RoutingConstraints, RoutingCosts, RoutingResourceMetadata, RoutingWorkspace,
+        congested_route_arcs, congested_route_arcs_indexed,
         local_connection_projected_cost_from_starts, place_analytically_with_net_sink_weights,
         place_and_route, place_with_constraints, placement_neighbors,
         projected_release_scope_penalty, projected_resource_penalty,
@@ -6591,14 +6945,6 @@ mod tests {
         let routes = vec![
             Some(Arc::new(NetRoute::new(
                 NetId(0),
-                vec![RouteArc {
-                    sink: Some(critical_sink),
-                    wires: vec![WireId(0), shared, WireId(2)],
-                    pips: vec![],
-                }],
-            ))),
-            Some(Arc::new(NetRoute::new(
-                NetId(1),
                 vec![
                     RouteArc {
                         sink: Some(conflicting_sink),
@@ -6612,6 +6958,14 @@ mod tests {
                     },
                 ],
             ))),
+            Some(Arc::new(NetRoute::new(
+                NetId(1),
+                vec![RouteArc {
+                    sink: Some(critical_sink),
+                    wires: vec![WireId(0), shared, WireId(2)],
+                    pips: vec![],
+                }],
+            ))),
         ];
         let wire_points = vec![Point::new(0, 0); 7];
         let wire_capacities = vec![1; 7];
@@ -6623,9 +6977,9 @@ mod tests {
         };
         let mut costs = RoutingCosts::new(vec![], BTreeMap::new());
         costs.set_sink_criticalities(BTreeMap::from([
-            ((NetId(0), critical_sink), 64),
-            ((NetId(1), conflicting_sink), 1),
-            ((NetId(1), retained_sink), 1),
+            ((NetId(0), conflicting_sink), 1),
+            ((NetId(0), retained_sink), 1),
+            ((NetId(1), critical_sink), 64),
         ]));
 
         let dirty = congested_route_arcs(
@@ -6635,13 +6989,27 @@ mod tests {
             Some(&costs),
             &[1, 2, 1, 1, 1, 1, 1],
             &[],
+            &mut ConnectionOwnerScratch::default(),
+        );
+        let mut resource_index = ResourceOwnerIndex::default();
+        resource_index.prepare(&routes, metadata);
+        let indexed_dirty = congested_route_arcs_indexed(
+            metadata,
+            &routes,
+            &RoutingConstraints::new(),
+            Some(&costs),
+            &mut resource_index,
+            &mut ConnectionOwnerScratch::default(),
         );
 
         assert_eq!(
             dirty,
-            BTreeMap::from([(NetId(1).0, BTreeSet::from([conflicting_sink]))])
+            BTreeMap::from([(NetId(0).0, BTreeSet::from([conflicting_sink]))])
         );
-        assert!(!dirty[&NetId(1).0].contains(&retained_sink));
+        assert_eq!(indexed_dirty, dirty);
+        resource_index.resolve_conflicts(&routes, &indexed_dirty);
+        assert_eq!(resource_index.wire_owners.get(&shared), Some(&NetId(1)));
+        assert!(!dirty[&NetId(0).0].contains(&retained_sink));
     }
 
     #[test]

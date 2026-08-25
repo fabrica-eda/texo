@@ -1291,3 +1291,32 @@ canonicalized again.
 This second exact indexing change again retained **-214 ps WNS, -399 ps WHS,
 and 25,649 PIPs**. Two runs measured **11.868/11.848 seconds** of critical
 closure, **20.069/19.741 seconds** of flow, and **25.88/25.59 seconds** wall.
+
+## Persistent connection ownership (2026-08-25)
+
+Negotiated routing already retained unaffected sink arcs, but conflict
+discovery rebuilt a nested `resource -> net -> sink` map by scanning every arc
+after each iteration. The router now keeps a sparse resource owner table for
+the lifetime of one routing transaction. Removing a losing sink arc releases
+only its no-longer-referenced resources; adding its replacement claims only
+the new resources. Capacity-one conflicts record the incumbent and challenger
+immediately, expand only those owner nets back to sink arcs, and preserve the
+highest-criticality owner. The table is repaired locally when a net that owns
+one resource loses elsewhere. Devices with larger resource capacities retain
+the general full-scan fallback.
+
+The owner records and victim-ranking buffers are reused by
+`RoutingWorkspace`. Flat sorted records replace the previous nested maps, so a
+conflict does not allocate one tree and sink set per resource. A regression
+test starts with the noncritical net as the physical owner, verifies that only
+its colliding sink is dirtied, retains its unrelated sink, and transfers the
+resource owner to the critical connection.
+
+On the 320 MHz AXI4 case, an adjacent release A/B run contained the same 58
+route-and-analyze trials. Their cumulative negotiated-routing time fell from
+**7544.067 ms to 7332.985 ms** (2.8%), and flow time fell from **11.999 s to
+11.756 s**. Sparse ownership kept peak RSS at **2,247,232 KiB**; a rejected
+dense-index experiment used about 270 MiB more. Both implementations produced
+the identical checkpoint SHA-256
+`bd0c1eeccb196b93582ab1f04b204ffd1e24edb1d98d81c786095808d73371f8`:
+**+7 ps WNS, +57 ps WHS, and 21,822 PIPs**.
