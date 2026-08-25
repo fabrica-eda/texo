@@ -35,7 +35,7 @@ sudo apt-get install \
   libboost-filesystem1.83.0=1.83.0-2.1ubuntu3.2 \
   libboost-program-options1.83.0=1.83.0-2.1ubuntu3.2 \
   libboost-thread1.83.0=1.83.0-2.1ubuntu3.2 \
-  zstd
+  zstd=1.5.5+dfsg2-2build1.1
 cargo build --release --locked -p texo-cli
 /usr/bin/python3 tools/build_ecp5_txdb.py --device LFE5UM5G-85F
 /usr/bin/python3 tools/build_ecp5_target_pack.py --device LFE5UM5G-85F
@@ -75,7 +75,7 @@ not something an end user installs.
 Download and verify a release in an empty directory:
 
 ```sh
-gh release download txdb-ecp5-v1 \
+gh release download txdb-ecp5-v3 \
   -p 'texo-LFE5UM5G-85F-schema6-cache5.*'
 sha256sum -c texo-LFE5UM5G-85F-schema6-cache5.SHA256SUMS
 zstd -d texo-LFE5UM5G-85F-schema6-cache5.txdb.zst

@@ -11,7 +11,8 @@
       "libboost-filesystem1.83.0": "1.83.0-2.1ubuntu3.2",
       "libboost-program-options1.83.0": "1.83.0-2.1ubuntu3.2",
       "libboost-thread1.83.0": "1.83.0-2.1ubuntu3.2",
-      "python3-pytrellis": "1.4-2build4"
+      "python3-pytrellis": "1.4-2build4",
+      "zstd": "1.5.5+dfsg2-2build1.1"
     },
     "project_trellis_revision": "project-trellis/1.4+ubuntu/1.4-2build4",
     "database_revision": "fpga-trellis-database/1.4-2build4",
