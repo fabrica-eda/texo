@@ -1,0 +1,10 @@
+/// Small file-input smoke test for the Texo CLI.
+module Xor (
+    lhs: input  logic,
+    rhs: input  logic,
+    value: output logic,
+) {
+    always_comb {
+        value = lhs ^ rhs;
+    }
+}

@@ -149,9 +149,21 @@ pub fn verify_post_map_with_celox<E>(
     Ok(())
 }
 
+/// Policy for caller-provided post-map functional-simulation evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PostMapSimulationPolicy {
+    /// Reject physical implementation until the evidence gate is present.
+    #[default]
+    RequireEvidence,
+    /// Permit implementation without a testbench and leave the gate absent.
+    AllowMissing,
+}
+
 /// Configuration for the complete Struo-to-ECP5 physical implementation flow.
 #[derive(Clone, Copy, Debug)]
 pub struct Ecp5FlowOptions<'a> {
+    /// Policy for caller-provided post-map functional-simulation evidence.
+    pub post_map_simulation: PostMapSimulationPolicy,
     /// Exact ECP5 speed grade used for all timing arcs.
     pub speed_grade: Option<&'a str>,
     /// Exact architecture package used to resolve LPF pin names.
@@ -185,6 +197,7 @@ pub struct Ecp5FlowOptions<'a> {
 impl Default for Ecp5FlowOptions<'_> {
     fn default() -> Self {
         Self {
+            post_map_simulation: PostMapSimulationPolicy::default(),
             speed_grade: None,
             package: None,
             lpf: None,
@@ -278,14 +291,16 @@ pub enum Ecp5FlowStage {
 ///
 /// The mapped object remains immutable for Celox. Its Texo design is cloned,
 /// then LUT/FF, DP16KD, DCCA, and optional LPF packing run before placement and
-/// routing. `PostMapSimulation` evidence is mandatory. Mapped-netlist and
+/// routing. `PostMapSimulation` evidence is required by default; callers that
+/// accept arbitrary designs without a testbench may explicitly disable that
+/// precondition without recording the missing gate. Mapped-netlist and
 /// physical-implementation evidence are committed only after every stage
 /// succeeds.
 ///
 /// # Errors
 ///
-/// Returns an error for missing simulation evidence, speed grade, or package
-/// selection, LPF resolution, target packing, placement, routing, or timing.
+/// Returns an error for required-but-missing simulation evidence, speed grade,
+/// or package selection, LPF resolution, target packing, placement, routing, or timing.
 /// The input import and caller's evidence remain unchanged on every failure.
 pub fn implement_struo_ecp5(
     imported: &ImportedEcp5Design,
@@ -311,7 +326,9 @@ pub fn implement_struo_ecp5_with_progress(
 ) -> Result<Ecp5FlowResult, Ecp5FlowError> {
     let flow_started = Instant::now();
     let mut phase_started = flow_started;
-    if !evidence.contains(Gate::PostMapSimulation) {
+    if options.post_map_simulation == PostMapSimulationPolicy::RequireEvidence
+        && !evidence.contains(Gate::PostMapSimulation)
+    {
         return Err(Ecp5FlowError::MissingPostMapSimulation);
     }
     let requested_speed_grade = options
@@ -3620,12 +3637,12 @@ mod tests {
     };
 
     use super::{
-        Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, accumulate_hold_minimums,
-        criticality_weight, delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model,
-        find_cell_pin, freeze_route_sinks_except, implement, implement_struo_ecp5,
-        implement_with_constraints, next_wns_regression_streak, pip_class_delay,
-        project_trellis_speed_grade, retain_projection_timing_frontier, slack_violations,
-        staged_timing_score, verify_post_map_with_celox,
+        Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, PostMapSimulationPolicy,
+        accumulate_hold_minimums, criticality_weight, delay_weighted_criticality,
+        ecp5_timing_constraints, ecp5_timing_model, find_cell_pin, freeze_route_sinks_except,
+        implement, implement_struo_ecp5, implement_with_constraints, next_wns_regression_streak,
+        pip_class_delay, project_trellis_speed_grade, retain_projection_timing_frontier,
+        slack_violations, staged_timing_score, verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -3913,6 +3930,41 @@ mod tests {
             Err(Ecp5FlowError::MissingPostMapSimulation)
         ));
         assert_eq!(evidence, Evidence::new());
+    }
+
+    #[test]
+    fn arbitrary_design_mode_does_not_invent_simulation_evidence() {
+        let mapped = mapped_xor();
+        let imported = import_ecp5(&mapped).unwrap();
+        let architecture = read_architecture(ECP5_FIXTURE.as_bytes()).unwrap();
+        let lpf = parse_lpf(
+            br"
+                LOCATE COMP lhs SITE A10;
+                LOCATE COMP rhs SITE B10;
+                LOCATE COMP value SITE C10;
+            "
+            .as_slice(),
+        )
+        .unwrap();
+        let mut evidence = Evidence::new();
+
+        implement_struo_ecp5(
+            &imported,
+            &architecture,
+            Ecp5FlowOptions {
+                post_map_simulation: PostMapSimulationPolicy::AllowMissing,
+                speed_grade: Some("6"),
+                package: Some("CABGA381"),
+                lpf: Some(&lpf),
+                ..Ecp5FlowOptions::default()
+            },
+            &mut evidence,
+        )
+        .unwrap();
+
+        assert!(!evidence.contains(Gate::PostMapSimulation));
+        assert!(evidence.contains(Gate::MappedNetlistComplete));
+        assert!(evidence.contains(Gate::PhysicalImplementation));
     }
 
     #[test]

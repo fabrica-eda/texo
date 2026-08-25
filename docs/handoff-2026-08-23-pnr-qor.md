@@ -46,7 +46,7 @@ gates hold repair on setup closure.
 ls /tmp/texo-LFE5UM5G-85F-final.txdb
 
 # Texo P&R at a given target (LPF FREQUENCY drives STA targets)
-TEXO_METRICS=1 cargo run --release -- axi4-pnr \
+TEXO_METRICS=1 cargo run --release -p texo-cli --example design-specific-flows -- axi4-pnr \
   /tmp/texo-LFE5UM5G-85F-final.txdb CABGA381 8 <lpf> [checkpoint.json] [weight-exp]
 
 # nextpnr reference (flags mirror struo CI; timingweight raised to 40 there)
@@ -493,7 +493,7 @@ existing solve→refine pipeline.**
 
 ```sh
 # budgets/ripup effect at 300 MHz (expect WNS −352 ps, ~290 s)
-TEXO_METRICS=1 target/release/texo axi4-pnr /tmp/texo-LFE5UM5G-85F-final.txdb \
+TEXO_METRICS=1 target/release/examples/design-specific-flows axi4-pnr /tmp/texo-LFE5UM5G-85F-final.txdb \
   CABGA381 8 /tmp/opencode/lpf-300.lpf
 
 # seed-selection diagnostic (expect seed=initial to always win)

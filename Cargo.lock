@@ -3237,9 +3237,11 @@ name = "texo-cli"
 version = "0.1.0"
 dependencies = [
  "celox",
+ "clap",
  "serde_json",
  "struo-celox",
  "struo-example-axi4-smartconnect",
+ "struo-frontend-veryl",
  "struo-ir",
  "struo-synth",
  "struo-target-ecp5",

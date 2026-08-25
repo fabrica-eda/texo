@@ -4,7 +4,7 @@ Texo can turn a JSON implementation checkpoint into a self-contained HTML/SVG
 view:
 
 ```sh
-texo visualize path/to/checkpoint.json [path/to/output.html]
+texo visualize path/to/checkpoint.json --output path/to/output.html
 ```
 
 When the output argument is omitted, Texo writes

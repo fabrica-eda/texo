@@ -90,7 +90,12 @@ initMeta();build();setView();
 "##;
 
 /// Writes an interactive, dependency-free HTML view of a Texo checkpoint.
-pub(crate) fn write_checkpoint_visualizer(
+///
+/// # Errors
+///
+/// Returns an error when the checkpoint cannot be read or parsed, required
+/// placement or route data is absent, or the HTML output cannot be written.
+pub fn write_checkpoint_visualizer(
     checkpoint_path: &str,
     output_path: &str,
 ) -> Result<(), Box<dyn Error>> {

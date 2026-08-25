@@ -40,7 +40,8 @@ into a crates.io Celox `FrontendArtifact` for post-map verification.
 
 `texo-flow::verify_post_map_with_celox` records simulation evidence only after
 a caller-provided Celox testbench succeeds. `implement_struo_ecp5` requires
-that evidence, clones the imported design, derives DP16KD requirements from
+that evidence by default; the arbitrary-file CLI explicitly permits it to be
+absent without recording the gate. The flow clones the imported design, derives DP16KD requirements from
 Struo metadata, runs LUT/FF, BRAM, DCCA, and LPF packing, then invokes generic
 placement and routing. Failures commit neither new evidence nor a partially
 transformed design. The owned success result retains primitive metadata,
@@ -48,8 +49,8 @@ absorbed configuration inputs, packing decisions, placement, and routes for
 later timing and bitstream stages; the original mapped object remains available
 for further Celox verification.
 
-The `texo ecp5-demo` executable exercises that boundary without intermediate
-netlist serialization. Its schema-versioned JSON checkpoint is deterministic
+The `texo pnr` command exercises that boundary for an arbitrary self-contained
+Veryl source without intermediate netlist serialization. Its schema-versioned JSON checkpoint is deterministic
 and records architecture/database provenance, verification evidence, mapped
 primitive configuration, absorbed inputs, target packing, final Cell-to-BEL
 bindings, selected speed grade, every routed Wire/PIP ID and name, and min/max
@@ -59,7 +60,8 @@ fixed/bidirectional edge attributes. `tools/axi4_bitstream.py` locks those
 placements and routes into nextpnr's packed ECP5 context, writes a Project
 Trellis configuration, invokes `ecppack`, and verifies an
 `ecpunpack`/`ecppack` byte-identical round trip. nextpnr does not place or route
-in this path.
+in this path. Design-specific Celox and AXI4 flows live in the
+`design-specific-flows` Cargo example rather than the installed CLI.
 
 ## Boundaries
 

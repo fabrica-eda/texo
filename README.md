@@ -7,10 +7,13 @@ target is Lattice ECP5. It is designed to complete this open EDA flow:
 Veryl source
     -> Struo analysis and synthesis
     -> Struo ECP5 technology-mapped netlist
-    -> Celox functional and post-map verification
     -> Texo packing, placement, routing, and timing
     -> Project Trellis configuration/bitstream tooling
 ```
+
+Celox functional and post-map verification can be attached by API clients that
+have a testbench. The general-purpose file CLI does not claim that evidence
+when no testbench was supplied.
 
 The workspace currently contains a small, deterministic reference PnR engine.
 It establishes the data ownership and error boundaries before ECP5-specific
@@ -43,19 +46,24 @@ splitting each primitive into two atomically packed ECP5 carry slices.
 ## Try it
 
 ```sh
-cargo run -- demo
-cargo run -- ecp5-demo \
-  crates/texo-target-ecp5/fixtures/minimal-ecp5.json \
-  CABGA381 \
-  6 \
-  crates/texo-target-ecp5/fixtures/xor.lpf \
-  /tmp/texo-xor-checkpoint.json
+cargo run --release -- pnr examples/xor/xor.veryl \
+  --top Xor \
+  --architecture crates/texo-target-ecp5/fixtures/minimal-ecp5.json \
+  --package CABGA381 \
+  --speed 6 \
+  --lpf examples/xor/xor.lpf \
+  --output /tmp/texo-xor-checkpoint.json
 cargo run -- target-info crates/texo-target-ecp5/fixtures/minimal-ecp5.json
-cargo run -- lpf-info crates/texo-target-ecp5/fixtures/minimal.lpf
+cargo run -- lpf-info examples/xor/xor.lpf
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
+
+`texo pnr` accepts any path to one self-contained Veryl compilation unit. Run
+`texo pnr --help` for synthesis-goal, placement-weight, unconstrained-IO,
+global-clock, and timing-closure controls. If `--output` is omitted, the
+checkpoint is written beside the source as `<source>.texo.json`.
 
 `tools/export_ecp5.py` generates a deduplicated architecture snapshot from a
 local Project Trellis build and database. Schema v4 includes PIP timing classes
@@ -71,10 +79,7 @@ provenance, and SHA-256 checksums. See
 [`docs/architecture-databases.md`](docs/architecture-databases.md) for the
 build, release, download, and verification procedure.
 
-`ecp5-demo` builds an XOR through Struo, verifies its complete truth table with
-crates.io Celox, applies the selected package, speed grade, and LPF, runs the
-unified ECP5 flow, and optionally writes a deterministic JSON checkpoint. The checkpoint
-contains provenance, evidence, primitive configuration, absorbed constants,
+The P&R checkpoint contains provenance, evidence, primitive configuration, absorbed constants,
 packing decisions, IO/clock constraints, placement, Wire/PIP routes, and the
 post-route timing report.
 
@@ -82,7 +87,8 @@ Render any such checkpoint as a self-contained interactive physical-design
 view (no server or architecture database is required):
 
 ```sh
-cargo run --release -- visualize artifacts/axi4.checkpoint.json artifacts/axi4.html
+cargo run --release -- visualize artifacts/axi4.checkpoint.json \
+  --output artifacts/axi4.html
 ```
 
 The viewer draws cells and per-net PIP topology, supports pan/zoom and search,
@@ -96,8 +102,8 @@ the lossless mapped netlist, run PnR, and emit the bitstream as follows:
 ```sh
 cargo build --release --locked -p texo-cli
 /usr/bin/python3 tools/build_ecp5_txdb.py --device LFE5UM5G-85F
-cargo run --release -- axi4-json artifacts/axi4.json
-cargo run --release -- axi4-pnr \
+cargo run --release -p texo-cli --example design-specific-flows -- axi4-json artifacts/axi4.json
+cargo run --release -p texo-cli --example design-specific-flows -- axi4-pnr \
   artifacts/architecture/texo-LFE5UM5G-85F-schema4-cache2.txdb CABGA381 8 \
   examples/axi4-self-test/lfe5um5g-85f-evn-250mhz.lpf \
   artifacts/axi4.checkpoint.json

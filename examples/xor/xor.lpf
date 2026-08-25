@@ -1,0 +1,7 @@
+# Minimal ECP5 fixture constraints for examples/xor/xor.veryl.
+LOCATE COMP "lhs" SITE "A10";
+LOCATE COMP "rhs" SITE "B10";
+LOCATE COMP "value" SITE "C10";
+IOBUF PORT "lhs" IO_TYPE=LVCMOS33;
+IOBUF PORT "rhs" IO_TYPE=LVCMOS33;
+IOBUF PORT "value" IO_TYPE=LVCMOS33;
