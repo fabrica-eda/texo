@@ -28,7 +28,7 @@ use texo_pnr::{NetRoute, Placement, PlacementConstraints, RoutingConstraints};
 pub const SCHEMA_VERSION: u32 = 4;
 
 /// Version of the expanded binary architecture cache.
-pub const ARCHITECTURE_CACHE_VERSION: u32 = 2;
+pub const ARCHITECTURE_CACHE_VERSION: u32 = 3;
 
 /// Provenance required for every generated architecture snapshot.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2602,12 +2602,10 @@ pub fn write_architecture_cache(
     writer: impl Write,
     architecture: &Ecp5Architecture,
 ) -> Result<(), ImportError> {
-    let mut serialized = architecture.clone();
-    serialized.device.decompact_routing_graph();
     postcard::to_io(
         &ArchitectureCacheRef {
             version: ARCHITECTURE_CACHE_VERSION,
-            architecture: &serialized,
+            architecture,
         },
         writer,
     )?;

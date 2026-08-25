@@ -656,10 +656,11 @@ pub struct Device {
     wires: Vec<Wire>,
     pips: Vec<Pip>,
     bels_by_kind: BTreeMap<ResourceKind, Vec<BelId>>,
+    #[serde(default)]
     routing_neighbors: Vec<Vec<CompactRoutingNeighbor>>,
-    #[serde(skip)]
+    #[serde(default)]
     routing_neighbor_offsets: Vec<u32>,
-    #[serde(skip)]
+    #[serde(default)]
     compact_routing_neighbors: Vec<CompactRoutingNeighbor>,
 }
 
