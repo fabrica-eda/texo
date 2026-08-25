@@ -116,6 +116,7 @@ needed to serialize an ECP5 bitstream. It does not contain Python.
 texo target fetch LFE5UM5G-85F                 # optional eager download
 texo pnr path/to/veryl-project --package CABGA381 --speed 8 \
   --lpf board.lpf --output design.checkpoint.json
+texo bitgen design.checkpoint.json --bit design.bit
 ```
 
 For an air-gapped machine, download the release `.txpkg.zst` elsewhere and run
@@ -123,11 +124,11 @@ For an air-gapped machine, download the release `.txpkg.zst` elsewhere and run
 location. Supplying individual architecture/database/codec paths remains a
 developer diagnostic mode, not a user prerequisite.
 
-`bitgen` intentionally accepts only a checkpoint carrying all functional,
-physical, and timing release gates; the general project CLI does not invent
-simulation evidence when no testbench was provided. The AXI4 self-test has a
-release-gated path from Struo through Texo-owned
-placement, routing, configuration generation, and bitstream emission:
+`bitgen` requires synthesis/mapping completeness, legal physical
+implementation, and timing closure. RTL and post-map simulation evidence is
+accepted when an API client supplies a testbench, but it is not required to
+emit a bitstream from the general project CLI. The AXI4 self-test additionally
+exercises the fully simulation-signed-off path:
 
 ```sh
 cargo build --release --locked -p texo-cli
@@ -143,10 +144,10 @@ cargo run --release -- bitgen artifacts/axi4.checkpoint.json \
 `texo bitgen` consumes checkpoint schema v3 and writes Trellis configuration
 features in Rust; neither nextpnr nor pytrellis is a runtime dependency. It
 selects the exact checkpoint device, configures every non-fixed Texo route edge
-and placed primitive, and refuses release without all six functional,
-physical, and timing evidence gates. LUT/carry, FF, single-ended IO, DCCA
-routing, and DP16KD configuration are emitted without reconstructing a second
-PnR context. The bundled `ecppack` is only the final binary codec.
+and placed primitive, and refuses generation without implementation and timing
+evidence. LUT/carry, FF, single-ended IO, DCCA routing, and DP16KD configuration
+are emitted without reconstructing a second PnR context. The bundled `ecppack`
+is only the final binary codec.
 
 See [docs/architecture.md](docs/architecture.md) for the integration boundary
 and [docs/roadmap.md](docs/roadmap.md) for the implementation sequence.

@@ -55,7 +55,7 @@ enum Command {
         /// LPF constraint file.
         constraints: PathBuf,
     },
-    /// Generate an ECP5 bitstream from a release-gated checkpoint.
+    /// Generate an ECP5 bitstream from an implemented, timing-closed checkpoint.
     Bitgen(BitgenArgs),
     /// Install or fetch architecture and bitstream-codec target packs.
     Target(TargetArgs),

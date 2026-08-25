@@ -8,11 +8,9 @@ use serde_json::Value;
 use texo_model::Point;
 use texo_target_ecp5::Ecp5Architecture;
 
-const REQUIRED_EVIDENCE: [&str; 6] = [
-    "rtl_simulation",
+const REQUIRED_IMPLEMENTATION_EVIDENCE: [&str; 4] = [
     "synthesis_equivalence",
     "mapped_netlist_complete",
-    "post_map_simulation",
     "physical_implementation",
     "timing_closure",
 ];
@@ -240,9 +238,10 @@ impl ChipConfig {
 ///
 /// # Errors
 ///
-/// Returns an error when the checkpoint is not release-gated, its target does
-/// not match the architecture/base configuration, or a routed/configured
-/// resource cannot be represented by the native ECP5 configuration writer.
+/// Returns an error when the checkpoint lacks implementation/timing evidence,
+/// its target does not match the architecture/base configuration, or a
+/// routed/configured resource cannot be represented by the native ECP5
+/// configuration writer. RTL and post-map simulation evidence is optional.
 pub fn generate_ecp5_config(
     checkpoint: &Value,
     architecture: &Ecp5Architecture,
@@ -355,20 +354,20 @@ fn validate_checkpoint(checkpoint: &Value) -> Result<(), BitgenError> {
         .iter()
         .filter_map(Value::as_str)
         .collect::<BTreeSet<_>>();
-    let missing = REQUIRED_EVIDENCE
+    let missing = REQUIRED_IMPLEMENTATION_EVIDENCE
         .iter()
         .filter(|gate| !evidence.contains(**gate))
         .copied()
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         return Err(BitgenError::new(format!(
-            "bitstream release is missing evidence: {}",
+            "bitstream generation is missing implementation evidence: {}",
             missing.join(", ")
         )));
     }
     if !bool_value(member(checkpoint, "timing")?, "met_timing")? {
         return Err(BitgenError::new(
-            "bitstream release requires a timing-closed checkpoint",
+            "bitstream generation requires a timing-closed checkpoint",
         ));
     }
     if string(member(checkpoint, "target")?, "family")? != "ECP5" {
@@ -1327,12 +1326,12 @@ mod tests {
     }
 
     #[test]
-    fn release_gate_requires_schema_three_closed_ecp5() {
+    fn bitgen_accepts_a_closed_ecp5_checkpoint_without_simulation_evidence() {
         let mut checkpoint = json!({
             "schema_version": 3,
             "evidence": [
-                "rtl_simulation", "synthesis_equivalence", "mapped_netlist_complete",
-                "post_map_simulation", "physical_implementation", "timing_closure"
+                "synthesis_equivalence", "mapped_netlist_complete",
+                "physical_implementation", "timing_closure"
             ],
             "timing": {"met_timing": true},
             "target": {"family": "ECP5"}
