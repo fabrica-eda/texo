@@ -5136,6 +5136,64 @@ impl RouteSearch {
                 metadata,
             );
         }
+        if criticality != 0 {
+            let goal_point = metadata.wire_points[goal.0];
+            let start_point = starts
+                .iter()
+                .map(|start| metadata.wire_points[start.0])
+                .min_by_key(|point| (point.manhattan(goal_point), *point))
+                .expect("a route tree always contains its driver");
+            let corridor =
+                routing_corridor(start_point, goal_point, graph.device(), TIMING_ROUTE_MARGIN);
+            if let Some(path) = self.shortest_path_attempt(
+                graph,
+                starts,
+                goal,
+                wire_congestion,
+                pip_congestion,
+                costs,
+                criticality,
+                delay_quantum_ps,
+                tree_delays_ps,
+                minimum_arrival_ps,
+                metadata,
+                Some(corridor),
+            ) {
+                return Some(path);
+            }
+        }
+        self.shortest_path_attempt(
+            graph,
+            starts,
+            goal,
+            wire_congestion,
+            pip_congestion,
+            costs,
+            criticality,
+            delay_quantum_ps,
+            tree_delays_ps,
+            minimum_arrival_ps,
+            metadata,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn shortest_path_attempt(
+        &mut self,
+        graph: &UnifiedGraph<'_>,
+        starts: &BTreeSet<WireId>,
+        goal: WireId,
+        wire_congestion: &[u32],
+        pip_congestion: &[u32],
+        costs: Option<&RoutingCosts>,
+        criticality: u64,
+        delay_quantum_ps: u64,
+        tree_delays_ps: &[u64],
+        minimum_arrival_ps: u64,
+        metadata: RoutingResourceMetadata<'_>,
+        corridor: Option<RoutingCorridor>,
+    ) -> Option<(Vec<WireId>, Vec<PipId>)> {
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             self.seen.fill(0);
@@ -5143,16 +5201,7 @@ impl RouteSearch {
             self.epoch = 1;
         }
         let epoch = self.epoch;
-        let device = graph.device();
         let goal_point = metadata.wire_points[goal.0];
-        let corridor = (criticality != 0).then(|| {
-            let start_point = starts
-                .iter()
-                .map(|start| metadata.wire_points[start.0])
-                .min_by_key(|point| (point.manhattan(goal_point), *point))
-                .expect("a route tree always contains its driver");
-            routing_corridor(start_point, goal_point, device, TIMING_ROUTE_MARGIN)
-        });
         self.queue.clear();
         for &start in starts {
             self.start_mark[start.0] = epoch;
@@ -5273,21 +5322,6 @@ impl RouteSearch {
                     compact_route_index(neighbor.0),
                 )));
             }
-        }
-        if corridor.is_some() {
-            return self.shortest_path(
-                graph,
-                starts,
-                goal,
-                wire_congestion,
-                pip_congestion,
-                None,
-                0,
-                ROUTING_DELAY_QUANTUM_PS,
-                tree_delays_ps,
-                minimum_arrival_ps,
-                metadata,
-            );
         }
         None
     }
