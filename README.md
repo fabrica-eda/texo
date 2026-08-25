@@ -67,6 +67,14 @@ synthesis-goal, placement-weight, unconstrained-IO, global-clock, and
 timing-closure controls. Without `--output`, project checkpoints go to
 `target/texo/<top>.json`.
 
+## Releases
+
+Release-plz maintains a release PR from conventional commits on `main`.
+Merging that PR creates a `vX.Y.Z` GitHub Release without publishing the
+workspace to crates.io. The release workflow builds the `texo` CLI for GNU and
+static-musl x86-64 Linux, Apple Silicon and Intel macOS, and x86-64 Windows. It
+uploads a platform archive and SHA-256 checksum for every binary.
+
 `tools/export_ecp5.py` generates a deduplicated architecture snapshot from a
 local Project Trellis build and database. Schema v4 includes PIP timing classes
 with their independently fitted `min/typ/max` corners and the `6/7/8/8_5G`
