@@ -780,33 +780,73 @@ fn repair_hold_with_dedicated_edge_release(
     // Once dedicated blockers have been released, repair all remaining
     // general-routing hold arcs together. This also handles designs whose
     // violations never involved a dedicated edge.
-    let minimums = hold_sink_min_delays(timing);
-    if !minimums.is_empty() {
-        let model = ecp5_timing_model(design, packing, speed_grade, constant_cells)?;
-        let constraints = ecp5_timing_constraints(design, packing)?;
-        if let Some((trial_implementation, trial_timing)) = route_hold_trial(
+    let model = ecp5_timing_model(design, packing, speed_grade, constant_cells)?;
+    let constraints = ecp5_timing_constraints(design, packing)?;
+    let mut rolling_implementation = implementation.clone();
+    let mut rolling_timing = timing.clone();
+    let mut best_score = timing_score(timing);
+    let mut best = None;
+    let mut seen = BTreeSet::from([implementation_topology_fingerprint(
+        design,
+        &rolling_implementation,
+    )]);
+    let mut accumulated_minimums = BTreeMap::<(NetId, CellPinId), u64>::new();
+    for _ in 0..MAX_GENERAL_HOLD_REPAIRS {
+        let new_minimums = hold_sink_min_delays(&rolling_timing);
+        if new_minimums.is_empty() {
+            break;
+        }
+        accumulate_hold_minimums(&mut accumulated_minimums, new_minimums);
+        let Some((trial_implementation, trial_timing)) = route_hold_trial(
             design,
             architecture,
             speed_grade,
             packing,
-            implementation,
-            timing,
+            &rolling_implementation,
+            &rolling_timing,
             &model,
             &constraints,
-            minimums,
+            accumulated_minimums.clone(),
             routing_costs,
             global_routing_cache,
             routing_workspace,
             progress,
-        )? && trial_timing.worst_slack_ps.is_some_and(|setup| setup >= 0)
-            && timing_score(&trial_timing) > timing_score(timing)
-        {
-            progress(Ecp5FlowStage::TimingTrialDecision {
-                improves_objective: true,
-            });
-            *implementation = trial_implementation;
-            *timing = trial_timing;
+        )?
+        else {
+            break;
+        };
+        if trial_timing.worst_slack_ps.is_none_or(|setup| setup < 0) {
+            break;
         }
+        let fingerprint = implementation_topology_fingerprint(design, &trial_implementation);
+        if !seen.insert(fingerprint) {
+            break;
+        }
+        let score = timing_score(&trial_timing);
+        let improves = score > best_score;
+        progress(Ecp5FlowStage::TimingTrialDecision {
+            improves_objective: improves,
+        });
+        if metrics_enabled() {
+            eprintln!(
+                "[metrics] general_hold_feedback wns={:?} whs={:?} best={improves}",
+                trial_timing.worst_slack_ps, trial_timing.worst_hold_slack_ps,
+            );
+        }
+        if improves {
+            best_score = score;
+            best = Some((trial_implementation.clone(), trial_timing.clone()));
+        }
+        let closed = trial_timing.met_timing();
+        rolling_implementation = trial_implementation;
+        rolling_timing = trial_timing;
+        if closed {
+            break;
+        }
+    }
+    if let Some((best_implementation, best_timing)) = best {
+        *implementation = best_implementation;
+        *timing = best_timing;
     }
     Ok(())
 }
@@ -2317,6 +2357,7 @@ const MAX_INCREMENTAL_REFINEMENTS: usize = 8;
 const MAX_CONSECUTIVE_MONOTONIC_WNS_REGRESSIONS: usize = 2;
 const LOCAL_TRIAL_ROUTING_ITERATIONS: u32 = 5;
 const MAX_HOLD_ROUTE_FEEDBACKS: usize = 2;
+const MAX_GENERAL_HOLD_REPAIRS: usize = 6;
 const MAX_HOLD_SETUP_RECOVERY_PS: i128 = 100;
 const MAX_DEDICATED_EDGE_TRIALS: usize = 1;
 // Geometry delay model for pre-screening route trials. Calibrated loosely
@@ -2652,6 +2693,18 @@ fn hold_sink_min_delays(timing: &TimingReport) -> BTreeMap<(NetId, CellPinId), u
             .or_insert(minimum_ps);
     }
     minimums
+}
+
+fn accumulate_hold_minimums(
+    accumulated: &mut BTreeMap<(NetId, CellPinId), u64>,
+    new_minimums: BTreeMap<(NetId, CellPinId), u64>,
+) {
+    for (sink, minimum) in new_minimums {
+        accumulated
+            .entry(sink)
+            .and_modify(|known| *known = (*known).max(minimum))
+            .or_insert(minimum);
+    }
 }
 
 fn freeze_route_sinks_except(
@@ -3450,7 +3503,7 @@ impl Error for MissingEvidence {}
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroU32;
 
     use struo_celox::ecp5_simulator;
@@ -3467,12 +3520,12 @@ mod tests {
     };
 
     use super::{
-        Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, criticality_weight,
-        delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, find_cell_pin,
-        freeze_route_sinks_except, implement, implement_struo_ecp5, implement_with_constraints,
-        next_wns_regression_streak, pip_class_delay, project_trellis_speed_grade,
-        retain_projection_timing_frontier, slack_violations, staged_timing_score,
-        verify_post_map_with_celox,
+        Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, accumulate_hold_minimums,
+        criticality_weight, delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model,
+        find_cell_pin, freeze_route_sinks_except, implement, implement_struo_ecp5,
+        implement_with_constraints, next_wns_regression_streak, pip_class_delay,
+        project_trellis_speed_grade, retain_projection_timing_frontier, slack_violations,
+        staged_timing_score, verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -3567,6 +3620,22 @@ mod tests {
             staged_timing_score(closed, hold_bad, 0, -1_000)
                 > staged_timing_score(setup_near, closed, -10, 10)
         );
+    }
+
+    #[test]
+    fn hold_feedback_retains_and_strengthens_prior_sink_floors() {
+        let first = (NetId(1), texo_model::CellPinId(10));
+        let second = (NetId(2), texo_model::CellPinId(20));
+        let mut accumulated = BTreeMap::from([(first, 120)]);
+
+        accumulate_hold_minimums(
+            &mut accumulated,
+            BTreeMap::from([(first, 100), (second, 80)]),
+        );
+        assert_eq!(accumulated, BTreeMap::from([(first, 120), (second, 80)]));
+
+        accumulate_hold_minimums(&mut accumulated, BTreeMap::from([(first, 140)]));
+        assert_eq!(accumulated, BTreeMap::from([(first, 140), (second, 80)]));
     }
 
     #[test]
