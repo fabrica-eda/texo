@@ -3325,7 +3325,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "texo-cli"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "celox",
  "clap",
@@ -3352,7 +3352,7 @@ dependencies = [
 
 [[package]]
 name = "texo-flow"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "serde_json",
  "struo-celox",
@@ -3367,25 +3367,25 @@ dependencies = [
 
 [[package]]
 name = "texo-model"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "texo-pnr"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "texo-model",
 ]
 
 [[package]]
 name = "texo-release-metadata"
-version = "0.1.3"
+version = "0.1.4"
 
 [[package]]
 name = "texo-struo"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "celox",
  "struo-celox",
@@ -3396,7 +3396,7 @@ dependencies = [
 
 [[package]]
 name = "texo-target-ecp5"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "postcard",
  "serde",
@@ -3410,7 +3410,7 @@ dependencies = [
 
 [[package]]
 name = "texo-timing"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "texo-model",
  "texo-pnr",
