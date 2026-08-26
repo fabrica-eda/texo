@@ -62,6 +62,7 @@ jobs:
 
   release-pr:
     name: Release Please PR
+    needs: release
     if: github.repository_owner == 'fabrica-eda'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
