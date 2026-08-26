@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4](https://github.com/fabrica-eda/texo/compare/v0.1.3...v0.1.4) (2026-08-26)
+
+
+### Features
+
+* **ecp5:** support dedicated JTAGG flow ([1fff703](https://github.com/fabrica-eda/texo/commit/1fff70389e89f98fbab79d43d62840412b698d4d))
+* **ecp5:** support dedicated JTAGG flow ([c3f2adf](https://github.com/fabrica-eda/texo/commit/c3f2adfc8aff0adde0276f1938f449243ba2f0ae))
+
+
+### Bug Fixes
+
+* **ci:** serialize release changelog generation ([20a0189](https://github.com/fabrica-eda/texo/commit/20a01890425a15f354fd7363fdaac28df543015c))
+* **ci:** serialize release changelog generation ([58d7de8](https://github.com/fabrica-eda/texo/commit/58d7de8963101d2244301d0b4da918ad3ad4ef9a))
+
 ## [0.1.3](https://github.com/fabrica-eda/texo/compare/v0.1.2...v0.1.3) (2026-08-26)
 
 
