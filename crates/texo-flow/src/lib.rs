@@ -21,7 +21,7 @@ use texo_pnr::{
     retain_route_for_sinks, route_with_timing_costs_workspace_and_progress,
     route_with_workspace_and_progress, swap_placement_cells,
 };
-use texo_struo::{ImportedEcp5Design, PrimitiveMetadata};
+use texo_struo::{ActiveLevel, ImportedEcp5Design, PrimitiveMetadata};
 use texo_target_ecp5::{
     BlockRamRequirement, DEFAULT_GLOBAL_CLOCK_FANOUT, DelayRangeRecord, Ecp5Architecture,
     Ecp5GlobalRoutingCache, Ecp5Packing, LpfConstraints, LpfError, LutFfPair, PackingError,
@@ -381,6 +381,10 @@ pub fn implement_struo_ecp5_with_progress(
         )?;
         packing.apply_resolved_lpf(&design, architecture, package, &resolved)?;
     }
+    packing.constrain_ff_slice_ce_muxes(
+        architecture,
+        ff_ce_control_sets(&design, imported.metadata()),
+    );
     progress(Ecp5FlowStage::Packed);
     report_metric_phase("packing", &mut phase_started);
 
@@ -574,6 +578,34 @@ pub fn implement_struo_ecp5_with_progress(
         timing,
         placement_weight_exponent: options.placement_weight_exponent,
     })
+}
+
+fn ff_ce_control_sets(
+    design: &Design,
+    metadata: &BTreeMap<CellId, PrimitiveMetadata>,
+) -> Vec<(CellId, u64)> {
+    metadata
+        .iter()
+        .filter_map(|(&cell, primitive)| {
+            let PrimitiveMetadata::FlipFlop { enable, .. } = primitive else {
+                return None;
+            };
+            let value = enable.map_or(0, |active| {
+                let ce = design.cells()[cell.0]
+                    .pins()
+                    .iter()
+                    .copied()
+                    .find(|pin| design.pins()[pin.0].name == "CE")
+                    .expect("enabled FF has a CE pin");
+                let net = design.pins()[ce.0]
+                    .net()
+                    .expect("enabled FF CE is connected");
+                1 + u64::try_from(net.0).expect("net ID fits u64") * 2
+                    + u64::from(active == ActiveLevel::Low)
+            });
+            Some((cell, value))
+        })
+        .collect()
 }
 
 fn project_trellis_speed_grade<'a>(device: &str, requested: &'a str) -> &'a str {
@@ -901,7 +933,15 @@ fn route_hold_trial(
         &implementation.placement,
         &trial_placement,
     ) {
-        if let Some(incumbent) = global_routes_from_implementation(packing, implementation) {
+        let restrictions = packing.routing_restrictions_cached(
+            design,
+            architecture,
+            &trial_placement,
+            global_routing_cache,
+        )?;
+        if let Some(incumbent) =
+            global_routes_from_implementation(packing, implementation, restrictions)
+        {
             recomputed_global_routing = incumbent;
             &recomputed_global_routing
         } else {
@@ -1743,11 +1783,18 @@ impl TimingDrivenContext<'_, '_, '_> {
             return Ok(None);
         }
         let repair_sinks = minimums.keys().copied().collect::<BTreeSet<_>>();
+        let restrictions = self.packing.routing_restrictions_cached(
+            self.design,
+            self.architecture,
+            &implementation.placement,
+            self.global_routing_cache,
+        )?;
         let frozen = freeze_route_sinks_except(
             self.design,
             self.architecture.device(),
             &implementation.placement,
             &implementation.routes,
+            &restrictions,
             &repair_sinks,
         )?;
         routing_costs.set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
@@ -1780,11 +1827,18 @@ impl TimingDrivenContext<'_, '_, '_> {
         if repair_sinks.is_empty() {
             return Ok(None);
         }
+        let restrictions = self.packing.routing_restrictions_cached(
+            self.design,
+            self.architecture,
+            &implementation.placement,
+            self.global_routing_cache,
+        )?;
         let frozen = freeze_route_sinks_except(
             self.design,
             self.architecture.device(),
             &implementation.placement,
             &implementation.routes,
+            &restrictions,
             &repair_sinks,
         )?;
         routing_costs.set_net_criticalities(timing_net_weights(timing, self.timing_constraints));
@@ -2037,8 +2091,11 @@ impl TimingDrivenContext<'_, '_, '_> {
         routing_costs.set_sink_criticalities(route_arc_weights.clone());
         let capacity_projection = (max_move_distance > 2)
             .then(|| RouteCapacityProjection::new(&implementation.routes, routing_costs));
-        let incumbent_global_routing =
-            global_routes_from_implementation(self.packing, implementation);
+        let incumbent_global_routing = global_routes_from_implementation(
+            self.packing,
+            implementation,
+            RoutingConstraints::new(),
+        );
         let mut placement = implementation.placement.clone();
         let mut rolling_implementation = implementation.clone();
         let mut rolling_moves = 0_usize;
@@ -2083,7 +2140,7 @@ impl TimingDrivenContext<'_, '_, '_> {
                     for &(cell, from, to) in &batch_moves {
                         progress(Ecp5FlowStage::CriticalPathMove { cell, from, to });
                     }
-                    let recomputed_global_routing;
+                    let mut recomputed_global_routing;
                     let base = if let Some(incumbent) = incumbent_global_routing.as_ref()
                         && global_clock_endpoints_unchanged(
                             self.design,
@@ -2091,7 +2148,16 @@ impl TimingDrivenContext<'_, '_, '_> {
                             &implementation.placement,
                             &batch,
                         ) {
-                        incumbent
+                        recomputed_global_routing = self.packing.routing_restrictions_cached(
+                            self.design,
+                            self.architecture,
+                            &batch,
+                            self.global_routing_cache,
+                        )?;
+                        for route in incumbent.routes().values() {
+                            recomputed_global_routing.add_route(route.clone());
+                        }
+                        &recomputed_global_routing
                     } else {
                         recomputed_global_routing =
                             self.packing.global_routing_constraints_cached(
@@ -2243,7 +2309,7 @@ impl TimingDrivenContext<'_, '_, '_> {
                 } else {
                     &rolling_implementation
                 };
-                let recomputed_global_routing;
+                let mut recomputed_global_routing;
                 let base = if let Some(incumbent) = incumbent_global_routing.as_ref()
                     && global_clock_endpoints_unchanged(
                         self.design,
@@ -2251,7 +2317,16 @@ impl TimingDrivenContext<'_, '_, '_> {
                         &route_incumbent.placement,
                         &refined,
                     ) {
-                    incumbent
+                    recomputed_global_routing = self.packing.routing_restrictions_cached(
+                        self.design,
+                        self.architecture,
+                        &refined,
+                        self.global_routing_cache,
+                    )?;
+                    for route in incumbent.routes().values() {
+                        recomputed_global_routing.add_route(route.clone());
+                    }
+                    &recomputed_global_routing
                 } else {
                     recomputed_global_routing = self.packing.global_routing_constraints_cached(
                         self.design,
@@ -2829,9 +2904,10 @@ fn freeze_route_sinks_except(
     device: &Device,
     placement: &Placement,
     routes: &[Arc<NetRoute>],
+    base: &RoutingConstraints,
     released: &BTreeSet<(NetId, CellPinId)>,
 ) -> Result<RoutingConstraints, PnrError> {
-    let mut frozen = RoutingConstraints::new();
+    let mut frozen = base.clone();
     for route in routes {
         let net = &design.nets()[route.net.0];
         let retained = net
@@ -3171,8 +3247,8 @@ fn implementation_topology_fingerprint(design: &Design, implementation: &PnrResu
 fn global_routes_from_implementation(
     packing: &Ecp5Packing,
     implementation: &PnrResult,
+    mut constraints: RoutingConstraints,
 ) -> Option<RoutingConstraints> {
-    let mut constraints = RoutingConstraints::new();
     for clock in packing.global_clocks() {
         let route = implementation
             .routes
@@ -3625,17 +3701,18 @@ impl Error for MissingEvidence {}
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::num::NonZeroU32;
 
     use struo_celox::ecp5_simulator;
-    use struo_ir::{ActiveLevel, ArithmeticOp, ClockEdge, Netlist, RegisterCell, ResetControl};
+    use struo_ir::{ActiveLevel, ClockEdge, Netlist, RegisterCell, ResetControl};
     use struo_target_ecp5::{
-        ArithmeticMapping, Ecp5Netlist, MappingOptions, OpenDrainIo, map_to_ecp5,
-        map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options,
+        Ecp5Netlist, OpenDrainIo, map_to_ecp5, map_to_ecp5_with_open_drain_ios,
     };
-    use texo_model::{BelId, CellId, Design, Device, NetId, PinDirection, ResourceKind};
-    use texo_pnr::{PlacementConstraints, place_and_route};
-    use texo_struo::{PrimitiveMetadata, import_ecp5};
+    use texo_model::{BelId, CellId, Design, Device, NetId, PinDirection, PipId, ResourceKind};
+    use texo_pnr::{PlacementConstraints, RoutingConstraints, place_and_route};
+    use texo_struo::{
+        ActiveLevel as ImportedActiveLevel, ClockEdge as ImportedClockEdge, PrimitiveMetadata,
+        import_ecp5,
+    };
     use texo_target_ecp5::{
         ArchitectureFile, Ecp5Packing, PipClassTimingRecord, PipRecord, RelativeRef,
         TimingCornersRecord, expand, find_global_clock_requirements, pack_lut_ffs,
@@ -3645,10 +3722,11 @@ mod tests {
     use super::{
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, PostMapSimulationPolicy,
         accumulate_hold_minimums, criticality_weight, delay_weighted_criticality,
-        ecp5_timing_constraints, ecp5_timing_model, find_cell_pin, freeze_route_sinks_except,
-        implement, implement_struo_ecp5, implement_with_constraints, next_wns_regression_streak,
-        pip_class_delay, project_trellis_speed_grade, retain_projection_timing_frontier,
-        slack_violations, staged_timing_score, verify_post_map_with_celox,
+        ecp5_timing_constraints, ecp5_timing_model, ff_ce_control_sets, find_cell_pin,
+        freeze_route_sinks_except, implement, implement_struo_ecp5, implement_with_constraints,
+        next_wns_regression_streak, pip_class_delay, project_trellis_speed_grade,
+        retain_projection_timing_frontier, slack_violations, staged_timing_score,
+        verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -3658,6 +3736,57 @@ mod tests {
         assert_eq!(project_trellis_speed_grade("LFE5UM5G-85F", "8"), "8_5G");
         assert_eq!(project_trellis_speed_grade("LFE5UM-85F", "8"), "8");
         assert_eq!(project_trellis_speed_grade("LFE5UM5G-85F", "7"), "7");
+    }
+
+    #[test]
+    fn ff_ce_control_sets_preserve_compatible_slice_placements() {
+        let mut design = Design::new();
+        let first_driver = design.add_cell("first_ce", ResourceKind::Logic);
+        let first_ce = design
+            .add_pin(first_driver, "out", PinDirection::Output)
+            .unwrap();
+        let second_driver = design.add_cell("second_ce", ResourceKind::Logic);
+        let second_ce = design
+            .add_pin(second_driver, "out", PinDirection::Output)
+            .unwrap();
+        let always = design.add_cell("always", ResourceKind::Register);
+        let high_a = design.add_cell("high_a", ResourceKind::Register);
+        let shared_ce_first = design.add_pin(high_a, "CE", PinDirection::Input).unwrap();
+        let high_b = design.add_cell("high_b", ResourceKind::Register);
+        let shared_ce_second = design.add_pin(high_b, "CE", PinDirection::Input).unwrap();
+        let low = design.add_cell("low", ResourceKind::Register);
+        let low_ce = design.add_pin(low, "CE", PinDirection::Input).unwrap();
+        let other = design.add_cell("other", ResourceKind::Register);
+        let other_ce = design.add_pin(other, "CE", PinDirection::Input).unwrap();
+        design
+            .add_net(
+                "shared_ce",
+                first_ce,
+                [shared_ce_first, shared_ce_second, low_ce],
+            )
+            .unwrap();
+        design.add_net("other_ce", second_ce, [other_ce]).unwrap();
+        let flip_flop = |enable| PrimitiveMetadata::FlipFlop {
+            edge: ImportedClockEdge::Rising,
+            enable,
+            reset: None,
+        };
+        let metadata = BTreeMap::from([
+            (always, flip_flop(None)),
+            (high_a, flip_flop(Some(ImportedActiveLevel::High))),
+            (high_b, flip_flop(Some(ImportedActiveLevel::High))),
+            (low, flip_flop(Some(ImportedActiveLevel::Low))),
+            (other, flip_flop(Some(ImportedActiveLevel::High))),
+        ]);
+
+        let sets = ff_ce_control_sets(&design, &metadata)
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(sets[&always], 0);
+        assert_eq!(sets[&high_a], sets[&high_b]);
+        assert_ne!(sets[&high_a], sets[&low]);
+        assert_ne!(sets[&high_a], sets[&other]);
     }
 
     #[test]
@@ -3784,18 +3913,22 @@ mod tests {
         design.add_net("b", second_output, [second_input]).unwrap();
         let device = Device::rectangular_logic(4, 4).unwrap();
         let implementation = place_and_route(&design, &device).unwrap();
+        let mut base = RoutingConstraints::new();
+        base.block_pips([PipId(0)]);
 
         let frozen = freeze_route_sinks_except(
             &design,
             &device,
             &implementation.placement,
             &implementation.routes,
+            &base,
             &BTreeSet::from([(NetId(1), second_input)]),
         )
         .unwrap();
 
         assert!(frozen.routes().contains_key(&NetId(0)));
         assert!(!frozen.routes().contains_key(&NetId(1)));
+        assert_eq!(frozen.blocked_pips(), &BTreeSet::from([PipId(0)]));
     }
 
     #[test]
@@ -4309,64 +4442,51 @@ mod tests {
 
     #[test]
     fn applies_characterized_timing_to_split_carry_slices() {
-        let mut source = Netlist::new("carry");
-        let width = NonZeroU32::new(2).unwrap();
-        let lhs = source.add_input_port("lhs", width);
-        let rhs = source.add_input_port("rhs", width);
-        let sum = source
-            .add_arithmetic(ArithmeticOp::Add, &lhs, &rhs)
+        let mut design = Design::new();
+        let first = design.add_cell("carry0", ResourceKind::Lut(4));
+        let first_a = design.add_pin(first, "A", PinDirection::Input).unwrap();
+        let first_carry_in = design.add_pin(first, "FCI", PinDirection::Input).unwrap();
+        let first_carry_out = design.add_pin(first, "FCO", PinDirection::Output).unwrap();
+        let second = design.add_cell("carry1", ResourceKind::Lut(4));
+        let second_carry_in = design.add_pin(second, "FCI", PinDirection::Input).unwrap();
+        let second_f = design.add_pin(second, "F", PinDirection::Output).unwrap();
+        design.add_pin(second, "FCO", PinDirection::Output).unwrap();
+        design
+            .add_net("internal_carry", first_carry_out, [second_carry_in])
             .unwrap();
-        source.add_output_port("sum", &sum).unwrap();
-        let mapped = map_to_ecp5_with_options(
-            &source,
-            MappingOptions {
-                arithmetic: ArithmeticMapping::CarryChain,
-                ..MappingOptions::default()
-            },
-        )
-        .unwrap();
-        let imported = import_ecp5(&mapped).unwrap();
         let architecture = read_architecture(ECP5_FIXTURE.as_bytes()).unwrap();
-        let mut packing = pack_lut_ffs(imported.design(), &architecture).unwrap();
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
         packing
-            .pack_carry_pairs(
-                imported.design(),
-                &architecture,
-                imported.carry_pairs().iter().copied(),
-            )
+            .pack_carry_pairs(&design, &architecture, [[first, second]])
             .unwrap();
 
         let model = ecp5_timing_model(
-            imported.design(),
+            &design,
             &packing,
             &architecture.speed_grades()["6"],
             &BTreeSet::new(),
         )
         .unwrap();
-        let pair = imported.carry_pairs()[0];
-        let first_a = find_cell_pin(imported.design(), pair[0], "A").unwrap();
-        let first_carry = (
-            find_cell_pin(imported.design(), pair[0], "FCI").unwrap(),
-            find_cell_pin(imported.design(), pair[0], "FCO").unwrap(),
-        );
-        let second_carry = (
-            find_cell_pin(imported.design(), pair[1], "FCI").unwrap(),
-            find_cell_pin(imported.design(), pair[1], "FCO").unwrap(),
-        );
-        let second_f = find_cell_pin(imported.design(), pair[1], "F").unwrap();
+        let second_carry_out = find_cell_pin(&design, second, "FCO").unwrap();
 
-        assert_eq!(model.cell_arc(first_a, first_carry.1).unwrap().max_ps, 447);
         assert_eq!(
-            model.cell_arc(first_carry.0, first_carry.1).unwrap().max_ps,
+            model.cell_arc(first_a, first_carry_out).unwrap().max_ps,
+            447
+        );
+        assert_eq!(
+            model
+                .cell_arc(first_carry_in, first_carry_out)
+                .unwrap()
+                .max_ps,
             71
         );
         assert_eq!(
-            model.cell_arc(second_carry.0, second_f).unwrap().max_ps,
+            model.cell_arc(second_carry_in, second_f).unwrap().max_ps,
             403
         );
         assert_eq!(
             model
-                .cell_arc(second_carry.0, second_carry.1)
+                .cell_arc(second_carry_in, second_carry_out)
                 .unwrap()
                 .max_ps,
             0

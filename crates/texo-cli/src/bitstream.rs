@@ -189,6 +189,16 @@ impl ChipConfig {
         self.tiles.entry(name.into()).or_default()
     }
 
+    fn validate(&self) -> Result<(), BitgenError> {
+        for (name, tile) in &self.tiles {
+            validate_tile_config(name, tile)?;
+        }
+        for (tiles, group) in &self.tile_groups {
+            validate_tile_config(&format!("group [{}]", tiles.join(", ")), group)?;
+        }
+        Ok(())
+    }
+
     fn serialize(&self) -> String {
         let mut output = format!(".device {}\n\n", self.device);
         if let Some(variant) = &self.variant {
@@ -229,6 +239,42 @@ impl ChipConfig {
         }
         output
     }
+}
+
+fn validate_tile_config(name: &str, tile: &TileConfig) -> Result<(), BitgenError> {
+    validate_unique_settings(
+        name,
+        "arc",
+        tile.arcs.iter().map(|(key, value)| (key, value)),
+    )?;
+    validate_unique_settings(
+        name,
+        "word",
+        tile.words.iter().map(|(key, value)| (key, value)),
+    )?;
+    validate_unique_settings(
+        name,
+        "enum",
+        tile.enums.iter().map(|(key, value)| (key, value)),
+    )
+}
+
+fn validate_unique_settings<'a, T: Eq + ?Sized + 'a>(
+    tile: &str,
+    kind: &str,
+    settings: impl IntoIterator<Item = (&'a String, &'a T)>,
+) -> Result<(), BitgenError> {
+    let mut values = BTreeMap::new();
+    for (key, value) in settings {
+        if let Some(previous) = values.insert(key, value)
+            && previous != value
+        {
+            return Err(BitgenError::new(format!(
+                "tile {tile} has conflicting {kind} settings for {key}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Generates Project Trellis configuration text without importing `pytrellis`.
@@ -298,13 +344,9 @@ pub fn generate_ecp5_config(
             .cloned()
             .unwrap_or_default();
         match string(configuration, "kind")? {
-            "lut4" | "carry_slice" | "constant" => write_comb(
-                &mut config,
-                placement,
-                configuration,
-                &incoming_flags,
-                &absorbed_inputs,
-            )?,
+            "lut4" | "carry_slice" | "constant" => {
+                write_comb(&mut config, placement, configuration, &incoming_flags)?;
+            }
             "flip_flop" => write_ff(
                 &mut config,
                 placement,
@@ -337,6 +379,7 @@ pub fn generate_ecp5_config(
             kind => return Err(BitgenError::new(format!("unsupported primitive {kind}"))),
         }
     }
+    config.validate()?;
 
     Ok(NativeEcp5Config {
         text: config.serialize(),
@@ -466,7 +509,6 @@ fn write_comb(
     placement: &Value,
     configuration: &Value,
     incoming_flags: &IncomingFlags,
-    absorbed_inputs: &serde_json::Map<String, Value>,
 ) -> Result<(), BitgenError> {
     let tile = logic_tile(placement)?.to_owned();
     let (slice, lc) = slice_and_lc(placement)?;
@@ -476,7 +518,7 @@ fn write_comb(
     } else {
         "LOGIC"
     };
-    let (init, used) = permute_lut(configuration, placement, incoming_flags, absorbed_inputs)?;
+    let (init, used) = permute_lut(configuration, placement, incoming_flags)?;
     let target = config.tile_mut(&tile);
     target.add_enum(format!("{slice}.MODE"), mode);
     target.add_word(
@@ -504,27 +546,15 @@ fn permute_lut(
     configuration: &Value,
     placement: &Value,
     incoming_flags: &IncomingFlags,
-    absorbed_inputs: &serde_json::Map<String, Value>,
 ) -> Result<(u16, BTreeSet<usize>), BitgenError> {
     let kind = string(configuration, "kind")?;
-    let mut original = optional_u64(configuration, "init")?.map_or_else(
+    let original = optional_u64(configuration, "init")?.map_or_else(
         || {
             optional_bool(configuration, "value")
                 .map(|value| if value.unwrap_or(false) { 0xffff } else { 0 })
         },
         |value| u16::try_from(value).map_err(|_| BitgenError::new("LUT INIT exceeds 16 bits")),
     )?;
-    if kind == "carry_slice" {
-        for (input, pin) in "ABCD".chars().enumerate() {
-            if absorbed_inputs
-                .get(&pin.to_string())
-                .and_then(Value::as_bool)
-                == Some(false)
-            {
-                original = fold_lut_input(original, input, false);
-            }
-        }
-    }
     let pin_wires = array(placement, "bel_pins")?
         .iter()
         .filter_map(|pin| {
@@ -553,13 +583,18 @@ fn permute_lut(
                 }
                 // Project Trellis LUT permutation flags name the logical
                 // source first and physical destination second. Preserve the
-                // same inverse mapping used by the architecture importer.
+                // same inverse mapping used by nextpnr's ECP5 bit generator.
                 physical_to_logical[logical].push(physical);
             } else {
                 physical_to_logical[physical].push(physical);
             }
         }
     }
+    let used = physical_to_logical
+        .iter()
+        .enumerate()
+        .filter_map(|(index, mappings)| (!mappings.is_empty()).then_some(index))
+        .collect();
     if kind == "carry_slice" {
         for (physical, logicals) in physical_to_logical.iter_mut().enumerate() {
             if !logicals.is_empty() {
@@ -587,11 +622,6 @@ fn permute_lut(
             permuted |= 1 << physical_value;
         }
     }
-    let used = physical_to_logical
-        .iter()
-        .enumerate()
-        .filter_map(|(index, mappings)| (!mappings.is_empty()).then_some(index))
-        .collect();
     Ok((permuted, used))
 }
 
@@ -1198,17 +1228,6 @@ fn reverse_bits(value: u64, width: usize) -> u64 {
     })
 }
 
-fn fold_lut_input(initialization: u16, input: usize, value: bool) -> u16 {
-    let mut folded = 0;
-    for output in 0..16 {
-        let source = (output & !(1 << input)) | (usize::from(value) << input);
-        if initialization & (1 << source) != 0 {
-            folded |= 1 << output;
-        }
-    }
-    folded
-}
-
 fn keyed_objects<'a>(
     values: &'a [Value],
     key: &str,
@@ -1317,8 +1336,8 @@ mod tests {
     use texo_target_ecp5::{ArchitectureFile, TileRecord, expand};
 
     use super::{
-        ChipConfig, TileConfig, fold_lut_input, generate_ecp5_config, io_base_direction,
-        reverse_bits, trellis_wire_name, validate_checkpoint, write_bram, write_jtagg,
+        ChipConfig, TileConfig, generate_ecp5_config, io_base_direction, reverse_bits,
+        trellis_wire_name, validate_checkpoint, write_bram, write_jtagg,
     };
 
     const ARCHITECTURE: &str = include_str!(concat!(
@@ -1341,8 +1360,19 @@ mod tests {
     #[test]
     fn bit_helpers_match_trellis_ordering() {
         assert_eq!(reverse_bits(0b000_000_011, 9), 0b110_000_000);
-        assert_eq!(fold_lut_input(0xaaaa, 0, false), 0x0000);
-        assert_eq!(fold_lut_input(0xaaaa, 0, true), 0xffff);
+    }
+
+    #[test]
+    fn rejects_conflicting_settings_for_one_physical_mux() {
+        let mut config = ChipConfig::default();
+        let tile = config.tile_mut("R0C0:PLC2");
+        tile.add_enum("SLICEA.CEMUX", "CE");
+        tile.add_enum("SLICEA.CEMUX", "CE");
+        assert!(config.validate().is_ok());
+
+        config.tile_mut("R0C0:PLC2").add_enum("SLICEA.CEMUX", "1");
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("conflicting enum settings for SLICEA.CEMUX"));
     }
 
     #[test]

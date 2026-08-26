@@ -28,12 +28,23 @@ pub struct PlacementGroup {
     pub assignments: Arc<[Vec<BelId>]>,
 }
 
+/// One target configuration value shared by multiple BELs in a physical site.
+///
+/// A placement is legal when every cell assigned to the same resource ID has
+/// the same value. Resource IDs and values are opaque target-defined numbers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlacementSharedResource {
+    cell_values: BTreeMap<CellId, u64>,
+    bel_resources: BTreeMap<BelId, u64>,
+}
+
 /// Optional grouped/fixed placement rules supplied by a target packer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlacementConstraints {
     groups: Vec<PlacementGroup>,
     pin_bindings: BTreeMap<(CellPinId, BelId), BelPinId>,
     pin_name_bindings: BTreeMap<CellPinId, String>,
+    shared_resources: Vec<PlacementSharedResource>,
 }
 
 /// Target-supplied immutable portions of logical net trees.
@@ -45,6 +56,7 @@ pub struct PlacementConstraints {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RoutingConstraints {
     routes: BTreeMap<NetId, Arc<NetRoute>>,
+    blocked_pips: BTreeSet<PipId>,
 }
 
 /// Characterized costs used by timing-driven negotiated routing.
@@ -176,6 +188,7 @@ impl RoutingConstraints {
     pub const fn new() -> Self {
         Self {
             routes: BTreeMap::new(),
+            blocked_pips: BTreeSet::new(),
         }
     }
 
@@ -190,6 +203,17 @@ impl RoutingConstraints {
     pub const fn routes(&self) -> &BTreeMap<NetId, Arc<NetRoute>> {
         &self.routes
     }
+
+    /// Prevents the router from using target-defined illegal PIPs.
+    pub fn block_pips(&mut self, pips: impl IntoIterator<Item = PipId>) {
+        self.blocked_pips.extend(pips);
+    }
+
+    /// PIPs unavailable in this placement-specific routing problem.
+    #[must_use]
+    pub const fn blocked_pips(&self) -> &BTreeSet<PipId> {
+        &self.blocked_pips
+    }
 }
 
 impl PlacementConstraints {
@@ -200,6 +224,7 @@ impl PlacementConstraints {
             groups: Vec::new(),
             pin_bindings: BTreeMap::new(),
             pin_name_bindings: BTreeMap::new(),
+            shared_resources: Vec::new(),
         }
     }
 
@@ -306,6 +331,27 @@ impl PlacementConstraints {
     #[must_use]
     pub const fn pin_name_bindings(&self) -> &BTreeMap<CellPinId, String> {
         &self.pin_name_bindings
+    }
+
+    /// Adds one target-defined shared-site configuration rule.
+    ///
+    /// Cells with no value and BELs with no resource ID do not participate.
+    /// Values only need to be stable and comparable within this rule.
+    pub fn add_shared_resource(
+        &mut self,
+        cell_values: impl IntoIterator<Item = (CellId, u64)>,
+        bel_resources: impl IntoIterator<Item = (BelId, u64)>,
+    ) {
+        self.shared_resources.push(PlacementSharedResource {
+            cell_values: cell_values.into_iter().collect(),
+            bel_resources: bel_resources.into_iter().collect(),
+        });
+    }
+
+    /// Target-defined shared-site configuration rules.
+    #[must_use]
+    pub fn shared_resources(&self) -> &[PlacementSharedResource] {
+        &self.shared_resources
     }
 }
 
@@ -1298,6 +1344,7 @@ pub fn placement_from_partial_bindings(
     let units = placement_units(&graph, constraints, &mut candidate_cache)?;
     let mut placed = vec![None; design.cells().len()];
     let mut occupied = BTreeSet::new();
+    let mut resource_usage = PlacementResourceUsage::default();
 
     for (&cell, &bel) in bindings {
         if cell.0 >= design.cells().len() {
@@ -1320,6 +1367,13 @@ pub fn placement_from_partial_bindings(
                     .iter()
                     .zip(*assignment)
                     .all(|(&cell, &bel)| bindings.get(&cell).is_none_or(|wanted| *wanted == bel))
+                    && assignment_resources_are_legal(
+                        &graph,
+                        constraints,
+                        &unit.cells,
+                        assignment,
+                        &resource_usage,
+                    )
             })
             .ok_or_else(|| PnrError::InvalidPlacement {
                 reason: format!(
@@ -1335,6 +1389,14 @@ pub fn placement_from_partial_bindings(
             }
             placed[cell.0] = Some(bel);
         }
+        update_placement_resource_usage(
+            &graph,
+            constraints,
+            &unit.cells,
+            assignment,
+            &mut resource_usage,
+            true,
+        );
     }
 
     finish_placement(&graph, constraints, placed)
@@ -1428,7 +1490,7 @@ pub fn refine_placement_with_net_weights(
     let (_, neighbors) = placement_neighbors(design, Some(net_weights), None, None);
     let mut candidate_cache = BTreeMap::new();
     let units = placement_units(&graph, constraints, &mut candidate_cache)?;
-    let mut placed = validate_refinement_start(&graph, &units, placement, None)?;
+    let mut placed = validate_refinement_start(&graph, constraints, &units, placement, None)?;
     let mut occupied = dense_placement_occupancy(device, &placed);
     let _ = refine_placement(
         &graph,
@@ -1464,7 +1526,7 @@ pub fn refine_placement_with_net_sink_weights(
     let (_, neighbors) = placement_neighbors(design, None, Some(sink_weights), None);
     let mut candidate_cache = BTreeMap::new();
     let units = placement_units(&graph, constraints, &mut candidate_cache)?;
-    let mut placed = validate_refinement_start(&graph, &units, placement, None)?;
+    let mut placed = validate_refinement_start(&graph, constraints, &units, placement, None)?;
     let mut occupied = dense_placement_occupancy(device, &placed);
     let _ = refine_placement(
         &graph,
@@ -1707,6 +1769,7 @@ impl<'a> PlacementRefiner<'a> {
             placement_neighbors(self.graph.design(), None, Some(sink_weights), sink_budgets);
         let mut placed = validate_refinement_start(
             &self.graph,
+            self.constraints,
             &self.units,
             placement,
             Some(&self.spatial_indexes),
@@ -1795,6 +1858,7 @@ impl<'a> PlacementRefiner<'a> {
         }
         let mut placed = validate_refinement_start(
             &self.graph,
+            self.constraints,
             &self.units,
             placement,
             Some(&self.spatial_indexes),
@@ -1842,14 +1906,14 @@ impl<'a> PlacementRefiner<'a> {
         };
 
         let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
-        let mut pin_usage = HashMap::new();
+        let mut pin_usage = PlacementResourceUsage::default();
         for known in &self.units {
             let assignment = known
                 .cells
                 .iter()
                 .map(|cell| placed[cell.0].expect("validated placement is complete"))
                 .collect::<Vec<_>>();
-            update_pin_usage(
+            update_placement_resource_usage(
                 &self.graph,
                 self.constraints,
                 &known.cells,
@@ -1864,7 +1928,7 @@ impl<'a> PlacementRefiner<'a> {
         for &cell in &unit.cells {
             placed[cell.0] = None;
         }
-        update_pin_usage(
+        update_placement_resource_usage(
             &self.graph,
             self.constraints,
             &unit.cells,
@@ -1885,7 +1949,7 @@ impl<'a> PlacementRefiner<'a> {
                     .point
                     .manhattan(current_point)
                     > max_move_distance
-                || !assignment_pin_wires_are_legal(
+                || !assignment_resources_are_legal(
                     &self.graph,
                     self.constraints,
                     &unit.cells,
@@ -2036,6 +2100,7 @@ impl<'a> PlacementRefiner<'a> {
         }
         let placed = validate_refinement_start(
             &self.graph,
+            self.constraints,
             &self.units,
             placement,
             Some(&self.spatial_indexes),
@@ -2089,14 +2154,14 @@ impl<'a> PlacementRefiner<'a> {
         }
 
         let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
-        let mut pin_usage = HashMap::new();
+        let mut pin_usage = PlacementResourceUsage::default();
         for known in &self.units {
             let assignment = known
                 .cells
                 .iter()
                 .map(|cell| placed[cell.0].expect("validated placement is complete"))
                 .collect::<Vec<_>>();
-            update_pin_usage(
+            update_placement_resource_usage(
                 &self.graph,
                 self.constraints,
                 &known.cells,
@@ -2108,7 +2173,7 @@ impl<'a> PlacementRefiner<'a> {
         for &bel in &current {
             occupied.remove(&bel);
         }
-        update_pin_usage(
+        update_placement_resource_usage(
             &self.graph,
             self.constraints,
             &unit.cells,
@@ -2129,7 +2194,7 @@ impl<'a> PlacementRefiner<'a> {
                     .point
                     .manhattan(current_point)
                     > max_move_distance
-                || !assignment_pin_wires_are_legal(
+                || !assignment_resources_are_legal(
                     &self.graph,
                     self.constraints,
                     &unit.cells,
@@ -2731,32 +2796,47 @@ fn place(
 
     let mut placed = vec![None; design.cells().len()];
     let mut occupied = BTreeSet::new();
+    let mut resource_usage = PlacementResourceUsage::default();
     for unit in &units {
         let choice = match &unit.choices {
             PlacementChoices::Shared(assignments) => choose_assignment(
                 &unit.cells,
                 assignments.iter().map(Vec::as_slice),
+                graph,
+                constraints,
                 device,
                 &neighbors,
                 &placed,
                 &occupied,
+                &resource_usage,
             ),
             PlacementChoices::SingleCell(candidates) => choose_assignment(
                 &unit.cells,
                 candidates.iter().map(std::slice::from_ref),
+                graph,
+                constraints,
                 device,
                 &neighbors,
                 &placed,
                 &occupied,
+                &resource_usage,
             ),
         };
         let assignment = choice.ok_or_else(|| PnrError::NoBel {
             cell: design.cells()[unit.cells[0].0].name.clone(),
         })?;
-        for (&cell, bel) in unit.cells.iter().zip(assignment) {
+        for (&cell, &bel) in unit.cells.iter().zip(&assignment) {
             occupied.insert(bel);
             placed[cell.0] = Some(bel);
         }
+        update_placement_resource_usage(
+            graph,
+            constraints,
+            &unit.cells,
+            &assignment,
+            &mut resource_usage,
+            true,
+        );
     }
 
     let mut refinement_occupied = dense_placement_occupancy(device, &placed);
@@ -2880,12 +2960,12 @@ fn analytical_place(
 
     let mut placed = vec![None; design.cells().len()];
     let mut occupied = BTreeSet::new();
-    let mut pin_usage = HashMap::new();
+    let mut pin_usage = PlacementResourceUsage::default();
     let mut point_usage = vec![0_usize; (device.width() * device.height()) as usize];
     for unit in units.iter().filter(|unit| unit.choices.len() == 1) {
         let assignment = unit.choices.assignment(0);
         if assignment.iter().any(|bel| occupied.contains(bel))
-            || !assignment_pin_wires_are_legal(
+            || !assignment_resources_are_legal(
                 graph,
                 constraints,
                 &unit.cells,
@@ -3068,13 +3148,13 @@ fn install_assignment(
     assignment: &[BelId],
     placed: &mut [Option<BelId>],
     occupied: &mut BTreeSet<BelId>,
-    pin_usage: &mut HashMap<WireId, HashMap<NetId, usize>>,
+    pin_usage: &mut PlacementResourceUsage,
 ) {
     for (&cell, &bel) in unit.cells.iter().zip(assignment) {
         occupied.insert(bel);
         placed[cell.0] = Some(bel);
     }
-    update_pin_usage(graph, constraints, &unit.cells, assignment, pin_usage, true);
+    update_placement_resource_usage(graph, constraints, &unit.cells, assignment, pin_usage, true);
 }
 
 fn solve_quadratic(
@@ -3153,6 +3233,7 @@ fn finish_placement(
         .into_iter()
         .map(|bel| bel.expect("every ordered cell was placed"))
         .collect::<Vec<_>>();
+    validate_complete_placement_resources(graph, constraints, &bindings)?;
     let mut pin_bindings = constraints
         .pin_bindings
         .iter()
@@ -3179,8 +3260,30 @@ fn finish_placement(
     })
 }
 
+fn validate_complete_placement_resources(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    bindings: &[BelId],
+) -> Result<(), PnrError> {
+    let mut usage = PlacementResourceUsage::default();
+    for (index, &bel) in bindings.iter().enumerate() {
+        let cell = CellId(index);
+        if !assignment_resources_are_legal(graph, constraints, &[cell], &[bel], &usage) {
+            return Err(PnrError::InvalidPlacement {
+                reason: format!(
+                    "cell {} conflicts with a shared physical placement resource",
+                    graph.design().cells()[index].name
+                ),
+            });
+        }
+        update_placement_resource_usage(graph, constraints, &[cell], &[bel], &mut usage, true);
+    }
+    Ok(())
+}
+
 fn validate_refinement_start(
     graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
     units: &[PlacementUnit],
     placement: Placement,
     spatial_indexes: Option<&BTreeMap<(u8, usize), Arc<SpatialChoiceIndex>>>,
@@ -3232,6 +3335,7 @@ fn validate_refinement_start(
             });
         }
     }
+    validate_complete_placement_resources(graph, constraints, &placement.bindings)?;
     Ok(placement.bindings.into_iter().map(Some).collect())
 }
 
@@ -3300,16 +3404,23 @@ fn placement_neighbors(
 
 const MAX_PLACEMENT_FANOUT: usize = 256;
 
+#[allow(clippy::too_many_arguments)]
 fn choose_assignment<'a>(
     cells: &[CellId],
     assignments: impl Iterator<Item = &'a [BelId]>,
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
     device: &Device,
     neighbors: &[Vec<PlacementNeighbor>],
     placed: &[Option<BelId>],
     occupied: &BTreeSet<BelId>,
+    resource_usage: &PlacementResourceUsage,
 ) -> Option<Vec<BelId>> {
     assignments
         .filter(|assignment| assignment.iter().all(|bel| !occupied.contains(bel)))
+        .filter(|assignment| {
+            assignment_resources_are_legal(graph, constraints, cells, assignment, resource_usage)
+        })
         .map(|assignment| {
             let cost = cells
                 .iter()
@@ -3358,14 +3469,14 @@ fn refine_placement(
     cached_spatial_indexes: Option<&BTreeMap<(u8, usize), Arc<SpatialChoiceIndex>>>,
 ) -> usize {
     let device = graph.device();
-    let mut pin_usage = HashMap::new();
+    let mut pin_usage = PlacementResourceUsage::default();
     for unit in units {
         let assignment = unit
             .cells
             .iter()
             .map(|cell| placed[cell.0].expect("initial placement is complete"))
             .collect::<Vec<_>>();
-        update_pin_usage(
+        update_placement_resource_usage(
             graph,
             constraints,
             &unit.cells,
@@ -3420,7 +3531,7 @@ fn refine_placement(
             for &cell in &unit.cells {
                 placed[cell.0] = None;
             }
-            update_pin_usage(
+            update_placement_resource_usage(
                 graph,
                 constraints,
                 &unit.cells,
@@ -3428,7 +3539,7 @@ fn refine_placement(
                 &mut pin_usage,
                 false,
             );
-            let current_is_legal = assignment_pin_wires_are_legal(
+            let current_is_legal = assignment_resources_are_legal(
                 graph,
                 constraints,
                 &unit.cells,
@@ -3457,7 +3568,7 @@ fn refine_placement(
                     occupied[bel.0] = true;
                     placed[cell.0] = Some(bel);
                 }
-                update_pin_usage(
+                update_placement_resource_usage(
                     graph,
                     constraints,
                     &unit.cells,
@@ -3478,7 +3589,7 @@ fn refine_placement(
                 occupied[bel.0] = true;
                 placed[cell.0] = Some(bel);
             }
-            update_pin_usage(
+            update_placement_resource_usage(
                 graph,
                 constraints,
                 &unit.cells,
@@ -3538,7 +3649,7 @@ fn choose_refined_assignment(
     neighbors: &[Vec<PlacementNeighbor>],
     placed: &[Option<BelId>],
     occupied: &[bool],
-    pin_usage: &HashMap<WireId, HashMap<NetId, usize>>,
+    pin_usage: &PlacementResourceUsage,
     workspace: &mut RefinementChoiceWorkspace,
 ) -> Option<Vec<BelId>> {
     let device = graph.device();
@@ -3577,7 +3688,7 @@ fn nearest_legal_assignments_with_density(
     constraints: &PlacementConstraints,
     target: Point,
     occupied: &BTreeSet<BelId>,
-    pin_usage: &HashMap<WireId, HashMap<NetId, usize>>,
+    pin_usage: &PlacementResourceUsage,
     point_usage: &[usize],
 ) -> Vec<usize> {
     let mut nearest = Vec::new();
@@ -3605,7 +3716,7 @@ fn nearest_legal_assignments_impl(
     constraints: &PlacementConstraints,
     target: Point,
     is_occupied: impl Fn(BelId) -> bool,
-    pin_usage: &HashMap<WireId, HashMap<NetId, usize>>,
+    pin_usage: &PlacementResourceUsage,
     point_usage: Option<&[usize]>,
     nearest: &mut Vec<usize>,
     pin_resources: &mut Vec<(WireId, NetId)>,
@@ -3625,7 +3736,7 @@ fn nearest_legal_assignments_impl(
                             && point_usage.is_none_or(|usage| {
                                 density_allows_assignment(graph, unit, assignment, usage)
                             })
-                            && assignment_pin_wires_are_legal_with_workspace(
+                            && assignment_resources_are_legal_with_workspace(
                                 graph,
                                 constraints,
                                 &unit.cells,
@@ -3699,15 +3810,21 @@ fn update_point_usage(device: &Device, assignment: &[BelId], point_usage: &mut [
     }
 }
 
-fn assignment_pin_wires_are_legal(
+#[derive(Default)]
+struct PlacementResourceUsage {
+    pin_wires: HashMap<WireId, HashMap<NetId, usize>>,
+    shared: HashMap<(usize, u64), HashMap<u64, usize>>,
+}
+
+fn assignment_resources_are_legal(
     graph: &UnifiedGraph<'_>,
     constraints: &PlacementConstraints,
     cells: &[CellId],
     assignment: &[BelId],
-    usage: &HashMap<WireId, HashMap<NetId, usize>>,
+    usage: &PlacementResourceUsage,
 ) -> bool {
     let mut candidate = Vec::new();
-    assignment_pin_wires_are_legal_with_workspace(
+    assignment_resources_are_legal_with_workspace(
         graph,
         constraints,
         cells,
@@ -3717,12 +3834,12 @@ fn assignment_pin_wires_are_legal(
     )
 }
 
-fn assignment_pin_wires_are_legal_with_workspace(
+fn assignment_resources_are_legal_with_workspace(
     graph: &UnifiedGraph<'_>,
     constraints: &PlacementConstraints,
     cells: &[CellId],
     assignment: &[BelId],
-    usage: &HashMap<WireId, HashMap<NetId, usize>>,
+    usage: &PlacementResourceUsage,
     candidate: &mut Vec<(WireId, NetId)>,
 ) -> bool {
     candidate.clear();
@@ -3738,7 +3855,7 @@ fn assignment_pin_wires_are_legal_with_workspace(
         while end < candidate.len() && candidate[end].0 == wire {
             end += 1;
         }
-        let existing = usage.get(&wire);
+        let existing = usage.pin_wires.get(&wire);
         let new_nets = candidate[start..end]
             .iter()
             .filter(|(_, net)| existing.is_none_or(|nets| !nets.contains_key(net)))
@@ -3749,23 +3866,52 @@ fn assignment_pin_wires_are_legal_with_workspace(
         }
         start = end;
     }
+    let mut shared = Vec::new();
+    visit_assignment_shared_resources(constraints, cells, assignment, |rule, resource, value| {
+        shared.push(((rule, resource), value));
+    });
+    shared.sort_unstable();
+    shared.dedup();
+    let mut start = 0;
+    while start < shared.len() {
+        let resource = shared[start].0;
+        let mut end = start + 1;
+        while end < shared.len() && shared[end].0 == resource {
+            end += 1;
+        }
+        let existing = usage.shared.get(&resource);
+        let new_values = shared[start..end]
+            .iter()
+            .filter(|(_, value)| existing.is_none_or(|values| !values.contains_key(value)))
+            .count();
+        if existing.map_or(0, HashMap::len) + new_values > 1 {
+            return false;
+        }
+        start = end;
+    }
     true
 }
 
-fn update_pin_usage(
+fn update_placement_resource_usage(
     graph: &UnifiedGraph<'_>,
     constraints: &PlacementConstraints,
     cells: &[CellId],
     assignment: &[BelId],
-    usage: &mut HashMap<WireId, HashMap<NetId, usize>>,
+    usage: &mut PlacementResourceUsage,
     add: bool,
 ) {
     visit_assignment_pin_resources(graph, constraints, cells, assignment, |wire, net| {
         if add {
-            *usage.entry(wire).or_default().entry(net).or_default() += 1;
+            *usage
+                .pin_wires
+                .entry(wire)
+                .or_default()
+                .entry(net)
+                .or_default() += 1;
         } else {
             let remove_wire = {
                 let nets = usage
+                    .pin_wires
                     .get_mut(&wire)
                     .expect("placed pin wire is present in usage");
                 let count = nets
@@ -3778,10 +3924,56 @@ fn update_pin_usage(
                 nets.is_empty()
             };
             if remove_wire {
-                usage.remove(&wire);
+                usage.pin_wires.remove(&wire);
             }
         }
     });
+    visit_assignment_shared_resources(constraints, cells, assignment, |rule, resource, value| {
+        let resource = (rule, resource);
+        if add {
+            *usage
+                .shared
+                .entry(resource)
+                .or_default()
+                .entry(value)
+                .or_default() += 1;
+        } else {
+            let remove_resource = {
+                let values = usage
+                    .shared
+                    .get_mut(&resource)
+                    .expect("placed shared resource is present in usage");
+                let count = values
+                    .get_mut(&value)
+                    .expect("placed shared value is present in usage");
+                *count -= 1;
+                if *count == 0 {
+                    values.remove(&value);
+                }
+                values.is_empty()
+            };
+            if remove_resource {
+                usage.shared.remove(&resource);
+            }
+        }
+    });
+}
+
+fn visit_assignment_shared_resources(
+    constraints: &PlacementConstraints,
+    cells: &[CellId],
+    assignment: &[BelId],
+    mut visit: impl FnMut(usize, u64, u64),
+) {
+    for (rule_index, rule) in constraints.shared_resources.iter().enumerate() {
+        for (&cell, &bel) in cells.iter().zip(assignment) {
+            if let (Some(&value), Some(&resource)) =
+                (rule.cell_values.get(&cell), rule.bel_resources.get(&bel))
+            {
+                visit(rule_index, resource, value);
+            }
+        }
+    }
 }
 
 fn visit_assignment_pin_resources(
@@ -3862,6 +4054,7 @@ fn placement_units_cached(
     validated_group_shapes: &mut Vec<ValidatedGroupShape>,
 ) -> Result<Vec<PlacementUnit>, PnrError> {
     validate_pin_bindings(graph, constraints)?;
+    validate_shared_resources(graph, constraints)?;
     let mut constrained = BTreeSet::new();
     let mut units = Vec::new();
     for (group_index, group) in constraints.groups.iter().enumerate() {
@@ -3950,6 +4143,42 @@ fn placement_units_cached(
         }
     }
     Ok(units)
+}
+
+fn validate_shared_resources(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+) -> Result<(), PnrError> {
+    for (index, resource) in constraints.shared_resources.iter().enumerate() {
+        let group = constraints.groups.len() + index;
+        if resource.cell_values.is_empty() || resource.bel_resources.is_empty() {
+            return Err(PnrError::InvalidPlacementConstraint {
+                group,
+                reason: "shared resource cell and BEL maps must be non-empty".into(),
+            });
+        }
+        if let Some(cell) = resource
+            .cell_values
+            .keys()
+            .find(|cell| cell.0 >= graph.design().cells().len())
+        {
+            return Err(PnrError::InvalidPlacementConstraint {
+                group,
+                reason: format!("shared resource names unknown cell ID {}", cell.0),
+            });
+        }
+        if let Some(bel) = resource
+            .bel_resources
+            .keys()
+            .find(|bel| bel.0 >= graph.device().bels().len())
+        {
+            return Err(PnrError::InvalidPlacementConstraint {
+                group,
+                reason: format!("shared resource names unknown BEL ID {}", bel.0),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn cached_placement_candidates(
@@ -4120,6 +4349,22 @@ fn placement_candidates(
 
 const MAX_ROUTING_ITERATIONS: u32 = 32;
 
+fn validate_routing_restrictions(
+    device: &Device,
+    constraints: &RoutingConstraints,
+) -> Result<(), PnrError> {
+    if let Some(pip) = constraints
+        .blocked_pips()
+        .iter()
+        .find(|pip| pip.0 >= device.pips().len())
+    {
+        return Err(PnrError::InvalidRoutingRestriction {
+            reason: format!("blocked PIP ID {} is outside the device", pip.0),
+        });
+    }
+    Ok(())
+}
+
 fn validate_routing_constraints(
     graph: &UnifiedGraph<'_>,
     placement: &Placement,
@@ -4128,6 +4373,7 @@ fn validate_routing_constraints(
 ) -> Result<(), PnrError> {
     let design = graph.design();
     let device = graph.device();
+    validate_routing_restrictions(device, constraints)?;
     for (&net_id, route) in constraints.routes() {
         let Some(net) = design.nets().get(net_id.0) else {
             return Err(PnrError::InvalidRoutingConstraint {
@@ -4179,6 +4425,12 @@ fn validate_routing_constraints(
                 .zip(arc.wires.iter().skip(1))
                 .zip(&arc.pips)
             {
+                if constraints.blocked_pips().contains(&pip_id) {
+                    return Err(PnrError::InvalidRoutingConstraint {
+                        net: net_id,
+                        reason: format!("immutable route uses blocked PIP {}", pip_id.0),
+                    });
+                }
                 let Some(pip) = device.pips().get(pip_id.0) else {
                     return Err(PnrError::InvalidRoutingConstraint {
                         net: net_id,
@@ -4527,6 +4779,7 @@ fn route(
                 net_id,
                 wire_congestion,
                 pip_congestion,
+                constraints.blocked_pips(),
                 costs,
                 &mut workspace.search,
                 &mut workspace.tree_arrival_ps,
@@ -5123,6 +5376,7 @@ fn route_net(
     net_id: NetId,
     wire_congestion: &[u32],
     pip_congestion: &[u32],
+    blocked_pips: &BTreeSet<PipId>,
     costs: Option<&RoutingCosts>,
     search: &mut RouteSearch,
     tree_arrival_ps: &mut [u64],
@@ -5179,7 +5433,13 @@ fn route_net(
             };
         }
     }
-    let sinks = ordered_sinks(net_id, &net.sinks, costs);
+    let driver_point = device.bels()[driver_bel.0].point;
+    let sinks = ordered_sinks(net_id, &net.sinks, costs, |sink| {
+        let sink_cell = design.pins()[sink.0].cell;
+        placement.bel(sink_cell).map_or(u64::MAX, |bel| {
+            device.bels()[bel.0].point.manhattan(driver_point)
+        })
+    });
     for sink_pin in &sinks {
         let sink_cell = design.pins()[sink_pin.0].cell;
         let sink_bel = placement
@@ -5244,6 +5504,7 @@ fn route_net(
                 sink_wire,
                 wire_congestion,
                 pip_congestion,
+                blocked_pips,
                 costs,
                 criticality,
                 delay_quantum_ps,
@@ -5319,7 +5580,12 @@ fn reconstruct_route_arc(
 /// Arrival sentinel for wires outside the routed tree under optimization.
 const UNROUTED_ARRIVAL_PS: u64 = u64::MAX;
 
-fn ordered_sinks(net: NetId, sinks: &[CellPinId], costs: Option<&RoutingCosts>) -> Vec<CellPinId> {
+fn ordered_sinks(
+    net: NetId,
+    sinks: &[CellPinId],
+    costs: Option<&RoutingCosts>,
+    mut distance: impl FnMut(CellPinId) -> u64,
+) -> Vec<CellPinId> {
     let mut ordered = sinks.to_vec();
     ordered.sort_by_key(|&sink| {
         let criticality = routing_arc_criticality(costs, net, sink);
@@ -5327,7 +5593,7 @@ fn ordered_sinks(net: NetId, sinks: &[CellPinId], costs: Option<&RoutingCosts>) 
             .and_then(|costs| costs.sink_min_delays_ps.get(&(net, sink)))
             .copied()
             .unwrap_or(0);
-        (Reverse(criticality), Reverse(minimum), sink)
+        (Reverse(criticality), Reverse(minimum), distance(sink), sink)
     });
     ordered
 }
@@ -5468,6 +5734,7 @@ impl RouteSearch {
         goal: WireId,
         wire_congestion: &[u32],
         pip_congestion: &[u32],
+        blocked_pips: &BTreeSet<PipId>,
         costs: Option<&RoutingCosts>,
         criticality: u64,
         delay_quantum_ps: u64,
@@ -5482,6 +5749,7 @@ impl RouteSearch {
                 goal,
                 wire_congestion,
                 pip_congestion,
+                blocked_pips,
                 costs?,
                 criticality,
                 tree_delays_ps,
@@ -5504,6 +5772,7 @@ impl RouteSearch {
                 goal,
                 wire_congestion,
                 pip_congestion,
+                blocked_pips,
                 costs,
                 criticality,
                 delay_quantum_ps,
@@ -5521,6 +5790,7 @@ impl RouteSearch {
             goal,
             wire_congestion,
             pip_congestion,
+            blocked_pips,
             costs,
             criticality,
             delay_quantum_ps,
@@ -5539,6 +5809,7 @@ impl RouteSearch {
         goal: WireId,
         wire_congestion: &[u32],
         pip_congestion: &[u32],
+        blocked_pips: &BTreeSet<PipId>,
         costs: Option<&RoutingCosts>,
         criticality: u64,
         delay_quantum_ps: u64,
@@ -5622,6 +5893,9 @@ impl RouteSearch {
             }
 
             for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
+                if blocked_pips.contains(&pip) {
+                    continue;
+                }
                 if self.start_mark[neighbor.0] == epoch {
                     continue;
                 }
@@ -5716,6 +5990,7 @@ fn shortest_hold_path(
     goal: WireId,
     wire_congestion: &[u32],
     pip_congestion: &[u32],
+    blocked_pips: &BTreeSet<PipId>,
     costs: &RoutingCosts,
     criticality: u64,
     tree_delays_ps: &[u64],
@@ -5776,6 +6051,9 @@ fn shortest_hold_path(
         }
 
         for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
+            if blocked_pips.contains(&pip) {
+                continue;
+            }
             if starts.contains(&neighbor) {
                 continue;
             }
@@ -5966,6 +6244,11 @@ pub enum PnrError {
         /// Specific invariant that failed.
         reason: String,
     },
+    /// A target supplied an invalid device-wide routing restriction.
+    InvalidRoutingRestriction {
+        /// Specific invariant that failed.
+        reason: String,
+    },
     /// Target timing costs did not match the routed design or device.
     InvalidRoutingCosts {
         /// Specific invariant that failed.
@@ -6035,6 +6318,9 @@ impl fmt::Display for PnrError {
             Self::InvalidRoutingConstraint { net, reason } => {
                 write!(f, "invalid routing constraint for net {}: {reason}", net.0)
             }
+            Self::InvalidRoutingRestriction { reason } => {
+                write!(f, "invalid routing restriction: {reason}")
+            }
             Self::InvalidRoutingCosts { reason } => write!(f, "invalid routing costs: {reason}"),
             Self::InvalidPlacement { reason } => write!(f, "invalid placement: {reason}"),
             Self::MissingPlacement { cell } => {
@@ -6070,6 +6356,7 @@ impl Error for PnrError {
             | Self::InvalidPinBinding { .. }
             | Self::InvalidPinNameBinding { .. }
             | Self::InvalidRoutingConstraint { .. }
+            | Self::InvalidRoutingRestriction { .. }
             | Self::InvalidRoutingCosts { .. }
             | Self::InvalidPlacement { .. }
             | Self::MissingPlacement { .. }
@@ -6092,8 +6379,8 @@ mod tests {
     use std::sync::Arc;
 
     use texo_model::{
-        BelId, CellId, Design, Device, NetId, PinDirection, Point, ResourceKind, UnifiedGraph,
-        WireId,
+        BelId, CellId, CellPinId, Design, Device, NetId, PinDirection, Point, ResourceKind,
+        UnifiedGraph, WireId,
     };
 
     use super::{
@@ -6102,14 +6389,14 @@ mod tests {
         PnrError, ResourceOwnerIndex, RouteArc, RouteCapacityProjection, RouteQueueEntry,
         RouteSearch, RoutingConstraints, RoutingCosts, RoutingResourceMetadata, RoutingWorkspace,
         congested_route_arcs, congested_route_arcs_indexed,
-        local_connection_projected_cost_from_starts, place_analytically_with_net_sink_weights,
-        place_and_route, place_with_constraints, placement_neighbors,
-        projected_release_scope_penalty, projected_resource_penalty,
-        refine_placement_with_net_sink_weights_limited, refine_placement_with_net_weights,
-        refinement_edge_cost, retain_route_for_sinks, route_reaches_all_sinks,
-        route_with_placement_and_progress, route_with_timing_costs_and_progress,
-        route_with_workspace_and_progress, routing_corridor, routing_step_cost,
-        routing_transition_cost, timing_tree_cost,
+        local_connection_projected_cost_from_starts, ordered_sinks,
+        place_analytically_with_net_sink_weights, place_and_route, place_with_constraints,
+        placement_from_partial_bindings, placement_neighbors, projected_release_scope_penalty,
+        projected_resource_penalty, refine_placement_with_net_sink_weights_limited,
+        refine_placement_with_net_weights, refinement_edge_cost, retain_route_for_sinks,
+        route_reaches_all_sinks, route_with_placement_and_progress,
+        route_with_timing_costs_and_progress, route_with_workspace_and_progress, routing_corridor,
+        routing_step_cost, routing_transition_cost, timing_tree_cost,
     };
 
     fn two_cell_design() -> Design {
@@ -6340,6 +6627,17 @@ mod tests {
         assert!(critical_edge.timing_driven);
         assert_eq!(ordinary_edge.weight, 32);
         assert!(!ordinary_edge.timing_driven);
+    }
+
+    #[test]
+    fn equal_priority_sinks_grow_the_route_tree_nearest_first() {
+        let sinks = [CellPinId(7), CellPinId(3), CellPinId(5)];
+        let distances =
+            BTreeMap::from([(CellPinId(3), 20), (CellPinId(5), 10), (CellPinId(7), 30)]);
+
+        let ordered = ordered_sinks(NetId(0), &sinks, None, |sink| distances[&sink]);
+
+        assert_eq!(ordered, [CellPinId(5), CellPinId(3), CellPinId(7)]);
     }
 
     #[test]
@@ -6622,6 +6920,7 @@ mod tests {
                 goal,
                 &[0; 3],
                 &[0; 2],
+                &BTreeSet::new(),
                 Some(&costs),
                 64,
                 50,
@@ -6633,6 +6932,61 @@ mod tests {
 
         assert_eq!(wires.last(), Some(&fast_tree));
         assert_ne!(wires.last(), Some(&WireId(0)));
+    }
+
+    #[test]
+    fn routing_avoids_target_blocked_pips() {
+        let design = Design::new();
+        let mut device = Device::new("blocked-pip", 1, 1).unwrap();
+        let start = device.add_wire("start", Point::new(0, 0), 1).unwrap();
+        let direct = device.add_wire("direct", Point::new(0, 0), 1).unwrap();
+        let detour = device.add_wire("detour", Point::new(0, 0), 1).unwrap();
+        let goal = device.add_wire("goal", Point::new(0, 0), 1).unwrap();
+        let blocked = device.add_pip(start, direct, false, 1).unwrap();
+        device.add_pip(direct, goal, false, 1).unwrap();
+        let detour_first = device.add_pip(start, detour, false, 1).unwrap();
+        let detour_last = device.add_pip(detour, goal, false, 1).unwrap();
+        let graph = UnifiedGraph::new(&design, &device);
+        let mut search = RouteSearch::new(device.wires().len());
+        let wire_points = device
+            .wires()
+            .iter()
+            .map(|wire| wire.point)
+            .collect::<Vec<_>>();
+        let wire_capacities = device
+            .wires()
+            .iter()
+            .map(|wire| wire.capacity)
+            .collect::<Vec<_>>();
+        let pip_capacities = device
+            .pips()
+            .iter()
+            .map(texo_model::Pip::capacity)
+            .collect::<Vec<_>>();
+        let metadata = RoutingResourceMetadata {
+            wire_points: &wire_points,
+            wire_capacities: &wire_capacities,
+            pip_capacities: &pip_capacities,
+        };
+
+        let (_, pips) = search
+            .shortest_path(
+                &graph,
+                &BTreeSet::from([start]),
+                goal,
+                &[0; 4],
+                &[0; 4],
+                &BTreeSet::from([blocked]),
+                None,
+                0,
+                50,
+                &[0; 4],
+                0,
+                metadata,
+            )
+            .unwrap();
+
+        assert_eq!(pips, vec![detour_last, detour_first]);
     }
 
     #[test]
@@ -6678,6 +7032,7 @@ mod tests {
                 goal,
                 &[0; 4],
                 &[0; 4],
+                &BTreeSet::new(),
                 Some(&costs),
                 0,
                 50,
@@ -6721,6 +7076,38 @@ mod tests {
         let placement = place_with_constraints(&design, &device, &constraints).unwrap();
 
         assert_eq!(placement.bindings(), &[BelId(1), BelId(0)]);
+    }
+
+    #[test]
+    fn separates_incompatible_values_of_a_shared_site_resource() {
+        let design = two_cell_design();
+        let device = Device::rectangular_logic(4, 1).unwrap();
+        let mut constraints = PlacementConstraints::new();
+        constraints.add_shared_resource(
+            [(CellId(0), 0), (CellId(1), 1)],
+            [(BelId(0), 0), (BelId(1), 0), (BelId(2), 1), (BelId(3), 1)],
+        );
+
+        let placement = place_with_constraints(&design, &device, &constraints).unwrap();
+
+        assert_ne!(placement.bindings()[0].0 / 2, placement.bindings()[1].0 / 2);
+    }
+
+    #[test]
+    fn permits_equal_values_of_a_shared_site_resource() {
+        let design = two_cell_design();
+        let device = Device::rectangular_logic(2, 1).unwrap();
+        let mut constraints = PlacementConstraints::new();
+        constraints.add_shared_resource(
+            [(CellId(0), 7), (CellId(1), 7)],
+            [(BelId(0), 0), (BelId(1), 0)],
+        );
+        let bindings = BTreeMap::from([(CellId(0), BelId(0)), (CellId(1), BelId(1))]);
+
+        let placement =
+            placement_from_partial_bindings(&design, &device, &constraints, &bindings).unwrap();
+
+        assert_eq!(placement.bindings(), &[BelId(0), BelId(1)]);
     }
 
     #[test]

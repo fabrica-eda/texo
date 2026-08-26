@@ -676,6 +676,41 @@ impl Ecp5Packing {
         &self.constraints
     }
 
+    /// Constrains both FFs in each ECP5 slice to one compatible CE control set.
+    ///
+    /// Values are opaque identifiers chosen by the mapped-netlist adapter. Two
+    /// registers may share a slice exactly when their identifiers are equal.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the architecture contains more ECP5 slices than fit in
+    /// a `u64` resource identifier.
+    pub fn constrain_ff_slice_ce_muxes(
+        &mut self,
+        architecture: &Ecp5Architecture,
+        cell_values: impl IntoIterator<Item = (CellId, u64)>,
+    ) {
+        let cell_values = cell_values.into_iter().collect::<Vec<_>>();
+        if cell_values.is_empty() {
+            return;
+        }
+        let mut resource_ids = BTreeMap::new();
+        let mut bel_resources = Vec::new();
+        for &bel in architecture.device().bels_of_kind(ResourceKind::Register) {
+            let metadata = architecture.bel_metadata(bel);
+            if metadata.bel_type != "TRELLIS_FF" {
+                continue;
+            }
+            let point = architecture.device().bels()[bel.0].point;
+            let key = (point, metadata.z >> 3);
+            let next = u64::try_from(resource_ids.len()).expect("ECP5 slice count fits u64");
+            let resource = *resource_ids.entry(key).or_insert(next);
+            bel_resources.push((bel, resource));
+        }
+        self.constraints
+            .add_shared_resource(cell_values, bel_resources);
+    }
+
     /// LUT/FF pairs using the dedicated data path (`SD=1`).
     #[must_use]
     pub fn lut_ff_pairs(&self) -> &[LutFfPair] {
@@ -1310,7 +1345,8 @@ impl Ecp5Packing {
     ) -> Result<RoutingConstraints, PackingError> {
         let device = architecture.device();
         let graph = UnifiedGraph::new(design, device);
-        let mut constraints = RoutingConstraints::new();
+        let mut constraints =
+            self.routing_restrictions_cached(design, architecture, placement, cache)?;
         for (network, clock) in self.global_clocks.iter().enumerate() {
             let net = &design.nets()[clock.global_net.0];
             let source = placed_pin_wire(&graph, placement, net.driver)?;
@@ -1377,6 +1413,84 @@ impl Ecp5Packing {
         }
         Ok(constraints)
     }
+
+    /// Builds placement-specific ECP5 routing legality restrictions without
+    /// constructing any immutable route trees.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a packed carry cell is missing from placement or
+    /// its placed BEL does not expose the required LUT inputs.
+    pub fn routing_restrictions(
+        &self,
+        design: &Design,
+        architecture: &Ecp5Architecture,
+        placement: &Placement,
+    ) -> Result<RoutingConstraints, PackingError> {
+        let cache = architecture.global_routing_cache();
+        self.routing_restrictions_cached(design, architecture, placement, &cache)
+    }
+
+    /// Cached equivalent of [`Self::routing_restrictions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as
+    /// [`Self::routing_restrictions`].
+    pub fn routing_restrictions_cached(
+        &self,
+        design: &Design,
+        architecture: &Ecp5Architecture,
+        placement: &Placement,
+        cache: &Ecp5GlobalRoutingCache<'_>,
+    ) -> Result<RoutingConstraints, PackingError> {
+        let mut constraints = RoutingConstraints::new();
+        block_illegal_carry_lut_permutations(
+            self,
+            design,
+            architecture,
+            placement,
+            &cache.incoming,
+            &mut constraints,
+        )?;
+        Ok(constraints)
+    }
+}
+
+fn block_illegal_carry_lut_permutations(
+    packing: &Ecp5Packing,
+    design: &Design,
+    architecture: &Ecp5Architecture,
+    placement: &Placement,
+    incoming: &CompactIncomingPips,
+    constraints: &mut RoutingConstraints,
+) -> Result<(), PackingError> {
+    let device = architecture.device();
+    for &cell in packing.carry_pairs.iter().flatten() {
+        let bel = placement
+            .bel(cell)
+            .ok_or_else(|| PackingError::CarryRouting {
+                cell: design.cells()[cell.0].name.clone(),
+                reason: "cell is missing from placement".into(),
+            })?;
+        for pin_name in ["A", "B", "C", "D"] {
+            let pin =
+                find_bel_pin(device, bel, pin_name).ok_or_else(|| PackingError::CarryRouting {
+                    cell: design.cells()[cell.0].name.clone(),
+                    reason: format!("placed BEL has no `{pin_name}` input"),
+                })?;
+            let wire = device.bel_pins()[pin.0].wire;
+            constraints.block_pips(incoming.for_wire(wire).iter().filter_map(|&raw_pip| {
+                let pip = PipId(raw_pip as usize);
+                let flags = architecture.pip_metadata(pip).lutperm_flags;
+                let is_lut_permutation = flags & 0x4000 != 0;
+                let source_input = flags & 0x3;
+                let destination_input = (flags >> 2) & 0x3;
+                (is_lut_permutation && source_input / 2 != destination_input / 2).then_some(pip)
+            }));
+        }
+    }
+    Ok(())
 }
 
 impl Ecp5Architecture {
@@ -2318,6 +2432,13 @@ pub enum PackingError {
         /// First logical slice name.
         cell: String,
     },
+    /// A placed carry slice cannot be routed using legal LUT input permutations.
+    CarryRouting {
+        /// Logical carry slice name.
+        cell: String,
+        /// Physical topology or placement reason.
+        reason: String,
+    },
     /// A requirement referenced an unknown logical cell.
     UnknownBlockRamCell(CellId),
     /// A requirement referenced a cell that is not a memory.
@@ -2475,6 +2596,12 @@ impl fmt::Display for PackingError {
             Self::MissingCarrySlicePair { cell } => {
                 write!(f, "carry slice `{cell}` has no compatible K0/K1 BEL pair")
             }
+            Self::CarryRouting { cell, reason } => {
+                write!(
+                    f,
+                    "carry slice `{cell}` has an invalid routing context: {reason}"
+                )
+            }
             Self::UnknownBlockRamCell(cell) => {
                 write!(f, "unknown block RAM cell ID {}", cell.0)
             }
@@ -2573,6 +2700,7 @@ impl Error for PackingError {
             | Self::DuplicateCarryCell { .. }
             | Self::InvalidCarryConnection { .. }
             | Self::MissingCarrySlicePair { .. }
+            | Self::CarryRouting { .. }
             | Self::UnknownBlockRamCell(_)
             | Self::CellIsNotBlockRam { .. }
             | Self::DuplicateBlockRamRequirement { .. }
@@ -3818,15 +3946,11 @@ mod tests {
         )
         .unwrap();
         let imported = import_ecp5(&mapped).unwrap();
-        let pair = imported.carry_pairs()[0];
+        let pair = *imported.carry_pairs().last().unwrap();
         let mut packing = pack_lut_ffs(imported.design(), &architecture).unwrap();
 
         packing
-            .pack_carry_pairs(
-                imported.design(),
-                &architecture,
-                imported.carry_pairs().iter().take(1).copied(),
-            )
+            .pack_carry_pairs(imported.design(), &architecture, [pair])
             .unwrap();
         assert_eq!(packing.carry_pairs(), &[pair]);
         let group = packing
@@ -3852,6 +3976,78 @@ mod tests {
     }
 
     #[test]
+    fn blocks_only_cross_half_lut_permutations_at_placed_carry_bels() {
+        let mut architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let pair = [
+            design.add_cell("carry0", ResourceKind::Lut(4)),
+            design.add_cell("carry1", ResourceKind::Lut(4)),
+        ];
+        for &cell in &pair {
+            for name in ["A", "B", "C", "D", "FCI"] {
+                design.add_pin(cell, name, PinDirection::Input).unwrap();
+            }
+            for name in ["F", "FCO"] {
+                design.add_pin(cell, name, PinDirection::Output).unwrap();
+            }
+        }
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+        packing
+            .pack_carry_pairs(&design, &architecture, [pair])
+            .unwrap();
+        let placement =
+            place_with_constraints(&design, architecture.device(), packing.constraints()).unwrap();
+        let carry_bel = placement.bel(pair[0]).unwrap();
+        let carry_wires = ["A", "B"].map(|name| {
+            let pin = find_bel_pin(architecture.device(), carry_bel, name).unwrap();
+            architecture.device().bel_pins()[pin.0].wire
+        });
+        let illegal_at_carry = architecture
+            .device()
+            .pips()
+            .iter()
+            .position(|pip| pip.to() == carry_wires[0])
+            .map(PipId)
+            .unwrap();
+        let legal_at_carry = architecture
+            .device()
+            .pips()
+            .iter()
+            .position(|pip| pip.to() == carry_wires[1])
+            .map(PipId)
+            .unwrap();
+        let other_bel = architecture
+            .device()
+            .bels_of_kind(ResourceKind::Lut(4))
+            .iter()
+            .copied()
+            .find(|&bel| architecture.bel_metadata(bel).z == 0 && bel != carry_bel)
+            .unwrap();
+        let other_a = find_bel_pin(architecture.device(), other_bel, "A").unwrap();
+        let other_a_wire = architecture.device().bel_pins()[other_a.0].wire;
+        let illegal_at_other_lut = architecture
+            .device()
+            .pips()
+            .iter()
+            .position(|pip| pip.to() == other_a_wire)
+            .map(PipId)
+            .unwrap();
+        // Physical C -> logical A crosses the carry-legal A/B and C/D halves.
+        architecture.pip_metadata[illegal_at_carry.0].lutperm_flags = 0x4002;
+        architecture.pip_metadata[illegal_at_other_lut.0].lutperm_flags = 0x4002;
+        // Physical B -> logical A remains within the A/B half.
+        architecture.pip_metadata[legal_at_carry.0].lutperm_flags = 0x4001;
+
+        let constraints = packing
+            .global_routing_constraints(&design, &architecture, &placement)
+            .unwrap();
+
+        assert!(constraints.blocked_pips().contains(&illegal_at_carry));
+        assert!(!constraints.blocked_pips().contains(&legal_at_carry));
+        assert!(!constraints.blocked_pips().contains(&illegal_at_other_lut));
+    }
+
+    #[test]
     fn packs_connected_ccu2c_pairs_as_one_physical_carry_chain() {
         let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
         let mut source = Netlist::new("carry_chain");
@@ -3872,23 +4068,17 @@ mod tests {
         .unwrap();
         let imported = import_ecp5(&mapped).unwrap();
         let mut packing = pack_lut_ffs(imported.design(), &architecture).unwrap();
+        let pairs = [
+            imported.carry_pairs()[1],
+            *imported.carry_pairs().last().unwrap(),
+        ];
 
         packing
-            .pack_carry_pairs(
-                imported.design(),
-                &architecture,
-                imported.carry_pairs().iter().take(2).copied(),
-            )
+            .pack_carry_pairs(imported.design(), &architecture, pairs)
             .unwrap();
 
-        assert_eq!(imported.carry_pairs().len(), 3);
-        let cells = imported
-            .carry_pairs()
-            .iter()
-            .take(2)
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
+        assert_eq!(imported.carry_pairs().len(), 4);
+        let cells = pairs.into_iter().flatten().collect::<Vec<_>>();
         let group = packing
             .constraints()
             .groups()
