@@ -67,6 +67,21 @@ synthesis-goal, placement-weight, unconstrained-IO, global-clock, and
 timing-closure controls. Without `--output`, project checkpoints go to
 `target/texo/<top>.json`.
 
+Board-level open-drain buses keep a two-state verification interface in the
+Veryl design and are fused into one physical bidirectional ECP5 pad at the
+mapping boundary. For example, this binds the scalar input `sda_i` and
+active-high pull-down request `sda_drive_low` to the LPF port `sda`:
+
+```sh
+texo pnr path/to/veryl-project --package CABGA381 --speed 8 \
+  --lpf board.lpf --open-drain sda:sda_i:sda_drive_low
+```
+
+Repeat `--open-drain` for additional pads. The LPF constrains only the fused
+pad name, such as `LOCATE COMP sda SITE A10;`; the generated PIO drives zero
+when requested, otherwise enters high impedance, and continuously feeds pad
+readback to the input port.
+
 ## Releases
 
 Release-plz maintains a release PR from conventional commits on `main`.
@@ -145,9 +160,9 @@ cargo run --release -- bitgen artifacts/axi4.checkpoint.json \
 features in Rust; neither nextpnr nor pytrellis is a runtime dependency. It
 selects the exact checkpoint device, configures every non-fixed Texo route edge
 and placed primitive, and refuses generation without implementation and timing
-evidence. LUT/carry, FF, single-ended IO, DCCA routing, and DP16KD configuration
-are emitted without reconstructing a second PnR context. The bundled `ecppack`
-is only the final binary codec.
+evidence. LUT/carry, FF, input/output and open-drain bidirectional IO, DCCA
+routing, and DP16KD configuration are emitted without reconstructing a second
+PnR context. The bundled `ecppack` is only the final binary codec.
 
 See [docs/architecture.md](docs/architecture.md) for the integration boundary
 and [docs/roadmap.md](docs/roadmap.md) for the implementation sequence.

@@ -3630,14 +3630,16 @@ mod tests {
     use struo_celox::ecp5_simulator;
     use struo_ir::{ActiveLevel, ArithmeticOp, ClockEdge, Netlist, RegisterCell, ResetControl};
     use struo_target_ecp5::{
-        ArithmeticMapping, Ecp5Netlist, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
+        ArithmeticMapping, Ecp5Netlist, MappingOptions, OpenDrainIo, map_to_ecp5,
+        map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options,
     };
     use texo_model::{BelId, CellId, Design, Device, NetId, PinDirection, ResourceKind};
     use texo_pnr::{PlacementConstraints, place_and_route};
     use texo_struo::{PrimitiveMetadata, import_ecp5};
     use texo_target_ecp5::{
-        Ecp5Packing, PipClassTimingRecord, TimingCornersRecord, find_global_clock_requirements,
-        pack_lut_ffs, pack_lut_ffs_excluding, parse_lpf, read_architecture, resolve_lpf_port_cells,
+        ArchitectureFile, Ecp5Packing, PipClassTimingRecord, PipRecord, RelativeRef,
+        TimingCornersRecord, expand, find_global_clock_requirements, pack_lut_ffs,
+        pack_lut_ffs_excluding, parse_lpf, read_architecture, resolve_lpf_port_cells,
     };
 
     use super::{
@@ -3915,6 +3917,125 @@ mod tests {
         assert_eq!(result.implementation.routes.len(), 3);
         assert_eq!(result.packing.io_attributes().len(), 1);
         assert_eq!(result.packing.constraints().groups().len(), 3);
+    }
+
+    fn open_drain_test_architecture() -> texo_target_ecp5::Ecp5Architecture {
+        let mut file: ArchitectureFile = serde_json::from_str(ECP5_FIXTURE).unwrap();
+        for (from, to) in [(4, 7), (4, 8), (35, 7), (35, 8)] {
+            file.location_types[0].pips.push(PipRecord {
+                from: RelativeRef {
+                    dx: 0,
+                    dy: 0,
+                    index: from,
+                },
+                to: RelativeRef {
+                    dx: 0,
+                    dy: 0,
+                    index: to,
+                },
+                fixed: false,
+                tile_type: "PLC2".into(),
+                timing_class: "default".into(),
+                lutperm_flags: 0,
+            });
+        }
+        for to in 22..=25 {
+            file.location_types[1].pips.push(PipRecord {
+                from: RelativeRef {
+                    dx: 0,
+                    dy: 0,
+                    index: 13,
+                },
+                to: RelativeRef {
+                    dx: 0,
+                    dy: 0,
+                    index: to,
+                },
+                fixed: false,
+                tile_type: "PLC2".into(),
+                timing_class: "default".into(),
+                lutperm_flags: 0,
+            });
+        }
+        for (from, to) in [(4, 7), (4, 8), (26, 7), (26, 8)] {
+            file.location_types[1].pips.push(PipRecord {
+                from: RelativeRef {
+                    dx: 0,
+                    dy: 0,
+                    index: from,
+                },
+                to: RelativeRef {
+                    dx: -1,
+                    dy: 0,
+                    index: to,
+                },
+                fixed: false,
+                tile_type: "PLC2".into(),
+                timing_class: "default".into(),
+                lutperm_flags: 0,
+            });
+        }
+        expand(file).unwrap()
+    }
+
+    #[test]
+    fn routes_one_open_drain_pad_through_all_three_pio_pins() {
+        let mut source = Netlist::new("open_drain");
+        let sda_i = source.add_input("sda_i");
+        let drive_low = source.add_input("drive_low");
+        source.add_output("sda_drive_low", drive_low);
+        let sampled = source.add_not(sda_i);
+        source.add_output("sampled", sampled);
+        let mapped = map_to_ecp5_with_open_drain_ios(
+            &source,
+            &[OpenDrainIo::new("sda", "sda_i", "sda_drive_low")],
+        )
+        .unwrap();
+        let imported = import_ecp5(&mapped).unwrap();
+        let architecture = open_drain_test_architecture();
+        let lpf = parse_lpf(
+            br"
+                LOCATE COMP sda SITE A10;
+                LOCATE COMP drive_low SITE B10;
+                LOCATE COMP sampled SITE C10;
+                IOBUF PORT sda IO_TYPE=LVCMOS33 PULLMODE=UP;
+            "
+            .as_slice(),
+        )
+        .unwrap();
+        let mut evidence = Evidence::new();
+
+        let result = implement_struo_ecp5(
+            &imported,
+            &architecture,
+            Ecp5FlowOptions {
+                post_map_simulation: PostMapSimulationPolicy::AllowMissing,
+                speed_grade: Some("6"),
+                package: Some("CABGA381"),
+                lpf: Some(&lpf),
+                optimize_timing: false,
+                ..Ecp5FlowOptions::default()
+            },
+            &mut evidence,
+        )
+        .unwrap();
+
+        let sda = imported
+            .ports()
+            .iter()
+            .find(|port| port.name == "sda")
+            .unwrap()
+            .bits[0];
+        let sda_bel = result.implementation.placement.bel(sda).unwrap();
+        assert_eq!(architecture.device().bels()[sda_bel.0].name, "R0C0/PIOA");
+        let routed_pin_names = result.design.cells()[sda.0]
+            .pins()
+            .iter()
+            .filter(|pin| result.design.pins()[pin.0].net().is_some())
+            .map(|pin| result.design.pins()[pin.0].name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(routed_pin_names, BTreeSet::from(["I", "O", "T"]));
+        assert_eq!(result.packing.io_attributes()[&sda]["PULLMODE"], "UP");
     }
 
     #[test]

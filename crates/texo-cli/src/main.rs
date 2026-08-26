@@ -11,7 +11,9 @@ use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
 use struo_synth::synthesize;
-use struo_target_ecp5::{ECP5_QOR_TARGET_MHZ, MappingOptions, map_to_ecp5_with_options};
+use struo_target_ecp5::{
+    ECP5_QOR_TARGET_MHZ, MappingOptions, OpenDrainIo, map_to_ecp5_with_options,
+};
 use texo_cli::{
     Ecp5TargetPack, VerylProject, ecp5_checkpoint, generate_ecp5_config, install_ecp5_target_pack,
     load_veryl_project, resolve_ecp5_target, write_checkpoint_visualizer,
@@ -160,6 +162,24 @@ struct PnrArgs {
     /// Keep the initial legal placement and route without timing closure.
     #[arg(long)]
     no_timing_optimization: bool,
+    /// Bind `PIN:INPUT:DRIVE_LOW` as one physical open-drain pad (repeatable).
+    #[arg(
+        long = "open-drain",
+        value_name = "PIN:INPUT:DRIVE_LOW",
+        value_parser = parse_open_drain
+    )]
+    open_drain: Vec<OpenDrainIo>,
+}
+
+fn parse_open_drain(value: &str) -> Result<OpenDrainIo, String> {
+    let mut fields = value.split(':');
+    let pin = fields.next().unwrap_or_default();
+    let input = fields.next().unwrap_or_default();
+    let drive_low = fields.next().unwrap_or_default();
+    if pin.is_empty() || input.is_empty() || drive_low.is_empty() || fields.next().is_some() {
+        return Err("expected PIN:INPUT:DRIVE_LOW".into());
+    }
+    Ok(OpenDrainIo::new(pin, input, drive_low))
 }
 
 const fn default_synthesis_goal() -> NonZeroU32 {
@@ -358,13 +378,14 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
     for report in &synthesized.reports {
         println!("synthesis {}: {}", report.pass, report.message);
     }
-    let mapped = map_to_ecp5_with_options(
+    let mut mapped = map_to_ecp5_with_options(
         &synthesized.netlist,
         MappingOptions {
             timing_goal_mhz: args.synthesis_goal_mhz.get(),
             ..MappingOptions::default()
         },
     )?;
+    mapped.bind_open_drain_ios(&args.open_drain)?;
     if !mapped.retiming().equivalence_signed_off {
         return Err("Struo mapping/retiming equivalence sign-off failed".into());
     }
@@ -780,6 +801,46 @@ mod tests {
         };
         assert_eq!(args.input, Path::new("project"));
         assert_eq!(args.top, None);
+    }
+
+    #[test]
+    fn parses_repeatable_open_drain_pad_bindings() {
+        let cli = Cli::try_parse_from([
+            "texo",
+            "pnr",
+            "project",
+            "--package",
+            "CABGA381",
+            "--speed",
+            "8",
+            "--open-drain",
+            "sda:sda_i:sda_drive_low",
+            "--open-drain",
+            "scl:scl_i:scl_drive_low",
+        ])
+        .unwrap();
+        let Command::Pnr(args) = cli.command else {
+            panic!("expected pnr command");
+        };
+        assert_eq!(args.open_drain.len(), 2);
+        assert_eq!(args.open_drain[0].pin, "sda");
+        assert_eq!(args.open_drain[0].input_port, "sda_i");
+        assert_eq!(args.open_drain[0].drive_low_port, "sda_drive_low");
+        assert_eq!(args.open_drain[1].pin, "scl");
+        assert!(
+            Cli::try_parse_from([
+                "texo",
+                "pnr",
+                "project",
+                "--package",
+                "CABGA381",
+                "--speed",
+                "8",
+                "--open-drain",
+                "sda:sda_i",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

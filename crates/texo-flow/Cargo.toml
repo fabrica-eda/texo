@@ -13,6 +13,7 @@ texo-target-ecp5.workspace = true
 texo-timing.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 struo-celox.workspace = true
 struo-ir.workspace = true
 struo-target-ecp5.workspace = true

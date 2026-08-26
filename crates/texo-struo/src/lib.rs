@@ -89,6 +89,8 @@ pub enum PortDirection {
     Input,
     /// Fabric output driving the package pin.
     Output,
+    /// Bidirectional package pad with separate fabric input/output controls.
+    Inout,
 }
 
 /// ECP5-specific immutable properties retained beside the generic graph.
@@ -253,6 +255,7 @@ struct Importer {
     metadata: BTreeMap<CellId, PrimitiveMetadata>,
     absorbed_inputs: BTreeMap<CellId, BTreeMap<String, bool>>,
     ports: Vec<ImportedPort>,
+    pending_inout_ports: BTreeMap<MappedSignal, CellId>,
     carry_pairs: Vec<[CellId; 2]>,
     next_synthetic_signal: u32,
     drivers: BTreeMap<MappedSignal, CellPinId>,
@@ -268,6 +271,7 @@ impl Importer {
         let direction = match port.direction {
             MappedPortDirection::Input => PortDirection::Input,
             MappedPortDirection::Output => PortDirection::Output,
+            MappedPortDirection::Inout => PortDirection::Inout,
         };
         let mut cells = Vec::with_capacity(port.bits.len());
         for (bit_index, mapped_bit) in port.bits.iter().copied().enumerate() {
@@ -292,6 +296,12 @@ impl Importer {
                     let pin = self.design.add_pin(cell, "I", PinDirection::Input)?;
                     self.add_sink(mapped_bit, pin);
                 }
+                PortDirection::Inout => {
+                    let signal = mapped_bit.into();
+                    if self.pending_inout_ports.insert(signal, cell).is_some() {
+                        return Err(AdapterError::DuplicateIoPad(signal));
+                    }
+                }
             }
             cells.push(cell);
         }
@@ -309,7 +319,32 @@ impl Importer {
             Ecp5Cell::Ccu2c { .. } => self.add_ccu2c(primitive),
             Ecp5Cell::FlipFlop { .. } => self.add_flip_flop(primitive),
             Ecp5Cell::BlockRam { .. } => self.add_block_ram(primitive),
+            Ecp5Cell::TrellisIo { .. } => self.add_trellis_io(primitive),
         }
+    }
+
+    fn add_trellis_io(&mut self, primitive: &Ecp5Cell) -> Result<(), AdapterError> {
+        let Ecp5Cell::TrellisIo {
+            pad,
+            fabric_output,
+            fabric_input,
+            tristate,
+            ..
+        } = primitive
+        else {
+            unreachable!("dispatch guarantees TRELLIS_IO")
+        };
+        let pad = MappedSignal::Wire(*pad);
+        let cell = self
+            .pending_inout_ports
+            .remove(&pad)
+            .ok_or(AdapterError::UnknownIoPad(pad))?;
+        // Keep both controls as routable pins. This mirrors nextpnr's ECP5
+        // constant packing: all open-drain pads share the lazily-created GND
+        // source for `I`, while a constant `T` can share the VCC/GND source.
+        self.add_input(cell, "I", *fabric_output)?;
+        self.add_input(cell, "T", *tristate)?;
+        self.add_output(cell, "O", *fabric_input)
     }
 
     fn add_ccu2c(&mut self, primitive: &Ecp5Cell) -> Result<(), AdapterError> {
@@ -796,6 +831,9 @@ impl Importer {
     }
 
     fn finish(mut self, name: &str) -> Result<ImportedEcp5Design, AdapterError> {
+        if let Some((&pad, _)) = self.pending_inout_ports.first_key_value() {
+            return Err(AdapterError::MissingIoBuffer(pad));
+        }
         self.insert_carry_feedins()?;
         self.insert_carry_feedouts()?;
         for (signal, sinks) in std::mem::take(&mut self.sinks) {
@@ -868,6 +906,12 @@ pub enum AdapterError {
     DuplicateDriver(MappedSignal),
     /// A consumed mapped signal had no driver.
     MissingDriver(MappedSignal),
+    /// More than one bidirectional top-level bit names the same physical pad signal.
+    DuplicateIoPad(MappedSignal),
+    /// A bidirectional top-level bit had no matching `TRELLIS_IO` primitive.
+    MissingIoBuffer(MappedSignal),
+    /// A `TRELLIS_IO` primitive did not match a bidirectional top-level bit.
+    UnknownIoPad(MappedSignal),
 }
 
 impl fmt::Display for AdapterError {
@@ -880,6 +924,18 @@ impl fmt::Display for AdapterError {
             Self::MissingDriver(signal) => {
                 write!(f, "mapped signal {signal:?} has no driver")
             }
+            Self::DuplicateIoPad(signal) => {
+                write!(
+                    f,
+                    "mapped bidirectional pad {signal:?} is declared more than once"
+                )
+            }
+            Self::MissingIoBuffer(signal) => {
+                write!(f, "mapped bidirectional pad {signal:?} has no TRELLIS_IO")
+            }
+            Self::UnknownIoPad(signal) => {
+                write!(f, "TRELLIS_IO pad {signal:?} is not a bidirectional port")
+            }
         }
     }
 }
@@ -888,7 +944,11 @@ impl Error for AdapterError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Model(error) => Some(error),
-            Self::DuplicateDriver(_) | Self::MissingDriver(_) => None,
+            Self::DuplicateDriver(_)
+            | Self::MissingDriver(_)
+            | Self::DuplicateIoPad(_)
+            | Self::MissingIoBuffer(_)
+            | Self::UnknownIoPad(_) => None,
         }
     }
 }
@@ -908,12 +968,12 @@ mod tests {
         ActiveLevel as StruoActiveLevel, ArithmeticOp, ClockEdge as StruoClockEdge, ComparisonOp,
         EnableControl, MemoryCell, Netlist, RegisterCell, ResetControl,
     };
-    use struo_target_ecp5::map_to_ecp5;
+    use struo_target_ecp5::{OpenDrainIo, map_to_ecp5, map_to_ecp5_with_open_drain_ios};
     use texo_model::{CellId, ResourceKind};
 
     use super::{
-        ActiveLevel, ClockEdge, PrimitiveMetadata, ResetMetadata, celox_frontend_artifact,
-        fold_lut_input, import_ecp5,
+        ActiveLevel, ClockEdge, PortDirection, PrimitiveMetadata, ResetMetadata,
+        celox_frontend_artifact, fold_lut_input, import_ecp5,
     };
 
     fn mapped_xor() -> struo_target_ecp5::Ecp5Netlist {
@@ -979,6 +1039,63 @@ mod tests {
 
         assert_eq!(artifact.module_name(), "logic");
         assert_eq!(artifact.port_order().len(), 3);
+    }
+
+    #[test]
+    fn fuses_an_open_drain_pad_into_one_bidirectional_io_cell() {
+        let mut source = Netlist::new("open_drain");
+        let sda_i = source.add_input("sda_i");
+        let drive_low = source.add_input("drive_low");
+        source.add_output("sda_drive_low", drive_low);
+        source.add_output("sampled", sda_i);
+        let mapped = map_to_ecp5_with_open_drain_ios(
+            &source,
+            &[OpenDrainIo::new("sda", "sda_i", "sda_drive_low")],
+        )
+        .unwrap();
+
+        let imported = import_ecp5(&mapped).unwrap();
+        let sda = imported
+            .ports()
+            .iter()
+            .find(|port| port.name == "sda")
+            .unwrap();
+        assert_eq!(sda.direction, PortDirection::Inout);
+        assert_eq!(sda.bits.len(), 1);
+        let cell = sda.bits[0];
+        assert_eq!(imported.design().cells()[cell.0].kind, ResourceKind::Io);
+        assert!(matches!(
+            imported.metadata().get(&cell),
+            Some(PrimitiveMetadata::Port {
+                name,
+                bit: 0,
+                direction: PortDirection::Inout,
+            }) if name == "sda"
+        ));
+        let pins = imported.design().cells()[cell.0]
+            .pins()
+            .iter()
+            .map(|pin| {
+                let pin = &imported.design().pins()[pin.0];
+                (pin.name.as_str(), pin.direction)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pins,
+            [
+                ("I", texo_model::PinDirection::Input),
+                ("T", texo_model::PinDirection::Input),
+                ("O", texo_model::PinDirection::Output),
+            ]
+        );
+        assert_eq!(
+            imported
+                .metadata()
+                .values()
+                .filter(|metadata| matches!(metadata, PrimitiveMetadata::Port { .. }))
+                .count(),
+            3
+        );
     }
 
     #[test]

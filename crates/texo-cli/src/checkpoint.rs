@@ -492,6 +492,7 @@ fn primitive_metadata_json(
             "direction": match direction {
                 PortDirection::Input => "input",
                 PortDirection::Output => "output",
+                PortDirection::Inout => "inout",
             },
         }),
         PrimitiveMetadata::Constant { value } => {
@@ -521,17 +522,36 @@ const fn active_level_name(level: ActiveLevel) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use texo_model::PinDirection;
+    use texo_model::{CellId, Design, PinDirection, ResourceKind};
+    use texo_struo::{PortDirection, PrimitiveMetadata};
     use texo_target_ecp5::{
         ArchitectureFile, PipRecord, RelativeRef, TileRecord, WireRecord, expand,
     };
 
-    use super::cib_ties_for_bels;
+    use super::{cib_ties_for_bels, primitive_metadata_json};
 
     const ARCHITECTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../texo-target-ecp5/fixtures/minimal-ecp5.json"
     ));
+
+    #[test]
+    fn checkpoints_bidirectional_port_direction() {
+        let mut design = Design::new();
+        let cell = design.add_cell("$sda[0]", ResourceKind::Io);
+        let configuration = primitive_metadata_json(
+            cell,
+            &PrimitiveMetadata::Port {
+                name: "sda".into(),
+                bit: 0,
+                direction: PortDirection::Inout,
+            },
+            &design,
+        );
+
+        assert_eq!(cell, CellId(0));
+        assert_eq!(configuration["configuration"]["direction"], "inout");
+    }
 
     #[test]
     fn checkpoints_the_fixed_cib_tie_before_a_dp16kd_pin() {

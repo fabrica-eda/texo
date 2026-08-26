@@ -668,11 +668,7 @@ fn write_io(
         .rsplit('/')
         .next()
         .ok_or_else(|| BitgenError::new("PIO BEL has no basename"))?;
-    let direction = if string(configuration, "direction")? == "input" {
-        "INPUT"
-    } else {
-        "OUTPUT"
-    };
+    let direction = io_base_direction(configuration)?;
     let attributes = attributes
         .map(|value| object(value, "attributes"))
         .transpose()?
@@ -688,7 +684,7 @@ fn write_io(
     config
         .tile_mut(&companion_tile)
         .add_enum(format!("{pio}.BASE_TYPE"), format!("{direction}_{io_type}"));
-    if direction == "INPUT" {
+    if matches!(direction, "INPUT" | "BIDIR") {
         config.tile_mut(&base_tile).add_enum(
             format!("{pio}.HYSTERESIS"),
             attributes
@@ -716,7 +712,7 @@ fn write_io(
             );
         }
     }
-    if direction == "OUTPUT" {
+    if matches!(direction, "OUTPUT" | "BIDIR") {
         let bank = io_bank(iodb, placement)?;
         let bank_type = format!("BANKREF{bank}");
         let bank_tile = unique_tile_of_type(architecture, &bank_type)?;
@@ -725,6 +721,19 @@ fn write_io(
             .add_enum("BANK.VCCIO", io_voltage(io_type)?);
     }
     Ok(())
+}
+
+fn io_base_direction(configuration: &Value) -> Result<&'static str, BitgenError> {
+    Ok(match string(configuration, "direction")? {
+        "input" => "INPUT",
+        "output" => "OUTPUT",
+        "inout" => "BIDIR",
+        direction => {
+            return Err(BitgenError::new(format!(
+                "unsupported IO direction {direction}"
+            )));
+        }
+    })
 }
 
 fn value_or_default<'a>(value: &'a str, _default: &'a str) -> &'a str {
@@ -1285,7 +1294,7 @@ mod tests {
     use texo_target_ecp5::{ArchitectureFile, TileRecord, expand};
 
     use super::{
-        ChipConfig, TileConfig, fold_lut_input, reverse_bits, trellis_wire_name,
+        ChipConfig, TileConfig, fold_lut_input, io_base_direction, reverse_bits, trellis_wire_name,
         validate_checkpoint, write_bram,
     };
 
@@ -1311,6 +1320,23 @@ mod tests {
         assert_eq!(reverse_bits(0b000_000_011, 9), 0b110_000_000);
         assert_eq!(fold_lut_input(0xaaaa, 0, false), 0x0000);
         assert_eq!(fold_lut_input(0xaaaa, 0, true), 0xffff);
+    }
+
+    #[test]
+    fn maps_bidirectional_ports_to_the_ecp5_bidir_base_type() {
+        assert_eq!(
+            io_base_direction(&json!({"direction": "input"})).unwrap(),
+            "INPUT"
+        );
+        assert_eq!(
+            io_base_direction(&json!({"direction": "output"})).unwrap(),
+            "OUTPUT"
+        );
+        assert_eq!(
+            io_base_direction(&json!({"direction": "inout"})).unwrap(),
+            "BIDIR"
+        );
+        assert!(io_base_direction(&json!({"direction": "unknown"})).is_err());
     }
 
     #[test]

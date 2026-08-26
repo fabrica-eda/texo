@@ -1,7 +1,10 @@
 //! Post-route static timing analysis over Texo's unified graph.
 //!
 //! Both early/minimum and late/maximum propagation are modeled so setup and
-//! hold checks can share one characterized target timing model.
+//! hold checks can share one characterized target timing model. Register
+//! launches are propagated independently per clock net; unconstrained primary
+//! inputs and cross-clock paths are not treated as zero-time synchronous
+//! launches.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
@@ -349,13 +352,27 @@ fn timing_report_from_net_delays(
         .iter()
         .map(|delay| ((delay.net, delay.sink), delay.delay))
         .collect::<BTreeMap<_, _>>();
-    let clock_arrivals = pin_arrivals(design, &delays_by_sink, model, &BTreeMap::new())?;
-    let mut register_starts = BTreeMap::new();
+    let clock_arrivals = pin_arrivals(design, &delays_by_sink, model, &BTreeMap::new(), true)?;
+    let mut register_starts_by_clock = BTreeMap::<NetId, BTreeMap<CellPinId, DelayRange>>::new();
     for (&output, &(clock, delay)) in &model.clock_to_q {
+        let Some(clock_net) = design.pins()[clock.0].net() else {
+            continue;
+        };
         let clock_arrival = clock_arrivals[clock.0].unwrap_or(DelayRange::zero());
-        register_starts.insert(output, clock_arrival.checked_add(delay)?);
+        register_starts_by_clock
+            .entry(clock_net)
+            .or_default()
+            .insert(output, clock_arrival.checked_add(delay)?);
     }
-    let arrivals = pin_arrivals(design, &delays_by_sink, model, &register_starts)?;
+    let arrivals_by_clock = register_starts_by_clock
+        .iter()
+        .map(|(&clock_net, starts)| {
+            Ok((
+                clock_net,
+                pin_arrivals(design, &delays_by_sink, model, starts, false)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, TimingError>>()?;
 
     let mut setup_checks = Vec::new();
     let mut hold_checks = Vec::new();
@@ -366,8 +383,15 @@ fn timing_report_from_net_delays(
         let Some(&period_ps) = constraints.clock_periods_ps.get(&clock_net) else {
             continue;
         };
+        let Some(arrival) = arrivals_by_clock
+            .get(&clock_net)
+            .and_then(|arrivals| arrivals[data_pin.0])
+        else {
+            // Primary-input and cross-clock paths need explicit timing
+            // constraints. Do not invent a synchronous launch at time zero.
+            continue;
+        };
         let clock_arrival = clock_arrivals[clock_pin.0].unwrap_or(DelayRange::zero());
-        let arrival = arrivals[data_pin.0].unwrap_or(DelayRange::zero());
         let required_ps =
             i128::from(period_ps) + i128::from(clock_arrival.min_ps) - i128::from(setup.max_ps);
         setup_checks.push(SetupCheck {
@@ -397,7 +421,13 @@ fn timing_report_from_net_delays(
     }
     let worst_slack_ps = setup_checks.iter().map(|check| check.slack_ps).min();
     let worst_hold_slack_ps = hold_checks.iter().map(|check| check.slack_ps).min();
-    let net_setup_slacks = net_setup_slacks(design, &net_delays, model, &arrivals, &setup_checks)?;
+    let net_setup_slacks = net_setup_slacks(
+        design,
+        &net_delays,
+        model,
+        &arrivals_by_clock,
+        &setup_checks,
+    )?;
     Ok(TimingReport {
         net_delays,
         net_setup_slacks,
@@ -412,7 +442,7 @@ fn net_setup_slacks(
     design: &Design,
     net_delays: &[NetDelay],
     model: &TimingModel,
-    arrivals: &[Option<DelayRange>],
+    arrivals_by_clock: &BTreeMap<NetId, Vec<Option<DelayRange>>>,
     setup_checks: &[SetupCheck],
 ) -> Result<Vec<NetSetupSlack>, TimingError> {
     let mut edges = vec![Vec::<(CellPinId, u64)>::new(); design.pins().len()];
@@ -447,33 +477,47 @@ fn net_setup_slacks(
         return Err(TimingError::CombinationalCycle);
     }
 
-    let mut required = vec![None::<i128>; design.pins().len()];
-    for check in setup_checks {
-        let entry = &mut required[check.data_pin.0];
-        *entry = Some(entry.map_or(check.required_ps, |known| known.min(check.required_ps)));
-    }
-    for &from in order.iter().rev() {
-        for &(to, delay_ps) in &edges[from.0] {
-            let Some(to_required) = required[to.0] else {
+    let mut slacks = BTreeMap::<(NetId, CellPinId), i128>::new();
+    for (&clock_net, arrivals) in arrivals_by_clock {
+        let mut required = vec![None::<i128>; design.pins().len()];
+        for check in setup_checks
+            .iter()
+            .filter(|check| check.clock_net == clock_net)
+        {
+            let entry = &mut required[check.data_pin.0];
+            *entry = Some(entry.map_or(check.required_ps, |known| known.min(check.required_ps)));
+        }
+        for &from in order.iter().rev() {
+            for &(to, delay_ps) in &edges[from.0] {
+                let Some(to_required) = required[to.0] else {
+                    continue;
+                };
+                let candidate = to_required - i128::from(delay_ps);
+                let entry = &mut required[from.0];
+                *entry = Some(entry.map_or(candidate, |known| known.min(candidate)));
+            }
+        }
+        for delay in net_delays {
+            let driver = design.nets()[delay.net.0].driver;
+            let (Some(required_ps), Some(arrival)) = (required[delay.sink.0], arrivals[driver.0])
+            else {
                 continue;
             };
-            let candidate = to_required - i128::from(delay_ps);
-            let entry = &mut required[from.0];
-            *entry = Some(entry.map_or(candidate, |known| known.min(candidate)));
+            let slack_ps =
+                required_ps - i128::from(arrival.max_ps) - i128::from(delay.delay.max_ps);
+            slacks
+                .entry((delay.net, delay.sink))
+                .and_modify(|known| *known = (*known).min(slack_ps))
+                .or_insert(slack_ps);
         }
     }
 
-    Ok(net_delays
-        .iter()
-        .filter_map(|delay| {
-            let driver = design.nets()[delay.net.0].driver;
-            Some(NetSetupSlack {
-                net: delay.net,
-                sink: delay.sink,
-                slack_ps: required[delay.sink.0]?
-                    - i128::from(arrivals[driver.0]?.max_ps)
-                    - i128::from(delay.delay.max_ps),
-            })
+    Ok(slacks
+        .into_iter()
+        .map(|((net, sink), slack_ps)| NetSetupSlack {
+            net,
+            sink,
+            slack_ps,
         })
         .collect())
 }
@@ -631,6 +675,7 @@ fn pin_arrivals(
     delays: &BTreeMap<(NetId, CellPinId), DelayRange>,
     model: &TimingModel,
     starts: &BTreeMap<CellPinId, DelayRange>,
+    implicit_root_starts: bool,
 ) -> Result<Vec<Option<DelayRange>>, TimingError> {
     let mut edges = vec![Vec::<(CellPinId, DelayRange)>::new(); design.pins().len()];
     let mut indegree = vec![0_usize; design.pins().len()];
@@ -655,20 +700,24 @@ fn pin_arrivals(
     for (index, &degree) in indegree.iter().enumerate() {
         if degree == 0 {
             let pin = CellPinId(index);
-            arrivals[index] = Some(starts.get(&pin).copied().unwrap_or(DelayRange::zero()));
+            arrivals[index] = starts
+                .get(&pin)
+                .copied()
+                .or_else(|| implicit_root_starts.then_some(DelayRange::zero()));
             ready.push_back(pin);
         }
     }
     let mut visited = 0_usize;
     while let Some(pin) = ready.pop_front() {
         visited += 1;
-        let arrival = arrivals[pin.0].unwrap_or(DelayRange::zero());
         for &(next, delay) in &edges[pin.0] {
-            let candidate = arrival.checked_add(delay)?;
-            arrivals[next.0] = Some(arrivals[next.0].map_or(candidate, |known| DelayRange {
-                min_ps: known.min_ps.min(candidate.min_ps),
-                max_ps: known.max_ps.max(candidate.max_ps),
-            }));
+            if let Some(arrival) = arrivals[pin.0] {
+                let candidate = arrival.checked_add(delay)?;
+                arrivals[next.0] = Some(arrivals[next.0].map_or(candidate, |known| DelayRange {
+                    min_ps: known.min_ps.min(candidate.min_ps),
+                    max_ps: known.max_ps.max(candidate.max_ps),
+                }));
+            }
             indegree[next.0] -= 1;
             if indegree[next.0] == 0 {
                 ready.push_back(next);
@@ -838,11 +887,13 @@ mod tests {
             &constraints,
         )
         .unwrap();
+        // The second modeled endpoint is driven only by an unconstrained
+        // primary input and therefore is not fabricated into this clock domain.
         assert_eq!(failed.setup_checks.len(), 1);
-        assert_eq!(failed.worst_slack_ps, Some(-90));
+        assert_eq!(failed.worst_slack_ps, Some(-240));
         assert!(!failed.met_timing());
 
-        constraints.set_clock_period_ps(clock_net, 150);
+        constraints.set_clock_period_ps(clock_net, 300);
         let passed = analyze_timing(
             &design,
             &device,
@@ -853,7 +904,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(passed.worst_slack_ps, Some(10));
-        assert_eq!(passed.worst_hold_slack_ps, Some(110));
+        assert_eq!(passed.worst_hold_slack_ps, Some(250));
         assert_eq!(passed.net_setup_slacks.len(), 2);
         assert!(
             passed
@@ -866,7 +917,7 @@ mod tests {
 
     #[test]
     fn a_hold_violation_blocks_timing_closure() {
-        let (design, device, clock_net, model) = registered_path(250);
+        let (design, device, clock_net, model) = registered_path(400);
         let implementation = place_and_route(&design, &device).unwrap();
         let pip_delays = device
             .pips()
@@ -887,7 +938,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.worst_hold_slack_ps, Some(-130));
+        assert_eq!(report.worst_hold_slack_ps, Some(-140));
         assert!(!report.met_timing());
     }
 
@@ -900,22 +951,64 @@ mod tests {
         let lut = design.add_cell("lut", ResourceKind::Lut(4));
         let lut_a = design.add_pin(lut, "A", PinDirection::Input).unwrap();
         let lut_f = design.add_pin(lut, "F", PinDirection::Output).unwrap();
-        let ff = design.add_cell("ff", ResourceKind::Register);
-        let ff_di = design.add_pin(ff, "DI", PinDirection::Input).unwrap();
-        let ff_clk = design.add_pin(ff, "CLK", PinDirection::Input).unwrap();
-        let ff_q = design.add_pin(ff, "Q", PinDirection::Output).unwrap();
-        design.add_net("input", input_o, [lut_a]).unwrap();
-        design.add_net("data", lut_f, [ff_di]).unwrap();
-        let clock_net = design.add_net("clock", clock_o, [ff_clk]).unwrap();
+        let launch = design.add_cell("launch", ResourceKind::Register);
+        let launch_di = design.add_pin(launch, "DI", PinDirection::Input).unwrap();
+        let launch_clk = design.add_pin(launch, "CLK", PinDirection::Input).unwrap();
+        let launch_q = design.add_pin(launch, "Q", PinDirection::Output).unwrap();
+        let capture = design.add_cell("capture", ResourceKind::Register);
+        let capture_di = design.add_pin(capture, "DI", PinDirection::Input).unwrap();
+        let capture_clk = design.add_pin(capture, "CLK", PinDirection::Input).unwrap();
+        let capture_q = design.add_pin(capture, "Q", PinDirection::Output).unwrap();
+        design.add_net("input", input_o, [launch_di]).unwrap();
+        design.add_net("launch-q", launch_q, [lut_a]).unwrap();
+        design.add_net("data", lut_f, [capture_di]).unwrap();
+        let clock_net = design
+            .add_net("clock", clock_o, [launch_clk, capture_clk])
+            .unwrap();
 
+        let device = timing_test_device();
+        let mut model = TimingModel::new();
+        model
+            .add_cell_arc(lut_a, lut_f, DelayRange::new(20, 30).unwrap())
+            .unwrap();
+        model
+            .add_clock_to_q(launch_clk, launch_q, DelayRange::new(40, 50).unwrap())
+            .unwrap();
+        model
+            .add_setup_hold(
+                launch_clk,
+                launch_di,
+                DelayRange::new(10, 10).unwrap(),
+                DelayRange::new(hold_ps, hold_ps).unwrap(),
+            )
+            .unwrap();
+        model
+            .add_clock_to_q(capture_clk, capture_q, DelayRange::new(40, 50).unwrap())
+            .unwrap();
+        model
+            .add_setup_hold(
+                capture_clk,
+                capture_di,
+                DelayRange::new(10, 10).unwrap(),
+                DelayRange::new(hold_ps, hold_ps).unwrap(),
+            )
+            .unwrap();
+        (design, device, clock_net, model)
+    }
+
+    fn timing_test_device() -> Device {
         let mut device = Device::new("timing", 4, 1).unwrap();
         let io_data_wire = device.add_wire("io-data", Point::new(0, 0), 1).unwrap();
         let io_clock_wire = device.add_wire("io-clock", Point::new(0, 0), 1).unwrap();
-        let logic_input_wire = device.add_wire("lut-a", Point::new(1, 0), 1).unwrap();
-        let logic_output_wire = device.add_wire("lut-f", Point::new(1, 0), 1).unwrap();
-        let ff_di_wire = device.add_wire("ff-di", Point::new(2, 0), 1).unwrap();
-        let ff_clk_wire = device.add_wire("ff-clk", Point::new(2, 0), 1).unwrap();
-        let ff_q_wire = device.add_wire("ff-q", Point::new(2, 0), 1).unwrap();
+        let launch_di_wire = device.add_wire("launch-di", Point::new(1, 0), 1).unwrap();
+        let launch_clk_wire = device.add_wire("launch-clk", Point::new(1, 0), 1).unwrap();
+        let launch_q_wire = device.add_wire("launch-q", Point::new(1, 0), 1).unwrap();
+        let logic_input_wire = device.add_wire("lut-a", Point::new(2, 0), 1).unwrap();
+        let logic_output_wire = device.add_wire("lut-f", Point::new(2, 0), 1).unwrap();
+        let capture_di_wire = device.add_wire("capture-di", Point::new(3, 0), 1).unwrap();
+        let capture_clk_wire = device.add_wire("capture-clk", Point::new(3, 0), 1).unwrap();
+        let capture_q_wire = device.add_wire("capture-q", Point::new(3, 0), 1).unwrap();
+
         let io_data = device
             .add_bel("IO-DATA", ResourceKind::Io, Point::new(0, 0))
             .unwrap();
@@ -928,51 +1021,52 @@ mod tests {
         device
             .add_bel_pin(io_clock, "O", PinDirection::Output, io_clock_wire)
             .unwrap();
-        let lut_bel = device
-            .add_bel("LUT", ResourceKind::Lut(4), Point::new(1, 0))
+        let launch = device
+            .add_bel("LAUNCH", ResourceKind::Register, Point::new(1, 0))
             .unwrap();
         device
-            .add_bel_pin(lut_bel, "A", PinDirection::Input, logic_input_wire)
+            .add_bel_pin(launch, "DI", PinDirection::Input, launch_di_wire)
             .unwrap();
         device
-            .add_bel_pin(lut_bel, "F", PinDirection::Output, logic_output_wire)
-            .unwrap();
-        let ff_bel = device
-            .add_bel("FF", ResourceKind::Register, Point::new(2, 0))
+            .add_bel_pin(launch, "CLK", PinDirection::Input, launch_clk_wire)
             .unwrap();
         device
-            .add_bel_pin(ff_bel, "DI", PinDirection::Input, ff_di_wire)
+            .add_bel_pin(launch, "Q", PinDirection::Output, launch_q_wire)
+            .unwrap();
+        let lut = device
+            .add_bel("LUT", ResourceKind::Lut(4), Point::new(2, 0))
             .unwrap();
         device
-            .add_bel_pin(ff_bel, "CLK", PinDirection::Input, ff_clk_wire)
+            .add_bel_pin(lut, "A", PinDirection::Input, logic_input_wire)
             .unwrap();
         device
-            .add_bel_pin(ff_bel, "Q", PinDirection::Output, ff_q_wire)
+            .add_bel_pin(lut, "F", PinDirection::Output, logic_output_wire)
+            .unwrap();
+        let capture = device
+            .add_bel("CAPTURE", ResourceKind::Register, Point::new(3, 0))
             .unwrap();
         device
-            .add_pip(io_data_wire, logic_input_wire, false, 1)
+            .add_bel_pin(capture, "DI", PinDirection::Input, capture_di_wire)
             .unwrap();
         device
-            .add_pip(logic_output_wire, ff_di_wire, false, 1)
+            .add_bel_pin(capture, "CLK", PinDirection::Input, capture_clk_wire)
             .unwrap();
         device
-            .add_pip(io_clock_wire, ff_clk_wire, false, 1)
+            .add_bel_pin(capture, "Q", PinDirection::Output, capture_q_wire)
             .unwrap();
-        let mut model = TimingModel::new();
-        model
-            .add_cell_arc(lut_a, lut_f, DelayRange::new(20, 30).unwrap())
-            .unwrap();
-        model
-            .add_clock_to_q(ff_clk, ff_q, DelayRange::new(40, 50).unwrap())
-            .unwrap();
-        model
-            .add_setup_hold(
-                ff_clk,
-                ff_di,
-                DelayRange::new(10, 10).unwrap(),
-                DelayRange::new(hold_ps, hold_ps).unwrap(),
-            )
-            .unwrap();
-        (design, device, clock_net, model)
+
+        for (from, to) in [
+            (io_data_wire, launch_di_wire),
+            (io_clock_wire, launch_di_wire),
+            (launch_q_wire, logic_input_wire),
+            (logic_output_wire, capture_di_wire),
+            (io_clock_wire, launch_clk_wire),
+            (io_clock_wire, capture_clk_wire),
+            (io_data_wire, launch_clk_wire),
+            (io_data_wire, capture_clk_wire),
+        ] {
+            device.add_pip(from, to, false, 1).unwrap();
+        }
+        device
     }
 }
