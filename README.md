@@ -134,6 +134,13 @@ texo pnr path/to/veryl-project --package CABGA381 --speed 8 \
 texo bitgen design.checkpoint.json --bit design.bit
 ```
 
+To use the dedicated ECP5 JTAG block, expose the scalar
+`jtag_tdo1`, `jtag_tdo2`, `jtag_tdi`, `jtag_tck`, `jtag_rti1`,
+`jtag_rti2`, `jtag_shift`, `jtag_update`, `jtag_rst_n`, `jtag_ce1`, and
+`jtag_ce2` ports and pass `--jtagg-prefix jtag` to `pnr`. Texo binds those
+ports to `JTAGG`, routes its fabric interface, and carries the ER1/ER2 settings
+through the checkpoint into native bit generation.
+
 For an air-gapped machine, download the release `.txpkg.zst` elsewhere and run
 `texo target install <pack.txpkg.zst>`. `TEXO_TARGET_DIR` overrides the cache
 location. Supplying individual architecture/database/codec paths remains a
@@ -160,9 +167,9 @@ cargo run --release -- bitgen artifacts/axi4.checkpoint.json \
 features in Rust; neither nextpnr nor pytrellis is a runtime dependency. It
 selects the exact checkpoint device, configures every non-fixed Texo route edge
 and placed primitive, and refuses generation without implementation and timing
-evidence. LUT/carry, FF, input/output and open-drain bidirectional IO, DCCA
-routing, and DP16KD configuration are emitted without reconstructing a second
-PnR context. The bundled `ecppack` is only the final binary codec.
+evidence. LUT/carry, FF, input/output and open-drain bidirectional IO, JTAGG,
+DCCA routing, and DP16KD configuration are emitted without reconstructing a
+second PnR context. The bundled `ecppack` is only the final binary codec.
 
 See [docs/architecture.md](docs/architecture.md) for the integration boundary
 and [docs/roadmap.md](docs/roadmap.md) for the implementation sequence.

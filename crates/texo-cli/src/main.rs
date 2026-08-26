@@ -12,7 +12,8 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand};
 use struo_synth::synthesize;
 use struo_target_ecp5::{
-    ECP5_QOR_TARGET_MHZ, MappingOptions, OpenDrainIo, map_to_ecp5_with_options,
+    ECP5_QOR_TARGET_MHZ, Ecp5Netlist, JtaggBinding, MappingError, MappingOptions, OpenDrainIo,
+    map_to_ecp5_with_options,
 };
 use texo_cli::{
     Ecp5TargetPack, VerylProject, ecp5_checkpoint, generate_ecp5_config, install_ecp5_target_pack,
@@ -169,6 +170,9 @@ struct PnrArgs {
         value_parser = parse_open_drain
     )]
     open_drain: Vec<OpenDrainIo>,
+    /// Bind `<PREFIX>_*` scalar ports to the dedicated ECP5 JTAG block.
+    #[arg(long, value_name = "PREFIX")]
+    jtagg_prefix: Option<String>,
 }
 
 fn parse_open_drain(value: &str) -> Result<OpenDrainIo, String> {
@@ -180,6 +184,18 @@ fn parse_open_drain(value: &str) -> Result<OpenDrainIo, String> {
         return Err("expected PIN:INPUT:DRIVE_LOW".into());
     }
     Ok(OpenDrainIo::new(pin, input, drive_low))
+}
+
+fn bind_target_primitives(
+    mapped: &mut Ecp5Netlist,
+    open_drain: &[OpenDrainIo],
+    jtagg_prefix: Option<&str>,
+) -> Result<(), MappingError> {
+    mapped.bind_open_drain_ios(open_drain)?;
+    if let Some(prefix) = jtagg_prefix {
+        mapped.bind_jtagg(&JtaggBinding::with_prefix(prefix))?;
+    }
+    Ok(())
 }
 
 const fn default_synthesis_goal() -> NonZeroU32 {
@@ -385,7 +401,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
             ..MappingOptions::default()
         },
     )?;
-    mapped.bind_open_drain_ios(&args.open_drain)?;
+    bind_target_primitives(&mut mapped, &args.open_drain, args.jtagg_prefix.as_deref())?;
     if !mapped.retiming().equivalence_signed_off {
         return Err("Struo mapping/retiming equivalence sign-off failed".into());
     }
@@ -841,6 +857,27 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_jtagg_prefix_binding() {
+        let cli = Cli::try_parse_from([
+            "texo",
+            "pnr",
+            "project",
+            "--package",
+            "CABGA381",
+            "--speed",
+            "8",
+            "--jtagg-prefix",
+            "debug",
+        ])
+        .unwrap();
+        let Command::Pnr(args) = cli.command else {
+            panic!("expected pnr command");
+        };
+
+        assert_eq!(args.jtagg_prefix.as_deref(), Some("debug"));
     }
 
     #[test]
