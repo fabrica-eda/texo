@@ -180,7 +180,8 @@ texo bitgen design.checkpoint.json --bit design.bit
 To use the dedicated ECP5 JTAG block, expose the scalar
 `jtag_tdo1`, `jtag_tdo2`, `jtag_tdi`, `jtag_tck`, `jtag_rti1`,
 `jtag_rti2`, `jtag_shift`, `jtag_update`, `jtag_rst_n`, `jtag_ce1`, and
-`jtag_ce2` ports and pass `--jtagg-prefix jtag` to `pnr`. Texo binds those
+`jtag_ce2` ports and pass `--jtagg-prefix jtag` to `pnr`. Add
+`--jtagg-disable-er2` when extension register two is not used. Texo binds those
 ports to `JTAGG`, routes its fabric interface, and carries the ER1/ER2 settings
 through the checkpoint into native bit generation.
 

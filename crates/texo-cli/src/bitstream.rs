@@ -437,7 +437,6 @@ fn write_jtagg(
 ) -> Result<(), BitgenError> {
     let tile = unique_tile_of_type(architecture, "EFB0_PICB0")?;
     let target = config.tile_mut(&tile);
-    target.add_enum("JTAG.MODE", "JTAGG");
     for (name, enabled) in [
         (
             "JTAG.ER1",
@@ -1364,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn jtagg_enables_its_mode_and_selected_extension_registers() {
+    fn jtagg_configures_only_selected_extension_registers() {
         let mut file: ArchitectureFile = serde_json::from_str(ARCHITECTURE).unwrap();
         file.locations[0].tiles.push(TileRecord {
             name: "MIB_R0C0:EFB0_PICB0".into(),
@@ -1387,7 +1386,6 @@ mod tests {
         assert_eq!(
             config.tiles["MIB_R0C0:EFB0_PICB0"].enums,
             [
-                ("JTAG.MODE".into(), "JTAGG".into()),
                 ("JTAG.ER1".into(), "ENABLED".into()),
                 ("JTAG.ER2".into(), "DISABLED".into()),
             ]
@@ -1444,7 +1442,6 @@ mod tests {
 
         assert!(generated.text.contains(
             ".tile MIB_R0C0:EFB0_PICB0\n\
-             enum: JTAG.MODE JTAGG\n\
              enum: JTAG.ER1 ENABLED\n\
              enum: JTAG.ER2 DISABLED\n"
         ));
