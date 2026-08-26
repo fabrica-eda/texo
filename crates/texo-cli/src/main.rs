@@ -173,6 +173,9 @@ struct PnrArgs {
     /// Bind `<PREFIX>_*` scalar ports to the dedicated ECP5 JTAG block.
     #[arg(long, value_name = "PREFIX")]
     jtagg_prefix: Option<String>,
+    /// Disable JTAG extension register two.
+    #[arg(long, requires = "jtagg_prefix")]
+    jtagg_disable_er2: bool,
 }
 
 fn parse_open_drain(value: &str) -> Result<OpenDrainIo, String> {
@@ -186,16 +189,18 @@ fn parse_open_drain(value: &str) -> Result<OpenDrainIo, String> {
     Ok(OpenDrainIo::new(pin, input, drive_low))
 }
 
-fn bind_target_primitives(
-    mapped: &mut Ecp5Netlist,
-    open_drain: &[OpenDrainIo],
-    jtagg_prefix: Option<&str>,
-) -> Result<(), MappingError> {
-    mapped.bind_open_drain_ios(open_drain)?;
-    if let Some(prefix) = jtagg_prefix {
-        mapped.bind_jtagg(&JtaggBinding::with_prefix(prefix))?;
+fn bind_target_primitives(mapped: &mut Ecp5Netlist, args: &PnrArgs) -> Result<(), MappingError> {
+    mapped.bind_open_drain_ios(&args.open_drain)?;
+    if let Some(prefix) = args.jtagg_prefix.as_deref() {
+        mapped.bind_jtagg(&jtagg_binding(prefix, args.jtagg_disable_er2))?;
     }
     Ok(())
+}
+
+fn jtagg_binding(prefix: &str, disable_er2: bool) -> JtaggBinding {
+    let mut binding = JtaggBinding::with_prefix(prefix);
+    binding.extension_register_2 = !disable_er2;
+    binding
 }
 
 const fn default_synthesis_goal() -> NonZeroU32 {
@@ -401,7 +406,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
             ..MappingOptions::default()
         },
     )?;
-    bind_target_primitives(&mut mapped, &args.open_drain, args.jtagg_prefix.as_deref())?;
+    bind_target_primitives(&mut mapped, args)?;
     if !mapped.retiming().equivalence_signed_off {
         return Err("Struo mapping/retiming equivalence sign-off failed".into());
     }
@@ -763,7 +768,7 @@ mod tests {
 
     use clap::{CommandFactory, Parser as _};
 
-    use super::{Cli, Command, ensure_distinct_paths};
+    use super::{Cli, Command, ensure_distinct_paths, jtagg_binding};
 
     #[test]
     fn parses_documented_pnr_command() {
@@ -871,6 +876,7 @@ mod tests {
             "8",
             "--jtagg-prefix",
             "debug",
+            "--jtagg-disable-er2",
         ])
         .unwrap();
         let Command::Pnr(args) = cli.command else {
@@ -878,6 +884,22 @@ mod tests {
         };
 
         assert_eq!(args.jtagg_prefix.as_deref(), Some("debug"));
+        assert!(args.jtagg_disable_er2);
+        assert!(!jtagg_binding("debug", args.jtagg_disable_er2).extension_register_2);
+        assert!(jtagg_binding("debug", false).extension_register_2);
+        assert!(
+            Cli::try_parse_from([
+                "texo",
+                "pnr",
+                "project",
+                "--package",
+                "CABGA381",
+                "--speed",
+                "8",
+                "--jtagg-disable-er2",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
