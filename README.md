@@ -67,6 +67,49 @@ synthesis-goal, placement-weight, unconstrained-IO, global-clock, and
 timing-closure controls. Without `--output`, project checkpoints go to
 `target/texo/<top>.json`.
 
+## PnR search model
+
+Texo is intended to support two entry points into the same deterministic,
+anytime PnR search:
+
+- a **scratch flow** that constructs an implementation from the mapped design
+  and target database alone; and
+- an **incremental/ECO flow** that starts from a compatible implementation
+  checkpoint, preserves unaffected placement and routing, and repairs the
+  physical consequences of a design or constraint change.
+
+Both flows keep the best legal implementation found so far while candidate
+placement and routing state is allowed to move through worse or temporarily
+congested states. Additional deterministic work should improve the incumbent
+instead of being required to recover an earlier result. The search must serve
+both useful QoR latency--how quickly Fmax rises--and QoR ceiling--the Fmax it
+can reach with more effort.
+
+A checkpoint is an optimization seed, not a memoized answer. PnR is
+trajectory-dependent: retained topology changes routing ownership, placement
+neighborhoods, and the later order of otherwise deterministic decisions.
+Consequently, a checkpoint-guided run can finish with either better or worse
+QoR than a scratch run, even when both are reproducible and both pass the same
+legality and timing gates. Scratch and incremental results are therefore not
+required to be physically identical, and benchmarks must identify the entry
+mode and compare QoR at fixed work budgets rather than treating warm-start
+time as cold-start time.
+
+Incremental preservation is a search bias, not a permanent restriction. The
+flow should first invalidate only changed cells, sink arcs, constraints, and
+their dependent timing state; route and place the smallest affected conflict
+component transactionally; and retain the previous implementation on a failed
+trial. If local repair stalls, it should progressively reopen shared route
+subtrees, whole nets, placement regions, and finally full-chip topology. A
+scratch rebase remains an available search branch. Reopening the chip restores
+search freedom, but cannot promise the identical basin or result of a separate
+scratch run.
+
+The current CLI writes complete physical checkpoints, but does not yet expose
+checkpoint-guided PnR as a general project command. Until that interface and
+its compatibility checks are implemented, checkpoints are output artifacts
+for inspection, bit generation, and future incremental reuse.
+
 Board-level open-drain buses keep a two-state verification interface in the
 Veryl design and are fused into one physical bidirectional ECP5 pad at the
 mapping boundary. For example, this binds the scalar input `sda_i` and
