@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3](https://github.com/fabrica-eda/texo/compare/v0.1.2...v0.1.3) (2026-08-26)
+
+
+### Features
+
+* support native ECP5 open-drain IO ([902334e](https://github.com/fabrica-eda/texo/commit/902334ecc63d441354c85bebe876054ace4e1ead))
+* support native ECP5 open-drain IO ([e794e12](https://github.com/fabrica-eda/texo/commit/e794e12f943a9ca5d47557d2f10d18e5c0f5f012))
+
 ## [0.1.2](https://github.com/fabrica-eda/texo/compare/v0.1.1...v0.1.2) (2026-08-25)
 
 
