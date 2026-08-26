@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -16,7 +17,7 @@ env:
 jobs:
   release:
     name: Release-plz release
-    if: github.repository_owner == 'fabrica-eda'
+    if: github.repository_owner == 'fabrica-eda' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -63,7 +64,7 @@ jobs:
   release-pr:
     name: Release Please PR
     needs: release
-    if: github.repository_owner == 'fabrica-eda'
+    if: github.repository_owner == 'fabrica-eda' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
