@@ -481,6 +481,14 @@ fn primitive_metadata_json(
             "write_enable": active_level_name(*write_enable),
             "read_enable": read_enable.map(active_level_name),
         }),
+        PrimitiveMetadata::Jtagg {
+            extension_register_1,
+            extension_register_2,
+        } => json!({
+            "kind": "jtagg",
+            "extension_register_1": extension_register_1,
+            "extension_register_2": extension_register_2,
+        }),
         PrimitiveMetadata::Port {
             name,
             bit,
@@ -551,6 +559,27 @@ mod tests {
 
         assert_eq!(cell, CellId(0));
         assert_eq!(configuration["configuration"]["direction"], "inout");
+    }
+
+    #[test]
+    fn checkpoints_jtagg_extension_registers() {
+        let mut design = Design::new();
+        let cell = design.add_cell("jtagg", ResourceKind::Logic);
+        let configuration = primitive_metadata_json(
+            cell,
+            &PrimitiveMetadata::Jtagg {
+                extension_register_1: true,
+                extension_register_2: false,
+            },
+            &design,
+        );
+
+        assert_eq!(configuration["configuration"]["kind"], "jtagg");
+        assert_eq!(configuration["configuration"]["extension_register_1"], true);
+        assert_eq!(
+            configuration["configuration"]["extension_register_2"],
+            false
+        );
     }
 
     #[test]

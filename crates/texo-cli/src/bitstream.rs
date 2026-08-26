@@ -333,6 +333,7 @@ pub fn generate_ecp5_config(
                     &absorbed_inputs,
                 )?;
             }
+            "jtagg" => write_jtagg(&mut config, architecture, configuration)?,
             kind => return Err(BitgenError::new(format!("unsupported primitive {kind}"))),
         }
     }
@@ -427,6 +428,29 @@ fn logic_tile(placement: &Value) -> Result<&str, BitgenError> {
         )));
     }
     Ok(matches[0])
+}
+
+fn write_jtagg(
+    config: &mut ChipConfig,
+    architecture: &Ecp5Architecture,
+    configuration: &Value,
+) -> Result<(), BitgenError> {
+    let tile = unique_tile_of_type(architecture, "EFB0_PICB0")?;
+    let target = config.tile_mut(&tile);
+    target.add_enum("JTAG.MODE", "JTAGG");
+    for (name, enabled) in [
+        (
+            "JTAG.ER1",
+            bool_value(configuration, "extension_register_1")?,
+        ),
+        (
+            "JTAG.ER2",
+            bool_value(configuration, "extension_register_2")?,
+        ),
+    ] {
+        target.add_enum(name, if enabled { "ENABLED" } else { "DISABLED" });
+    }
+    Ok(())
 }
 
 fn slice_and_lc(placement: &Value) -> Result<(String, usize), BitgenError> {
@@ -1294,8 +1318,8 @@ mod tests {
     use texo_target_ecp5::{ArchitectureFile, TileRecord, expand};
 
     use super::{
-        ChipConfig, TileConfig, fold_lut_input, io_base_direction, reverse_bits, trellis_wire_name,
-        validate_checkpoint, write_bram,
+        ChipConfig, TileConfig, fold_lut_input, generate_ecp5_config, io_base_direction,
+        reverse_bits, trellis_wire_name, validate_checkpoint, write_bram, write_jtagg,
     };
 
     const ARCHITECTURE: &str = include_str!(concat!(
@@ -1337,6 +1361,93 @@ mod tests {
             "BIDIR"
         );
         assert!(io_base_direction(&json!({"direction": "unknown"})).is_err());
+    }
+
+    #[test]
+    fn jtagg_enables_its_mode_and_selected_extension_registers() {
+        let mut file: ArchitectureFile = serde_json::from_str(ARCHITECTURE).unwrap();
+        file.locations[0].tiles.push(TileRecord {
+            name: "MIB_R0C0:EFB0_PICB0".into(),
+            tile_type: "EFB0_PICB0".into(),
+        });
+        let architecture = expand(file).unwrap();
+        let mut config = ChipConfig::default();
+
+        write_jtagg(
+            &mut config,
+            &architecture,
+            &json!({
+                "kind": "jtagg",
+                "extension_register_1": true,
+                "extension_register_2": false,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.tiles["MIB_R0C0:EFB0_PICB0"].enums,
+            [
+                ("JTAG.MODE".into(), "JTAGG".into()),
+                ("JTAG.ER1".into(), "ENABLED".into()),
+                ("JTAG.ER2".into(), "DISABLED".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn native_bitgen_serializes_jtagg_configuration_from_a_checkpoint() {
+        let mut file: ArchitectureFile = serde_json::from_str(ARCHITECTURE).unwrap();
+        file.locations[0].tiles.push(TileRecord {
+            name: "MIB_R0C0:EFB0_PICB0".into(),
+            tile_type: "EFB0_PICB0".into(),
+        });
+        let architecture = expand(file).unwrap();
+        let checkpoint = json!({
+            "schema_version": 3,
+            "evidence": [
+                "synthesis_equivalence",
+                "mapped_netlist_complete",
+                "physical_implementation",
+                "timing_closure",
+            ],
+            "timing": {"met_timing": true},
+            "target": {
+                "family": "ECP5",
+                "device": "LFE5UM5G-85F-test",
+                "package": "CABGA381",
+            },
+            "routes": [],
+            "primitive_metadata": [{
+                "cell_id": 0,
+                "configuration": {
+                    "kind": "jtagg",
+                    "extension_register_1": true,
+                    "extension_register_2": false,
+                },
+            }],
+            "absorbed_inputs": [],
+            "packing": {
+                "io_attributes": [],
+                "block_rams": [],
+                "lut_ff_pairs": [],
+            },
+            "placement": [{"cell_id": 0, "kind": "logic"}],
+        });
+
+        let generated = generate_ecp5_config(
+            &checkpoint,
+            &architecture,
+            ".device LFE5UM5G-85F-test\n",
+            &json!({}),
+        )
+        .unwrap();
+
+        assert!(generated.text.contains(
+            ".tile MIB_R0C0:EFB0_PICB0\n\
+             enum: JTAG.MODE JTAGG\n\
+             enum: JTAG.ER1 ENABLED\n\
+             enum: JTAG.ER2 DISABLED\n"
+        ));
     }
 
     #[test]

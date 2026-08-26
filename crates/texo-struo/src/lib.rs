@@ -134,6 +134,13 @@ pub enum PrimitiveMetadata {
         /// Optional read-enable assertion level.
         read_enable: Option<ActiveLevel>,
     },
+    /// Dedicated ECP5 JTAG TAP access block.
+    Jtagg {
+        /// Whether extension register one is present.
+        extension_register_1: bool,
+        /// Whether extension register two is present.
+        extension_register_2: bool,
+    },
     /// One bit of a top-level mapped port.
     Port {
         /// Source-level vector port name.
@@ -320,7 +327,52 @@ impl Importer {
             Ecp5Cell::FlipFlop { .. } => self.add_flip_flop(primitive),
             Ecp5Cell::BlockRam { .. } => self.add_block_ram(primitive),
             Ecp5Cell::TrellisIo { .. } => self.add_trellis_io(primitive),
+            Ecp5Cell::Jtagg { .. } => self.add_jtagg(primitive),
         }
+    }
+
+    fn add_jtagg(&mut self, primitive: &Ecp5Cell) -> Result<(), AdapterError> {
+        let Ecp5Cell::Jtagg {
+            name,
+            tdo,
+            tdi,
+            clock,
+            run_test_idle,
+            shift,
+            update,
+            reset_n,
+            clock_enable,
+            extension_register_1,
+            extension_register_2,
+        } = primitive
+        else {
+            unreachable!("dispatch guarantees JTAGG")
+        };
+        let cell = self.add_cell(
+            name,
+            ResourceKind::Logic,
+            PrimitiveMetadata::Jtagg {
+                extension_register_1: *extension_register_1,
+                extension_register_2: *extension_register_2,
+            },
+        );
+        for (name, bit) in ["JTDO1", "JTDO2"].into_iter().zip(*tdo) {
+            self.add_input(cell, name, bit)?;
+        }
+        for (name, wire) in [
+            ("JTDI", *tdi),
+            ("JTCK", *clock),
+            ("JRTI1", run_test_idle[0]),
+            ("JRTI2", run_test_idle[1]),
+            ("JSHIFT", *shift),
+            ("JUPDATE", *update),
+            ("JRSTN", *reset_n),
+            ("JCE1", clock_enable[0]),
+            ("JCE2", clock_enable[1]),
+        ] {
+            self.add_output(cell, name, wire)?;
+        }
+        Ok(())
     }
 
     fn add_trellis_io(&mut self, primitive: &Ecp5Cell) -> Result<(), AdapterError> {
@@ -968,7 +1020,10 @@ mod tests {
         ActiveLevel as StruoActiveLevel, ArithmeticOp, ClockEdge as StruoClockEdge, ComparisonOp,
         EnableControl, MemoryCell, Netlist, RegisterCell, ResetControl,
     };
-    use struo_target_ecp5::{OpenDrainIo, map_to_ecp5, map_to_ecp5_with_open_drain_ios};
+    use struo_target_ecp5::{
+        JtaggBinding, OpenDrainIo, map_to_ecp5, map_to_ecp5_with_jtagg,
+        map_to_ecp5_with_open_drain_ios,
+    };
     use texo_model::{CellId, ResourceKind};
 
     use super::{
@@ -983,6 +1038,71 @@ mod tests {
         let value = source.add_xor(lhs, rhs);
         source.add_output("value", value);
         map_to_ecp5(&source).unwrap()
+    }
+
+    #[test]
+    fn imports_jtagg_pins_and_extension_register_configuration() {
+        let mut source = Netlist::new("debug_top");
+        for name in [
+            "jtag_tdi",
+            "jtag_tck",
+            "jtag_rti1",
+            "jtag_rti2",
+            "jtag_shift",
+            "jtag_update",
+            "jtag_rst_n",
+            "jtag_ce1",
+            "jtag_ce2",
+        ] {
+            source.add_input(name);
+        }
+        let zero = source.add_constant(false);
+        source.add_output("jtag_tdo1", zero);
+        source.add_output("jtag_tdo2", zero);
+        let mut binding = JtaggBinding::with_prefix("jtag");
+        binding.extension_register_2 = false;
+        let mapped = map_to_ecp5_with_jtagg(&source, &binding).unwrap();
+
+        let imported = import_ecp5(&mapped).unwrap();
+        let (cell, metadata) = imported
+            .metadata()
+            .iter()
+            .find(|(_, metadata)| matches!(metadata, PrimitiveMetadata::Jtagg { .. }))
+            .unwrap();
+
+        assert!(imported.ports().is_empty());
+        assert_eq!(imported.design().cells()[cell.0].kind, ResourceKind::Logic);
+        assert_eq!(
+            metadata,
+            &PrimitiveMetadata::Jtagg {
+                extension_register_1: true,
+                extension_register_2: false,
+            }
+        );
+        let pins = imported.design().cells()[cell.0]
+            .pins()
+            .iter()
+            .map(|pin| {
+                let pin = &imported.design().pins()[pin.0];
+                (pin.name.as_str(), pin.direction)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pins,
+            [
+                ("JTDO1", texo_model::PinDirection::Input),
+                ("JTDO2", texo_model::PinDirection::Input),
+                ("JTDI", texo_model::PinDirection::Output),
+                ("JTCK", texo_model::PinDirection::Output),
+                ("JRTI1", texo_model::PinDirection::Output),
+                ("JRTI2", texo_model::PinDirection::Output),
+                ("JSHIFT", texo_model::PinDirection::Output),
+                ("JUPDATE", texo_model::PinDirection::Output),
+                ("JRSTN", texo_model::PinDirection::Output),
+                ("JCE1", texo_model::PinDirection::Output),
+                ("JCE2", texo_model::PinDirection::Output),
+            ]
+        );
     }
 
     #[test]
