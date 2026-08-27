@@ -385,6 +385,7 @@ pub fn implement_struo_ecp5_with_progress(
         architecture,
         ff_ce_control_sets(&design, imported.metadata()),
     );
+    constrain_pll_outputs(&design, imported.metadata(), &mut packing)?;
     progress(Ecp5FlowStage::Packed);
     report_metric_phase("packing", &mut phase_started);
 
@@ -3332,12 +3333,89 @@ fn ecp5_timing_constraints(
         let source_net = *driven_nets.first().expect("set length was checked");
         insert_clock_period(&mut constraints, source_net, period_ps)?;
     }
+    for (&net, &period_ps) in packing.generated_clock_periods_ps() {
+        insert_clock_period(&mut constraints, net, period_ps)?;
+    }
     for clock in packing.global_clocks() {
         if let Some(&period_ps) = constraints.clock_periods_ps().get(&clock.source_net) {
             insert_clock_period(&mut constraints, clock.global_net, period_ps)?;
         }
     }
     Ok(constraints)
+}
+
+fn constrain_pll_outputs(
+    design: &Design,
+    metadata: &BTreeMap<CellId, PrimitiveMetadata>,
+    packing: &mut Ecp5Packing,
+) -> Result<(), Ecp5FlowError> {
+    for (&cell, primitive) in metadata {
+        let PrimitiveMetadata::Pll {
+            fabric_output,
+            attributes,
+            ..
+        } = primitive
+        else {
+            continue;
+        };
+        let attribute = format!("FREQUENCY_PIN_{}", fabric_output.port());
+        let frequency_mhz =
+            attributes
+                .get(&attribute)
+                .ok_or_else(|| Ecp5FlowError::MissingPllOutputFrequency {
+                    cell: design.cells()[cell.0].name.clone(),
+                    attribute: attribute.clone(),
+                })?;
+        let period_ps = decimal_mhz_period_ps(frequency_mhz).ok_or_else(|| {
+            Ecp5FlowError::InvalidPllOutputFrequency {
+                cell: design.cells()[cell.0].name.clone(),
+                attribute,
+                value: frequency_mhz.clone(),
+            }
+        })?;
+        let pin = find_cell_pin(design, cell, fabric_output.port()).ok_or_else(|| {
+            Ecp5FlowError::MissingPllOutputPin {
+                cell: design.cells()[cell.0].name.clone(),
+                pin: fabric_output.port().into(),
+            }
+        })?;
+        let net = design.pins()[pin.0]
+            .net()
+            .ok_or_else(|| Ecp5FlowError::MissingPllOutputNet {
+                cell: design.cells()[cell.0].name.clone(),
+                pin: fabric_output.port().into(),
+            })?;
+        if let Some(previous) = packing.set_generated_clock_period_ps(net, period_ps)
+            && previous != period_ps
+        {
+            return Err(Ecp5FlowError::ConflictingClockPeriods { net });
+        }
+    }
+    Ok(())
+}
+
+fn decimal_mhz_period_ps(value: &str) -> Option<u64> {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || value.matches('.').count() > 1
+    {
+        return None;
+    }
+    let scale = 10_u128.checked_pow(u32::try_from(fraction.len()).ok()?)?;
+    let whole = whole.parse::<u128>().ok()?;
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u128>().ok()?
+    };
+    let scaled_mhz = whole.checked_mul(scale)?.checked_add(fraction)?;
+    let numerator = 1_000_000_u128.checked_mul(scale)?;
+    let period_ps = numerator
+        .checked_add(scaled_mhz / 2)?
+        .checked_div(scaled_mhz)?;
+    u64::try_from(period_ps).ok().filter(|period| *period != 0)
 }
 
 fn ecp5_pip_delays(
@@ -3580,6 +3658,36 @@ pub enum Ecp5FlowError {
         /// Logical clock net.
         net: NetId,
     },
+    /// The selected PLL output has no generated-clock frequency attribute.
+    MissingPllOutputFrequency {
+        /// Logical PLL cell name.
+        cell: String,
+        /// Required frequency attribute.
+        attribute: String,
+    },
+    /// A PLL frequency attribute is not a positive decimal MHz value.
+    InvalidPllOutputFrequency {
+        /// Logical PLL cell name.
+        cell: String,
+        /// Attribute containing the invalid value.
+        attribute: String,
+        /// Invalid attribute value.
+        value: String,
+    },
+    /// An imported PLL is missing its selected output pin.
+    MissingPllOutputPin {
+        /// Logical PLL cell name.
+        cell: String,
+        /// Expected primitive output pin.
+        pin: String,
+    },
+    /// An imported PLL output pin does not drive a logical net.
+    MissingPllOutputNet {
+        /// Logical PLL cell name.
+        cell: String,
+        /// Expected primitive output pin.
+        pin: String,
+    },
     /// Static timing analysis failed.
     Timing(TimingError),
 }
@@ -3626,6 +3734,24 @@ impl fmt::Display for Ecp5FlowError {
             Self::ConflictingClockPeriods { net } => {
                 write!(f, "clock net {} has conflicting periods", net.0)
             }
+            Self::InvalidPllOutputFrequency {
+                cell,
+                attribute,
+                value,
+            } => write!(
+                f,
+                "PLL `{cell}` attribute `{attribute}` has invalid MHz value `{value}`"
+            ),
+            Self::MissingPllOutputFrequency { cell, attribute } => write!(
+                f,
+                "PLL `{cell}` requires generated-clock attribute `{attribute}`"
+            ),
+            Self::MissingPllOutputPin { cell, pin } => {
+                write!(f, "PLL `{cell}` has no selected output pin `{pin}`")
+            }
+            Self::MissingPllOutputNet { cell, pin } => {
+                write!(f, "PLL `{cell}` output pin `{pin}` does not drive a net")
+            }
             Self::Timing(error) => write!(f, "ECP5 static timing analysis failed: {error}"),
         }
     }
@@ -3647,7 +3773,11 @@ impl Error for Ecp5FlowError {
             | Self::TimingDelayOverflow
             | Self::ClockIoNet { .. }
             | Self::ClockFrequencyOutOfRange { .. }
-            | Self::ConflictingClockPeriods { .. } => None,
+            | Self::ConflictingClockPeriods { .. }
+            | Self::MissingPllOutputFrequency { .. }
+            | Self::InvalidPllOutputFrequency { .. }
+            | Self::MissingPllOutputPin { .. }
+            | Self::MissingPllOutputNet { .. } => None,
         }
     }
 }
@@ -3721,12 +3851,12 @@ mod tests {
 
     use super::{
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, PostMapSimulationPolicy,
-        accumulate_hold_minimums, criticality_weight, delay_weighted_criticality,
-        ecp5_timing_constraints, ecp5_timing_model, ff_ce_control_sets, find_cell_pin,
-        freeze_route_sinks_except, implement, implement_struo_ecp5, implement_with_constraints,
-        next_wns_regression_streak, pip_class_delay, project_trellis_speed_grade,
-        retain_projection_timing_frontier, slack_violations, staged_timing_score,
-        verify_post_map_with_celox,
+        accumulate_hold_minimums, criticality_weight, decimal_mhz_period_ps,
+        delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, ff_ce_control_sets,
+        find_cell_pin, freeze_route_sinks_except, implement, implement_struo_ecp5,
+        implement_with_constraints, next_wns_regression_streak, pip_class_delay,
+        project_trellis_speed_grade, retain_projection_timing_frontier, slack_violations,
+        staged_timing_score, verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -3787,6 +3917,15 @@ mod tests {
         assert_eq!(sets[&high_a], sets[&high_b]);
         assert_ne!(sets[&high_a], sets[&low]);
         assert_ne!(sets[&high_a], sets[&other]);
+    }
+
+    #[test]
+    fn converts_decimal_pll_frequencies_to_picosecond_periods() {
+        assert_eq!(decimal_mhz_period_ps("250"), Some(4_000));
+        assert_eq!(decimal_mhz_period_ps("125.0"), Some(8_000));
+        assert_eq!(decimal_mhz_period_ps("12.5"), Some(80_000));
+        assert_eq!(decimal_mhz_period_ps("0"), None);
+        assert_eq!(decimal_mhz_period_ps("250MHz"), None);
     }
 
     #[test]

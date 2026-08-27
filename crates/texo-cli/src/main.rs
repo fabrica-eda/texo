@@ -12,7 +12,7 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand};
 use struo_synth::synthesize;
 use struo_target_ecp5::{
-    ECP5_QOR_TARGET_MHZ, Ecp5Netlist, JtaggBinding, MappingError, MappingOptions, OpenDrainIo,
+    ECP5_QOR_TARGET_MHZ, Ecp5Netlist, JtaggBinding, MappingOptions, OpenDrainIo, PllBinding,
     map_to_ecp5_with_options,
 };
 use texo_cli::{
@@ -176,6 +176,9 @@ struct PnrArgs {
     /// Disable JTAG extension register two.
     #[arg(long, requires = "jtagg_prefix")]
     jtagg_disable_er2: bool,
+    /// Apply a user-owned EHXPLLL boundary binding from JSON (repeatable).
+    #[arg(long, value_name = "JSON")]
+    pll_binding: Vec<PathBuf>,
 }
 
 fn parse_open_drain(value: &str) -> Result<OpenDrainIo, String> {
@@ -189,10 +192,13 @@ fn parse_open_drain(value: &str) -> Result<OpenDrainIo, String> {
     Ok(OpenDrainIo::new(pin, input, drive_low))
 }
 
-fn bind_target_primitives(mapped: &mut Ecp5Netlist, args: &PnrArgs) -> Result<(), MappingError> {
+fn bind_target_primitives(mapped: &mut Ecp5Netlist, args: &PnrArgs) -> Result<(), Box<dyn Error>> {
     mapped.bind_open_drain_ios(&args.open_drain)?;
     if let Some(prefix) = args.jtagg_prefix.as_deref() {
         mapped.bind_jtagg(&jtagg_binding(prefix, args.jtagg_disable_er2))?;
+    }
+    for binding in load_pll_bindings(&args.pll_binding)? {
+        mapped.bind_pll(&binding)?;
     }
     Ok(())
 }
@@ -201,6 +207,20 @@ fn jtagg_binding(prefix: &str, disable_er2: bool) -> JtaggBinding {
     let mut binding = JtaggBinding::with_prefix(prefix);
     binding.extension_register_2 = !disable_er2;
     binding
+}
+
+fn load_pll_bindings(paths: &[PathBuf]) -> Result<Vec<PllBinding>, Box<dyn Error>> {
+    paths
+        .iter()
+        .map(|path| {
+            let file = File::open(path).map_err(|error| {
+                format!("failed to read PLL binding `{}`: {error}", path.display())
+            })?;
+            serde_json::from_reader(BufReader::new(file)).map_err(|error| {
+                format!("invalid PLL binding `{}`: {error}", path.display()).into()
+            })
+        })
+        .collect()
 }
 
 const fn default_synthesis_goal() -> NonZeroU32 {
@@ -296,6 +316,7 @@ fn target(args: &TargetArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
     let flow_started = Instant::now();
     let (loaded, output) = prepare_veryl_input(args)?;
@@ -798,6 +819,32 @@ mod tests {
                 "--jtagg-disable-er2",
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_repeatable_pll_bindings() {
+        let cli = Cli::try_parse_from([
+            "texo",
+            "pnr",
+            "project",
+            "--package",
+            "CABGA381",
+            "--speed",
+            "8",
+            "--pll-binding",
+            "pll-a.json",
+            "--pll-binding",
+            "pll-b.json",
+        ])
+        .unwrap();
+        let Command::Pnr(args) = cli.command else {
+            panic!("expected pnr command");
+        };
+
+        assert_eq!(
+            args.pll_binding,
+            [Path::new("pll-a.json"), Path::new("pll-b.json")]
         );
     }
 

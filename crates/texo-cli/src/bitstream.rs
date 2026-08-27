@@ -376,6 +376,7 @@ pub fn generate_ecp5_config(
                 )?;
             }
             "jtagg" => write_jtagg(&mut config, architecture, configuration)?,
+            "pll" => write_pll(&mut config, architecture, placement, configuration)?,
             kind => return Err(BitgenError::new(format!("unsupported primitive {kind}"))),
         }
     }
@@ -493,6 +494,224 @@ fn write_jtagg(
         target.add_enum(name, if enabled { "ENABLED" } else { "DISABLED" });
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn write_pll(
+    config: &mut ChipConfig,
+    architecture: &Ecp5Architecture,
+    placement: &Value,
+    configuration: &Value,
+) -> Result<(), BitgenError> {
+    let parameters = object(configuration, "parameters")?;
+    let attributes = object(configuration, "attributes")?;
+    let mut target = TileConfig::default();
+    target.add_enum("MODE", "EHXPLLL");
+
+    for name in ["CLKI_DIV", "CLKFB_DIV"] {
+        let value = pll_integer(parameters, name, 1)?;
+        let encoded = value
+            .checked_sub(1)
+            .ok_or_else(|| BitgenError::new(format!("PLL {name} must be greater than zero")))?;
+        target.add_word(name, checked_integer_bits(name, encoded, 7)?);
+    }
+    for name in [
+        "CLKOP_ENABLE",
+        "CLKOS_ENABLE",
+        "CLKOS2_ENABLE",
+        "CLKOS3_ENABLE",
+    ] {
+        target.add_enum(name, pll_text(parameters, name, "ENABLED")?);
+    }
+    for output in ["CLKOP", "CLKOS", "CLKOS2", "CLKOS3"] {
+        let divider = format!("{output}_DIV");
+        let value = pll_integer(parameters, &divider, 8)?;
+        let encoded = value
+            .checked_sub(1)
+            .ok_or_else(|| BitgenError::new(format!("PLL {divider} must be greater than zero")))?;
+        target.add_word(&divider, checked_integer_bits(&divider, encoded, 7)?);
+        for (suffix, width) in [("CPHASE", 7), ("FPHASE", 3)] {
+            let name = format!("{output}_{suffix}");
+            let value = pll_integer(parameters, &name, 0)?;
+            target.add_word(&name, checked_integer_bits(&name, value, width)?);
+        }
+    }
+    target.add_enum("FEEDBK_PATH", pll_text(parameters, "FEEDBK_PATH", "CLKOP")?);
+    for (name, default) in [
+        ("CLKOP_TRIM_POL", "RISING"),
+        ("CLKOP_TRIM_DELAY", "0"),
+        ("CLKOS_TRIM_POL", "RISING"),
+        ("CLKOS_TRIM_DELAY", "0"),
+    ] {
+        target.add_enum(name, pll_text(parameters, name, default)?);
+    }
+    let has_clkop = [
+        string(configuration, "fabric_output")?,
+        string(configuration, "feedback_output")?,
+    ]
+    .contains(&"CLKOP");
+    for (name, connected_default) in [
+        ("OUTDIVIDER_MUXA", "DIVA"),
+        ("OUTDIVIDER_MUXB", "DIVB"),
+        ("OUTDIVIDER_MUXC", "DIVC"),
+        ("OUTDIVIDER_MUXD", "DIVD"),
+    ] {
+        let default = if has_clkop {
+            connected_default
+        } else {
+            "REFCLK"
+        };
+        target.add_enum(name, pll_text(parameters, name, default)?);
+    }
+    let lock_mode = pll_integer(parameters, "PLL_LOCK_MODE", 0)?;
+    target.add_word(
+        "PLL_LOCK_MODE",
+        checked_integer_bits("PLL_LOCK_MODE", lock_mode, 3)?,
+    );
+    for (name, default) in [
+        ("STDBY_ENABLE", "DISABLED"),
+        ("REFIN_RESET", "DISABLED"),
+        ("SYNC_ENABLE", "DISABLED"),
+        ("INT_LOCK_STICKY", "ENABLED"),
+        ("DPHASE_SOURCE", "DISABLED"),
+        ("PLLRST_ENA", "DISABLED"),
+        ("INTFB_WAKE", "DISABLED"),
+    ] {
+        target.add_enum(name, pll_text(parameters, name, default)?);
+    }
+    for (name, default, width) in [
+        ("KVCO", 0, 3),
+        ("LPF_CAPACITOR", 0, 2),
+        ("LPF_RESISTOR", 0, 7),
+        ("ICP_CURRENT", 0, 5),
+        ("FREQ_LOCK_ACCURACY", 0, 2),
+        ("MFG_GMC_GAIN", 0, 3),
+        ("MFG_GMC_TEST", 14, 4),
+        ("MFG1_TEST", 0, 3),
+        ("MFG2_TEST", 0, 3),
+        ("MFG_FORCE_VFILTER", 0, 1),
+        ("MFG_ICP_TEST", 0, 1),
+        ("MFG_EN_UP", 0, 1),
+        ("MFG_FLOAT_ICP", 0, 1),
+        ("MFG_GMC_PRESET", 0, 1),
+        ("MFG_LF_PRESET", 0, 1),
+        ("MFG_GMC_RESET", 0, 1),
+        ("MFG_LF_RESET", 0, 1),
+        ("MFG_LF_RESGRND", 0, 1),
+        ("MFG_GMCREF_SEL", 0, 2),
+        ("MFG_ENABLE_FILTEROPAMP", 0, 1),
+    ] {
+        let value = pll_integer(attributes, name, default)?;
+        target.add_word(name, checked_integer_bits(name, value, width)?);
+    }
+
+    config
+        .tile_groups
+        .push((pll_tiles(architecture, placement)?, target));
+    Ok(())
+}
+
+fn pll_tiles(
+    architecture: &Ecp5Architecture,
+    placement: &Value,
+) -> Result<Vec<String>, BitgenError> {
+    let x = usize_value(placement, "x")?;
+    let y = usize_value(placement, "y")?;
+    let basename = string(placement, "bel")?
+        .rsplit('/')
+        .next()
+        .ok_or_else(|| BitgenError::new("PLL BEL has no basename"))?;
+    let tiles = match basename {
+        "EHXPLL_UL" => vec![
+            chip_tile(architecture, pll_coordinate(x, -1)?, y, &["PLL0_UL"])?,
+            chip_tile(
+                architecture,
+                pll_coordinate(x, -1)?,
+                pll_coordinate(y, 1)?,
+                &["PLL1_UL"],
+            )?,
+        ],
+        "EHXPLL_LL" => vec![
+            chip_tile(architecture, x, pll_coordinate(y, 1)?, &["PLL0_LL"])?,
+            chip_tile(
+                architecture,
+                pll_coordinate(x, 1)?,
+                pll_coordinate(y, 1)?,
+                &["BANKREF8"],
+            )?,
+        ],
+        "EHXPLL_LR" => vec![
+            chip_tile(architecture, x, pll_coordinate(y, 1)?, &["PLL0_LR"])?,
+            chip_tile(
+                architecture,
+                pll_coordinate(x, -1)?,
+                pll_coordinate(y, 1)?,
+                &["PLL1_LR", "BANKREF4"],
+            )?,
+        ],
+        "EHXPLL_UR" => vec![
+            chip_tile(architecture, pll_coordinate(x, 1)?, y, &["PLL0_UR"])?,
+            chip_tile(
+                architecture,
+                pll_coordinate(x, 1)?,
+                pll_coordinate(y, 1)?,
+                &["PLL1_UR"],
+            )?,
+        ],
+        _ => {
+            return Err(BitgenError::new(format!(
+                "unsupported PLL BEL `{basename}`"
+            )));
+        }
+    };
+    Ok(tiles)
+}
+
+fn pll_coordinate(value: usize, offset: isize) -> Result<usize, BitgenError> {
+    value
+        .checked_add_signed(offset)
+        .ok_or_else(|| BitgenError::new("PLL configuration tile coordinate overflow"))
+}
+
+fn pll_text<'a>(
+    values: &'a serde_json::Map<String, Value>,
+    name: &str,
+    default: &'a str,
+) -> Result<&'a str, BitgenError> {
+    match values.get(name) {
+        None => Ok(default),
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| BitgenError::new(format!("PLL {name} is not a string"))),
+    }
+}
+
+fn pll_integer(
+    values: &serde_json::Map<String, Value>,
+    name: &str,
+    default: u64,
+) -> Result<u64, BitgenError> {
+    match values.get(name) {
+        None => Ok(default),
+        Some(Value::String(value)) => value
+            .parse()
+            .map_err(|_| BitgenError::new(format!("PLL {name} is not an unsigned integer"))),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .ok_or_else(|| BitgenError::new(format!("PLL {name} is not an unsigned integer"))),
+        Some(_) => Err(BitgenError::new(format!(
+            "PLL {name} is not an unsigned integer"
+        ))),
+    }
+}
+
+fn checked_integer_bits(name: &str, value: u64, width: usize) -> Result<Vec<bool>, BitgenError> {
+    if value >= (1_u64 << width) {
+        return Err(BitgenError::new(format!(
+            "PLL {name} value {value} exceeds {width} bits"
+        )));
+    }
+    Ok(integer_bits(value, width))
 }
 
 fn slice_and_lc(placement: &Value) -> Result<(String, usize), BitgenError> {
@@ -1337,7 +1556,7 @@ mod tests {
 
     use super::{
         ChipConfig, TileConfig, generate_ecp5_config, io_base_direction, reverse_bits,
-        trellis_wire_name, validate_checkpoint, write_bram, write_jtagg,
+        trellis_wire_name, validate_checkpoint, write_bram, write_jtagg, write_pll,
     };
 
     const ARCHITECTURE: &str = include_str!(concat!(
@@ -1419,6 +1638,79 @@ mod tests {
                 ("JTAG.ER1".into(), "ENABLED".into()),
                 ("JTAG.ER2".into(), "DISABLED".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn pll_configuration_matches_nextpnr_encoding() {
+        let mut file: ArchitectureFile = serde_json::from_str(ARCHITECTURE).unwrap();
+        file.height = 2;
+        let mut lower_left = file.locations[0].clone();
+        lower_left.y = 1;
+        let mut lower_right = file.locations[1].clone();
+        lower_right.y = 1;
+        file.locations.extend([lower_left, lower_right]);
+        file.locations[0].tiles.push(TileRecord {
+            name: "MIB_R0C0:PLL0_UL".into(),
+            tile_type: "PLL0_UL".into(),
+        });
+        file.locations[2].tiles.push(TileRecord {
+            name: "MIB_R1C0:PLL1_UL".into(),
+            tile_type: "PLL1_UL".into(),
+        });
+        let architecture = expand(file).unwrap();
+        let mut config = ChipConfig::default();
+
+        write_pll(
+            &mut config,
+            &architecture,
+            &json!({"x": 1, "y": 0, "bel": "R0C1/EHXPLL_UL"}),
+            &json!({
+                "fabric_output": "CLKOS",
+                "feedback_output": "CLKOP",
+                "parameters": {
+                    "CLKI_DIV": "3",
+                    "CLKFB_DIV": "5",
+                    "CLKOP_DIV": "25",
+                    "CLKOP_CPHASE": "9",
+                    "CLKOS_DIV": "2",
+                    "FEEDBK_PATH": "CLKOP",
+                },
+                "attributes": {
+                    "ICP_CURRENT": "12",
+                    "LPF_RESISTOR": "8",
+                    "MFG_ENABLE_FILTEROPAMP": "1",
+                    "MFG_GMCREF_SEL": "2",
+                },
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.tile_groups[0].0,
+            ["MIB_R0C0:PLL0_UL", "MIB_R1C0:PLL1_UL"]
+        );
+        let pll = &config.tile_groups[0].1;
+        assert!(pll.enums.contains(&("MODE".into(), "EHXPLLL".into())));
+        assert!(
+            pll.enums
+                .contains(&("INT_LOCK_STICKY".into(), "ENABLED".into()))
+        );
+        assert!(pll.words.contains(&(
+            "CLKI_DIV".into(),
+            vec![false, true, false, false, false, false, false]
+        )));
+        assert!(pll.words.contains(&(
+            "CLKOP_DIV".into(),
+            vec![false, false, false, true, true, false, false]
+        )));
+        assert!(
+            pll.words
+                .contains(&("MFG_GMC_TEST".into(), vec![false, true, true, true]))
+        );
+        assert!(
+            pll.words
+                .contains(&("MFG_GMCREF_SEL".into(), vec![false, true]))
         );
     }
 

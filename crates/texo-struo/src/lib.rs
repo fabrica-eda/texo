@@ -9,7 +9,9 @@ use std::error::Error;
 use std::fmt;
 
 use struo_ir::{ActiveLevel as StruoActiveLevel, ClockEdge as StruoClockEdge};
-use struo_target_ecp5::{Bit, Control, Ecp5Cell, Ecp5Netlist, MappedPortDirection, Reset};
+use struo_target_ecp5::{
+    Bit, Control, Ecp5Cell, Ecp5Netlist, MappedPortDirection, PllOutput as StruoPllOutput, Reset,
+};
 use texo_model::{CellId, CellPinId, Design, ModelError, PinDirection, ResourceKind};
 
 /// Logical signal identity retained from Struo's mapped netlist.
@@ -60,6 +62,43 @@ pub enum ClockEdge {
     Rising,
     /// High-to-low transition.
     Falling,
+}
+
+/// One clock output of an ECP5 `EHXPLLL` primitive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PllOutput {
+    /// Primary output (`CLKOP`).
+    Clkop,
+    /// Secondary output (`CLKOS`).
+    Clkos,
+    /// Secondary output two (`CLKOS2`).
+    Clkos2,
+    /// Secondary output three (`CLKOS3`).
+    Clkos3,
+}
+
+impl PllOutput {
+    /// ECP5 primitive port name.
+    #[must_use]
+    pub const fn port(self) -> &'static str {
+        match self {
+            Self::Clkop => "CLKOP",
+            Self::Clkos => "CLKOS",
+            Self::Clkos2 => "CLKOS2",
+            Self::Clkos3 => "CLKOS3",
+        }
+    }
+}
+
+impl From<StruoPllOutput> for PllOutput {
+    fn from(value: StruoPllOutput) -> Self {
+        match value {
+            StruoPllOutput::Clkop => Self::Clkop,
+            StruoPllOutput::Clkos => Self::Clkos,
+            StruoPllOutput::Clkos2 => Self::Clkos2,
+            StruoPllOutput::Clkos3 => Self::Clkos3,
+        }
+    }
 }
 
 impl From<StruoClockEdge> for ClockEdge {
@@ -140,6 +179,17 @@ pub enum PrimitiveMetadata {
         extension_register_1: bool,
         /// Whether extension register two is present.
         extension_register_2: bool,
+    },
+    /// User-configured ECP5 phase-locked loop.
+    Pll {
+        /// PLL output routed into the fabric.
+        fabric_output: PllOutput,
+        /// PLL output looped back to `CLKFB`.
+        feedback_output: PllOutput,
+        /// Raw `EHXPLLL` parameters supplied by the user.
+        parameters: BTreeMap<String, String>,
+        /// Raw `EHXPLLL` attributes supplied by the user.
+        attributes: BTreeMap<String, String>,
     },
     /// One bit of a top-level mapped port.
     Port {
@@ -328,7 +378,57 @@ impl Importer {
             Ecp5Cell::BlockRam { .. } => self.add_block_ram(primitive),
             Ecp5Cell::TrellisIo { .. } => self.add_trellis_io(primitive),
             Ecp5Cell::Jtagg { .. } => self.add_jtagg(primitive),
+            Ecp5Cell::Pll { .. } => self.add_pll(primitive),
         }
+    }
+
+    fn add_pll(&mut self, primitive: &Ecp5Cell) -> Result<(), AdapterError> {
+        let Ecp5Cell::Pll {
+            name,
+            reference_clock,
+            feedback_clock,
+            output_clock,
+            locked,
+            fabric_output,
+            feedback_output,
+            parameters,
+            attributes,
+        } = primitive
+        else {
+            unreachable!("dispatch guarantees EHXPLLL")
+        };
+        let fabric_output = PllOutput::from(*fabric_output);
+        let feedback_output = PllOutput::from(*feedback_output);
+        let cell = self.add_cell(
+            name,
+            ResourceKind::Logic,
+            PrimitiveMetadata::Pll {
+                fabric_output,
+                feedback_output,
+                parameters: parameters.clone(),
+                attributes: attributes.clone(),
+            },
+        );
+        self.add_input(cell, "CLKI", *reference_clock)?;
+        self.add_input(cell, "CLKFB", Bit::Wire(*feedback_clock))?;
+        for (name, bit) in [
+            ("RST", Bit::Zero),
+            ("STDBY", Bit::Zero),
+            ("PHASESEL0", Bit::Zero),
+            ("PHASESEL1", Bit::Zero),
+            ("PHASEDIR", Bit::One),
+            ("PHASESTEP", Bit::One),
+            ("PHASELOADREG", Bit::One),
+            ("PLLWAKESYNC", Bit::Zero),
+            ("ENCLKOP", Bit::Zero),
+        ] {
+            self.add_input(cell, name, bit)?;
+        }
+        self.add_output(cell, fabric_output.port(), *output_clock)?;
+        if fabric_output != feedback_output {
+            self.add_output(cell, feedback_output.port(), *feedback_clock)?;
+        }
+        self.add_output(cell, "LOCK", *locked)
     }
 
     fn add_jtagg(&mut self, primitive: &Ecp5Cell) -> Result<(), AdapterError> {
@@ -1062,8 +1162,8 @@ mod tests {
         EnableControl, MemoryCell, Netlist, RegisterCell, ResetControl,
     };
     use struo_target_ecp5::{
-        Bit, JtaggBinding, OpenDrainIo, map_to_ecp5, map_to_ecp5_with_jtagg,
-        map_to_ecp5_with_open_drain_ios,
+        Bit, JtaggBinding, OpenDrainIo, PllBinding, PllOutput as StruoPllOutput, map_to_ecp5,
+        map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_pll,
     };
     use texo_model::{CellId, ResourceKind};
 
@@ -1192,6 +1292,84 @@ mod tests {
             error,
             super::AdapterError::DisabledJtagOutput { register: 2, .. }
         ));
+    }
+
+    #[test]
+    fn imports_user_configured_pll_pins_and_metadata() {
+        let mut source = Netlist::new("pll_top");
+        source.add_input("clk");
+        source.add_input("clk_250");
+        let locked = source.add_input("pll_locked");
+        source.add_output("locked", locked);
+        let mut binding = PllBinding::new(
+            "clk",
+            "clk_250",
+            "pll_locked",
+            StruoPllOutput::Clkos,
+            StruoPllOutput::Clkop,
+        );
+        binding.parameters.insert("CLKI_DIV".into(), "3".into());
+        binding
+            .attributes
+            .insert("FREQUENCY_PIN_CLKOS".into(), "250".into());
+        let mapped = map_to_ecp5_with_pll(&source, &binding).unwrap();
+
+        let imported = import_ecp5(&mapped).unwrap();
+        let (cell, metadata) = imported
+            .metadata()
+            .iter()
+            .find(|(_, metadata)| matches!(metadata, PrimitiveMetadata::Pll { .. }))
+            .unwrap();
+
+        assert_eq!(imported.ports()[0].name, "clk");
+        assert_eq!(
+            metadata,
+            &PrimitiveMetadata::Pll {
+                fabric_output: super::PllOutput::Clkos,
+                feedback_output: super::PllOutput::Clkop,
+                parameters: BTreeMap::from([("CLKI_DIV".into(), "3".into())]),
+                attributes: BTreeMap::from([("FREQUENCY_PIN_CLKOS".into(), "250".into())]),
+            }
+        );
+        let pins = imported.design().cells()[cell.0]
+            .pins()
+            .iter()
+            .map(|pin| {
+                let pin = &imported.design().pins()[pin.0];
+                (pin.name.as_str(), pin.direction)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pins,
+            [
+                ("CLKI", texo_model::PinDirection::Input),
+                ("CLKFB", texo_model::PinDirection::Input),
+                ("RST", texo_model::PinDirection::Input),
+                ("STDBY", texo_model::PinDirection::Input),
+                ("PHASESEL0", texo_model::PinDirection::Input),
+                ("PHASESEL1", texo_model::PinDirection::Input),
+                ("PHASEDIR", texo_model::PinDirection::Input),
+                ("PHASESTEP", texo_model::PinDirection::Input),
+                ("PHASELOADREG", texo_model::PinDirection::Input),
+                ("PLLWAKESYNC", texo_model::PinDirection::Input),
+                ("ENCLKOP", texo_model::PinDirection::Input),
+                ("CLKOS", texo_model::PinDirection::Output),
+                ("CLKOP", texo_model::PinDirection::Output),
+                ("LOCK", texo_model::PinDirection::Output),
+            ]
+        );
+        assert!(
+            imported
+                .metadata()
+                .values()
+                .any(|metadata| matches!(metadata, PrimitiveMetadata::Constant { value: false }))
+        );
+        assert!(
+            imported
+                .metadata()
+                .values()
+                .any(|metadata| matches!(metadata, PrimitiveMetadata::Constant { value: true }))
+        );
     }
 
     #[test]
