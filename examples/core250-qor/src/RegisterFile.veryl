@@ -1,0 +1,52 @@
+/// RV32 2-read/1-write register file built from two replicated 1R1W memories.
+///
+/// Reads are synchronous with one-cycle latency. Register x0 is masked to zero
+/// and writes to x0 are suppressed. The replication is intentional: each bank
+/// supplies one independent read port while both banks receive every write.
+module RegisterFile (
+    clk          : input  clock    ,
+    write_enable : input  logic    ,
+    write_address: input  logic<5> ,
+    write_data   : input  logic<32>,
+    read_address_a: input  logic<5> ,
+    read_address_b: input  logic<5> ,
+    read_data_a  : output logic<32>,
+    read_data_b  : output logic<32>,
+) {
+    var bank_a: logic<32> [32];
+    var bank_b: logic<32> [32];
+    var read_data_a_raw: logic<32>;
+    var read_data_b_raw: logic<32>;
+
+    always_ff (clk) {
+        if write_enable && (write_address != 5'd0) {
+            bank_a[write_address] = write_data;
+        }
+        if write_enable && (write_address != 5'd0) {
+            bank_b[write_address] = write_data;
+        }
+    }
+
+    always_ff (clk) {
+        read_data_a_raw = bank_a[read_address_a];
+    }
+
+    always_ff (clk) {
+        read_data_b_raw = bank_b[read_address_b];
+    }
+
+    always_comb {
+        if read_address_a == 5'd0 {
+            read_data_a = 32'h0000_0000;
+        } else {
+            read_data_a = read_data_a_raw;
+        }
+
+        if read_address_b == 5'd0 {
+            read_data_b = 32'h0000_0000;
+        } else {
+            read_data_b = read_data_b_raw;
+        }
+    }
+}
+

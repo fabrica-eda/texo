@@ -1,0 +1,258 @@
+/// Core250 with internal instruction/data BRAM and an I2C debug register bank.
+/// Firmware and data memory are writable only while run=0, which also holds
+/// the core in reset.
+module Core250Soc (
+    clk           : input  clock   ,
+    rst_n         : input  reset   ,
+    scl_i         : input  logic   ,
+    sda_i         : input  logic   ,
+    sda_drive_low : output logic   ,
+    led           : output logic<8>,
+    halted_probe  : output logic   ,
+) {
+    var run_q             : logic;
+    var core_run_q        : logic;
+    var memory_select_q   : logic;
+    var memory_address_q  : logic<8>;
+    var memory_write_q    : logic<32>;
+    var memory_write_strobe: logic;
+    var memory_read_data  : logic<32>;
+
+    var debug_address     : logic<8>;
+    var debug_write_data  : logic<8>;
+    var debug_write_strobe: logic;
+    var debug_read_data_q : logic<8>;
+    var debug_write_data_q: logic<8>;
+    var debug_status      : logic<8>;
+    var debug_selected_word: logic<32>;
+    var debug_word_q      : logic<32>;
+    var debug_word_select_q: logic<16>;
+    var debug_byte_select_q: logic<2>;
+    var memory_read_data_q: logic<32>;
+    var write_run_strobe_q: logic;
+    var write_select_strobe_q: logic;
+    var write_address_strobe_q: logic;
+    var write_word0_strobe_q: logic;
+    var write_word1_strobe_q: logic;
+    var write_word2_strobe_q: logic;
+    var write_word3_strobe_q: logic;
+    var memory_commit_strobe_q: logic;
+
+    var core_rst_n        : reset;
+    var core_pc           : logic<32>;
+    var instruction       : logic<32>;
+    var data_address      : logic<32>;
+    var data_write_data   : logic<32>;
+    var data_write_enable : logic;
+    var data_read_data    : logic<32>;
+    var core_halted       : logic;
+    var commit_valid      : logic;
+    var commit_pc         : logic<32>;
+    var commit_instr      : logic<32>;
+    var commit_rd         : logic<5>;
+    var commit_data       : logic<32>;
+    var commit_mem_we     : logic;
+    var commit_mem_addr   : logic<32>;
+    var commit_mem_wdata  : logic<32>;
+    var debug_x31         : logic<32>;
+
+    inst i2c_target: I2cTarget250 (
+        clk               : clk,
+        rst_n             : rst_n,
+        scl_i             : scl_i,
+        sda_i             : sda_i,
+        sda_drive_low     : sda_drive_low,
+        debug_address     : debug_address,
+        debug_write_data  : debug_write_data,
+        debug_write_strobe: debug_write_strobe,
+        debug_read_data   : debug_read_data_q,
+    );
+
+    inst memory: SocMemory (
+        clk               : clk,
+        run               : run_q,
+        instr_address     : core_pc[9:2],
+        data_address      : data_address[9:2],
+        data_write_data   : data_write_data,
+        data_write_enable : data_write_enable,
+        debug_select      : memory_select_q,
+        debug_address     : memory_address_q,
+        debug_write_data  : memory_write_q,
+        debug_write_enable: memory_write_strobe,
+        instr_read_data   : instruction,
+        data_read_data    : data_read_data,
+        debug_read_data   : memory_read_data,
+    );
+
+    inst core: Core250 (
+        clk             : clk,
+        rst_n           : core_rst_n,
+        instr           : instruction,
+        data_rdata      : data_read_data,
+        pc              : core_pc,
+        data_addr       : data_address,
+        data_wdata      : data_write_data,
+        data_we         : data_write_enable,
+        halted          : core_halted,
+        commit_valid    : commit_valid,
+        commit_pc       : commit_pc,
+        commit_instr    : commit_instr,
+        commit_rd       : commit_rd,
+        commit_data     : commit_data,
+        commit_mem_we   : commit_mem_we,
+        commit_mem_addr : commit_mem_addr,
+        commit_mem_wdata: commit_mem_wdata,
+        debug_x31       : debug_x31,
+    );
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            run_q = 1'b0;
+            memory_select_q = 1'b0;
+            memory_address_q = 8'h00;
+            memory_write_q = 32'h0000_0000;
+            debug_write_data_q = 8'h00;
+            write_run_strobe_q = 1'b0;
+            write_select_strobe_q = 1'b0;
+            write_address_strobe_q = 1'b0;
+            write_word0_strobe_q = 1'b0;
+            write_word1_strobe_q = 1'b0;
+            write_word2_strobe_q = 1'b0;
+            write_word3_strobe_q = 1'b0;
+            memory_commit_strobe_q = 1'b0;
+        } else {
+            // Register the sparse write decode.  I2C is much slower than clk,
+            // and this keeps its state machine and register-index counter out
+            // of every writable system register's D path.
+            debug_write_data_q = debug_write_data;
+            write_run_strobe_q = debug_write_strobe && (debug_address == 8'h10);
+            write_select_strobe_q = debug_write_strobe && (debug_address == 8'h11);
+            write_address_strobe_q = debug_write_strobe && (debug_address == 8'h12);
+            write_word0_strobe_q = debug_write_strobe && (debug_address == 8'h14);
+            write_word1_strobe_q = debug_write_strobe && (debug_address == 8'h15);
+            write_word2_strobe_q = debug_write_strobe && (debug_address == 8'h16);
+            write_word3_strobe_q = debug_write_strobe && (debug_address == 8'h17);
+            // Commit one cycle after byte 3 so SocMemory observes the completed
+            // memory_write_q word rather than its previous upper byte.
+            memory_commit_strobe_q = write_word3_strobe_q;
+
+            if write_run_strobe_q {
+                run_q = debug_write_data_q[0];
+            }
+            if write_select_strobe_q {
+                memory_select_q = debug_write_data_q[0];
+            }
+            if write_address_strobe_q {
+                memory_address_q = debug_write_data_q;
+            }
+            if write_word0_strobe_q {
+                memory_write_q[7:0] = debug_write_data_q;
+            }
+            if write_word1_strobe_q {
+                memory_write_q[15:8] = debug_write_data_q;
+            }
+            if write_word2_strobe_q {
+                memory_write_q[23:16] = debug_write_data_q;
+            }
+            if write_word3_strobe_q {
+                memory_write_q[31:24] = debug_write_data_q;
+            }
+            if memory_commit_strobe_q {
+                if !run_q {
+                    memory_address_q = memory_address_q + 8'd1;
+                }
+            }
+        }
+    }
+
+    // On a halted-to-running transition, give the synchronous instruction
+    // BRAM one complete clock to switch from the debug address to PC=0 before
+    // releasing the core.  Deassertion remains immediate through run_q.
+    always_ff (clk, rst_n) {
+        if_reset {
+            core_run_q = 1'b0;
+        } else {
+            core_run_q = run_q;
+        }
+    }
+
+    // I2C provides many system-clock cycles between changing the register
+    // pointer and sampling a byte. Pipeline the wide debug word mux and byte
+    // selection so BRAM clock-to-out delay is never combined with both muxes.
+    always_ff (clk, rst_n) {
+        if_reset {
+            debug_word_q = 32'h0000_0000;
+            debug_word_select_q = 16'h0000;
+            debug_byte_select_q = 2'd0;
+            memory_read_data_q = 32'h0000_0000;
+            debug_read_data_q = 8'h00;
+        } else {
+            // Decode the word address into registered one-hot selects.  This
+            // prevents the address decoder and the wide data mux from forming
+            // one seven-LUT path.  The I2C pointer remains stable for hundreds
+            // of system-clock cycles before a byte is sampled.
+            debug_word_select_q[0] = debug_address[7:2] == 6'h00;
+            debug_word_select_q[1] = debug_address[7:2] == 6'h04;
+            debug_word_select_q[2] = debug_address[7:2] == 6'h05;
+            debug_word_select_q[3] = debug_address[7:2] == 6'h06;
+            debug_word_select_q[4] = debug_address[7:2] == 6'h08;
+            debug_word_select_q[5] = debug_address[7:2] == 6'h09;
+            debug_word_select_q[6] = debug_address[7:2] == 6'h0a;
+            debug_word_select_q[7] = debug_address[7:2] == 6'h0b;
+            debug_word_select_q[8] = debug_address[7:2] == 6'h0c;
+            debug_word_select_q[9] = debug_address[7:2] == 6'h0d;
+            debug_word_select_q[10] = debug_address[7:2] == 6'h0e;
+            debug_word_select_q[11] = debug_address[7:2] == 6'h0f;
+            debug_word_select_q[12] = debug_address[7:2] == 6'h10;
+            debug_word_select_q[13] = debug_address[7:2] == 6'h11;
+            debug_word_select_q[14] = debug_address[7:2] == 6'h12;
+            debug_word_select_q[15] = debug_address[7:2] == 6'h13;
+            memory_read_data_q = memory_read_data;
+            debug_word_q = debug_selected_word;
+            debug_byte_select_q = debug_address[1:0];
+            case debug_byte_select_q {
+                2'd0: debug_read_data_q = debug_word_q[7:0];
+                2'd1: debug_read_data_q = debug_word_q[15:8];
+                2'd2: debug_read_data_q = debug_word_q[23:16];
+                default: debug_read_data_q = debug_word_q[31:24];
+            }
+        }
+    }
+
+    always_comb {
+        memory_write_strobe = memory_commit_strobe_q && !run_q;
+        debug_status = {5'b00000, commit_valid, core_halted, run_q};
+        // The registered selects are mutually exclusive, so this is a balanced
+        // OR mux rather than a priority chain.  Unmapped words retain the old
+        // 0xffff_ffff response.
+        debug_selected_word =
+            (((({debug_word_select_q[0] repeat 32}
+                    & {{3'b000, commit_rd}, debug_status, 8'h03, 8'h52})
+                | ({debug_word_select_q[1] repeat 32}
+                    & {8'hff, memory_address_q,
+                        {7'b0000000, memory_select_q}, {7'b0000000, run_q}}))
+              | (({debug_word_select_q[2] repeat 32} & memory_write_q)
+                | ({debug_word_select_q[3] repeat 32} & memory_read_data_q)))
+             | ((({debug_word_select_q[4] repeat 32} & commit_pc)
+                | ({debug_word_select_q[5] repeat 32} & debug_x31))
+              | (({debug_word_select_q[6] repeat 32} & commit_mem_addr)
+                | ({debug_word_select_q[7] repeat 32} & commit_mem_wdata))))
+            | (((({debug_word_select_q[8] repeat 32} & commit_pc)
+                | ({debug_word_select_q[9] repeat 32} & commit_instr))
+              | (({debug_word_select_q[10] repeat 32} & commit_data)
+                | ({debug_word_select_q[11] repeat 32} & commit_mem_addr)))
+             | ((({debug_word_select_q[12] repeat 32} & commit_mem_wdata)
+                | ({debug_word_select_q[13] repeat 32} & commit_mem_wdata))
+              | (({debug_word_select_q[14] repeat 32} & commit_mem_wdata)
+                | ({debug_word_select_q[15] repeat 32} & commit_mem_wdata))))
+            | {!(|debug_word_select_q) repeat 32};
+
+        core_rst_n = rst_n && run_q && core_run_q;
+        halted_probe = core_halted;
+        if run_q {
+            led = debug_x31[7:0];
+        } else {
+            led = {memory_select_q, memory_address_q[6:0]};
+        }
+    }
+}

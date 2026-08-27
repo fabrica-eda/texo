@@ -1,0 +1,637 @@
+/// Fifteen-cycle RV32I subset core for the 250 MHz bring-up path.
+///
+/// Instructions do not overlap: register-file read, decode/operand capture,
+/// execute, then commit.
+module Core250 (
+    clk             : input  clock    ,
+    rst_n           : input  reset    ,
+    instr           : input  logic<32>,
+    data_rdata      : input  logic<32>,
+    pc              : output logic<32>,
+    data_addr       : output logic<32>,
+    data_wdata      : output logic<32>,
+    data_we         : output logic    ,
+    halted          : output logic    ,
+    commit_valid    : output logic    ,
+    commit_pc       : output logic<32>,
+    commit_instr    : output logic<32>,
+    commit_rd       : output logic<5> ,
+    commit_data     : output logic<32>,
+    commit_mem_we   : output logic    ,
+    commit_mem_addr : output logic<32>,
+    commit_mem_wdata: output logic<32>,
+    debug_x31       : output logic<32>,
+) {
+    // state 0: issue synchronous register read
+    // state 1: capture compact opcode/funct predecode
+    // state 2: capture micro-op control and selected immediate
+    // state 3: capture register operands
+    // states 4--11: execute one 4-bit arithmetic segment per cycle
+    // state 12: capture synchronous data-memory read data
+    // state 13: select and capture writeback/next-PC data
+    // state 14: commit
+    var state_q     : logic<15>;
+    var pc_q        : logic<32>;
+    var instr_q     : logic<32>;
+    var instr_pc_q  : logic<32>;
+    var halted_q    : logic;
+    var debug_x31_q : logic<32>;
+    var rs1_data    : logic<32>;
+    var rs2_data    : logic<32>;
+
+    // ALU: 0 add, 1 sub, 2 xor, 3 or, 4 and, 5 pass operand B.
+    var subtract_q     : logic;
+    var logic_xor_q    : logic;
+    var logic_or_q     : logic;
+    var logic_and_q    : logic;
+    var logic_pass_q   : logic;
+    var is_lui_q       : logic;
+    var is_auipc_q     : logic;
+    var is_jal_q       : logic;
+    var is_jalr_q      : logic;
+    var is_branch_q    : logic;
+    var is_load_q      : logic;
+    var is_store_q     : logic;
+    var is_opimm_q     : logic;
+    var is_op_q        : logic;
+    var is_system_q    : logic;
+    var funct3_q       : logic<3>;
+    var funct7_q       : logic<7>;
+    var immediate_q    : logic<32>;
+    var operand_a_select_q: logic<2>;
+    var operand_b_select_q: logic<2>;
+    var operand_a_q    : logic<32>;
+    var operand_b_q    : logic<32>;
+    var rs1_value_q    : logic<32>;
+    var rs2_value_q    : logic<32>;
+    var rd_q           : logic<5>;
+    var write_enable_q : logic;
+    // Result: 0 ALU, 1 load data, 2 link address.
+    var result_load_q  : logic;
+    var result_link_q  : logic;
+    var result_arithmetic_q: logic;
+    var result_logic_q : logic;
+    var pc_target_q    : logic;
+    var pc_branch_q    : logic;
+    var pc_branch_invert_q: logic;
+    var pc_alu_q       : logic;
+    var fallthrough_q  : logic<32>;
+    var target_q       : logic<32>;
+    var link_q         : logic<32>;
+    var mem_write_q    : logic;
+    var mem_wdata_q    : logic<32>;
+    var halt_q         : logic;
+    var target_offset_q: logic<32>;
+    var alu_partial_q  : logic<32>;
+    var alu_carry0_q   : logic;
+    var alu_carry1_q   : logic;
+    var alu_carry2_q   : logic;
+    var alu_carry3_q   : logic;
+    var alu_carry4_q   : logic;
+    var alu_carry5_q   : logic;
+    var alu_carry6_q   : logic;
+    var target_partial_q: logic<32>;
+    var target_carry0_q: logic;
+    var target_carry1_q: logic;
+    var target_carry2_q: logic;
+    var target_carry3_q: logic;
+    var target_carry4_q: logic;
+    var target_carry5_q: logic;
+    var target_carry6_q: logic;
+    var fall_partial_q : logic<32>;
+    var fall_carry0_q  : logic;
+    var fall_carry1_q  : logic;
+    var fall_carry2_q  : logic;
+    var fall_carry3_q  : logic;
+    var fall_carry4_q  : logic;
+    var fall_carry5_q  : logic;
+    var fall_carry6_q  : logic;
+    var alu_result_q   : logic<32>;
+    var logic_result_q : logic<32>;
+    var compare_equal_q: logic;
+    var load_data_q    : logic<32>;
+    var writeback_q    : logic<32>;
+    var next_pc_q      : logic<32>;
+
+    var imm_i          : logic<32>;
+    var imm_s          : logic<32>;
+    var imm_b          : logic<32>;
+    var imm_u          : logic<32>;
+    var imm_j          : logic<32>;
+    var alu_op_d       : logic<3>;
+    var immediate_d    : logic<32>;
+    var operand_a_select_d: logic<2>;
+    var operand_b_select_d: logic<2>;
+    var operand_a_d    : logic<32>;
+    var operand_b_d    : logic<32>;
+    var write_enable_d : logic;
+    var result_select_d: logic<2>;
+    var pc_select_d    : logic<3>;
+    var mem_write_d    : logic;
+    var halt_d         : logic;
+    var illegal_d      : logic;
+    var jalr_valid     : logic;
+    var branch_valid   : logic;
+    var load_valid     : logic;
+    var store_valid    : logic;
+    var opimm_valid    : logic;
+    var op_valid       : logic;
+    var recognized     : logic;
+    var use_imm_u      : logic;
+    var use_imm_j      : logic;
+    var use_imm_b      : logic;
+    var use_imm_s      : logic;
+    var use_imm_i      : logic;
+    var alu_sub_d      : logic;
+    var alu_xor_d      : logic;
+    var alu_or_d       : logic;
+    var alu_and_d      : logic;
+    var alu_pass_d     : logic;
+
+    var alu_nibble0_ext: logic<5>;
+    var alu_nibble1_ext: logic<5>;
+    var alu_nibble2_ext: logic<5>;
+    var alu_nibble3_ext: logic<5>;
+    var alu_nibble4_ext: logic<5>;
+    var alu_nibble5_ext: logic<5>;
+    var alu_nibble6_ext: logic<5>;
+    var alu_nibble7_ext: logic<5>;
+    var adjusted_b     : logic<32>;
+    var target_nibble0_ext: logic<5>;
+    var target_nibble1_ext: logic<5>;
+    var target_nibble2_ext: logic<5>;
+    var target_nibble3_ext: logic<5>;
+    var target_nibble4_ext: logic<5>;
+    var target_nibble5_ext: logic<5>;
+    var target_nibble6_ext: logic<5>;
+    var target_nibble7_ext: logic<5>;
+    var fall_nibble0_ext: logic<5>;
+    var fall_nibble1_ext: logic<5>;
+    var fall_nibble2_ext: logic<5>;
+    var fall_nibble3_ext: logic<5>;
+    var fall_nibble4_ext: logic<5>;
+    var fall_nibble5_ext: logic<5>;
+    var fall_nibble6_ext: logic<5>;
+    var fall_nibble7_ext: logic<5>;
+    var arithmetic_result: logic<32>;
+    var logic_result   : logic<32>;
+    var segmented_target: logic<32>;
+    var segmented_fall: logic<32>;
+    var writeback_data : logic<32>;
+    var execute_next_pc: logic<32>;
+    var pc_use_target  : logic;
+    var pc_use_alu     : logic;
+    var rf_write       : logic;
+
+    inst registers: RegisterFile (
+        clk           : clk,
+        write_enable  : rf_write,
+        write_address : rd_q,
+        write_data    : writeback_q,
+        // Do not place the instruction BRAM clock-to-out path in front of the
+        // distributed register-file decoder.  instr_q is already available a
+        // full cycle before the operands are consumed.
+        read_address_a: instr_q[19:15],
+        read_address_b: instr_q[24:20],
+        read_data_a   : rs1_data,
+        read_data_b   : rs2_data,
+    );
+
+    always_comb {
+        imm_i = {instr_q[31] repeat 21, instr_q[30:20]};
+        imm_s = {instr_q[31] repeat 21, instr_q[30:25], instr_q[11:7]};
+        imm_b = {instr_q[31] repeat 20, instr_q[7], instr_q[30:25], instr_q[11:8], 1'b0};
+        imm_u = {instr_q[31:12], 12'h000};
+        imm_j = {instr_q[31] repeat 12, instr_q[19:12], instr_q[20], instr_q[30:21], 1'b0};
+
+        alu_op_d = 3'd0;
+        immediate_d = imm_i;
+        // Operand A: 0 rs1, 1 instruction PC, 2 zero.
+        operand_a_select_d = 2'd0;
+        // Operand B: 0 selected immediate, 1 rs2, 2 zero.
+        operand_b_select_d = 2'd0;
+        write_enable_d = 1'b0;
+        result_select_d = 2'd0;
+        pc_select_d = 3'd0;
+        mem_write_d = 1'b0;
+        halt_d = 1'b0;
+        illegal_d = 1'b0;
+
+        jalr_valid = is_jalr_q && (funct3_q == 3'b000);
+        branch_valid = is_branch_q
+            && ((funct3_q == 3'b000) || (funct3_q == 3'b001));
+        load_valid = is_load_q && (funct3_q == 3'b010);
+        store_valid = is_store_q && (funct3_q == 3'b010);
+        opimm_valid = is_opimm_q && ((funct3_q == 3'b000)
+            || (funct3_q == 3'b100) || (funct3_q == 3'b110)
+            || (funct3_q == 3'b111));
+        op_valid = is_op_q && ((funct3_q == 3'b100)
+            || (funct3_q == 3'b110) || (funct3_q == 3'b111)
+            || ((funct3_q == 3'b000) && ((funct7_q == 7'b0000000)
+                || (funct7_q == 7'b0100000))));
+        recognized = is_lui_q || is_auipc_q || is_jal_q || jalr_valid
+            || branch_valid || load_valid || store_valid || opimm_valid
+            || op_valid || is_system_q;
+
+        use_imm_u = is_lui_q || is_auipc_q;
+        use_imm_j = is_jal_q;
+        use_imm_b = is_branch_q;
+        use_imm_s = is_store_q;
+        use_imm_i = !(use_imm_u || use_imm_j || use_imm_b || use_imm_s);
+        immediate_d = (imm_u & {use_imm_u repeat 32})
+            | (imm_j & {use_imm_j repeat 32})
+            | (imm_b & {use_imm_b repeat 32})
+            | (imm_s & {use_imm_s repeat 32})
+            | (imm_i & {use_imm_i repeat 32});
+        operand_a_select_d = {
+            is_lui_q || is_jal_q || is_system_q,
+            is_auipc_q
+        };
+        operand_b_select_d = {
+            is_jal_q || is_system_q,
+            is_op_q || is_branch_q
+        };
+
+        case operand_a_select_q {
+            2'd1: operand_a_d = instr_pc_q;
+            2'd2: operand_a_d = 32'h0000_0000;
+            default: operand_a_d = rs1_value_q;
+        }
+        case operand_b_select_q {
+            2'd1: operand_b_d = rs2_value_q;
+            2'd2: operand_b_d = 32'h0000_0000;
+            default: operand_b_d = immediate_q;
+        }
+
+        illegal_d = !recognized;
+        write_enable_d = is_lui_q || is_auipc_q || is_jal_q || jalr_valid
+            || load_valid || opimm_valid || op_valid;
+        result_select_d = {is_jal_q || jalr_valid, load_valid};
+        pc_select_d = {
+            jalr_valid,
+            branch_valid,
+            is_jal_q || (branch_valid && (funct3_q == 3'b001))
+        };
+        mem_write_d = store_valid;
+        halt_d = is_system_q || illegal_d;
+
+        alu_sub_d = is_op_q && (funct3_q == 3'b000)
+            && (funct7_q == 7'b0100000);
+        alu_xor_d = (is_opimm_q || is_op_q) && (funct3_q == 3'b100);
+        alu_or_d = (is_opimm_q || is_op_q) && (funct3_q == 3'b110);
+        alu_and_d = (is_opimm_q || is_op_q) && (funct3_q == 3'b111);
+        alu_pass_d = is_lui_q;
+        alu_op_d = {
+            alu_and_d || alu_pass_d,
+            alu_xor_d || alu_or_d,
+            alu_sub_d || alu_or_d || alu_pass_d
+        };
+    }
+
+    always_comb {
+        adjusted_b = operand_b_q ^ {subtract_q repeat 32};
+        alu_nibble0_ext = {1'b0, operand_a_q[3:0]}
+            + {1'b0, adjusted_b[3:0]} + {4'h0, subtract_q};
+        alu_nibble1_ext = {1'b0, operand_a_q[7:4]}
+            + {1'b0, adjusted_b[7:4]} + {4'h0, alu_carry0_q};
+        alu_nibble2_ext = {1'b0, operand_a_q[11:8]}
+            + {1'b0, adjusted_b[11:8]} + {4'h0, alu_carry1_q};
+        alu_nibble3_ext = {1'b0, operand_a_q[15:12]}
+            + {1'b0, adjusted_b[15:12]} + {4'h0, alu_carry2_q};
+        alu_nibble4_ext = {1'b0, operand_a_q[19:16]}
+            + {1'b0, adjusted_b[19:16]} + {4'h0, alu_carry3_q};
+        alu_nibble5_ext = {1'b0, operand_a_q[23:20]}
+            + {1'b0, adjusted_b[23:20]} + {4'h0, alu_carry4_q};
+        alu_nibble6_ext = {1'b0, operand_a_q[27:24]}
+            + {1'b0, adjusted_b[27:24]} + {4'h0, alu_carry5_q};
+        alu_nibble7_ext = {1'b0, operand_a_q[31:28]}
+            + {1'b0, adjusted_b[31:28]} + {4'h0, alu_carry6_q};
+
+        target_nibble0_ext = {1'b0, instr_pc_q[3:0]}
+            + {1'b0, target_offset_q[3:0]};
+        target_nibble1_ext = {1'b0, instr_pc_q[7:4]}
+            + {1'b0, target_offset_q[7:4]} + {4'h0, target_carry0_q};
+        target_nibble2_ext = {1'b0, instr_pc_q[11:8]}
+            + {1'b0, target_offset_q[11:8]} + {4'h0, target_carry1_q};
+        target_nibble3_ext = {1'b0, instr_pc_q[15:12]}
+            + {1'b0, target_offset_q[15:12]} + {4'h0, target_carry2_q};
+        target_nibble4_ext = {1'b0, instr_pc_q[19:16]}
+            + {1'b0, target_offset_q[19:16]} + {4'h0, target_carry3_q};
+        target_nibble5_ext = {1'b0, instr_pc_q[23:20]}
+            + {1'b0, target_offset_q[23:20]} + {4'h0, target_carry4_q};
+        target_nibble6_ext = {1'b0, instr_pc_q[27:24]}
+            + {1'b0, target_offset_q[27:24]} + {4'h0, target_carry5_q};
+        target_nibble7_ext = {1'b0, instr_pc_q[31:28]}
+            + {1'b0, target_offset_q[31:28]} + {4'h0, target_carry6_q};
+
+        fall_nibble0_ext = {1'b0, instr_pc_q[3:0]} + 5'd4;
+        fall_nibble1_ext = {1'b0, instr_pc_q[7:4]} + {4'h0, fall_carry0_q};
+        fall_nibble2_ext = {1'b0, instr_pc_q[11:8]} + {4'h0, fall_carry1_q};
+        fall_nibble3_ext = {1'b0, instr_pc_q[15:12]} + {4'h0, fall_carry2_q};
+        fall_nibble4_ext = {1'b0, instr_pc_q[19:16]} + {4'h0, fall_carry3_q};
+        fall_nibble5_ext = {1'b0, instr_pc_q[23:20]} + {4'h0, fall_carry4_q};
+        fall_nibble6_ext = {1'b0, instr_pc_q[27:24]} + {4'h0, fall_carry5_q};
+        fall_nibble7_ext = {1'b0, instr_pc_q[31:28]} + {4'h0, fall_carry6_q};
+
+        arithmetic_result = {alu_nibble7_ext[3:0], alu_partial_q[27:0]};
+        // Keep the four logic operations one-hot.  The explicit balanced tree
+        // maps to three LUT levels instead of decoding alu_op through a
+        // five-level priority mux.
+        logic_result =
+            (({logic_xor_q repeat 32} & (operand_a_q ^ operand_b_q))
+                | ({logic_or_q repeat 32} & (operand_a_q | operand_b_q)))
+            | (({logic_and_q repeat 32} & (operand_a_q & operand_b_q))
+                | ({logic_pass_q repeat 32} & operand_b_q));
+        segmented_target = {target_nibble7_ext[3:0], target_partial_q[27:0]};
+        segmented_fall = {fall_nibble7_ext[3:0], fall_partial_q[27:0]};
+
+        // The result class is registered one-hot at decode.  Spell the mux as
+        // a balanced tree so no encoded-result decoder is left on this final
+        // writeback stage.
+        writeback_data =
+            (({result_load_q repeat 32} & load_data_q)
+                | ({result_link_q repeat 32} & link_q))
+            | (({result_arithmetic_q repeat 32} & alu_result_q)
+                | ({result_logic_q repeat 32} & logic_result_q));
+
+        pc_use_target = pc_target_q
+            || (pc_branch_q && (compare_equal_q != pc_branch_invert_q));
+        pc_use_alu = pc_alu_q;
+        if pc_use_alu {
+            execute_next_pc = alu_result_q & 32'hffff_fffe;
+        } else if pc_use_target {
+            execute_next_pc = target_q;
+        } else {
+            execute_next_pc = fallthrough_q;
+        }
+
+        rf_write = state_q[14] && !halted_q && write_enable_q
+            && (rd_q != 5'd0);
+        if state_q[11] {
+            data_addr = arithmetic_result;
+        } else {
+            data_addr = alu_result_q;
+        }
+        data_wdata = mem_wdata_q;
+        data_we = state_q[14] && !halted_q && mem_write_q;
+        // During commit, present the next fetch address early enough for a
+        // synchronous instruction BRAM to return data before state 0 captures
+        // the next instruction.
+        if state_q[14] {
+            pc = next_pc_q;
+        } else {
+            pc = pc_q;
+        }
+        halted = halted_q;
+        debug_x31 = debug_x31_q;
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            state_q = 15'h0001;
+            pc_q = 32'h0000_0000;
+            instr_q = 32'h0000_0073;
+            instr_pc_q = 32'h0000_0000;
+            halted_q = 1'b0;
+            debug_x31_q = 32'h0000_0000;
+            subtract_q = 1'b0;
+            logic_xor_q = 1'b0;
+            logic_or_q = 1'b0;
+            logic_and_q = 1'b0;
+            logic_pass_q = 1'b0;
+            is_lui_q = 1'b0;
+            is_auipc_q = 1'b0;
+            is_jal_q = 1'b0;
+            is_jalr_q = 1'b0;
+            is_branch_q = 1'b0;
+            is_load_q = 1'b0;
+            is_store_q = 1'b0;
+            is_opimm_q = 1'b0;
+            is_op_q = 1'b0;
+            is_system_q = 1'b1;
+            funct3_q = 3'd0;
+            funct7_q = 7'd0;
+            immediate_q = 0;
+            operand_a_select_q = 0;
+            operand_b_select_q = 0;
+            operand_a_q = 0;
+            operand_b_q = 0;
+            rs1_value_q = 0;
+            rs2_value_q = 0;
+            rd_q = 0;
+            write_enable_q = 1'b0;
+            result_load_q = 1'b0;
+            result_link_q = 1'b0;
+            result_arithmetic_q = 1'b1;
+            result_logic_q = 1'b0;
+            pc_target_q = 1'b0;
+            pc_branch_q = 1'b0;
+            pc_branch_invert_q = 1'b0;
+            pc_alu_q = 1'b0;
+            fallthrough_q = 0;
+            target_q = 0;
+            link_q = 0;
+            mem_write_q = 1'b0;
+            mem_wdata_q = 0;
+            halt_q = 1'b0;
+            target_offset_q = 0;
+            alu_partial_q = 0;
+            alu_carry0_q = 1'b0;
+            alu_carry1_q = 1'b0;
+            alu_carry2_q = 1'b0;
+            alu_carry3_q = 1'b0;
+            alu_carry4_q = 1'b0;
+            alu_carry5_q = 1'b0;
+            alu_carry6_q = 1'b0;
+            target_partial_q = 0;
+            target_carry0_q = 1'b0;
+            target_carry1_q = 1'b0;
+            target_carry2_q = 1'b0;
+            target_carry3_q = 1'b0;
+            target_carry4_q = 1'b0;
+            target_carry5_q = 1'b0;
+            target_carry6_q = 1'b0;
+            fall_partial_q = 0;
+            fall_carry0_q = 1'b0;
+            fall_carry1_q = 1'b0;
+            fall_carry2_q = 1'b0;
+            fall_carry3_q = 1'b0;
+            fall_carry4_q = 1'b0;
+            fall_carry5_q = 1'b0;
+            fall_carry6_q = 1'b0;
+            alu_result_q = 0;
+            logic_result_q = 0;
+            compare_equal_q = 1'b0;
+            load_data_q = 0;
+            writeback_q = 0;
+            next_pc_q = 0;
+            commit_valid = 1'b0;
+            commit_pc = 0;
+            commit_instr = 0;
+            commit_rd = 0;
+            commit_data = 0;
+            commit_mem_we = 1'b0;
+            commit_mem_addr = 0;
+            commit_mem_wdata = 0;
+        } else {
+            commit_valid = 1'b0;
+            commit_mem_we = 1'b0;
+            if !halted_q {
+                if state_q[0] {
+                    instr_q = instr;
+                    instr_pc_q = pc_q;
+                }
+                if state_q[1] {
+                    is_lui_q = instr_q[6:0] == 7'b0110111;
+                    is_auipc_q = instr_q[6:0] == 7'b0010111;
+                    is_jal_q = instr_q[6:0] == 7'b1101111;
+                    is_jalr_q = instr_q[6:0] == 7'b1100111;
+                    is_branch_q = instr_q[6:0] == 7'b1100011;
+                    is_load_q = instr_q[6:0] == 7'b0000011;
+                    is_store_q = instr_q[6:0] == 7'b0100011;
+                    is_opimm_q = instr_q[6:0] == 7'b0010011;
+                    is_op_q = instr_q[6:0] == 7'b0110011;
+                    is_system_q = instr_q[6:0] == 7'b1110011;
+                    funct3_q = instr_q[14:12];
+                    funct7_q = instr_q[31:25];
+                }
+                if state_q[2] {
+                    subtract_q = alu_op_d == 3'd1;
+                    logic_xor_q = alu_op_d == 3'd2;
+                    logic_or_q = alu_op_d == 3'd3;
+                    logic_and_q = alu_op_d == 3'd4;
+                    logic_pass_q = alu_op_d == 3'd5;
+                    // The register-file BRAM clock-to-out and x0 mask end
+                    // here; operand selection starts from these registers in
+                    // the following cycle.
+                    rs1_value_q = rs1_data;
+                    rs2_value_q = rs2_data;
+                    immediate_q = immediate_d;
+                    operand_a_select_q = operand_a_select_d;
+                    operand_b_select_q = operand_b_select_d;
+                    rd_q = instr_q[11:7];
+                    write_enable_q = write_enable_d;
+                    result_load_q = result_select_d == 2'd1;
+                    result_link_q = result_select_d == 2'd2;
+                    result_arithmetic_q = (result_select_d == 2'd0)
+                        && ((alu_op_d == 3'd0) || (alu_op_d == 3'd1));
+                    result_logic_q = (result_select_d == 2'd0)
+                        && !((alu_op_d == 3'd0) || (alu_op_d == 3'd1));
+                    pc_target_q = pc_select_d == 3'd1;
+                    pc_branch_q = (pc_select_d == 3'd2) || (pc_select_d == 3'd3);
+                    pc_branch_invert_q = pc_select_d == 3'd3;
+                    pc_alu_q = pc_select_d == 3'd4;
+                    mem_write_q = mem_write_d;
+                    halt_q = halt_d;
+                }
+                if state_q[3] {
+                    operand_a_q = operand_a_d;
+                    operand_b_q = operand_b_d;
+                    if pc_target_q || pc_branch_q {
+                        target_offset_q = immediate_q;
+                    } else {
+                        target_offset_q = 32'd4;
+                    }
+                    mem_wdata_q = rs2_value_q;
+                }
+                if state_q[4] {
+                    logic_result_q = logic_result;
+                    alu_partial_q[3:0] = alu_nibble0_ext[3:0];
+                    alu_carry0_q = alu_nibble0_ext[4];
+                    target_partial_q[3:0] = target_nibble0_ext[3:0];
+                    target_carry0_q = target_nibble0_ext[4];
+                    fall_partial_q[3:0] = fall_nibble0_ext[3:0];
+                    fall_carry0_q = fall_nibble0_ext[4];
+                }
+                if state_q[5] {
+                    alu_partial_q[7:4] = alu_nibble1_ext[3:0];
+                    alu_carry1_q = alu_nibble1_ext[4];
+                    target_partial_q[7:4] = target_nibble1_ext[3:0];
+                    target_carry1_q = target_nibble1_ext[4];
+                    fall_partial_q[7:4] = fall_nibble1_ext[3:0];
+                    fall_carry1_q = fall_nibble1_ext[4];
+                }
+                if state_q[6] {
+                    alu_partial_q[11:8] = alu_nibble2_ext[3:0];
+                    alu_carry2_q = alu_nibble2_ext[4];
+                    target_partial_q[11:8] = target_nibble2_ext[3:0];
+                    target_carry2_q = target_nibble2_ext[4];
+                    fall_partial_q[11:8] = fall_nibble2_ext[3:0];
+                    fall_carry2_q = fall_nibble2_ext[4];
+                }
+                if state_q[7] {
+                    alu_partial_q[15:12] = alu_nibble3_ext[3:0];
+                    alu_carry3_q = alu_nibble3_ext[4];
+                    target_partial_q[15:12] = target_nibble3_ext[3:0];
+                    target_carry3_q = target_nibble3_ext[4];
+                    fall_partial_q[15:12] = fall_nibble3_ext[3:0];
+                    fall_carry3_q = fall_nibble3_ext[4];
+                }
+                if state_q[8] {
+                    alu_partial_q[19:16] = alu_nibble4_ext[3:0];
+                    alu_carry4_q = alu_nibble4_ext[4];
+                    target_partial_q[19:16] = target_nibble4_ext[3:0];
+                    target_carry4_q = target_nibble4_ext[4];
+                    fall_partial_q[19:16] = fall_nibble4_ext[3:0];
+                    fall_carry4_q = fall_nibble4_ext[4];
+                }
+                if state_q[9] {
+                    alu_partial_q[23:20] = alu_nibble5_ext[3:0];
+                    alu_carry5_q = alu_nibble5_ext[4];
+                    target_partial_q[23:20] = target_nibble5_ext[3:0];
+                    target_carry5_q = target_nibble5_ext[4];
+                    fall_partial_q[23:20] = fall_nibble5_ext[3:0];
+                    fall_carry5_q = fall_nibble5_ext[4];
+                }
+                if state_q[10] {
+                    alu_partial_q[27:24] = alu_nibble6_ext[3:0];
+                    alu_carry6_q = alu_nibble6_ext[4];
+                    target_partial_q[27:24] = target_nibble6_ext[3:0];
+                    target_carry6_q = target_nibble6_ext[4];
+                    fall_partial_q[27:24] = fall_nibble6_ext[3:0];
+                    fall_carry6_q = fall_nibble6_ext[4];
+                }
+                if state_q[11] {
+                    alu_result_q = arithmetic_result;
+                    target_q = segmented_target;
+                    fallthrough_q = segmented_fall;
+                    link_q = segmented_fall;
+                    compare_equal_q = operand_a_q == operand_b_q;
+                }
+                if state_q[12] {
+                    load_data_q = data_rdata;
+                }
+                if state_q[13] {
+                    writeback_q = writeback_data;
+                    next_pc_q = execute_next_pc;
+                }
+                if state_q[14] {
+                    pc_q = next_pc_q;
+                    halted_q = halt_q;
+                    commit_valid = 1'b1;
+                    commit_pc = instr_pc_q;
+                    commit_instr = instr_q;
+                    commit_rd = 0;
+                    commit_data = 0;
+                    commit_mem_we = data_we;
+                    commit_mem_addr = alu_result_q;
+                    commit_mem_wdata = mem_wdata_q;
+
+                    if write_enable_q && (rd_q != 5'd0) {
+                        commit_rd = rd_q;
+                        commit_data = writeback_q;
+                        if rd_q == 5'd31 {
+                            debug_x31_q = writeback_q;
+                        }
+                    }
+                }
+                if state_q[14] {
+                    state_q = 15'h0001;
+                } else {
+                    state_q = {state_q[13:0], 1'b0};
+                }
+            }
+        }
+    }
+}
+

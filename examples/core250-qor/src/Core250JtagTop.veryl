@@ -1,0 +1,66 @@
+/// Physical timing top: Core250 SoC plus the existing ER1 JTAG-to-I2C bridge.
+/// Logical jtag_* ports are bound to the dedicated ECP5 JTAGG after mapping.
+module Core250JtagTop (
+    clk         : input  'system clock,
+    clk_250     : input  'fast clock,
+    pll_locked  : input  'fast logic,
+    rst_n       : input  'system reset_async_low,
+    led         : output 'fast logic<8>,
+    jtag_tdi    : input  'tap logic,
+    jtag_tck    : input  'tap clock,
+    jtag_rti1   : input  'tap logic,
+    jtag_rti2   : input  'tap logic,
+    jtag_shift  : input  'tap logic,
+    jtag_update : input  'tap clock,
+    jtag_rst_n  : input  'tap reset_async_low,
+    jtag_ce1    : input  'tap logic,
+    jtag_ce2    : input  'tap logic,
+    jtag_tdo1   : output 'tap logic,
+    jtag_tdo2   : output 'tap logic,
+) {
+    var shift_register : logic<2>;
+    var master_scl     : logic;
+    var master_sda_low : logic;
+    var target_sda_low : 'fast logic;
+    var target_scl     : 'fast logic;
+    var wired_sda      : 'fast logic;
+    var target_rst_n   : 'fast reset_async_low;
+    var core_halted    : 'fast logic;
+
+    inst soc: Core250Soc (
+        clk          : clk_250,
+        rst_n        : target_rst_n,
+        scl_i        : target_scl,
+        sda_i        : wired_sda,
+        sda_drive_low: target_sda_low,
+        led          : led,
+        halted_probe : core_halted,
+    );
+
+    always_ff (jtag_tck, jtag_rst_n) {
+        if_reset {
+            shift_register = 2'b00;
+        } else if jtag_ce1 && jtag_shift {
+            shift_register = {jtag_tdi, shift_register[1]};
+        }
+    }
+
+    always_ff (jtag_update, jtag_rst_n) {
+        if_reset {
+            master_scl = 1'b1;
+            master_sda_low = 1'b0;
+        } else {
+            master_scl = shift_register[1];
+            master_sda_low = shift_register[0];
+        }
+    }
+
+    unsafe (cdc) {
+        assign target_rst_n = rst_n && jtag_rst_n && pll_locked;
+        assign target_scl = master_scl;
+        assign wired_sda = !(master_sda_low || target_sda_low);
+        assign jtag_tdo1 = wired_sda;
+        assign jtag_tdo2 = core_halted;
+    }
+}
+
