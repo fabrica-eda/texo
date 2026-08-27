@@ -385,6 +385,10 @@ pub fn implement_struo_ecp5_with_progress(
         architecture,
         ff_ce_control_sets(&design, imported.metadata()),
     );
+    packing.constrain_ff_clock_muxes(
+        architecture,
+        ff_clock_control_sets(&design, imported.metadata()),
+    );
     constrain_pll_outputs(&design, imported.metadata(), &mut packing)?;
     progress(Ecp5FlowStage::Packed);
     report_metric_phase("packing", &mut phase_started);
@@ -604,6 +608,30 @@ fn ff_ce_control_sets(
                 1 + u64::try_from(net.0).expect("net ID fits u64") * 2
                     + u64::from(active == ActiveLevel::Low)
             });
+            Some((cell, value))
+        })
+        .collect()
+}
+
+fn ff_clock_control_sets(
+    design: &Design,
+    metadata: &BTreeMap<CellId, PrimitiveMetadata>,
+) -> Vec<(CellId, u64)> {
+    metadata
+        .iter()
+        .filter_map(|(&cell, primitive)| {
+            let PrimitiveMetadata::FlipFlop { edge, .. } = primitive else {
+                return None;
+            };
+            let clock = design.cells()[cell.0]
+                .pins()
+                .iter()
+                .copied()
+                .find(|pin| design.pins()[pin.0].name == "CLK")
+                .expect("FF has a CLK pin");
+            let net = design.pins()[clock.0].net().expect("FF CLK is connected");
+            let value = u64::try_from(net.0).expect("net ID fits u64") * 2
+                + u64::from(*edge == texo_struo::ClockEdge::Falling);
             Some((cell, value))
         })
         .collect()
@@ -2968,13 +2996,17 @@ fn freeze_unchanged_routes(
         .enumerate()
         .filter_map(|(index, (before, after))| (before != after).then_some(CellId(index)))
         .collect::<BTreeSet<_>>();
+    let rebound = (0..design.pins().len())
+        .map(CellPinId)
+        .filter(|&pin| implementation.placement.pin_binding(pin) != placement.pin_binding(pin))
+        .collect::<BTreeSet<_>>();
     let mut frozen = base.clone();
     for route in &implementation.routes {
         if base.routes().contains_key(&route.net) {
             continue;
         }
         let net = &design.nets()[route.net.0];
-        if moved.contains(&design.pins()[net.driver.0].cell) {
+        if moved.contains(&design.pins()[net.driver.0].cell) || rebound.contains(&net.driver) {
             continue;
         }
         let mut released_sinks = route
@@ -2984,6 +3016,7 @@ fn freeze_unchanged_routes(
                 arc.sink.filter(|&sink| {
                     released.contains(&(route.net, sink))
                         || moved.contains(&design.pins()[sink.0].cell)
+                        || rebound.contains(&sink)
                 })
             })
             .collect::<BTreeSet<_>>();
@@ -3831,14 +3864,20 @@ impl Error for MissingEvidence {}
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
 
     use struo_celox::ecp5_simulator;
     use struo_ir::{ActiveLevel, ClockEdge, Netlist, RegisterCell, ResetControl};
     use struo_target_ecp5::{
         Ecp5Netlist, OpenDrainIo, map_to_ecp5, map_to_ecp5_with_open_drain_ios,
     };
-    use texo_model::{BelId, CellId, Design, Device, NetId, PinDirection, PipId, ResourceKind};
-    use texo_pnr::{PlacementConstraints, RoutingConstraints, place_and_route};
+    use texo_model::{
+        BelId, CellId, Design, Device, NetId, PinDirection, PipId, Point, ResourceKind,
+    };
+    use texo_pnr::{
+        NetRoute, PlacementConstraints, PnrResult, RouteArc, RoutingConstraints, place_and_route,
+        placement_from_partial_bindings, rebind_placement_pins,
+    };
     use texo_struo::{
         ActiveLevel as ImportedActiveLevel, ClockEdge as ImportedClockEdge, PrimitiveMetadata,
         import_ecp5,
@@ -3853,10 +3892,10 @@ mod tests {
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, PostMapSimulationPolicy,
         accumulate_hold_minimums, criticality_weight, decimal_mhz_period_ps,
         delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, ff_ce_control_sets,
-        find_cell_pin, freeze_route_sinks_except, implement, implement_struo_ecp5,
-        implement_with_constraints, next_wns_regression_streak, pip_class_delay,
-        project_trellis_speed_grade, retain_projection_timing_frontier, slack_violations,
-        staged_timing_score, verify_post_map_with_celox,
+        ff_clock_control_sets, find_cell_pin, freeze_route_sinks_except, freeze_unchanged_routes,
+        implement, implement_struo_ecp5, implement_with_constraints, next_wns_regression_streak,
+        pip_class_delay, project_trellis_speed_grade, retain_projection_timing_frontier,
+        slack_violations, staged_timing_score, verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -3917,6 +3956,51 @@ mod tests {
         assert_eq!(sets[&high_a], sets[&high_b]);
         assert_ne!(sets[&high_a], sets[&low]);
         assert_ne!(sets[&high_a], sets[&other]);
+    }
+
+    #[test]
+    fn ff_clock_control_sets_separate_nets_and_edges() {
+        let mut design = Design::new();
+        let first_driver = design.add_cell("first_clock", ResourceKind::Logic);
+        let first_clock = design
+            .add_pin(first_driver, "out", PinDirection::Output)
+            .unwrap();
+        let second_driver = design.add_cell("second_clock", ResourceKind::Logic);
+        let second_clock = design
+            .add_pin(second_driver, "out", PinDirection::Output)
+            .unwrap();
+        let rising_a = design.add_cell("rising_a", ResourceKind::Register);
+        let rising_b = design.add_cell("rising_b", ResourceKind::Register);
+        let falling = design.add_cell("falling", ResourceKind::Register);
+        let shared_clock_sinks = [rising_a, rising_b, falling]
+            .map(|cell| design.add_pin(cell, "CLK", PinDirection::Input).unwrap());
+        let other = design.add_cell("other", ResourceKind::Register);
+        let other_clock = design.add_pin(other, "CLK", PinDirection::Input).unwrap();
+        design
+            .add_net("shared_clock", first_clock, shared_clock_sinks)
+            .unwrap();
+        design
+            .add_net("other_clock", second_clock, [other_clock])
+            .unwrap();
+        let flip_flop = |edge| PrimitiveMetadata::FlipFlop {
+            edge,
+            enable: None,
+            reset: None,
+        };
+        let metadata = BTreeMap::from([
+            (rising_a, flip_flop(ImportedClockEdge::Rising)),
+            (rising_b, flip_flop(ImportedClockEdge::Rising)),
+            (falling, flip_flop(ImportedClockEdge::Falling)),
+            (other, flip_flop(ImportedClockEdge::Rising)),
+        ]);
+
+        let sets = ff_clock_control_sets(&design, &metadata)
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(sets[&rising_a], sets[&rising_b]);
+        assert_ne!(sets[&rising_a], sets[&falling]);
+        assert_ne!(sets[&rising_a], sets[&other]);
     }
 
     #[test]
@@ -4068,6 +4152,75 @@ mod tests {
         assert!(frozen.routes().contains_key(&NetId(0)));
         assert!(!frozen.routes().contains_key(&NetId(1)));
         assert_eq!(frozen.blocked_pips(), &BTreeSet::from([PipId(0)]));
+    }
+
+    #[test]
+    fn hold_repair_does_not_freeze_a_route_to_a_rebound_physical_pin() {
+        let mut design = Design::new();
+        let source = design.add_cell("source", ResourceKind::Logic);
+        let output = design.add_pin(source, "out", PinDirection::Output).unwrap();
+        let register = design.add_cell("register", ResourceKind::Register);
+        let input = design.add_pin(register, "DI", PinDirection::Input).unwrap();
+        let net = design.add_net("data", output, [input]).unwrap();
+
+        let mut device = Device::new("rebound-pin", 1, 1).unwrap();
+        let point = Point::new(0, 0);
+        let driver_wire = device.add_wire("driver", point, 1).unwrap();
+        let di_wire = device.add_wire("DI", point, 1).unwrap();
+        let m_wire = device.add_wire("M", point, 1).unwrap();
+        let source_bel = device
+            .add_bel("source", ResourceKind::Logic, point)
+            .unwrap();
+        device
+            .add_bel_pin(source_bel, "out", PinDirection::Output, driver_wire)
+            .unwrap();
+        let register_bel = device
+            .add_bel("register", ResourceKind::Register, point)
+            .unwrap();
+        let di_pin = device
+            .add_bel_pin(register_bel, "DI", PinDirection::Input, di_wire)
+            .unwrap();
+        let m_pin = device
+            .add_bel_pin(register_bel, "M", PinDirection::Input, m_wire)
+            .unwrap();
+        let dedicated_pip = device.add_pip(driver_wire, di_wire, false, 1).unwrap();
+        device.add_pip(driver_wire, m_wire, false, 1).unwrap();
+        let bindings = BTreeMap::from([(source, source_bel), (register, register_bel)]);
+        let mut dedicated = PlacementConstraints::new();
+        dedicated.bind_pin(input, register_bel, di_pin);
+        let original =
+            placement_from_partial_bindings(&design, &device, &dedicated, &bindings).unwrap();
+        let mut general = PlacementConstraints::new();
+        general.bind_pin(input, register_bel, m_pin);
+        let rebound = rebind_placement_pins(&design, &device, &general, &original).unwrap();
+        let implementation = PnrResult {
+            placement: original,
+            routes: vec![Arc::new(NetRoute::new(
+                net,
+                vec![RouteArc {
+                    sink: Some(input),
+                    wires: vec![driver_wire, di_wire],
+                    pips: vec![dedicated_pip],
+                }],
+            ))],
+            total_pips: 1,
+        };
+
+        let frozen = freeze_unchanged_routes(
+            &design,
+            &implementation,
+            &rebound,
+            &RoutingConstraints::new(),
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(
+            implementation.placement.bel(register),
+            rebound.bel(register)
+        );
+        assert_eq!(implementation.placement.pin_binding(input), Some(di_pin));
+        assert_eq!(rebound.pin_binding(input), Some(m_pin));
+        assert!(!frozen.routes().contains_key(&net));
     }
 
     #[test]

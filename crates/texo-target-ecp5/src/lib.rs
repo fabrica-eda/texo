@@ -411,6 +411,12 @@ pub struct Ecp5GlobalRoutingCache<'a> {
 
 type GlobalClockBranch = (WireId, Vec<WireId>, Vec<PipId>);
 
+#[derive(Clone, Copy, Debug)]
+struct BlockedGlobalResources<'a> {
+    wires: &'a BTreeSet<WireId>,
+    pips: &'a BTreeSet<PipId>,
+}
+
 /// Compressed sparse-row reverse PIP index. PIP IDs within each wire retain
 /// device order, matching the former `Vec<Vec<PipId>>` traversal exactly.
 #[derive(Debug)]
@@ -706,6 +712,43 @@ impl Ecp5Packing {
             let key = (point, metadata.z >> 3);
             let next = u64::try_from(resource_ids.len()).expect("ECP5 slice count fits u64");
             let resource = *resource_ids.entry(key).or_insert(next);
+            bel_resources.push((bel, resource));
+        }
+        self.constraints
+            .add_shared_resource(cell_values, bel_resources);
+    }
+
+    /// Constrains FFs sharing one ECP5 logic-tile clock input to a compatible control set.
+    ///
+    /// Values identify the logical clock net and active edge. Multiple slices
+    /// can share one physical `CLK0` or `CLK1` wire, so compatibility is keyed
+    /// by each FF BEL's actual clock-pin wire rather than by its slice number.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the architecture contains more shared ECP5 clock wires
+    /// than fit in a `u64` resource identifier.
+    pub fn constrain_ff_clock_muxes(
+        &mut self,
+        architecture: &Ecp5Architecture,
+        cell_values: impl IntoIterator<Item = (CellId, u64)>,
+    ) {
+        let cell_values = cell_values.into_iter().collect::<Vec<_>>();
+        if cell_values.is_empty() {
+            return;
+        }
+        let mut resource_ids = BTreeMap::new();
+        let mut bel_resources = Vec::new();
+        for &bel in architecture.device().bels_of_kind(ResourceKind::Register) {
+            let metadata = architecture.bel_metadata(bel);
+            if metadata.bel_type != "TRELLIS_FF" {
+                continue;
+            }
+            let clock_pin =
+                find_bel_pin(architecture.device(), bel, "CLK").expect("TRELLIS_FF has a CLK pin");
+            let clock_wire = architecture.device().bel_pins()[clock_pin.0].wire;
+            let next = u64::try_from(resource_ids.len()).expect("ECP5 clock wire count fits u64");
+            let resource = *resource_ids.entry(clock_wire).or_insert(next);
             bel_resources.push((bel, resource));
         }
         self.constraints
@@ -1359,6 +1402,8 @@ impl Ecp5Packing {
         let graph = UnifiedGraph::new(design, device);
         let mut constraints =
             self.routing_restrictions_cached(design, architecture, placement, cache)?;
+        let mut reserved_wires = BTreeSet::new();
+        let mut reserved_pips = BTreeSet::new();
         for (network, clock) in self.global_clocks.iter().enumerate() {
             let net = &design.nets()[clock.global_net.0];
             let source = placed_pin_wire(&graph, placement, net.driver)?;
@@ -1390,7 +1435,17 @@ impl Ecp5Packing {
                     continue;
                 }
                 let (join, branch_wires, branch_pips) = cache
-                    .reverse_route(device, network, sink_wire, &wires, &tile_name)
+                    .reverse_route(
+                        device,
+                        network,
+                        sink_wire,
+                        &wires,
+                        BlockedGlobalResources {
+                            wires: &reserved_wires,
+                            pips: &reserved_pips,
+                        },
+                        &tile_name,
+                    )
                     .ok_or_else(|| {
                         global_route_error(
                             net,
@@ -1419,8 +1474,26 @@ impl Ecp5Packing {
                 .copied()
                 .map(|sink| Ok((sink, placed_pin_wire(&graph, placement, sink)?)))
                 .collect::<Result<Vec<_>, PackingError>>()?;
-            let route = NetRoute::from_tree(clock.global_net, source, sinks, pips, device)
-                .map_err(|reason| global_route_error(net, reason))?;
+            ensure_global_route_disjoint(
+                net,
+                device,
+                &wires,
+                &pips,
+                BlockedGlobalResources {
+                    wires: &reserved_wires,
+                    pips: &reserved_pips,
+                },
+            )?;
+            let route = NetRoute::from_tree(
+                clock.global_net,
+                source,
+                sinks,
+                pips.iter().copied(),
+                device,
+            )
+            .map_err(|reason| global_route_error(net, reason))?;
+            reserved_wires.extend(wires.iter().copied());
+            reserved_pips.extend(pips.iter().copied());
             constraints.add_route(route);
         }
         Ok(constraints)
@@ -1556,17 +1629,20 @@ impl Ecp5GlobalRoutingCache<'_> {
         network: usize,
         sink: WireId,
         tree: &BTreeSet<WireId>,
+        blocked: BlockedGlobalResources<'_>,
         target_name: &str,
     ) -> Option<(WireId, Vec<WireId>, Vec<PipId>)> {
         let key = (network, sink);
         if let Some((join, wires, pips)) = self.reverse_routes.get(&key)
             && (tree.contains(join) || wire_basename(&device.wires()[join.0].name) == target_name)
+            && wires.iter().all(|wire| !blocked.wires.contains(wire))
+            && pips.iter().all(|pip| !blocked.pips.contains(pip))
         {
             return Some((*join, wires.clone(), pips.clone()));
         }
-        let route = self
-            .reverse_search
-            .route(device, &self.incoming, sink, tree, target_name)?;
+        let route =
+            self.reverse_search
+                .route(device, &self.incoming, sink, tree, blocked, target_name)?;
         self.reverse_routes.insert(key, route.clone());
         Some(route)
     }
@@ -1577,6 +1653,31 @@ fn global_route_error(net: &texo_model::Net, reason: impl Into<String>) -> Packi
         net: net.name.clone(),
         reason: reason.into(),
     }
+}
+
+fn ensure_global_route_disjoint(
+    net: &texo_model::Net,
+    device: &Device,
+    wires: &BTreeSet<WireId>,
+    pips: &BTreeSet<PipId>,
+    blocked: BlockedGlobalResources<'_>,
+) -> Result<(), PackingError> {
+    if let Some(wire) = wires.intersection(blocked.wires).next() {
+        return Err(global_route_error(
+            net,
+            format!(
+                "global clock trees overlap at wire `{}`",
+                device.wires()[wire.0].name
+            ),
+        ));
+    }
+    if let Some(pip) = pips.intersection(blocked.pips).next() {
+        return Err(global_route_error(
+            net,
+            format!("global clock trees overlap at PIP {}", pip.0),
+        ));
+    }
+    Ok(())
 }
 
 fn placed_pin_wire(
@@ -1653,8 +1754,12 @@ impl GlobalReverseSearch {
         incoming: &CompactIncomingPips,
         sink: WireId,
         tree: &BTreeSet<WireId>,
+        blocked: BlockedGlobalResources<'_>,
         target_name: &str,
     ) -> Option<(WireId, Vec<WireId>, Vec<PipId>)> {
+        if blocked.wires.contains(&sink) {
+            return None;
+        }
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             self.seen.fill(0);
@@ -1679,8 +1784,11 @@ impl GlobalReverseSearch {
             }
             for &pip in incoming.for_wire(wire) {
                 let pip = PipId(pip as usize);
+                if blocked.pips.contains(&pip) {
+                    continue;
+                }
                 let prior = device.pips()[pip.0].from();
-                if self.seen[prior.0] != epoch {
+                if !blocked.wires.contains(&prior) && self.seen[prior.0] != epoch {
                     self.seen[prior.0] = epoch;
                     self.next_wire[prior.0] = wire.0;
                     self.next_pip[prior.0] = pip.0;
@@ -3545,6 +3653,7 @@ impl From<ModelError> for ImportError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::num::NonZeroU32;
 
     use struo_ir::{
@@ -3563,11 +3672,12 @@ mod tests {
     use texo_struo::{PrimitiveMetadata, import_ecp5};
 
     use super::{
-        ArchitectureFile, BlockRamRequirement, CompactIncomingPips, GlobalClockRequirement,
-        ImportError, LogicalPort, LutFfPair, PackagePinBinding, PackedBlockRam, PackingError,
-        PipMetadata, TileRecord, expand, find_bel_pin, find_global_clock_requirements,
-        pack_lut_ffs, pack_lut_ffs_excluding, pack_lut_ffs_with_pairs, parse_lpf,
-        read_architecture, read_architecture_cache, resolve_lpf_port_cells, resolve_lpf_ports,
+        ArchitectureFile, BlockRamRequirement, BlockedGlobalResources, CompactIncomingPips,
+        GlobalClockRequirement, GlobalReverseSearch, ImportError, LogicalPort, LutFfPair,
+        PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, TileRecord, expand,
+        find_bel_pin, find_global_clock_requirements, logical_carry_chains, pack_lut_ffs,
+        pack_lut_ffs_excluding, pack_lut_ffs_with_pairs, parse_lpf, read_architecture,
+        read_architecture_cache, resolve_lpf_port_cells, resolve_lpf_ports,
         write_architecture_cache,
     };
 
@@ -4111,6 +4221,60 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_a_32_bit_counter_as_one_logical_carry_chain() {
+        let mut source = Netlist::new("counter");
+        let clock = source.add_input("clock");
+        let state = (0..32)
+            .map(|bit| source.add_register_output(format!("counter[{bit}]")))
+            .collect::<Vec<_>>();
+        let zero = source.add_constant(false);
+        let one = source.add_constant(true);
+        let increment = std::iter::once(one)
+            .chain(std::iter::repeat_n(zero, 31))
+            .collect::<Vec<_>>();
+        let next = source
+            .add_arithmetic(ArithmeticOp::Add, &state, &increment)
+            .unwrap();
+        for (bit, (&output, &data)) in state.iter().zip(&next).enumerate() {
+            source.add_register(RegisterCell::new(
+                format!("counter[{bit}]"),
+                output,
+                data,
+                clock,
+                StruoClockEdge::Rising,
+                None,
+                None,
+            ));
+        }
+        source.add_output_port("counter", &state).unwrap();
+
+        let mapped = map_to_ecp5_with_options(
+            &source,
+            MappingOptions {
+                timing_goal_mhz: 250,
+                arithmetic: ArithmeticMapping::CarryChain,
+            },
+        )
+        .unwrap();
+        let imported = import_ecp5(&mapped).unwrap();
+        let chains = logical_carry_chains(imported.design(), imported.carry_pairs()).unwrap();
+
+        // Sixteen CCU2C cells implement the 32 data bits. Struo adds one
+        // feed-in and one feed-out pair, and Texo must keep all eighteen
+        // pairs in one atomic physical FCI/FCO chain.
+        assert_eq!(imported.carry_pairs().len(), 18);
+        assert_eq!(
+            chains,
+            vec![
+                std::iter::once(16)
+                    .chain(0..16)
+                    .chain(std::iter::once(17))
+                    .collect::<Vec<_>>()
+            ]
+        );
+    }
+
+    #[test]
     fn binds_an_unpaired_ff_to_the_general_routing_input() {
         let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
         let mut design = Design::new();
@@ -4475,6 +4639,40 @@ mod tests {
         );
         assert_eq!(result.routes.len(), 2);
         assert_eq!(result.total_pips, 2);
+    }
+
+    #[test]
+    fn global_clock_branch_avoids_a_reserved_clock_wire() {
+        let mut device = texo_model::Device::new("clock-branches", 1, 1).unwrap();
+        let point = Point::new(0, 0);
+        let first_root = device.add_wire("first_root", point, 1).unwrap();
+        let second_root = device.add_wire("second_root", point, 1).unwrap();
+        let reserved = device.add_wire("reserved", point, 1).unwrap();
+        let alternate = device.add_wire("alternate", point, 1).unwrap();
+        let sink = device.add_wire("sink", point, 1).unwrap();
+        device.add_pip(first_root, reserved, false, 1).unwrap();
+        device.add_pip(reserved, sink, false, 1).unwrap();
+        device.add_pip(second_root, alternate, false, 1).unwrap();
+        device.add_pip(alternate, sink, false, 1).unwrap();
+        let incoming = CompactIncomingPips::new(&device);
+        let mut search = GlobalReverseSearch::new(device.wires().len());
+
+        let (join, wires, _) = search
+            .route(
+                &device,
+                &incoming,
+                sink,
+                &BTreeSet::from([first_root, second_root]),
+                BlockedGlobalResources {
+                    wires: &BTreeSet::from([reserved]),
+                    pips: &BTreeSet::new(),
+                },
+                "unused_target",
+            )
+            .unwrap();
+
+        assert_eq!(join, second_root);
+        assert_eq!(wires, [second_root, alternate, sink]);
     }
 
     #[test]
