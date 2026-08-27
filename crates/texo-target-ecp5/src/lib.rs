@@ -3675,9 +3675,10 @@ mod tests {
         ArchitectureFile, BlockRamRequirement, BlockedGlobalResources, CompactIncomingPips,
         GlobalClockRequirement, GlobalReverseSearch, ImportError, LogicalPort, LutFfPair,
         PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, TileRecord, expand,
-        find_bel_pin, find_global_clock_requirements, pack_lut_ffs, pack_lut_ffs_excluding,
-        pack_lut_ffs_with_pairs, parse_lpf, read_architecture, read_architecture_cache,
-        resolve_lpf_port_cells, resolve_lpf_ports, write_architecture_cache,
+        find_bel_pin, find_global_clock_requirements, logical_carry_chains, pack_lut_ffs,
+        pack_lut_ffs_excluding, pack_lut_ffs_with_pairs, parse_lpf, read_architecture,
+        read_architecture_cache, resolve_lpf_port_cells, resolve_lpf_ports,
+        write_architecture_cache,
     };
 
     const FIXTURE: &str = include_str!("../fixtures/minimal-ecp5.json");
@@ -4217,6 +4218,60 @@ mod tests {
                 architecture.device().bel_pins()[second_fci.0].wire
             );
         }
+    }
+
+    #[test]
+    fn recognizes_a_32_bit_counter_as_one_logical_carry_chain() {
+        let mut source = Netlist::new("counter");
+        let clock = source.add_input("clock");
+        let state = (0..32)
+            .map(|bit| source.add_register_output(format!("counter[{bit}]")))
+            .collect::<Vec<_>>();
+        let zero = source.add_constant(false);
+        let one = source.add_constant(true);
+        let increment = std::iter::once(one)
+            .chain(std::iter::repeat_n(zero, 31))
+            .collect::<Vec<_>>();
+        let next = source
+            .add_arithmetic(ArithmeticOp::Add, &state, &increment)
+            .unwrap();
+        for (bit, (&output, &data)) in state.iter().zip(&next).enumerate() {
+            source.add_register(RegisterCell::new(
+                format!("counter[{bit}]"),
+                output,
+                data,
+                clock,
+                StruoClockEdge::Rising,
+                None,
+                None,
+            ));
+        }
+        source.add_output_port("counter", &state).unwrap();
+
+        let mapped = map_to_ecp5_with_options(
+            &source,
+            MappingOptions {
+                timing_goal_mhz: 250,
+                arithmetic: ArithmeticMapping::CarryChain,
+            },
+        )
+        .unwrap();
+        let imported = import_ecp5(&mapped).unwrap();
+        let chains = logical_carry_chains(imported.design(), imported.carry_pairs()).unwrap();
+
+        // Sixteen CCU2C cells implement the 32 data bits. Struo adds one
+        // feed-in and one feed-out pair, and Texo must keep all eighteen
+        // pairs in one atomic physical FCI/FCO chain.
+        assert_eq!(imported.carry_pairs().len(), 18);
+        assert_eq!(
+            chains,
+            vec![
+                std::iter::once(16)
+                    .chain(0..16)
+                    .chain(std::iter::once(17))
+                    .collect::<Vec<_>>()
+            ]
+        );
     }
 
     #[test]
