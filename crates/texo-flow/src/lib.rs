@@ -533,6 +533,7 @@ pub fn implement_struo_ecp5_with_progress(
             speed_grade,
             timing_model: &timing_model,
             timing_constraints: &timing_constraints,
+            placement_weight_exponent: options.placement_weight_exponent,
             routing_workspace: &mut routing_workspace,
             global_ripup_attempted: false,
             critical_move_trials: BTreeSet::new(),
@@ -810,6 +811,7 @@ fn repair_hold_with_dedicated_edge_release(
                     speed_grade,
                     timing_model: &trial_model,
                     timing_constraints: &trial_constraints,
+                    placement_weight_exponent: 1,
                     routing_workspace,
                     global_ripup_attempted: true,
                     critical_move_trials: BTreeSet::new(),
@@ -1220,6 +1222,9 @@ struct TimingDrivenContext<'a, 'work, 'cache> {
     speed_grade: &'a SpeedGradeRecord,
     timing_model: &'a TimingModel,
     timing_constraints: &'a TimingConstraints,
+    /// User-selected sharpening for timing-driven analytical placement.
+    /// An exponent of one preserves the historical weighting exactly.
+    placement_weight_exponent: u32,
     routing_workspace: &'work mut RoutingWorkspace,
     /// Whether the post-global-placement data routes have already received
     /// their one full-chip timing renegotiation. Later critical moves reroute
@@ -1285,7 +1290,12 @@ impl TimingDrivenContext<'_, '_, '_> {
             self.close_setup_critically(archive, placement_refiner, routing_costs, progress)?;
         report_metric_phase("closure_critical_vertices", &mut phase_started);
         emit_archive_metric("closure_critical", self, &archive);
-        archive = self.repair_setup_archive(archive, routing_costs, progress)?;
+        archive = self.repair_setup_and_reenter_critical(
+            archive,
+            placement_refiner,
+            routing_costs,
+            progress,
+        )?;
         report_metric_phase("closure_setup_eco", &mut phase_started);
         emit_archive_metric("closure_setup_eco", self, &archive);
         if !archive
@@ -1338,6 +1348,41 @@ impl TimingDrivenContext<'_, '_, '_> {
         Ok((final_implementation, final_timing))
     }
 
+    fn repair_setup_and_reenter_critical(
+        &mut self,
+        mut archive: Vec<TimingCandidate>,
+        placement_refiner: &PlacementRefiner<'_>,
+        routing_costs: &mut RoutingCosts,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
+        let previous_topologies = archive
+            .iter()
+            .map(|(implementation, _)| {
+                implementation_topology_fingerprint(self.design, implementation)
+            })
+            .collect::<BTreeSet<_>>();
+        archive = self.repair_setup_archive(archive, routing_costs, progress)?;
+        let changed_topology = archive.iter().any(|(implementation, _)| {
+            !previous_topologies.contains(&implementation_topology_fingerprint(
+                self.design,
+                implementation,
+            ))
+        });
+        let setup_closed = archive
+            .iter()
+            .any(|(_, timing)| timing.worst_slack_ps.is_some_and(|slack| slack >= 0));
+        if changed_topology && !setup_closed {
+            // A setup reroute can expose a different worst endpoint while
+            // leaving placement unchanged. Re-enter critical placement from
+            // that new route topology instead of sending the stale placement
+            // directly to a whole-design basin kick.
+            archive =
+                self.close_setup_critically(archive, placement_refiner, routing_costs, progress)?;
+            archive = self.repair_setup_archive(archive, routing_costs, progress)?;
+        }
+        Ok(archive)
+    }
+
     /// Routes an independently solved timing-weighted placement seed.
     ///
     /// A connectivity-only analytical solve is a strong default for sparse
@@ -1351,12 +1396,13 @@ impl TimingDrivenContext<'_, '_, '_> {
         routing_costs: &RoutingCosts,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<Option<TimingCandidate>, Ecp5FlowError> {
-        let placement = self
-            .placement_refiner
-            .place_analytically(&timing_placement_weights(
-                initial_timing,
-                self.timing_constraints,
-            ))?;
+        let placement =
+            self.placement_refiner
+                .place_analytically(&timing_placement_weights_with_exponent(
+                    initial_timing,
+                    self.timing_constraints,
+                    self.placement_weight_exponent,
+                ))?;
         progress(Ecp5FlowStage::TimingDrivenPlaced);
         let routing = self.packing.global_routing_constraints_cached(
             self.design,
@@ -1625,9 +1671,13 @@ impl TimingDrivenContext<'_, '_, '_> {
                         .is_some_and(|slack| (-LOCAL_SETUP_ECO_TRIGGER_PS..0).contains(&slack))
                 {
                     setup_eco_attempted = true;
-                    if let Some(repaired) =
-                        self.repair_setup_locally(&seed.0, &seed.1, routing_costs, progress)?
-                    {
+                    if let Some(repaired) = self.repair_setup_locally(
+                        &seed.0,
+                        &seed.1,
+                        routing_costs,
+                        texo_pnr::ROUTING_DELAY_QUANTUM_PS,
+                        progress,
+                    )? {
                         let improves_objective = timing_score(&repaired.1) > timing_score(&seed.1);
                         progress(Ecp5FlowStage::TimingTrialDecision { improves_objective });
                         if improves_objective {
@@ -1919,6 +1969,7 @@ impl TimingDrivenContext<'_, '_, '_> {
         implementation: &PnrResult,
         timing: &TimingReport,
         routing_costs: &mut RoutingCosts,
+        delay_quantum_ps: u64,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<Option<TimingCandidate>, Ecp5FlowError> {
         let repair_sinks = timing
@@ -1947,6 +1998,7 @@ impl TimingDrivenContext<'_, '_, '_> {
         routing_costs.set_sink_criticalities(timing_arc_weights(timing, self.timing_constraints));
         routing_costs.set_sink_min_delays_ps(BTreeMap::new());
         routing_costs.set_detailed_timing_nets(released_net_ids(&repair_sinks));
+        routing_costs.set_detailed_delay_quantum_ps(delay_quantum_ps);
         let repaired = self.route_local_trial_and_analyze(
             implementation.placement.clone(),
             &frozen,
@@ -1954,6 +2006,7 @@ impl TimingDrivenContext<'_, '_, '_> {
             progress,
         );
         routing_costs.set_detailed_timing_nets(BTreeSet::new());
+        routing_costs.set_detailed_delay_quantum_ps(texo_pnr::ROUTING_DELAY_QUANTUM_PS);
         match repaired {
             Ok(repaired) => Ok(Some(repaired)),
             Err(Ecp5FlowError::Pnr(_)) => Ok(None),
@@ -1967,7 +2020,7 @@ impl TimingDrivenContext<'_, '_, '_> {
         routing_costs: &mut RoutingCosts,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
-        for _ in 0..MAX_LOCAL_SETUP_REPAIRS {
+        for delay_quantum_ps in LOCAL_SETUP_REPAIR_QUANTA_PS {
             let seed = archive
                 .iter()
                 .max_by_key(|(_, timing)| timing_score(timing))
@@ -1976,15 +2029,20 @@ impl TimingDrivenContext<'_, '_, '_> {
             if seed.1.worst_slack_ps.is_none_or(|slack| slack >= 0) {
                 break;
             }
-            let Some(repaired) =
-                self.repair_setup_locally(&seed.0, &seed.1, routing_costs, progress)?
+            let Some(repaired) = self.repair_setup_locally(
+                &seed.0,
+                &seed.1,
+                routing_costs,
+                delay_quantum_ps,
+                progress,
+            )?
             else {
                 break;
             };
             let improves_objective = timing_score(&repaired.1) > timing_score(&seed.1);
             progress(Ecp5FlowStage::TimingTrialDecision { improves_objective });
             if !improves_objective {
-                break;
+                continue;
             }
             archive.push(repaired);
             archive = select_timing_frontier(archive);
@@ -2001,7 +2059,11 @@ impl TimingDrivenContext<'_, '_, '_> {
         max_refined_units: usize,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<(Option<TimingCandidate>, usize), Ecp5FlowError> {
-        let refinement_weights = timing_placement_weights(timing, self.timing_constraints);
+        let refinement_weights = timing_placement_weights_with_exponent(
+            timing,
+            self.timing_constraints,
+            self.placement_weight_exponent,
+        );
         let sink_budgets = placement_sink_budgets(
             self.design,
             self.architecture.device(),
@@ -2650,7 +2712,7 @@ const MAX_CONSECUTIVE_MONOTONIC_WNS_REGRESSIONS: usize = 2;
 const LOCAL_TRIAL_ROUTING_ITERATIONS: u32 = 5;
 const MAX_HOLD_ROUTE_FEEDBACKS: usize = 2;
 const LOCAL_SETUP_ECO_TRIGGER_PS: i128 = 12;
-const MAX_LOCAL_SETUP_REPAIRS: usize = 2;
+const LOCAL_SETUP_REPAIR_QUANTA_PS: [u64; 4] = [50, 50, 10, 1];
 const MAX_GENERAL_HOLD_REPAIRS: usize = 6;
 const MAX_HOLD_SETUP_RECOVERY_PS: i128 = 100;
 const MAX_DEDICATED_EDGE_TRIALS: usize = 1;
@@ -2958,6 +3020,21 @@ fn timing_placement_weights(
             )
         })
         .collect()
+}
+
+fn timing_placement_weights_with_exponent(
+    timing: &TimingReport,
+    constraints: &TimingConstraints,
+    exponent: u32,
+) -> BTreeMap<(NetId, CellPinId), u64> {
+    timing_placement_weights(timing, constraints)
+        .into_iter()
+        .map(|(sink, weight)| (sink, exponentiate_placement_weight(weight, exponent)))
+        .collect()
+}
+
+fn exponentiate_placement_weight(weight: u64, exponent: u32) -> u64 {
+    weight.saturating_pow(exponent.max(1))
 }
 
 fn delay_weighted_criticality(criticality: u64, delay_ps: u64, period_ps: u64) -> u64 {
@@ -4123,6 +4200,13 @@ mod tests {
         assert_eq!(delay_weighted_criticality(64, 500, 4_000), 32);
         assert_eq!(delay_weighted_criticality(64, 1_000, 4_000), 64);
         assert_eq!(delay_weighted_criticality(64, 2_000, 4_000), 64);
+    }
+
+    #[test]
+    fn placement_weight_exponent_controls_analytical_weights() {
+        assert_eq!(super::exponentiate_placement_weight(8, 1), 8);
+        assert_eq!(super::exponentiate_placement_weight(8, 2), 64);
+        assert_eq!(super::exponentiate_placement_weight(8, 0), 8);
     }
 
     #[test]
