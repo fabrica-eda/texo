@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5](https://github.com/fabrica-eda/texo/compare/v0.1.4...v0.1.5) (2026-08-27)
+
+
+### Features
+
+* **cli:** expose end-to-end bitgen API ([#21](https://github.com/fabrica-eda/texo/issues/21)) ([c3b1cb3](https://github.com/fabrica-eda/texo/commit/c3b1cb3ff24a42d9d04e971b85e8a23d930563e5))
+* **ecp5:** support user-configured PLL bindings ([#24](https://github.com/fabrica-eda/texo/issues/24)) ([430a3a8](https://github.com/fabrica-eda/texo/commit/430a3a84d51579d58cc0807b0502d7527991ffa0))
+
+
+### Bug Fixes
+
+* **ecp5:** emit valid JTAGG configuration ([#20](https://github.com/fabrica-eda/texo/issues/20)) ([a59f787](https://github.com/fabrica-eda/texo/commit/a59f787de1a7608cdbeb8b652a71c017e3bce001))
+* **ecp5:** insert routed carry feed-ins ([#27](https://github.com/fabrica-eda/texo/issues/27)) ([3c01ca5](https://github.com/fabrica-eda/texo/commit/3c01ca568f7184b6700b0ce9aefa72fe249647ea))
+* **ecp5:** preserve dedicated routing across clocks and ECOs ([#25](https://github.com/fabrica-eda/texo/issues/25)) ([299836d](https://github.com/fabrica-eda/texo/commit/299836dd8ee35afe2ce616d8dddb77c9973d3918))
+* **ecp5:** preserve legal JTAG and carry configuration ([#23](https://github.com/fabrica-eda/texo/issues/23)) ([522d7ca](https://github.com/fabrica-eda/texo/commit/522d7cafc0af9ed4b082925b84f0b418a7aa70d8))
+* **pnr:** stabilize placement across processes ([#29](https://github.com/fabrica-eda/texo/issues/29)) ([077453c](https://github.com/fabrica-eda/texo/commit/077453cf065902af8b1e56a3a472e4ce9a3fd4b8))
+* **timing:** harden CPPR and endpoint coverage ([#34](https://github.com/fabrica-eda/texo/issues/34)) ([b452fb7](https://github.com/fabrica-eda/texo/commit/b452fb7ac60c22a43a9f1dc40b0d17e94c9e258f))
+* **timing:** remove common clock path pessimism ([#32](https://github.com/fabrica-eda/texo/issues/32)) ([22825cd](https://github.com/fabrica-eda/texo/commit/22825cd47e3ffc1beea8de8fc07f65d02803d033))
+
+
+### Performance Improvements
+
+* **pnr:** add timing-driven placement portfolio ([#28](https://github.com/fabrica-eda/texo/issues/28)) ([bdfb4ac](https://github.com/fabrica-eda/texo/commit/bdfb4acb5aad08e91e3dea3a5fcbc84efd3c3ae7))
+* **pnr:** bound speculative timing closure search ([#31](https://github.com/fabrica-eda/texo/issues/31)) ([d776ddc](https://github.com/fabrica-eda/texo/commit/d776ddc0692257024a81ffb532526a3d80bffa74))
+
 ## [0.1.4](https://github.com/fabrica-eda/texo/compare/v0.1.3...v0.1.4) (2026-08-26)
 
 
