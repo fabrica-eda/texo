@@ -1349,3 +1349,48 @@ corridor uses **21,829 PIPs**, seven more than the baseline. Margin 3 and 2 are
 rejected: they ran fewer trials but failed closure at -48 ps and -241 ps WNS,
 respectively. Raising the geometric delay heuristic from 100 to 125 ps/tile
 also failed at -29 ps WNS.
+
+## Core250 internal-memory SoC follow-up (2026-08-27)
+
+The Core250 reproducer adds a different placement regime from the sparse AXI4
+self-test: 4,719 Struo-mapped cells, eight fixed `DP16KD` memories, one
+`JTAGG`, ten ordinary I/Os, and a 4.000 ns constraint. The reported Texo
+checkpoint routed at 7.188 ns (139.1 MHz), while bundled nextpnr seed 2 routed
+the same Struo mapping at 5.995 ns (166.81 MHz).
+
+The connectivity-only analytical placement started this design more than 6 ns
+below the setup target. Local refinement could improve that placement, but it
+could not reliably escape its global basin. The flow now also solves and
+routes one independent timing-weighted analytical seed. It remains
+speculative: a routing failure discards only the alternative, and measured STA
+selects between it and the already legal connectivity seed.
+
+Timing closure also keeps two incumbents: the aggregate violation-score winner
+that drives the established search trajectory, and the best achieved WNS.
+Before full timing closure the final checkpoint reports the best period rather
+than silently replacing it with a lower-TNS but slower candidate. Once any
+candidate closes setup and hold, the existing timing-clean objective retains
+priority.
+
+The final reproducer run reached **5.718 ns (174.9 MHz), -1718 ps WNS, +290 ps
+WHS, and 64,340 PIPs** in 126.46 seconds. This improves the reported Texo
+period by 1.470 ns and is 277 ps faster than the bundled nextpnr seed. The RTL
+still misses the 4.000 ns constraint; this change closes the reported P&R QoR
+gap, not the design's remaining logic depth.
+
+Remaining work is deliberately separate:
+
+1. Initial placement varied across some rebuilt executable/process runs even
+   though cell names and IDs remained stable. Find and remove the unstable
+   ordering or tie-break upstream of analytical placement, then record
+   checkpoint hashes across clean processes.
+2. Re-run the 300/320 MHz AXI4 scoreboards at fixed work budgets. The additional
+   routed seed is a QoR investment and should be measured for latency as well
+   as final WNS on designs where the connectivity seed already wins.
+3. Add the Core250 bundle, or a license-compatible reduced derivative, to a
+   durable benchmark/CI location. The current reproducer is external to this
+   repository, so unit tests cover legality and failure isolation but not its
+   full QoR number.
+4. Optimize the remaining 1.718 ns RTL path separately. Neither Texo nor the
+   bundled nextpnr run meets 250 MHz, so RTL closure must not be conflated with
+   this P&R comparison.
