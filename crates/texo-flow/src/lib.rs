@@ -385,6 +385,10 @@ pub fn implement_struo_ecp5_with_progress(
         architecture,
         ff_ce_control_sets(&design, imported.metadata()),
     );
+    packing.constrain_ff_clock_muxes(
+        architecture,
+        ff_clock_control_sets(&design, imported.metadata()),
+    );
     constrain_pll_outputs(&design, imported.metadata(), &mut packing)?;
     progress(Ecp5FlowStage::Packed);
     report_metric_phase("packing", &mut phase_started);
@@ -604,6 +608,30 @@ fn ff_ce_control_sets(
                 1 + u64::try_from(net.0).expect("net ID fits u64") * 2
                     + u64::from(active == ActiveLevel::Low)
             });
+            Some((cell, value))
+        })
+        .collect()
+}
+
+fn ff_clock_control_sets(
+    design: &Design,
+    metadata: &BTreeMap<CellId, PrimitiveMetadata>,
+) -> Vec<(CellId, u64)> {
+    metadata
+        .iter()
+        .filter_map(|(&cell, primitive)| {
+            let PrimitiveMetadata::FlipFlop { edge, .. } = primitive else {
+                return None;
+            };
+            let clock = design.cells()[cell.0]
+                .pins()
+                .iter()
+                .copied()
+                .find(|pin| design.pins()[pin.0].name == "CLK")
+                .expect("FF has a CLK pin");
+            let net = design.pins()[clock.0].net().expect("FF CLK is connected");
+            let value = u64::try_from(net.0).expect("net ID fits u64") * 2
+                + u64::from(*edge == texo_struo::ClockEdge::Falling);
             Some((cell, value))
         })
         .collect()
@@ -3853,10 +3881,10 @@ mod tests {
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, PostMapSimulationPolicy,
         accumulate_hold_minimums, criticality_weight, decimal_mhz_period_ps,
         delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, ff_ce_control_sets,
-        find_cell_pin, freeze_route_sinks_except, implement, implement_struo_ecp5,
-        implement_with_constraints, next_wns_regression_streak, pip_class_delay,
-        project_trellis_speed_grade, retain_projection_timing_frontier, slack_violations,
-        staged_timing_score, verify_post_map_with_celox,
+        ff_clock_control_sets, find_cell_pin, freeze_route_sinks_except, implement,
+        implement_struo_ecp5, implement_with_constraints, next_wns_regression_streak,
+        pip_class_delay, project_trellis_speed_grade, retain_projection_timing_frontier,
+        slack_violations, staged_timing_score, verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -3917,6 +3945,51 @@ mod tests {
         assert_eq!(sets[&high_a], sets[&high_b]);
         assert_ne!(sets[&high_a], sets[&low]);
         assert_ne!(sets[&high_a], sets[&other]);
+    }
+
+    #[test]
+    fn ff_clock_control_sets_separate_nets_and_edges() {
+        let mut design = Design::new();
+        let first_driver = design.add_cell("first_clock", ResourceKind::Logic);
+        let first_clock = design
+            .add_pin(first_driver, "out", PinDirection::Output)
+            .unwrap();
+        let second_driver = design.add_cell("second_clock", ResourceKind::Logic);
+        let second_clock = design
+            .add_pin(second_driver, "out", PinDirection::Output)
+            .unwrap();
+        let rising_a = design.add_cell("rising_a", ResourceKind::Register);
+        let rising_b = design.add_cell("rising_b", ResourceKind::Register);
+        let falling = design.add_cell("falling", ResourceKind::Register);
+        let shared_clock_sinks = [rising_a, rising_b, falling]
+            .map(|cell| design.add_pin(cell, "CLK", PinDirection::Input).unwrap());
+        let other = design.add_cell("other", ResourceKind::Register);
+        let other_clock = design.add_pin(other, "CLK", PinDirection::Input).unwrap();
+        design
+            .add_net("shared_clock", first_clock, shared_clock_sinks)
+            .unwrap();
+        design
+            .add_net("other_clock", second_clock, [other_clock])
+            .unwrap();
+        let flip_flop = |edge| PrimitiveMetadata::FlipFlop {
+            edge,
+            enable: None,
+            reset: None,
+        };
+        let metadata = BTreeMap::from([
+            (rising_a, flip_flop(ImportedClockEdge::Rising)),
+            (rising_b, flip_flop(ImportedClockEdge::Rising)),
+            (falling, flip_flop(ImportedClockEdge::Falling)),
+            (other, flip_flop(ImportedClockEdge::Rising)),
+        ]);
+
+        let sets = ff_clock_control_sets(&design, &metadata)
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(sets[&rising_a], sets[&rising_b]);
+        assert_ne!(sets[&rising_a], sets[&falling]);
+        assert_ne!(sets[&rising_a], sets[&other]);
     }
 
     #[test]
