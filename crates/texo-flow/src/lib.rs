@@ -2884,8 +2884,12 @@ fn emit_placement_metric(
     let hpwl = placement_hpwl(design, device, placement);
     match timing {
         Some(timing) => eprintln!(
-            "[metrics] stage={stage} hpwl={hpwl} wns={:?} hold={:?} pips={}",
-            timing.worst_slack_ps, timing.worst_hold_slack_ps, 0,
+            "[metrics] stage={stage} hpwl={hpwl} wns={:?} hold={:?} pips={} timing_endpoints_checked={} timing_endpoints_modeled={}",
+            timing.worst_slack_ps,
+            timing.worst_hold_slack_ps,
+            0,
+            timing.setup_checks.len(),
+            timing.modeled_endpoint_count(),
         ),
         None => eprintln!("[metrics] stage={stage} hpwl={hpwl}"),
     }

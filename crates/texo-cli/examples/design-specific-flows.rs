@@ -468,8 +468,9 @@ fn ecp5_demo(
     );
     match result.timing.worst_slack_ps {
         Some(slack_ps) => println!(
-            "timing: {} setup/hold checks, worst setup {slack_ps} ps, worst hold {} ps ({})",
+            "timing: {}/{} endpoints checked, worst setup {slack_ps} ps, worst hold {} ps ({})",
             result.timing.setup_checks.len(),
+            result.timing.modeled_endpoint_count(),
             result.timing.worst_hold_slack_ps.unwrap_or(0),
             if result.timing.met_timing() {
                 "passed"
@@ -477,7 +478,10 @@ fn ecp5_demo(
                 "failed"
             }
         ),
-        None => println!("timing: no constrained sequential endpoints"),
+        None => println!(
+            "timing: no constrained sequential endpoints (0/{} endpoints checked)",
+            result.timing.modeled_endpoint_count()
+        ),
     }
     for (cell_id, &bel_id) in result
         .implementation
@@ -1070,6 +1074,14 @@ mod tests {
             0
         );
         assert_eq!(checkpoint["timing"]["met_timing"], false);
+        assert_eq!(checkpoint["timing"]["modeled_endpoint_count"], 0);
+        assert_eq!(checkpoint["timing"]["all_modeled_endpoints_checked"], true);
+        assert!(
+            checkpoint["timing"]["unchecked_endpoints"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             checkpoint["evidence"]
                 .as_array()

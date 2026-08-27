@@ -407,7 +407,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         flow_started.elapsed(),
     );
     println!(
-        "timing: WNS {}, WHS {}, {}",
+        "timing: WNS {}, WHS {}, {}; endpoints {}/{} checked",
         format_slack(result.timing.worst_slack_ps),
         format_slack(result.timing.worst_hold_slack_ps),
         if result.timing.met_timing() {
@@ -415,6 +415,8 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         } else {
             "not met"
         },
+        result.timing.setup_checks.len(),
+        result.timing.modeled_endpoint_count(),
     );
     println!("checkpoint: {}", output.display());
     println!(

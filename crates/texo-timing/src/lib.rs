@@ -257,9 +257,47 @@ pub struct HoldCheck {
     /// Latest characterized hold requirement.
     pub hold_ps: u64,
     /// Earliest allowed data arrival.
-    pub required_ps: u64,
+    pub required_ps: i128,
     /// Actual minus required arrival.
     pub slack_ps: i128,
+}
+
+/// Why a modeled sequential endpoint was not checked by this timing pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UncheckedEndpointReason {
+    /// The modeled clock pin is not connected to a logical net.
+    UnconnectedClock,
+    /// The endpoint's clock net has no period constraint.
+    UnconstrainedClock,
+    /// No launch in the capture clock domain reaches the endpoint.
+    NoSynchronousLaunch,
+}
+
+impl UncheckedEndpointReason {
+    /// Stable diagnostic name used by checkpoints and other reports.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnconnectedClock => "unconnected_clock",
+            Self::UnconstrainedClock => "unconstrained_clock",
+            Self::NoSynchronousLaunch => "no_synchronous_launch",
+        }
+    }
+}
+
+/// One modeled sequential endpoint omitted from setup and hold checks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UncheckedEndpoint {
+    /// Register cell.
+    pub cell: CellId,
+    /// Register data input pin.
+    pub data_pin: CellPinId,
+    /// Modeled register clock pin.
+    pub clock_pin: CellPinId,
+    /// Logical clock net, when the clock pin is connected.
+    pub clock_net: Option<NetId>,
+    /// Reason this endpoint was not analyzed.
+    pub reason: UncheckedEndpointReason,
 }
 
 /// Complete result of one static timing pass.
@@ -273,6 +311,8 @@ pub struct TimingReport {
     pub setup_checks: Vec<SetupCheck>,
     /// Constrained register hold checks.
     pub hold_checks: Vec<HoldCheck>,
+    /// Modeled endpoints omitted from setup and hold checks, with reasons.
+    pub unchecked_endpoints: Vec<UncheckedEndpoint>,
     /// Smallest setup slack, or `None` when no endpoint was constrained.
     pub worst_slack_ps: Option<i128>,
     /// Smallest hold slack, or `None` when no endpoint was constrained.
@@ -285,6 +325,22 @@ impl TimingReport {
     pub fn met_timing(&self) -> bool {
         self.worst_slack_ps.is_some_and(|slack| slack >= 0)
             && self.worst_hold_slack_ps.is_some_and(|slack| slack >= 0)
+    }
+
+    /// Number of sequential endpoints present in the timing model.
+    #[must_use]
+    pub fn modeled_endpoint_count(&self) -> usize {
+        self.setup_checks.len() + self.unchecked_endpoints.len()
+    }
+
+    /// Whether every modeled sequential endpoint was checked.
+    ///
+    /// This is deliberately separate from [`Self::met_timing`]: primary-input
+    /// and cross-clock paths require constraints that the current constraint
+    /// model cannot yet express, so existing flows may intentionally omit them.
+    #[must_use]
+    pub fn all_modeled_endpoints_checked(&self) -> bool {
+        self.unchecked_endpoints.is_empty()
     }
 }
 
@@ -376,11 +432,26 @@ fn timing_report_from_net_delays(
 
     let mut setup_checks = Vec::new();
     let mut hold_checks = Vec::new();
+    let mut unchecked_endpoints = Vec::new();
     for (&data_pin, &(clock_pin, setup, hold)) in &model.setup_holds {
         let Some(clock_net) = design.pins()[clock_pin.0].net() else {
+            unchecked_endpoints.push(unchecked_endpoint(
+                design,
+                data_pin,
+                clock_pin,
+                None,
+                UncheckedEndpointReason::UnconnectedClock,
+            ));
             continue;
         };
         let Some(&period_ps) = constraints.clock_periods_ps.get(&clock_net) else {
+            unchecked_endpoints.push(unchecked_endpoint(
+                design,
+                data_pin,
+                clock_pin,
+                Some(clock_net),
+                UncheckedEndpointReason::UnconstrainedClock,
+            ));
             continue;
         };
         let Some(arrival) = arrivals_by_clock
@@ -389,49 +460,31 @@ fn timing_report_from_net_delays(
         else {
             // Primary-input and cross-clock paths need explicit timing
             // constraints. Do not invent a synchronous launch at time zero.
+            unchecked_endpoints.push(unchecked_endpoint(
+                design,
+                data_pin,
+                clock_pin,
+                Some(clock_net),
+                UncheckedEndpointReason::NoSynchronousLaunch,
+            ));
             continue;
         };
         let clock_arrival = clock_arrivals[clock_pin.0].unwrap_or(DelayRange::zero());
-        // Every launch in this analysis group and the capture endpoint share
-        // the path up to the constrained clock net's driver. Its min/max
-        // characterization range is common-mode delay, not clock skew. Add
-        // that range back to setup and remove it from hold (CPPR), while
-        // preserving all sink-branch variation beyond the driver.
         let common_clock_arrival =
             clock_arrivals[design.nets()[clock_net.0].driver.0].unwrap_or(DelayRange::zero());
-        let common_clock_pessimism_ps = common_clock_arrival
-            .max_ps
-            .checked_sub(common_clock_arrival.min_ps)
-            .ok_or(TimingError::DelayOverflow)?;
-        let required_ps = i128::from(period_ps)
-            + i128::from(clock_arrival.min_ps)
-            + i128::from(common_clock_pessimism_ps)
-            - i128::from(setup.max_ps);
-        setup_checks.push(SetupCheck {
-            cell: design.pins()[data_pin.0].cell,
+        let (setup_check, hold_check) = endpoint_checks(EndpointCheckContext {
+            design,
             data_pin,
             clock_net,
-            arrival_ps: arrival.max_ps,
-            clock_arrival_ps: clock_arrival.min_ps,
-            setup_ps: setup.max_ps,
-            required_ps,
-            slack_ps: required_ps - i128::from(arrival.max_ps),
+            period_ps,
+            arrival,
+            clock_arrival,
+            common_clock_arrival,
+            setup,
+            hold,
         });
-        let hold_required_ps = clock_arrival
-            .max_ps
-            .checked_add(hold.max_ps)
-            .and_then(|required| required.checked_sub(common_clock_pessimism_ps))
-            .ok_or(TimingError::DelayOverflow)?;
-        hold_checks.push(HoldCheck {
-            cell: design.pins()[data_pin.0].cell,
-            data_pin,
-            clock_net,
-            arrival_ps: arrival.min_ps,
-            clock_arrival_ps: clock_arrival.max_ps,
-            hold_ps: hold.max_ps,
-            required_ps: hold_required_ps,
-            slack_ps: i128::from(arrival.min_ps) - i128::from(hold_required_ps),
-        });
+        setup_checks.push(setup_check);
+        hold_checks.push(hold_check);
     }
     let worst_slack_ps = setup_checks.iter().map(|check| check.slack_ps).min();
     let worst_hold_slack_ps = hold_checks.iter().map(|check| check.slack_ps).min();
@@ -447,9 +500,87 @@ fn timing_report_from_net_delays(
         net_setup_slacks,
         setup_checks,
         hold_checks,
+        unchecked_endpoints,
         worst_slack_ps,
         worst_hold_slack_ps,
     })
+}
+
+#[derive(Clone, Copy)]
+struct EndpointCheckContext<'a> {
+    design: &'a Design,
+    data_pin: CellPinId,
+    clock_net: NetId,
+    period_ps: u64,
+    arrival: DelayRange,
+    clock_arrival: DelayRange,
+    common_clock_arrival: DelayRange,
+    setup: DelayRange,
+    hold: DelayRange,
+}
+
+fn endpoint_checks(context: EndpointCheckContext<'_>) -> (SetupCheck, HoldCheck) {
+    let EndpointCheckContext {
+        design,
+        data_pin,
+        clock_net,
+        period_ps,
+        arrival,
+        clock_arrival,
+        common_clock_arrival,
+        setup,
+        hold,
+    } = context;
+    // Every launch in this analysis group and the capture endpoint share the
+    // path up to the constrained clock net's driver. Its corner range is
+    // common-mode delay, not clock skew, and therefore cancels through CPPR.
+    // Early and late values are independently fitted and need not be ordered,
+    // so the correction must remain signed.
+    let common_clock_pessimism_ps =
+        i128::from(common_clock_arrival.max_ps) - i128::from(common_clock_arrival.min_ps);
+    let setup_required_ps =
+        i128::from(period_ps) + i128::from(clock_arrival.min_ps) + common_clock_pessimism_ps
+            - i128::from(setup.max_ps);
+    let hold_required_ps =
+        i128::from(clock_arrival.max_ps) + i128::from(hold.max_ps) - common_clock_pessimism_ps;
+    (
+        SetupCheck {
+            cell: design.pins()[data_pin.0].cell,
+            data_pin,
+            clock_net,
+            arrival_ps: arrival.max_ps,
+            clock_arrival_ps: clock_arrival.min_ps,
+            setup_ps: setup.max_ps,
+            required_ps: setup_required_ps,
+            slack_ps: setup_required_ps - i128::from(arrival.max_ps),
+        },
+        HoldCheck {
+            cell: design.pins()[data_pin.0].cell,
+            data_pin,
+            clock_net,
+            arrival_ps: arrival.min_ps,
+            clock_arrival_ps: clock_arrival.max_ps,
+            hold_ps: hold.max_ps,
+            required_ps: hold_required_ps,
+            slack_ps: i128::from(arrival.min_ps) - hold_required_ps,
+        },
+    )
+}
+
+fn unchecked_endpoint(
+    design: &Design,
+    data_pin: CellPinId,
+    clock_pin: CellPinId,
+    clock_net: Option<NetId>,
+    reason: UncheckedEndpointReason,
+) -> UncheckedEndpoint {
+    UncheckedEndpoint {
+        cell: design.pins()[data_pin.0].cell,
+        data_pin,
+        clock_pin,
+        clock_net,
+        reason,
+    }
 }
 
 fn net_setup_slacks(
@@ -537,18 +668,14 @@ fn net_setup_slacks(
 }
 
 fn validate_model(design: &Design, model: &TimingModel) -> Result<(), TimingError> {
-    for (&(from, to), delay) in &model.cell_arcs {
+    for &(from, to) in model.cell_arcs.keys() {
         validate_pin_pair(design, from, to)?;
-        validate_range(*delay)?;
     }
-    for (&output, &(clock, delay)) in &model.clock_to_q {
+    for (&output, &(clock, _)) in &model.clock_to_q {
         validate_pin_pair(design, clock, output)?;
-        validate_range(delay)?;
     }
-    for (&signal, &(clock, setup, hold)) in &model.setup_holds {
+    for (&signal, &(clock, _, _)) in &model.setup_holds {
         validate_pin_pair(design, clock, signal)?;
-        validate_range(setup)?;
-        validate_range(hold)?;
     }
     Ok(())
 }
@@ -570,17 +697,6 @@ fn validate_pin_pair(
         return Err(TimingError::CrossCellTimingArc { first, second });
     }
     Ok(())
-}
-
-const fn validate_range(delay: DelayRange) -> Result<(), TimingError> {
-    if delay.min_ps <= delay.max_ps {
-        Ok(())
-    } else {
-        Err(TimingError::InvalidDelayRange {
-            min_ps: delay.min_ps,
-            max_ps: delay.max_ps,
-        })
-    }
 }
 
 fn validate_constraints(
@@ -877,7 +993,10 @@ mod tests {
     use texo_model::{Design, Device, PinDirection, Point, ResourceKind};
     use texo_pnr::place_and_route;
 
-    use super::{DelayRange, TimingConstraints, TimingModel, analyze_timing};
+    use super::{
+        DelayRange, NetDelay, TimingConstraints, TimingModel, UncheckedEndpointReason,
+        analyze_timing, timing_report_from_net_delays,
+    };
 
     #[test]
     fn reports_positive_and_negative_post_route_setup_slack() {
@@ -904,6 +1023,13 @@ mod tests {
         // The second modeled endpoint is driven only by an unconstrained
         // primary input and therefore is not fabricated into this clock domain.
         assert_eq!(failed.setup_checks.len(), 1);
+        assert_eq!(failed.modeled_endpoint_count(), 2);
+        assert_eq!(failed.unchecked_endpoints.len(), 1);
+        assert_eq!(
+            failed.unchecked_endpoints[0].reason,
+            UncheckedEndpointReason::NoSynchronousLaunch
+        );
+        assert!(!failed.all_modeled_endpoints_checked());
         assert_eq!(failed.worst_slack_ps, Some(-240));
         assert!(!failed.met_timing());
 
@@ -927,6 +1053,83 @@ mod tests {
                 .all(|edge| edge.slack_ps == 10)
         );
         assert!(passed.met_timing());
+    }
+
+    #[test]
+    fn reports_why_modeled_endpoints_are_unchecked() {
+        let mut design = Design::new();
+        let register = design.add_cell("register", ResourceKind::Register);
+        let data = design.add_pin(register, "DI", PinDirection::Input).unwrap();
+        let clock = design
+            .add_pin(register, "CLK", PinDirection::Input)
+            .unwrap();
+        let mut model = TimingModel::new();
+        model
+            .add_setup_hold(
+                clock,
+                data,
+                DelayRange::new(10, 10).unwrap(),
+                DelayRange::new(10, 10).unwrap(),
+            )
+            .unwrap();
+
+        let report =
+            timing_report_from_net_delays(&design, &model, &TimingConstraints::new(), Vec::new())
+                .unwrap();
+
+        assert_eq!(report.modeled_endpoint_count(), 1);
+        assert_eq!(report.setup_checks.len(), 0);
+        assert_eq!(report.hold_checks.len(), 0);
+        assert_eq!(report.unchecked_endpoints.len(), 1);
+        assert_eq!(
+            report.unchecked_endpoints[0].reason,
+            UncheckedEndpointReason::UnconnectedClock
+        );
+        assert!(!report.all_modeled_endpoints_checked());
+        assert!(!report.met_timing());
+    }
+
+    #[test]
+    fn reports_unconstrained_clock_endpoints() {
+        let mut design = Design::new();
+        let clock_source = design.add_cell("clock", ResourceKind::Io);
+        let clock_output = design
+            .add_pin(clock_source, "O", PinDirection::Output)
+            .unwrap();
+        let register = design.add_cell("register", ResourceKind::Register);
+        let data = design.add_pin(register, "DI", PinDirection::Input).unwrap();
+        let clock = design
+            .add_pin(register, "CLK", PinDirection::Input)
+            .unwrap();
+        let clock_net = design.add_net("clock", clock_output, [clock]).unwrap();
+        let mut model = TimingModel::new();
+        model
+            .add_setup_hold(
+                clock,
+                data,
+                DelayRange::new(10, 10).unwrap(),
+                DelayRange::new(10, 10).unwrap(),
+            )
+            .unwrap();
+
+        let report = timing_report_from_net_delays(
+            &design,
+            &model,
+            &TimingConstraints::new(),
+            vec![NetDelay {
+                net: clock_net,
+                sink: clock,
+                delay: DelayRange::zero(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(report.unchecked_endpoints.len(), 1);
+        assert_eq!(report.unchecked_endpoints[0].clock_net, Some(clock_net));
+        assert_eq!(
+            report.unchecked_endpoints[0].reason,
+            UncheckedEndpointReason::UnconstrainedClock
+        );
     }
 
     #[test]
@@ -1066,6 +1269,45 @@ mod tests {
         // Without CPPR this path is incorrectly reported at -360 ps.
         assert_eq!(report.worst_hold_slack_ps, Some(40));
         assert!(report.met_timing());
+
+        // Independently fitted early/late corners can be numerically inverted.
+        // CPPR is a signed corner delta, so swapping the common clock corner
+        // values must not change setup or hold slack and must not overflow.
+        let mut inverted_model = TimingModel::new();
+        inverted_model
+            .add_cell_arc(
+                buffer_a,
+                buffer_f,
+                DelayRange::from_independent_corners(500, 100),
+            )
+            .unwrap();
+        inverted_model
+            .add_clock_to_q(register_clk, register_q, DelayRange::new(40, 50).unwrap())
+            .unwrap();
+        inverted_model
+            .add_setup_hold(
+                register_clk,
+                register_di,
+                DelayRange::new(10, 10).unwrap(),
+                DelayRange::new(100, 100).unwrap(),
+            )
+            .unwrap();
+        let inverted_report = analyze_timing(
+            &design,
+            &device,
+            &implementation,
+            &pip_delays,
+            &inverted_model,
+            &constraints,
+        )
+        .unwrap();
+
+        assert_eq!(inverted_report.worst_slack_ps, report.worst_slack_ps);
+        assert_eq!(
+            inverted_report.worst_hold_slack_ps,
+            report.worst_hold_slack_ps
+        );
+        assert!(inverted_report.met_timing());
     }
 
     fn registered_path(hold_ps: u64) -> (Design, Device, texo_model::NetId, TimingModel) {
