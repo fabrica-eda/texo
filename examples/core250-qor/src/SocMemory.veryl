@@ -1,0 +1,74 @@
+/// Two internal 256x32 memories shared between Core250 and the halted debug
+/// port. Both reads are synchronous so Struo can infer ECP5 block RAMs.
+module SocMemory (
+    clk              : input  clock    ,
+    run              : input  logic    ,
+    instr_address    : input  logic<8> ,
+    data_address     : input  logic<8> ,
+    data_write_data  : input  logic<32>,
+    data_write_enable: input  logic    ,
+    debug_select     : input  logic    ,
+    debug_address    : input  logic<8> ,
+    debug_write_data : input  logic<32>,
+    debug_write_enable: input logic    ,
+    instr_read_data  : output logic<32>,
+    data_read_data   : output logic<32>,
+    debug_read_data  : output logic<32>,
+) {
+    var instruction_memory: logic<32> [256];
+    var data_memory       : logic<32> [256];
+    var instruction_read_address: logic<8>;
+    var data_read_address : logic<8>;
+    var data_write_address: logic<8>;
+    var selected_data_write: logic<32>;
+    var instruction_write_enable: logic;
+    var selected_data_write_enable: logic;
+
+    always_comb {
+        if run {
+            instruction_read_address = instr_address;
+            data_read_address = data_address;
+        } else {
+            instruction_read_address = debug_address;
+            data_read_address = debug_address;
+        }
+
+        instruction_write_enable = !run && debug_write_enable && !debug_select;
+        selected_data_write_enable = (run && data_write_enable)
+            || (!run && debug_write_enable && debug_select);
+        if run {
+            data_write_address = data_address;
+            selected_data_write = data_write_data;
+        } else {
+            data_write_address = debug_address;
+            selected_data_write = debug_write_data;
+        }
+
+        if debug_select {
+            debug_read_data = data_read_data;
+        } else {
+            debug_read_data = instr_read_data;
+        }
+    }
+
+    always_ff (clk) {
+        if instruction_write_enable {
+            instruction_memory[debug_address] = debug_write_data;
+        }
+    }
+
+    always_ff (clk) {
+        instr_read_data = instruction_memory[instruction_read_address];
+    }
+
+    always_ff (clk) {
+        if selected_data_write_enable {
+            data_memory[data_write_address] = selected_data_write;
+        }
+    }
+
+    always_ff (clk) {
+        data_read_data = data_memory[data_read_address];
+    }
+}
+

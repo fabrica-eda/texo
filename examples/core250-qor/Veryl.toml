@@ -1,0 +1,11 @@
+[project]
+name = "texo_core250_qor"
+version = "0.1.0"
+
+[build]
+sources = ["src"]
+exclude_std = true
+target = { type = "directory", path = "target/veryl" }
+
+[synth]
+top = "Core250JtagTop"

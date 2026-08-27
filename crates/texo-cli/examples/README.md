@@ -11,4 +11,6 @@ cargo run -p texo-cli --example design-specific-flows -- help
 ```
 
 New reusable behavior belongs in `texo pnr`; design-specific experiments and
-testbenches belong here.
+testbenches belong here. The frozen `examples/core250-qor` Veryl project is the
+larger ECP5 timing-closure regression used to exercise BRAM, JTAGG, PLL, carry,
+setup, and hold behavior together.

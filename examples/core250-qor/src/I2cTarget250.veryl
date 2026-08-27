@@ -1,0 +1,201 @@
+/// Timing-oriented implementation of the debug I2C target.
+///
+/// Control is one-hot and expressed as parallel next-state equations. The
+/// receive shifter, bit counter, SDA driver, and register bus each have an
+/// independent register update path so no monolithic priority mux is formed.
+module I2cTarget250 (
+    clk               : input  clock   ,
+    rst_n             : input  reset   ,
+    scl_i             : input  logic   ,
+    sda_i             : input  logic   ,
+    sda_drive_low     : output logic   ,
+    debug_address     : output logic<8>,
+    debug_write_data  : output logic<8>,
+    debug_write_strobe: output logic   ,
+    debug_read_data   : input  logic<8>,
+) {
+    var scl_meta: logic;
+    var scl_sync: logic;
+    var scl_prev_n: logic;
+    var sda_meta: logic;
+    var sda_sync: logic;
+    var sda_prev_n: logic;
+
+    var state     : logic<15>;
+    var state_next: logic<15>;
+
+    var bit_count      : logic<3>;
+    var shift_register : logic<8>;
+    var register_index : logic<8>;
+    var read_data_latch: logic<8>;
+    var selected       : logic   ;
+    var read_direction : logic   ;
+    var drive_low_q    : logic   ;
+
+    var scl_rise         : logic;
+    var scl_fall         : logic;
+    var start_detect     : logic;
+    var stop_detect      : logic;
+    var normal_transition: logic;
+    var receive_bit      : logic;
+    var receive_last     : logic;
+    var begin_write_reg  : logic;
+    var begin_write_data : logic;
+    var write_byte       : logic;
+    var begin_read       : logic;
+    var read_shift       : logic;
+    var read_continue    : logic;
+    var drive_update     : logic;
+    var drive_value      : logic;
+    var read_next_low    : logic;
+
+    always_comb {
+        scl_rise          = scl_sync && scl_prev_n;
+        scl_fall          = !scl_sync && !scl_prev_n;
+        start_detect      = scl_sync && !sda_prev_n && !sda_sync;
+        stop_detect       = scl_sync && sda_prev_n && sda_sync;
+        normal_transition = !start_detect && !stop_detect;
+
+        receive_bit      = scl_rise && (state[1] || state[4] || state[7]);
+        receive_last     = receive_bit && (bit_count == 3'd7);
+        begin_write_reg  = state[3] && scl_fall && !read_direction;
+        begin_write_data = scl_fall && (state[6] || state[9]);
+        write_byte       = state[7] && scl_rise && (bit_count == 3'd7);
+        begin_read       = scl_fall && ((state[3] && read_direction) || state[13]);
+        read_shift       = state[10] && scl_fall && (bit_count != 3'd0);
+        read_continue    = state[12] && scl_rise && !sda_sync;
+
+        state_next[0]  = stop_detect || (normal_transition && state[0]);
+        state_next[1]  = start_detect || (normal_transition && state[1] && !receive_last);
+        state_next[2]  = normal_transition && ((state[1] && receive_last) || (state[2] && !scl_fall));
+        state_next[3]  = normal_transition && ((state[2] && scl_fall && selected) || (state[3] && !scl_fall));
+        state_next[4]  = normal_transition && (begin_write_reg || (state[4] && !receive_last));
+        state_next[5]  = normal_transition && ((state[4] && receive_last) || (state[5] && !scl_fall));
+        state_next[6]  = normal_transition && ((state[5] && scl_fall) || (state[6] && !scl_fall));
+        state_next[7]  = normal_transition && (begin_write_data || (state[7] && !write_byte));
+        state_next[8]  = normal_transition && (write_byte || (state[8] && !scl_fall));
+        state_next[9]  = normal_transition && ((state[8] && scl_fall) || (state[9] && !scl_fall));
+        state_next[10] = normal_transition && (begin_read || (state[10] && !(scl_rise && (bit_count == 3'd0))));
+        state_next[11] = normal_transition
+            && ((state[10] && scl_rise && (bit_count == 3'd0)) || (state[11] && !scl_fall));
+        state_next[12] = normal_transition && ((state[11] && scl_fall) || (state[12] && !scl_rise));
+        state_next[13] = normal_transition && (read_continue || (state[13] && !scl_fall));
+        state_next[14] = normal_transition
+            && (state[14] || (state[2] && scl_fall && !selected) || (state[12] && scl_rise && sda_sync));
+
+        read_next_low = !read_data_latch[bit_count - 3'd1];
+
+        drive_update = start_detect || stop_detect || (state[2] && scl_fall) || (state[3] && scl_fall)
+            || (state[5] && scl_fall) || (state[6] && scl_fall) || (state[8] && scl_fall) || (state[9] && scl_fall)
+            || read_shift || (state[11] && scl_fall) || (state[13] && scl_fall);
+        drive_value  = (state[2] && scl_fall && selected)
+            || (state[3] && scl_fall && read_direction && !debug_read_data[7]) || (state[5] && scl_fall)
+            || (state[8] && scl_fall) || (read_shift && read_next_low)
+            || (state[13] && scl_fall && !debug_read_data[7]);
+
+        sda_drive_low = drive_low_q;
+        debug_address = register_index;
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            scl_meta = 1'b1;
+            scl_sync = 1'b1;
+            scl_prev_n = 1'b0;
+            sda_meta = 1'b1;
+            sda_sync = 1'b1;
+            sda_prev_n = 1'b0;
+        } else {
+            scl_meta = scl_i;
+            scl_sync = scl_meta;
+            scl_prev_n = !scl_sync;
+            sda_meta = sda_i;
+            sda_sync = sda_meta;
+            sda_prev_n = !sda_sync;
+        }
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            state = 15'b000_0000_0000_0001;
+        } else {
+            state = state_next;
+        }
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            bit_count = 3'd0;
+        } else if start_detect || begin_write_reg || begin_write_data {
+            bit_count = 3'd0;
+        } else if begin_read {
+            bit_count = 3'd7;
+        } else if receive_bit {
+            if bit_count == 3'd7 {
+                bit_count = 3'd0;
+            } else {
+                bit_count = bit_count + 3'd1;
+            }
+        } else if read_shift {
+            bit_count = bit_count - 3'd1;
+        }
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            shift_register = 8'h00;
+            selected       = 1'b0;
+            read_direction = 1'b0;
+        } else {
+            if start_detect {
+                shift_register = 8'h00;
+                selected       = 1'b0;
+            } else if receive_bit {
+                shift_register = {shift_register[6:0], sda_sync};
+            }
+            if state[1] && scl_rise && (bit_count == 3'd7) {
+                selected       = shift_register[6:0] == 7'h42;
+                read_direction = sda_sync;
+            }
+        }
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            register_index = 8'h00;
+        } else if state[4] && scl_rise && (bit_count == 3'd7) {
+            register_index = {shift_register[6:0], sda_sync};
+        } else if (state[9] && scl_fall) || read_continue {
+            register_index = register_index + 8'd1;
+        }
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            read_data_latch = 8'h00;
+        } else if begin_read {
+            read_data_latch = debug_read_data;
+        }
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            drive_low_q = 1'b0;
+        } else if drive_update {
+            drive_low_q = drive_value;
+        }
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            debug_write_data   = 8'h00;
+            debug_write_strobe = 1'b0;
+        } else {
+            debug_write_strobe = write_byte;
+            if write_byte {
+                debug_write_data = {shift_register[6:0], sda_sync};
+            }
+        }
+    }
+}
+
