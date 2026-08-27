@@ -1243,13 +1243,14 @@ impl TimingDrivenContext<'_, '_, '_> {
         if initial_timing.met_timing() {
             return Ok((initial_implementation, initial_timing));
         }
-        // The separate timing-driven analytical seed never won archive
-        // selection on the measured designs (the connectivity-only solve wins
-        // after routing), so refinement descends directly from the initial
-        // implementation and the second solve's route-and-analyze is skipped.
         routing_costs
             .set_sink_criticalities(timing_arc_weights(&initial_timing, self.timing_constraints));
-        let mut archive = vec![(initial_implementation, initial_timing)];
+        let timed_candidate = self.timing_driven_seed(&initial_timing, routing_costs, progress)?;
+        let mut seeds = vec![(initial_implementation, initial_timing)];
+        if let Some(candidate) = timed_candidate {
+            seeds.push(candidate);
+        }
+        let mut archive = select_timing_frontier(seeds);
         let placement_refiner = self.placement_refiner;
         archive =
             self.refine_setup_monotonically(archive, placement_refiner, routing_costs, progress)?;
@@ -1312,9 +1313,20 @@ impl TimingDrivenContext<'_, '_, '_> {
         archive.extend(hold_repairs);
         report_metric_phase("closure_hold_repair", &mut phase_started);
         archive = select_timing_frontier(archive);
+        // A timing-clean implementation always wins. Before closure, report
+        // the best achieved period instead of silently replacing it with an
+        // aggregate-slack candidate from the parallel search trajectory.
+        let timing_closed = archive.iter().any(|(_, timing)| timing.met_timing());
         let (final_implementation, final_timing) = archive
             .into_iter()
-            .max_by_key(|(_, timing)| timing_score(timing))
+            .filter(|(_, timing)| !timing_closed || timing.met_timing())
+            .max_by_key(|(_, timing)| {
+                if timing_closed {
+                    (None, timing_score(timing))
+                } else {
+                    (timing.worst_slack_ps, timing_score(timing))
+                }
+            })
             .expect("the timing archive is non-empty");
         emit_placement_metric(
             "final",
@@ -1324,6 +1336,40 @@ impl TimingDrivenContext<'_, '_, '_> {
             Some(&final_timing),
         );
         Ok((final_implementation, final_timing))
+    }
+
+    /// Routes an independently solved timing-weighted placement seed.
+    ///
+    /// A connectivity-only analytical solve is a strong default for sparse
+    /// logic, but fixed resources such as BRAMs can leave it in a placement
+    /// basin that local refinement cannot escape. Measured STA still selects
+    /// between the two seeds, and failure to route this speculative alternative
+    /// does not invalidate the already legal initial implementation.
+    fn timing_driven_seed(
+        &mut self,
+        initial_timing: &TimingReport,
+        routing_costs: &RoutingCosts,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<Option<TimingCandidate>, Ecp5FlowError> {
+        let placement = self
+            .placement_refiner
+            .place_analytically(&timing_placement_weights(
+                initial_timing,
+                self.timing_constraints,
+            ))?;
+        progress(Ecp5FlowStage::TimingDrivenPlaced);
+        let routing = self.packing.global_routing_constraints_cached(
+            self.design,
+            self.architecture,
+            &placement,
+            self.global_routing_cache,
+        )?;
+        progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
+        match self.route_and_analyze(placement, &routing, Some(routing_costs), progress) {
+            Ok(candidate) => Ok(Some(candidate)),
+            Err(Ecp5FlowError::Pnr(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Nets touching a cell whose BEL differs between the two placements.
@@ -2591,7 +2637,10 @@ const PRESCREEN_PS_PER_TILE_PS: u64 = 250;
 const PRESCREEN_HOP_OVERHEAD_PS: u64 = 300;
 const MAX_LOCAL_CONNECTION_REFINEMENTS: usize = 4;
 const MAX_LOCAL_CONNECTION_CANDIDATES: usize = 8;
-const TIMING_FRONTIER_WIDTH: usize = 1;
+// Preserve the aggregate-objective search seed and the best achieved WNS.
+// Refinement still descends from the aggregate winner, so retaining the Fmax
+// candidate does not perturb the established search trajectory.
+const TIMING_FRONTIER_WIDTH: usize = 2;
 const REFINED_PLACEMENT_UNIT_LIMITS: [usize; 4] = [256, 128, 64, 32];
 const DETAILED_ROUTING_QUANTA_PS: [u64; 1] = [10];
 // The second 1 ps quantum measured as a pure extra full renegotiation on the
@@ -3330,6 +3379,26 @@ fn select_timing_candidates(
                 ))
         },
     );
+    if width > 1 && candidates.len() > width {
+        let best_fmax = candidates
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (implementation, timing))| {
+                (
+                    timing.worst_slack_ps,
+                    timing_score(timing),
+                    Reverse(implementation.total_pips),
+                )
+            })
+            .map(|(index, _)| index)
+            .expect("the timing archive is non-empty");
+        if best_fmax >= width {
+            let candidate = candidates.remove(best_fmax);
+            candidates.truncate(width - 1);
+            candidates.push(candidate);
+            return candidates;
+        }
+    }
     candidates.truncate(width);
     candidates
 }
