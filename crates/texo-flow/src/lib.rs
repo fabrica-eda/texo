@@ -1670,8 +1670,26 @@ impl TimingDrivenContext<'_, '_, '_> {
                     );
                 }
                 let Some(improved) = refinement else { break };
+                let regresses_wns = improved
+                    .1
+                    .worst_slack_ps
+                    .zip(seed.1.worst_slack_ps)
+                    .is_some_and(|(child, parent)| child <= parent);
                 archive.push(improved);
                 archive = select_timing_frontier(archive);
+                // Once the whole-design rip-up has already supplied a fresh
+                // topology, an aggregate-slack move that sacrifices WNS is a
+                // hierarchy transition rather than a reason to exhaust every
+                // remaining placement radius.  Keep the candidate in the
+                // archive (it may seed the next closure round), but hand
+                // control back immediately.  The best-WNS candidate remains
+                // available for final selection.
+                if self.global_ripup_attempted && regresses_wns {
+                    if metrics_enabled() {
+                        eprintln!("[metrics] critical_transition reason=post_ripup_wns_regression");
+                    }
+                    return Ok(archive);
+                }
             }
         }
         Ok(archive)
@@ -1823,8 +1841,17 @@ impl TimingDrivenContext<'_, '_, '_> {
             routing_costs
                 .set_sink_criticalities(timing_arc_weights(&seed.1, self.timing_constraints));
             routing_costs.set_sink_min_delays_ps(BTreeMap::new());
+            // A basin kick is speculative and starts from a placement with no
+            // resident data routes.  Successful full routes in the measured
+            // portfolio settle within four negotiations; a candidate that is
+            // still congested after eight iterations has historically run to
+            // the 32-iteration hard limit and then been discarded.  Bound
+            // only this disposable trial, leaving authoritative full routes
+            // and accepted incremental work at their normal budget.
+            let mut bounded_costs = routing_costs.clone();
+            bounded_costs.set_max_iterations(SPECULATIVE_FULL_ROUTING_ITERATIONS);
             let trial =
-                match self.route_and_analyze(kicked, &routing, Some(routing_costs), progress) {
+                match self.route_and_analyze(kicked, &routing, Some(&bounded_costs), progress) {
                     Ok(trial) => trial,
                     Err(Ecp5FlowError::Pnr(_)) => break,
                     Err(error) => return Err(error),
@@ -2663,6 +2690,7 @@ const MAX_CRITICAL_PATH_VERTEX_REFINEMENTS: usize = 4;
 // different deterministic basin; no randomness or recorded seed is involved.
 const MAX_BASIN_ESCAPE_ROUNDS: usize = 2;
 const BASIN_ESCAPE_WEIGHT_EXPONENT: u32 = 4;
+const SPECULATIVE_FULL_ROUTING_ITERATIONS: u32 = 8;
 // Start with cheap local legalization, then let only an internal vertex of the
 // actual worst path escape a bad placement basin.  The broad pass is still a
 // deterministic exhaustive choice over that one unit's legal BEL assignments;
