@@ -421,16 +421,38 @@ fn checkpoint_timing(result: &Ecp5FlowResult) -> Value {
             })
         })
         .collect::<Vec<_>>();
+    let unchecked_endpoints = checkpoint_unchecked_endpoints(result);
     json!({
         "delay_model": "project_trellis_speed_grade_min_max_ps",
         "net_delays": net_delays,
         "net_setup_slacks": net_setup_slacks,
         "setup_checks": setup_checks,
         "hold_checks": hold_checks,
+        "unchecked_endpoints": unchecked_endpoints,
+        "modeled_endpoint_count": result.timing.modeled_endpoint_count(),
+        "all_modeled_endpoints_checked": result.timing.all_modeled_endpoints_checked(),
         "worst_slack_ps": result.timing.worst_slack_ps,
         "worst_hold_slack_ps": result.timing.worst_hold_slack_ps,
         "met_timing": result.timing.met_timing(),
     })
+}
+
+fn checkpoint_unchecked_endpoints(result: &Ecp5FlowResult) -> Vec<Value> {
+    result
+        .timing
+        .unchecked_endpoints
+        .iter()
+        .map(|endpoint| {
+            json!({
+                "cell_id": endpoint.cell.0,
+                "cell": result.design.cells()[endpoint.cell.0].name,
+                "data_pin_id": endpoint.data_pin.0,
+                "clock_pin_id": endpoint.clock_pin.0,
+                "clock_net_id": endpoint.clock_net.map(|net| net.0),
+                "reason": endpoint.reason.as_str(),
+            })
+        })
+        .collect()
 }
 
 fn checkpoint_evidence(evidence: &Evidence) -> Vec<&'static str> {
