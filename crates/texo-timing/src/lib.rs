@@ -392,8 +392,21 @@ fn timing_report_from_net_delays(
             continue;
         };
         let clock_arrival = clock_arrivals[clock_pin.0].unwrap_or(DelayRange::zero());
-        let required_ps =
-            i128::from(period_ps) + i128::from(clock_arrival.min_ps) - i128::from(setup.max_ps);
+        // Every launch in this analysis group and the capture endpoint share
+        // the path up to the constrained clock net's driver. Its min/max
+        // characterization range is common-mode delay, not clock skew. Add
+        // that range back to setup and remove it from hold (CPPR), while
+        // preserving all sink-branch variation beyond the driver.
+        let common_clock_arrival =
+            clock_arrivals[design.nets()[clock_net.0].driver.0].unwrap_or(DelayRange::zero());
+        let common_clock_pessimism_ps = common_clock_arrival
+            .max_ps
+            .checked_sub(common_clock_arrival.min_ps)
+            .ok_or(TimingError::DelayOverflow)?;
+        let required_ps = i128::from(period_ps)
+            + i128::from(clock_arrival.min_ps)
+            + i128::from(common_clock_pessimism_ps)
+            - i128::from(setup.max_ps);
         setup_checks.push(SetupCheck {
             cell: design.pins()[data_pin.0].cell,
             data_pin,
@@ -407,6 +420,7 @@ fn timing_report_from_net_delays(
         let hold_required_ps = clock_arrival
             .max_ps
             .checked_add(hold.max_ps)
+            .and_then(|required| required.checked_sub(common_clock_pessimism_ps))
             .ok_or(TimingError::DelayOverflow)?;
         hold_checks.push(HoldCheck {
             cell: design.pins()[data_pin.0].cell,
@@ -940,6 +954,118 @@ mod tests {
 
         assert_eq!(report.worst_hold_slack_ps, Some(-140));
         assert!(!report.met_timing());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn removes_common_clock_path_pessimism() {
+        let mut design = Design::new();
+        let clock = design.add_cell("clock", ResourceKind::Io);
+        let clock_o = design.add_pin(clock, "O", PinDirection::Output).unwrap();
+        let clock_buffer = design.add_cell("clock-buffer", ResourceKind::Lut(1));
+        let buffer_a = design
+            .add_pin(clock_buffer, "A", PinDirection::Input)
+            .unwrap();
+        let buffer_f = design
+            .add_pin(clock_buffer, "F", PinDirection::Output)
+            .unwrap();
+        let register = design.add_cell("register", ResourceKind::Register);
+        let register_di = design.add_pin(register, "DI", PinDirection::Input).unwrap();
+        let register_clk = design
+            .add_pin(register, "CLK", PinDirection::Input)
+            .unwrap();
+        let register_q = design.add_pin(register, "Q", PinDirection::Output).unwrap();
+        design.add_net("clock-input", clock_o, [buffer_a]).unwrap();
+        let clock_net = design
+            .add_net("clock-tree", buffer_f, [register_clk])
+            .unwrap();
+        design
+            .add_net("feedback", register_q, [register_di])
+            .unwrap();
+
+        let mut device = Device::new("cppr", 3, 1).unwrap();
+        let clock_wire = device.add_wire("clock", Point::new(0, 0), 1).unwrap();
+        let buffer_input_wire = device.add_wire("buffer-a", Point::new(1, 0), 1).unwrap();
+        let buffer_output_wire = device.add_wire("buffer-f", Point::new(1, 0), 1).unwrap();
+        let register_clk_wire = device
+            .add_wire("register-clk", Point::new(2, 0), 1)
+            .unwrap();
+        let register_di_wire = device.add_wire("register-di", Point::new(2, 0), 1).unwrap();
+        let register_q_wire = device.add_wire("register-q", Point::new(2, 0), 1).unwrap();
+        let clock_bel = device
+            .add_bel("CLOCK", ResourceKind::Io, Point::new(0, 0))
+            .unwrap();
+        device
+            .add_bel_pin(clock_bel, "O", PinDirection::Output, clock_wire)
+            .unwrap();
+        let buffer_bel = device
+            .add_bel("BUFFER", ResourceKind::Lut(1), Point::new(1, 0))
+            .unwrap();
+        device
+            .add_bel_pin(buffer_bel, "A", PinDirection::Input, buffer_input_wire)
+            .unwrap();
+        device
+            .add_bel_pin(buffer_bel, "F", PinDirection::Output, buffer_output_wire)
+            .unwrap();
+        let register_bel = device
+            .add_bel("REGISTER", ResourceKind::Register, Point::new(2, 0))
+            .unwrap();
+        device
+            .add_bel_pin(register_bel, "DI", PinDirection::Input, register_di_wire)
+            .unwrap();
+        device
+            .add_bel_pin(register_bel, "CLK", PinDirection::Input, register_clk_wire)
+            .unwrap();
+        device
+            .add_bel_pin(register_bel, "Q", PinDirection::Output, register_q_wire)
+            .unwrap();
+        for (from, to) in [
+            (clock_wire, buffer_input_wire),
+            (buffer_output_wire, register_clk_wire),
+            (register_q_wire, register_di_wire),
+        ] {
+            device.add_pip(from, to, false, 1).unwrap();
+        }
+
+        let mut model = TimingModel::new();
+        model
+            .add_cell_arc(buffer_a, buffer_f, DelayRange::new(100, 500).unwrap())
+            .unwrap();
+        model
+            .add_clock_to_q(register_clk, register_q, DelayRange::new(40, 50).unwrap())
+            .unwrap();
+        model
+            .add_setup_hold(
+                register_clk,
+                register_di,
+                DelayRange::new(10, 10).unwrap(),
+                DelayRange::new(100, 100).unwrap(),
+            )
+            .unwrap();
+        let implementation = place_and_route(&design, &device).unwrap();
+        let pip_delays = device
+            .pips()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| (texo_model::PipId(index), DelayRange::new(100, 100).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        let mut constraints = TimingConstraints::new();
+        constraints.set_clock_period_ps(clock_net, 1_000);
+
+        let report = analyze_timing(
+            &design,
+            &device,
+            &implementation,
+            &pip_delays,
+            &model,
+            &constraints,
+        )
+        .unwrap();
+
+        // The 400 ps min/max width on the common clock-buffer arc cancels.
+        // Without CPPR this path is incorrectly reported at -360 ps.
+        assert_eq!(report.worst_hold_slack_ps, Some(40));
+        assert!(report.met_timing());
     }
 
     fn registered_path(hold_ps: u64) -> (Design, Device, texo_model::NetId, TimingModel) {
