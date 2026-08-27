@@ -937,8 +937,15 @@ impl Importer {
     }
 
     fn insert_carry_feedins(&mut self) -> Result<(), AdapterError> {
-        let mut feedin_sinks = [MappedSignal::Zero, MappedSignal::One]
-            .into_iter()
+        let mut feedin_sinks = self
+            .sinks
+            .keys()
+            .copied()
+            .filter(|signal| {
+                self.drivers
+                    .get(signal)
+                    .is_none_or(|driver| self.design.pins()[driver.0].name != "FCO")
+            })
             .flat_map(|signal| {
                 self.sinks
                     .get(&signal)
@@ -1572,6 +1579,54 @@ mod tests {
                 slice: 1,
             }
         ));
+    }
+
+    #[test]
+    fn inserts_a_ccu2c_feedin_for_a_routed_carry_input() {
+        let mut source = Netlist::new("carry_input");
+        let width = NonZeroU32::new(8).unwrap();
+        let lhs = source.add_input_port("lhs", width);
+        let rhs = source.add_input_port("rhs", width);
+        let carry = source.add_input("carry");
+        let sum = source.add_arithmetic_with_carry(&lhs, &rhs, carry).unwrap();
+        source.add_output_port("sum", &sum).unwrap();
+
+        let imported = import_ecp5(&map_to_ecp5(&source).unwrap()).unwrap();
+
+        assert_eq!(imported.carry_pairs().len(), 6);
+        let feedin = &imported.carry_pairs()[4];
+        assert_eq!(
+            imported.design().cells()[feedin[0].0].name,
+            "$carry_feedin0$slice0"
+        );
+        let input = imported.design().cells()[feedin[0].0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| imported.design().pins()[pin.0].name == "A")
+            .expect("carry feed-in must enter through a routable LUT input");
+        let net = imported.design().pins()[input.0]
+            .net()
+            .expect("carry feed-in input must be connected");
+        let driver = imported.design().nets()[net.0].driver;
+        let driver_cell = imported.design().pins()[driver.0].cell;
+        assert!(matches!(
+            imported.metadata()[&driver_cell],
+            PrimitiveMetadata::Port { ref name, .. } if name == "carry"
+        ));
+        for net in imported.design().nets() {
+            if net
+                .sinks
+                .iter()
+                .any(|sink| imported.design().pins()[sink.0].name == "FCI")
+            {
+                assert_eq!(
+                    imported.design().pins()[net.driver.0].name,
+                    "FCO",
+                    "every dedicated FCI edge must originate at FCO"
+                );
+            }
+        }
     }
 
     #[test]
