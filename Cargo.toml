@@ -33,13 +33,13 @@ sha2 = "0.10"
 postcard = { version = "1.1.3", features = ["use-std"] }
 ureq = { version = "3.1", default-features = false, features = ["rustls"] }
 zstd = "0.13"
-struo-celox = { git = "https://github.com/fabrica-eda/struo.git", rev = "8fb85bc5850a06deed66046f6e1ac87852292a47" }
-struo-example-axi4-smartconnect = { git = "https://github.com/fabrica-eda/struo.git", rev = "8fb85bc5850a06deed66046f6e1ac87852292a47" }
-struo-frontend-veryl = { git = "https://github.com/fabrica-eda/struo.git", rev = "8fb85bc5850a06deed66046f6e1ac87852292a47" }
-struo-ir = { git = "https://github.com/fabrica-eda/struo.git", rev = "8fb85bc5850a06deed66046f6e1ac87852292a47" }
-struo-rtl = { git = "https://github.com/fabrica-eda/struo.git", rev = "8fb85bc5850a06deed66046f6e1ac87852292a47" }
-struo-synth = { git = "https://github.com/fabrica-eda/struo.git", rev = "8fb85bc5850a06deed66046f6e1ac87852292a47" }
-struo-target-ecp5 = { git = "https://github.com/fabrica-eda/struo.git", rev = "8fb85bc5850a06deed66046f6e1ac87852292a47" }
+struo-celox = { git = "https://github.com/fabrica-eda/struo.git", rev = "4ea4a1375fe8ee077c5fcb5ffdd80b7a5a0de7b3" }
+struo-example-axi4-smartconnect = { git = "https://github.com/fabrica-eda/struo.git", rev = "4ea4a1375fe8ee077c5fcb5ffdd80b7a5a0de7b3" }
+struo-frontend-veryl = { git = "https://github.com/fabrica-eda/struo.git", rev = "4ea4a1375fe8ee077c5fcb5ffdd80b7a5a0de7b3" }
+struo-ir = { git = "https://github.com/fabrica-eda/struo.git", rev = "4ea4a1375fe8ee077c5fcb5ffdd80b7a5a0de7b3" }
+struo-rtl = { git = "https://github.com/fabrica-eda/struo.git", rev = "4ea4a1375fe8ee077c5fcb5ffdd80b7a5a0de7b3" }
+struo-synth = { git = "https://github.com/fabrica-eda/struo.git", rev = "4ea4a1375fe8ee077c5fcb5ffdd80b7a5a0de7b3" }
+struo-target-ecp5 = { git = "https://github.com/fabrica-eda/struo.git", rev = "4ea4a1375fe8ee077c5fcb5ffdd80b7a5a0de7b3" }
 texo-flow = { path = "crates/texo-flow" }
 texo-model = { path = "crates/texo-model" }
 texo-pnr = { path = "crates/texo-pnr" }
