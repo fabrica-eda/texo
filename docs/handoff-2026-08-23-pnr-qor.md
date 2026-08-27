@@ -1378,19 +1378,44 @@ period by 1.470 ns and is 277 ps faster than the bundled nextpnr seed. The RTL
 still misses the 4.000 ns constraint; this change closes the reported P&R QoR
 gap, not the design's remaining logic depth.
 
+## Core250 cross-process determinism (2026-08-27)
+
+The unstable initial placement originated before analytical placement. Struo's
+Veryl memory inference traversed a `HashSet` of inferred memories directly, so
+independent `DP16KD` cells could be lowered in a process-random order. Their
+shifted IDs then changed later LUT mapping and every cell-ID placement
+tie-break. Texo now pins Struo commit
+`8fb85bc5850a06deed66046f6e1ac87852292a47`, which sorts inferred memories by
+stable memory name. The Texo Struo adapter additionally sorts each logical
+net's sinks by stable pin ID before analytical placement.
+
+Six clean-process Core250 runs with timing optimization disabled produced
+byte-identical initial implementation checkpoints:
+
+```text
+371e6df3160cf68f70cadc2a8a5296065aeaac6a03ba82758c74849b7a05ceb8  (6/6)
+```
+
+Two clean-process full timing-optimization runs also produced byte-identical
+checkpoints:
+
+```text
+39224248f5ae9589147da896937cfa1d4579ba4418c2520b4126742f2f611a6a  (2/2)
+```
+
+Both full runs implemented 4,855 cells and 5,078 nets with 63,626 PIPs, -2021
+ps WNS, and +290 ps WHS. Before the fix, six equivalent clean-process initial
+runs produced three distinct checkpoint hashes.
+
 Remaining work is deliberately separate:
 
-1. Initial placement varied across some rebuilt executable/process runs even
-   though cell names and IDs remained stable. Find and remove the unstable
-   ordering or tie-break upstream of analytical placement, then record
-   checkpoint hashes across clean processes.
-2. Re-run the 300/320 MHz AXI4 scoreboards at fixed work budgets. The additional
+1. Re-run the 300/320 MHz AXI4 scoreboards at fixed work budgets. The additional
    routed seed is a QoR investment and should be measured for latency as well
    as final WNS on designs where the connectivity seed already wins.
-3. Add the Core250 bundle, or a license-compatible reduced derivative, to a
+2. Add the Core250 bundle, or a license-compatible reduced derivative, to a
    durable benchmark/CI location. The current reproducer is external to this
    repository, so unit tests cover legality and failure isolation but not its
    full QoR number.
-4. Optimize the remaining 1.718 ns RTL path separately. Neither Texo nor the
+3. Optimize the remaining 1.718 ns RTL path separately. Neither Texo nor the
    bundled nextpnr run meets 250 MHz, so RTL closure must not be conflated with
    this P&R comparison.

@@ -1008,7 +1008,11 @@ impl Importer {
         }
         self.insert_carry_feedins()?;
         self.insert_carry_feedouts()?;
-        for (signal, sinks) in std::mem::take(&mut self.sinks) {
+        for (signal, mut sinks) in std::mem::take(&mut self.sinks) {
+            // Sink order has no logical meaning. Keep it independent of the
+            // primitive traversal that discovered the pins so analytical
+            // adjacency and floating-point accumulation are canonical too.
+            sinks.sort_unstable();
             let driver = if let Some(driver) = self.drivers.get(&signal) {
                 *driver
             } else {
