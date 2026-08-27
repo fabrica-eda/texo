@@ -322,6 +322,18 @@ fn checkpoint_packing(result: &Ecp5FlowResult) -> Value {
             })
         })
         .collect::<Vec<_>>();
+    let generated_clock_periods_ps = result
+        .packing
+        .generated_clock_periods_ps()
+        .iter()
+        .map(|(net, period_ps)| {
+            json!({
+                "net_id": net.0,
+                "net": result.design.nets()[net.0].name,
+                "period_ps": period_ps,
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
         "lut_ff_pairs": lut_ff_pairs,
         "carry_pairs": carry_pairs,
@@ -330,6 +342,7 @@ fn checkpoint_packing(result: &Ecp5FlowResult) -> Value {
         "global_clocks": global_clocks,
         "io_attributes": io_attributes,
         "clock_frequencies_hz": clock_frequencies_hz,
+        "generated_clock_periods_ps": generated_clock_periods_ps,
         "unsupported_lpf_commands": result.packing.unsupported_lpf_commands(),
     })
 }
@@ -489,6 +502,18 @@ fn primitive_metadata_json(
             "extension_register_1": extension_register_1,
             "extension_register_2": extension_register_2,
         }),
+        PrimitiveMetadata::Pll {
+            fabric_output,
+            feedback_output,
+            parameters,
+            attributes,
+        } => json!({
+            "kind": "pll",
+            "fabric_output": fabric_output.port(),
+            "feedback_output": feedback_output.port(),
+            "parameters": parameters,
+            "attributes": attributes,
+        }),
         PrimitiveMetadata::Port {
             name,
             bit,
@@ -530,8 +555,10 @@ const fn active_level_name(level: ActiveLevel) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use texo_model::{CellId, Design, PinDirection, ResourceKind};
-    use texo_struo::{PortDirection, PrimitiveMetadata};
+    use texo_struo::{PllOutput, PortDirection, PrimitiveMetadata};
     use texo_target_ecp5::{
         ArchitectureFile, PipRecord, RelativeRef, TileRecord, WireRecord, expand,
     };
@@ -579,6 +606,34 @@ mod tests {
         assert_eq!(
             configuration["configuration"]["extension_register_2"],
             false
+        );
+    }
+
+    #[test]
+    fn checkpoints_pll_configuration() {
+        let mut design = Design::new();
+        let cell = design.add_cell("pll", ResourceKind::Logic);
+        let configuration = primitive_metadata_json(
+            cell,
+            &PrimitiveMetadata::Pll {
+                fabric_output: PllOutput::Clkos,
+                feedback_output: PllOutput::Clkop,
+                parameters: BTreeMap::from([("CLKI_DIV".into(), "3".into())]),
+                attributes: BTreeMap::from([("FREQUENCY_PIN_CLKOS".into(), "250".into())]),
+            },
+            &design,
+        );
+
+        assert_eq!(configuration["configuration"]["kind"], "pll");
+        assert_eq!(configuration["configuration"]["fabric_output"], "CLKOS");
+        assert_eq!(configuration["configuration"]["feedback_output"], "CLKOP");
+        assert_eq!(
+            configuration["configuration"]["parameters"]["CLKI_DIV"],
+            "3"
+        );
+        assert_eq!(
+            configuration["configuration"]["attributes"]["FREQUENCY_PIN_CLKOS"],
+            "250"
         );
     }
 

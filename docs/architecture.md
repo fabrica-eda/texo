@@ -19,7 +19,7 @@ The inspected upstream versions are:
 
 | Project | Dependency policy | Relevant contract |
 |---|---|---|
-| `fabrica-eda/struo` | `8dad8c2e27f4dacd6283bb4015ad99208618c228` | `Ecp5Netlist`, `Ecp5Cell`, `CCU2C`, mapped ports, nextpnr-compatible JSON, verification policy |
+| `fabrica-eda/struo` | `0986eb917a65a0ee83f8842eb6a8f454b8dabc24` | `Ecp5Netlist`, `Ecp5Cell`, `CCU2C`, `PllBinding`, mapped ports, nextpnr-compatible JSON, verification policy |
 | `celox` | crates.io exact version `=0.3.1` | `FrontendArtifact` and native post-map simulation |
 | `YosysHQ/prjtrellis` | exporter inspected at `3afe7b52b30f4b4417ee98f03016767a502006e3` | deduplicated chip database, relative resource references, package IO database |
 | `prjtrellis-db` | snapshot records the exact revision; fixture uses `015e0330630d7c238c0e4f2cdd9c8157eb78c54a` | ECP5 routing, package, cell timing, and interconnect timing data |
@@ -32,7 +32,7 @@ upgrade.
 
 `texo-struo` implements that boundary. It consumes Struo's in-memory
 `Ecp5Netlist`, creates explicit logical pins for LUT4, CCU2C carry slices,
-TRELLIS_FF, DP16KD, constant networks, and every top-level port bit, then
+TRELLIS_FF, DP16KD, EHXPLLL, constant networks, and every top-level port bit, then
 connects them through Texo nets without serializing JSON. Each compound CCU2C
 is split into two cells joined by an adapter-local carry net while INIT and
 INJECT configuration remains in metadata. The same mapped object can be turned
@@ -63,6 +63,14 @@ has no nextpnr, Python, pytrellis, or system Project Trellis dependency.
 Design-specific
 Celox and AXI4 flows live in the
 `design-specific-flows` Cargo example rather than the installed CLI.
+
+User-configured Struo `PllBinding` values cross the adapter as an EHXPLLL
+logical cell with explicit reference, feedback, generated-clock, lock, and
+constant control pins. Pin compatibility restricts it to an EHXPLLL BEL. The
+selected `FREQUENCY_PIN_<output>` attribute becomes a generated-clock STA
+period and follows any later DCCA promotion. Raw divider parameters and analog
+attributes remain in primitive metadata so checkpoint and native bitgen can
+emit the same multi-tile configuration and defaults as nextpnr.
 
 ## Boundaries
 

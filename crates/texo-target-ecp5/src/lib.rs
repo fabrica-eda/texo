@@ -657,6 +657,7 @@ pub struct Ecp5Packing {
     global_clocks_packed: bool,
     io_attributes: BTreeMap<CellId, BTreeMap<String, String>>,
     clock_frequencies_hz: BTreeMap<CellId, u64>,
+    generated_clock_periods_ps: BTreeMap<NetId, u64>,
     unsupported_lpf_commands: Vec<String>,
 }
 
@@ -950,6 +951,17 @@ impl Ecp5Packing {
     #[must_use]
     pub const fn clock_frequencies_hz(&self) -> &BTreeMap<CellId, u64> {
         &self.clock_frequencies_hz
+    }
+
+    /// User-configured primitive output clock periods indexed by logical net.
+    #[must_use]
+    pub const fn generated_clock_periods_ps(&self) -> &BTreeMap<NetId, u64> {
+        &self.generated_clock_periods_ps
+    }
+
+    /// Records a generated-clock period and returns any previous value.
+    pub fn set_generated_clock_period_ps(&mut self, net: NetId, period_ps: u64) -> Option<u64> {
+        self.generated_clock_periods_ps.insert(net, period_ps)
     }
 
     /// LPF commands retained because this packing stage does not implement them.
@@ -2167,6 +2179,7 @@ pub fn pack_lut_ffs_excluding(
         global_clocks_packed: false,
         io_attributes: BTreeMap::new(),
         clock_frequencies_hz: BTreeMap::new(),
+        generated_clock_periods_ps: BTreeMap::new(),
         unsupported_lpf_commands: Vec::new(),
     })
 }
@@ -2329,6 +2342,7 @@ pub fn pack_lut_ffs_with_pairs(
         global_clocks_packed: false,
         io_attributes: BTreeMap::new(),
         clock_frequencies_hz: BTreeMap::new(),
+        generated_clock_periods_ps: BTreeMap::new(),
         unsupported_lpf_commands: Vec::new(),
     })
 }
