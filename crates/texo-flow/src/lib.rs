@@ -820,6 +820,7 @@ fn repair_hold_with_dedicated_edge_release(
                     vec![(trial_implementation, trial_timing)],
                     &placement_refiner,
                     routing_costs,
+                    false,
                     progress,
                 )?;
                 (trial_implementation, trial_timing) = recovered
@@ -1535,6 +1536,7 @@ impl TimingDrivenContext<'_, '_, '_> {
                 archive,
                 placement_refiner,
                 routing_costs,
+                false,
                 progress,
             )?;
             archive =
@@ -1543,6 +1545,40 @@ impl TimingDrivenContext<'_, '_, '_> {
                 .iter()
                 .any(|(_, timing)| timing.worst_slack_ps.is_some_and(|slack| slack >= 0));
             if setup_closed {
+                return Ok(archive);
+            }
+        }
+        // Aggregate closure deliberately rejects some WNS gains to protect
+        // TNS. Revisit those physical proposals under an explicitly Fmax-first
+        // objective only after the established trajectory has completed.
+        self.critical_move_trials.clear();
+        for _ in 0..MAX_FMAX_CLOSURE_ROUNDS {
+            let incumbent = archive
+                .iter()
+                .map(|(implementation, timing)| setup_closure_score(implementation, timing))
+                .max()
+                .expect("the timing archive is non-empty");
+            archive = self.refine_critical_path_vertices(
+                archive,
+                placement_refiner,
+                routing_costs,
+                true,
+                progress,
+            )?;
+            archive =
+                self.refine_critical_routes_multiresolution(archive, routing_costs, progress)?;
+            if archive
+                .iter()
+                .any(|(_, timing)| timing.worst_slack_ps.is_some_and(|slack| slack >= 0))
+            {
+                break;
+            }
+            let improved = archive
+                .iter()
+                .map(|(implementation, timing)| setup_closure_score(implementation, timing))
+                .max()
+                .is_some_and(|score| score > incumbent);
+            if !improved {
                 break;
             }
         }
@@ -1643,11 +1679,13 @@ impl TimingDrivenContext<'_, '_, '_> {
         }
         Ok(archive)
     }
+    #[allow(clippy::too_many_lines)]
     fn refine_critical_path_vertices(
         &mut self,
         mut archive: Vec<TimingCandidate>,
         placement_refiner: &PlacementRefiner<'_>,
         routing_costs: &mut RoutingCosts,
+        prefer_fmax: bool,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
         let mut setup_eco_attempted = false;
@@ -1661,7 +1699,17 @@ impl TimingDrivenContext<'_, '_, '_> {
                 }
                 let seed = archive
                     .iter()
-                    .max_by_key(|(_, timing)| timing_score(timing))
+                    .max_by_key(|(implementation, timing)| {
+                        if prefer_fmax {
+                            setup_closure_score(implementation, timing)
+                        } else {
+                            (
+                                i128::MIN,
+                                timing_score(timing),
+                                Reverse(implementation.total_pips),
+                            )
+                        }
+                    })
                     .expect("the timing archive is non-empty")
                     .clone();
                 if !setup_eco_attempted
@@ -1692,21 +1740,38 @@ impl TimingDrivenContext<'_, '_, '_> {
                     }
                 }
                 let trial_started = Instant::now();
-                let refinement = self
-                    .refine_critical_path_cells(
-                        &seed.0,
-                        &seed.1,
-                        placement_refiner,
-                        routing_costs,
-                        move_distance,
-                        progress,
-                    )?
-                    .into_iter()
+                let candidates = self.refine_critical_path_cells(
+                    &seed.0,
+                    &seed.1,
+                    placement_refiner,
+                    routing_costs,
+                    move_distance,
+                    prefer_fmax,
+                    progress,
+                )?;
+                let aggregate_refinement = candidates
+                    .iter()
                     .max_by_key(|(_, timing)| timing_score(timing))
-                    .filter(|(_, timing)| timing_score(timing) > timing_score(&seed.1));
+                    .filter(|(_, timing)| timing_score(timing) > timing_score(&seed.1))
+                    .cloned();
+                let fmax_refinement = candidates
+                    .into_iter()
+                    .max_by_key(|(implementation, timing)| {
+                        setup_closure_score(implementation, timing)
+                    })
+                    .filter(|(implementation, timing)| {
+                        setup_closure_score(implementation, timing)
+                            > setup_closure_score(&seed.0, &seed.1)
+                    });
+                let refinement = if prefer_fmax {
+                    fmax_refinement
+                } else {
+                    aggregate_refinement
+                };
                 if metrics_enabled() {
+                    let objective = if prefer_fmax { "fmax" } else { "aggregate" };
                     eprintln!(
-                        "[metrics] critical_transition distance={move_distance} round={} elapsed={:?} seed_wns={:?} child_wns={:?} child_tns={:?}",
+                        "[metrics] critical_transition objective={objective} distance={move_distance} round={} elapsed={:?} seed_wns={:?} child_wns={:?} child_tns={:?}",
                         refinement_round + 1,
                         trial_started.elapsed(),
                         seed.1.worst_slack_ps,
@@ -1727,14 +1792,11 @@ impl TimingDrivenContext<'_, '_, '_> {
                     .is_some_and(|(child, parent)| child <= parent);
                 archive.push(improved);
                 archive = select_timing_frontier(archive);
-                // Once the whole-design rip-up has already supplied a fresh
-                // topology, an aggregate-slack move that sacrifices WNS is a
-                // hierarchy transition rather than a reason to exhaust every
-                // remaining placement radius.  Keep the candidate in the
-                // archive (it may seed the next closure round), but hand
-                // control back immediately.  The best-WNS candidate remains
-                // available for final selection.
-                if self.global_ripup_attempted && regresses_wns {
+                // Once the whole-design rip-up has already supplied a
+                // fresh topology, an aggregate-slack move that sacrifices
+                // WNS is a hierarchy transition. The Fmax pass never
+                // accepts such a move and may keep walking its frontier.
+                if !prefer_fmax && self.global_ripup_attempted && regresses_wns {
                     if metrics_enabled() {
                         eprintln!("[metrics] critical_transition reason=post_ripup_wns_regression");
                     }
@@ -2192,7 +2254,7 @@ impl TimingDrivenContext<'_, '_, '_> {
         Ok(candidates)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn refine_critical_path_cells(
         &mut self,
         implementation: &PnrResult,
@@ -2200,6 +2262,7 @@ impl TimingDrivenContext<'_, '_, '_> {
         placement_refiner: &PlacementRefiner<'_>,
         routing_costs: &mut RoutingCosts,
         max_move_distance: u64,
+        prefer_fmax: bool,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
         let profile_started = Instant::now();
@@ -2349,14 +2412,20 @@ impl TimingDrivenContext<'_, '_, '_> {
                         self.route_local_trial_and_analyze(batch, &frozen, routing_costs, progress);
                     routing_costs.set_detailed_timing_nets(BTreeSet::new());
                     if let Ok(candidate) = trial {
-                        let improves_objective = timing_score(&candidate.1) > timing_score(timing);
                         let wns_gain = candidate
                             .1
                             .worst_slack_ps
                             .zip(timing.worst_slack_ps)
                             .map_or(0, |(candidate, incumbent)| candidate - incumbent);
-                        let accepts_batch =
-                            improves_objective && wns_gain >= LOCAL_CRITICAL_BATCH_MIN_WNS_GAIN_PS;
+                        let improves_objective = improves_setup_objective(
+                            prefer_fmax,
+                            &candidate.0,
+                            &candidate.1,
+                            implementation,
+                            timing,
+                        );
+                        let accepts_batch = improves_objective
+                            && (prefer_fmax || wns_gain >= LOCAL_CRITICAL_BATCH_MIN_WNS_GAIN_PS);
                         progress(Ecp5FlowStage::TimingTrialDecision {
                             improves_objective: accepts_batch,
                         });
@@ -2524,7 +2593,13 @@ impl TimingDrivenContext<'_, '_, '_> {
                 routing_costs.set_detailed_timing_nets(BTreeSet::new());
                 if let Ok(candidate) = trial {
                     let score = timing_score(&candidate.1);
-                    let improves_objective = score > timing_score(timing);
+                    let improves_objective = improves_setup_objective(
+                        prefer_fmax,
+                        &candidate.0,
+                        &candidate.1,
+                        implementation,
+                        timing,
+                    );
                     let closes_setup = candidate
                         .1
                         .worst_slack_ps
@@ -2548,9 +2623,18 @@ impl TimingDrivenContext<'_, '_, '_> {
                         );
                     }
                     progress(Ecp5FlowStage::TimingTrialDecision { improves_objective });
-                    if best_for_cell.as_ref().is_none_or(|(_, best_timing)| {
-                        timing_score(&candidate.1) > timing_score(best_timing)
-                    }) {
+                    if best_for_cell
+                        .as_ref()
+                        .is_none_or(|(best_implementation, best_timing)| {
+                            improves_setup_objective(
+                                prefer_fmax,
+                                &candidate.0,
+                                &candidate.1,
+                                best_implementation,
+                                best_timing,
+                            )
+                        })
+                    {
                         best_for_cell = Some(candidate.clone());
                     }
                     candidates.push(candidate);
@@ -2570,7 +2654,13 @@ impl TimingDrivenContext<'_, '_, '_> {
                 }
             }
             if let Some((best_implementation, best_timing)) = best_for_cell
-                && timing_score(&best_timing) > timing_score(timing)
+                && improves_setup_objective(
+                    prefer_fmax,
+                    &best_implementation,
+                    &best_timing,
+                    implementation,
+                    timing,
+                )
             {
                 placement = best_implementation.placement.clone();
                 rolling_implementation = best_implementation;
@@ -2745,6 +2835,7 @@ const LOCAL_BATCH_RECOVERY_WNS_PS: i128 = -800;
 const LOCAL_BATCH_NEAR_CLOSURE_WNS_PS: i128 = -400;
 const MAX_PROJECTED_PATH_CELL_CANDIDATES: usize = 4;
 const MAX_CRITICAL_CLOSURE_ROUNDS: usize = 4;
+const MAX_FMAX_CLOSURE_ROUNDS: usize = 4;
 const MAX_CRITICAL_PATH_VERTEX_REFINEMENTS: usize = 4;
 // Basin-escape budget for designs that stall with negative setup slack after
 // every refinement phase. Kicks re-solve the analytical placement with the
@@ -3413,6 +3504,46 @@ fn slack_violations(slacks: impl Iterator<Item = i128>) -> SlackViolations {
 
 type TimingCandidate = (PnrResult, TimingReport);
 
+/// Orders setup-failing candidates for critical-path closure.
+///
+/// The broad placement/routing objective intentionally balances WNS and TNS,
+/// but a critical-path walk must be allowed to cross a small TNS regression
+/// when it shortens the worst path. Otherwise a better-Fmax candidate is kept
+/// in the archive yet can never become the seed for the next critical move.
+fn setup_closure_score(
+    implementation: &PnrResult,
+    timing: &TimingReport,
+) -> (i128, TimingScore, Reverse<usize>) {
+    setup_closure_key(
+        timing.worst_slack_ps.unwrap_or(i128::MIN),
+        timing_score(timing),
+        implementation.total_pips,
+    )
+}
+
+fn improves_setup_objective(
+    prefer_fmax: bool,
+    candidate_implementation: &PnrResult,
+    candidate_timing: &TimingReport,
+    incumbent_implementation: &PnrResult,
+    incumbent_timing: &TimingReport,
+) -> bool {
+    if prefer_fmax {
+        setup_closure_score(candidate_implementation, candidate_timing)
+            > setup_closure_score(incumbent_implementation, incumbent_timing)
+    } else {
+        timing_score(candidate_timing) > timing_score(incumbent_timing)
+    }
+}
+
+fn setup_closure_key(
+    worst_slack_ps: i128,
+    timing_score: TimingScore,
+    total_pips: usize,
+) -> (i128, TimingScore, Reverse<usize>) {
+    (worst_slack_ps, timing_score, Reverse(total_pips))
+}
+
 fn placement_fingerprint(design: &Design, placement: &Placement) -> u64 {
     let mut fingerprint = DefaultHasher::new();
     placement.bindings().hash(&mut fingerprint);
@@ -3488,6 +3619,10 @@ fn select_timing_candidates(
                 ))
         },
     );
+    // A candidate can win both the aggregate and Fmax objectives. Keeping
+    // both clones would consume the two-entry frontier and evict the other
+    // physical trajectory that the archive exists to preserve.
+    candidates.dedup();
     if width > 1 && candidates.len() > width {
         let best_fmax = candidates
             .iter()
@@ -4262,6 +4397,20 @@ mod tests {
         assert!(
             staged_timing_score(narrow, narrow, -100, -100)
                 > staged_timing_score(widespread, widespread, -99, -99)
+        );
+    }
+
+    #[test]
+    fn critical_path_closure_can_follow_a_wns_gain_across_a_tns_regression() {
+        let aggregate_winner = slack_violations([-100, 0].into_iter()).score();
+        let fmax_winner = slack_violations(std::iter::repeat_n(-99, 100)).score();
+        let aggregate_score = staged_timing_score(aggregate_winner, aggregate_winner, -100, 0);
+        let fmax_score = staged_timing_score(fmax_winner, fmax_winner, -99, 0);
+
+        assert!(aggregate_score > fmax_score);
+        assert!(
+            super::setup_closure_key(-99, fmax_score, 110)
+                > super::setup_closure_key(-100, aggregate_score, 100)
         );
     }
 
