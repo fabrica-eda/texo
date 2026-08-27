@@ -348,6 +348,18 @@ impl Importer {
         else {
             unreachable!("dispatch guarantees JTAGG")
         };
+        for (register, (enabled, bit)) in [*extension_register_1, *extension_register_2]
+            .into_iter()
+            .zip(*tdo)
+            .enumerate()
+        {
+            if !enabled && constant_value(bit).is_none() {
+                return Err(AdapterError::DisabledJtagOutput {
+                    register: register + 1,
+                    signal: bit.into(),
+                });
+            }
+        }
         let cell = self.add_cell(
             name,
             ResourceKind::Logic,
@@ -416,18 +428,31 @@ impl Importer {
         self.next_synthetic_signal += 1;
         let mut slices = [CellId(0); 2];
         for slice in 0..2 {
+            let (packed_init, absorbed) = pack_carry_inputs(init[slice], inputs[slice]);
             let cell = self.add_cell(
                 format!("{name}$slice{slice}"),
                 ResourceKind::Lut(4),
                 PrimitiveMetadata::CarrySlice {
-                    init: init[slice],
+                    init: packed_init,
                     inject: inject[slice],
                     slice: u8::try_from(slice).expect("CCU2C has two slices"),
                 },
             );
             slices[slice] = cell;
-            for (pin_name, bit) in ["A", "B", "C", "D"].into_iter().zip(inputs[slice]) {
-                self.add_absorbable_input(cell, pin_name, bit)?;
+            for (index, (pin_name, bit)) in ["A", "B", "C", "D"]
+                .into_iter()
+                .zip(inputs[slice])
+                .enumerate()
+            {
+                if absorbed[index] {
+                    self.record_absorbed_input(
+                        cell,
+                        pin_name,
+                        constant_value(bit).expect("only constants are absorbed"),
+                    );
+                } else {
+                    self.add_input(cell, pin_name, bit)?;
+                }
             }
             if slice == 0 {
                 self.add_input(cell, "FCI", *carry_in)?;
@@ -733,15 +758,15 @@ impl Importer {
 
     fn insert_carry_feedouts(&mut self) -> Result<(), AdapterError> {
         let feedout_signals = self
-            .sinks
+            .drivers
             .iter()
-            .filter_map(|(&signal, sinks)| {
-                let driver = *self.drivers.get(&signal)?;
-                (self.design.pins()[driver.0].name == "FCO"
-                    && sinks
+            .filter_map(|(&signal, &driver)| {
+                let needs_feedout = self.sinks.get(&signal).is_none_or(|sinks| {
+                    sinks
                         .iter()
-                        .any(|sink| self.design.pins()[sink.0].name != "FCI"))
-                .then_some(signal)
+                        .any(|sink| self.design.pins()[sink.0].name != "FCI")
+                });
+                (self.design.pins()[driver.0].name == "FCO" && needs_feedout).then_some(signal)
             })
             .collect::<Vec<_>>();
 
@@ -764,9 +789,6 @@ impl Importer {
                     slice: 0,
                 },
             );
-            for pin in ["A", "B", "C", "D"] {
-                self.record_absorbed_input(first, pin, false);
-            }
             self.add_signal_input(first, "FCI", signal)?;
             self.add_signal_output(first, "F", sum_signal)?;
             self.add_signal_output(first, "FCO", internal_carry)?;
@@ -780,14 +802,9 @@ impl Importer {
                     slice: 1,
                 },
             );
-            if carry_sinks.is_empty() {
-                self.record_absorbed_input(second, "A", false);
-            } else {
+            if !carry_sinks.is_empty() {
                 let pin = self.design.add_pin(second, "A", PinDirection::Input)?;
                 self.sinks.entry(sum_signal).or_default().push(pin);
-            }
-            for pin in ["B", "C", "D"] {
-                self.record_absorbed_input(second, pin, false);
             }
             self.add_signal_input(second, "FCI", internal_carry)?;
             let unused_sum = self.fresh_synthetic_signal();
@@ -805,10 +822,12 @@ impl Importer {
                         .expect("feed-out FCI was just inserted"),
                 ],
             );
-            self.sinks
-                .entry(sum_signal)
-                .or_default()
-                .extend(general_sinks);
+            if !general_sinks.is_empty() {
+                self.sinks
+                    .entry(sum_signal)
+                    .or_default()
+                    .extend(general_sinks);
+            }
             if !carry_sinks.is_empty() {
                 self.sinks.insert(continued_carry, carry_sinks);
             }
@@ -849,10 +868,7 @@ impl Importer {
                     slice: 0,
                 },
             );
-            self.record_absorbed_input(first, "A", constant == MappedSignal::One);
-            for pin in ["B", "C", "D"] {
-                self.record_absorbed_input(first, pin, false);
-            }
+            self.add_signal_input(first, "A", constant)?;
             self.add_signal_output(first, "FCO", internal_carry)?;
 
             let second = self.add_cell(
@@ -864,9 +880,6 @@ impl Importer {
                     slice: 1,
                 },
             );
-            for pin in ["A", "B", "C", "D"] {
-                self.record_absorbed_input(second, pin, false);
-            }
             self.add_signal_input(second, "FCI", internal_carry)?;
             self.add_signal_output(second, "FCO", continued_carry)?;
             self.sinks.insert(continued_carry, vec![original_sink]);
@@ -921,6 +934,22 @@ const fn constant_value(bit: Bit) -> Option<bool> {
     }
 }
 
+fn pack_carry_inputs(mut init: u16, inputs: [Bit; 4]) -> (u16, [bool; 4]) {
+    let values = inputs.map(constant_value);
+    let mut absorbed = [false; 4];
+    for (index, value) in values.into_iter().enumerate() {
+        absorbed[index] = match value {
+            Some(true) => true,
+            Some(false) if index < 2 || values[index ^ 1] == Some(true) => {
+                init = fold_lut_input(init, index, false);
+                true
+            }
+            Some(false) | None => false,
+        };
+    }
+    (init, absorbed)
+}
+
 fn fold_lut_input(init: u16, input: usize, value: bool) -> u16 {
     let mut folded = 0_u16;
     for output_index in 0..16 {
@@ -964,6 +993,13 @@ pub enum AdapterError {
     MissingIoBuffer(MappedSignal),
     /// A `TRELLIS_IO` primitive did not match a bidirectional top-level bit.
     UnknownIoPad(MappedSignal),
+    /// A disabled JTAG extension register still had a fabric-driven TDO input.
+    DisabledJtagOutput {
+        /// One-based extension-register number.
+        register: usize,
+        /// Fabric signal that would become unobservable.
+        signal: MappedSignal,
+    },
 }
 
 impl fmt::Display for AdapterError {
@@ -988,6 +1024,10 @@ impl fmt::Display for AdapterError {
             Self::UnknownIoPad(signal) => {
                 write!(f, "TRELLIS_IO pad {signal:?} is not a bidirectional port")
             }
+            Self::DisabledJtagOutput { register, signal } => write!(
+                f,
+                "JTAG extension register {register} is disabled but JTDO{register} is driven by {signal:?}"
+            ),
         }
     }
 }
@@ -1000,7 +1040,8 @@ impl Error for AdapterError {
             | Self::MissingDriver(_)
             | Self::DuplicateIoPad(_)
             | Self::MissingIoBuffer(_)
-            | Self::UnknownIoPad(_) => None,
+            | Self::UnknownIoPad(_)
+            | Self::DisabledJtagOutput { .. } => None,
         }
     }
 }
@@ -1021,14 +1062,14 @@ mod tests {
         EnableControl, MemoryCell, Netlist, RegisterCell, ResetControl,
     };
     use struo_target_ecp5::{
-        JtaggBinding, OpenDrainIo, map_to_ecp5, map_to_ecp5_with_jtagg,
+        Bit, JtaggBinding, OpenDrainIo, map_to_ecp5, map_to_ecp5_with_jtagg,
         map_to_ecp5_with_open_drain_ios,
     };
     use texo_model::{CellId, ResourceKind};
 
     use super::{
         ActiveLevel, ClockEdge, PortDirection, PrimitiveMetadata, ResetMetadata,
-        celox_frontend_artifact, fold_lut_input, import_ecp5,
+        celox_frontend_artifact, fold_lut_input, import_ecp5, pack_carry_inputs,
     };
 
     fn mapped_xor() -> struo_target_ecp5::Ecp5Netlist {
@@ -1038,6 +1079,22 @@ mod tests {
         let value = source.add_xor(lhs, rhs);
         source.add_output("value", value);
         map_to_ecp5(&source).unwrap()
+    }
+
+    #[test]
+    fn packs_ccu2_constants_with_ecp5_tie_high_rules() {
+        assert_eq!(
+            pack_carry_inputs(0x96aa, [Bit::Wire(0), Bit::One, Bit::Zero, Bit::One]),
+            (0x66aa, [false, true, true, true])
+        );
+        assert_eq!(
+            pack_carry_inputs(0x96aa, [Bit::Wire(0), Bit::Zero, Bit::Zero, Bit::One]),
+            (0xaaaa, [false, true, true, true])
+        );
+        assert_eq!(
+            pack_carry_inputs(0x96aa, [Bit::Wire(0), Bit::One, Bit::Zero, Bit::Zero]),
+            (0x96aa, [false, true, false, false])
+        );
     }
 
     #[test]
@@ -1103,6 +1160,38 @@ mod tests {
                 ("JCE2", texo_model::PinDirection::Output),
             ]
         );
+    }
+
+    #[test]
+    fn rejects_a_fabric_driven_tdo_for_a_disabled_jtag_register() {
+        let mut source = Netlist::new("debug_top");
+        for name in [
+            "jtag_tdi",
+            "jtag_tck",
+            "jtag_rti1",
+            "jtag_rti2",
+            "jtag_shift",
+            "jtag_update",
+            "jtag_rst_n",
+            "jtag_ce1",
+            "jtag_ce2",
+        ] {
+            source.add_input(name);
+        }
+        let zero = source.add_constant(false);
+        let probe = source.add_input("probe");
+        source.add_output("jtag_tdo1", zero);
+        source.add_output("jtag_tdo2", probe);
+        let mut binding = JtaggBinding::with_prefix("jtag");
+        binding.extension_register_2 = false;
+        let mapped = map_to_ecp5_with_jtagg(&source, &binding).unwrap();
+
+        let error = import_ecp5(&mapped).unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::AdapterError::DisabledJtagOutput { register: 2, .. }
+        ));
     }
 
     #[test]
@@ -1231,15 +1320,15 @@ mod tests {
 
         let imported = import_ecp5(&map_to_ecp5(&source).unwrap()).unwrap();
 
-        assert_eq!(imported.carry_pairs().len(), 5);
+        assert_eq!(imported.carry_pairs().len(), 6);
         for pair in &imported.carry_pairs()[..4] {
             for (slice, &cell) in pair.iter().enumerate() {
                 assert!(matches!(
                     imported.metadata()[&cell],
                     PrimitiveMetadata::CarrySlice {
-                        init: 0x96aa,
                         inject: false,
                         slice: actual,
+                        ..
                     } if usize::from(actual) == slice
                 ));
             }
@@ -1256,7 +1345,7 @@ mod tests {
             assert!(first_pins.contains(&"FCO"));
             assert!(second_pins.contains(&"FCI"));
         }
-        let feedin = imported.carry_pairs().last().unwrap();
+        let feedin = &imported.carry_pairs()[4];
         assert_eq!(
             imported.design().cells()[feedin[0].0].name,
             "$carry_feedin0$slice0"
@@ -1274,6 +1363,34 @@ mod tests {
             PrimitiveMetadata::CarrySlice {
                 init: 0xffff,
                 inject: true,
+                slice: 1,
+            }
+        ));
+        assert!(
+            imported.design().cells()[feedin[0].0]
+                .pins()
+                .iter()
+                .any(|pin| imported.design().pins()[pin.0].name == "A"),
+            "the carry-chain constant must be routed to physical input A"
+        );
+        let feedout = imported.carry_pairs().last().unwrap();
+        assert_eq!(
+            imported.design().cells()[feedout[0].0].name,
+            "$carry_feedout0$slice0"
+        );
+        assert!(matches!(
+            imported.metadata()[&feedout[0]],
+            PrimitiveMetadata::CarrySlice {
+                init: 0,
+                inject: false,
+                slice: 0,
+            }
+        ));
+        assert!(matches!(
+            imported.metadata()[&feedout[1]],
+            PrimitiveMetadata::CarrySlice {
+                init: 10,
+                inject: false,
                 slice: 1,
             }
         ));
