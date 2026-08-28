@@ -1,6 +1,6 @@
 {
   "manifest_version": 1,
-  "architecture_schema_version": 6,
+  "architecture_schema_version": 7,
   "cache_format_version": 5,
   "source": {
     "distribution": "Ubuntu 24.04 (noble, amd64)",
@@ -25,9 +25,9 @@
   "devices": [
     {
       "device": "LFE5UM5G-85F",
-      "artifact_stem": "texo-LFE5UM5G-85F-schema6-cache5",
-      "expected_txdb_bytes": 853900985,
-      "expected_txdb_sha256": "198fd14bff6eb370ccfcf519feb3b6e4fb9b0f1ee57f27dad241f2c7ece57097"
+      "artifact_stem": "texo-LFE5UM5G-85F-schema7-cache5",
+      "expected_txdb_bytes": 853901491,
+      "expected_txdb_sha256": "b13e4914862dc73b2d64dfc64140f34d942097e86167ecba44f0b88b0abf82ff"
     }
   ]
 }

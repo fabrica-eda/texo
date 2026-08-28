@@ -25,7 +25,7 @@ use texo_model::{
 use texo_pnr::{NetRoute, Placement, PlacementConstraints, RoutingConstraints};
 
 /// Current on-disk architecture schema version.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Version of the expanded binary architecture cache.
 pub const ARCHITECTURE_CACHE_VERSION: u32 = 5;
