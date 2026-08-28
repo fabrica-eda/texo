@@ -19,7 +19,7 @@ The inspected upstream versions are:
 
 | Project | Dependency policy | Relevant contract |
 |---|---|---|
-| `fabrica-eda/struo` | `69c0e5c92e5aac30dab0327dd60be910ccb2bc29` | `Ecp5Netlist`, `Ecp5Cell`, `PFUMX`/`L6MUX21`, `CCU2C`, `PllBinding`, mapped ports, nextpnr-compatible JSON, verification policy |
+| `fabrica-eda/struo` | `aa4b864219520e953a5bf5ca7b4544251b486190` | `Ecp5Netlist`, `Ecp5Cell`, `PFUMX`/`L6MUX21`, `CCU2C`, `PllBinding`, mapped ports, nextpnr-compatible JSON, verification policy |
 | `celox` | crates.io exact version `=0.3.1` | `FrontendArtifact` and native post-map simulation |
 | `YosysHQ/prjtrellis` | exporter inspected at `3afe7b52b30f4b4417ee98f03016767a502006e3` | deduplicated chip database, relative resource references, package IO database |
 | `prjtrellis-db` | snapshot records the exact revision; fixture uses `015e0330630d7c238c0e4f2cdd9c8157eb78c54a` | ECP5 routing, package, cell timing, and interconnect timing data |
@@ -39,9 +39,10 @@ INJECT configuration remains in metadata. The same mapped object can be turned
 into a crates.io Celox `FrontendArtifact` for post-map verification.
 Struo `PFUMX` and `L6MUX21` cells are absorbed into their driving LUT4 cells in
 the same form used by nextpnr-ecp5: `F1`/`M`/`OFX` represent a LUT5 and
-`FXA`/`FXB`/`M`/`OFX` extend two such pairs into a LUT6. Packing keeps these as
-two- or four-LUT atomic placement groups on consecutive ECP5 logic slots, and
-STA uses the Project Trellis `SLOGICB` wide-mux characterization.
+`FXA`/`FXB`/`M`/`OFX` recursively extend those results into LUT6 and LUT7
+cascades. Packing keeps these as two-, four-, or eight-LUT atomic placement
+groups on consecutive ECP5 logic slots, and STA uses the Project Trellis
+`SLOGICB` wide-mux characterization.
 
 `texo-flow::verify_post_map_with_celox` records simulation evidence only after
 a caller-provided Celox testbench succeeds. `implement_struo_ecp5` requires

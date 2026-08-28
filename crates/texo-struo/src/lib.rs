@@ -267,10 +267,11 @@ impl ImportedEcp5Design {
         &self.carry_pairs
     }
 
-    /// LUT4 cells constrained into one dedicated LUT5 or LUT6 cluster.
+    /// LUT4 cells constrained into one dedicated LUT5, LUT6, or LUT7 cluster.
     ///
     /// Two-cell clusters occupy one ECP5 slice. Four-cell clusters occupy two
-    /// adjacent slices and preserve the physical order required by the
+    /// adjacent slices. Eight-cell clusters occupy one complete PLC. All
+    /// cluster sizes preserve the physical order required by the
     /// `PFUMX`/`L6MUX21` cascade.
     #[must_use]
     pub fn wide_lut_clusters(&self) -> &[Vec<CellId>] {
@@ -343,7 +344,7 @@ struct Importer {
     ports: Vec<ImportedPort>,
     pending_inout_ports: BTreeMap<MappedSignal, CellId>,
     carry_pairs: Vec<[CellId; 2]>,
-    pending_pfu_muxes: BTreeMap<u32, [CellId; 2]>,
+    pending_wide_muxes: BTreeMap<u32, Vec<CellId>>,
     wide_lut_clusters: Vec<Vec<CellId>>,
     next_synthetic_signal: u32,
     drivers: BTreeMap<MappedSignal, CellPinId>,
@@ -452,8 +453,8 @@ impl Importer {
         self.add_input(root, "M", *select)?;
         self.add_output(root, "OFX", *output)?;
         if self
-            .pending_pfu_muxes
-            .insert(*output, [root, child])
+            .pending_wide_muxes
+            .insert(*output, vec![root, child])
             .is_some()
         {
             return Err(AdapterError::InvalidWideLut {
@@ -531,35 +532,53 @@ impl Importer {
         };
         let zero_wire = wide_mux_wire(name, *data_zero, "D0")?;
         let one_wire = wide_mux_wire(name, *data_one, "D1")?;
-        let zero = self.pending_pfu_muxes.remove(&zero_wire).ok_or_else(|| {
+        let zero = self.pending_wide_muxes.remove(&zero_wire).ok_or_else(|| {
             AdapterError::InvalidWideLut {
                 cell: name.clone(),
-                reason: format!("D0 wire {zero_wire} is not driven by a PFUMX"),
+                reason: format!("D0 wire {zero_wire} is not driven by a packed wide mux"),
             }
         })?;
-        let one = self.pending_pfu_muxes.remove(&one_wire).ok_or_else(|| {
+        let one = self.pending_wide_muxes.remove(&one_wire).ok_or_else(|| {
             AdapterError::InvalidWideLut {
                 cell: name.clone(),
-                reason: format!("D1 wire {one_wire} is not driven by a PFUMX"),
+                reason: format!("D1 wire {one_wire} is not driven by a packed wide mux"),
             }
         })?;
+        if zero.len() != one.len() || !matches!(zero.len(), 2 | 4) {
+            return Err(AdapterError::InvalidWideLut {
+                cell: name.clone(),
+                reason: format!(
+                    "D0 and D1 have incompatible {}- and {}-LUT clusters",
+                    zero.len(),
+                    one.len()
+                ),
+            });
+        }
         if zero.iter().any(|cell| one.contains(cell)) {
             return Err(AdapterError::InvalidWideLut {
                 cell: name.clone(),
-                reason: "D0 and D1 PFUMX clusters overlap".into(),
+                reason: "D0 and D1 wide-mux clusters overlap".into(),
             });
         }
 
         // This is the same packed representation used by nextpnr-ecp5. The
-        // upper LUT of the D1 PFUMX owns the LUT6 mux ports; physical order is
-        // D1 PFUMX followed by D0 PFUMX across two adjacent slices.
-        let root = one[1];
+        // last LUT of the D1 half owns this L6MUX21's ports. For LUT6 this is
+        // the upper LUT of its D1 PFUMX; for LUT7 it is the otherwise unused
+        // upper LUT of its D1 LUT6's D0 PFUMX. Physical order is always D1
+        // followed by D0.
+        let root = *one.last().expect("wide-mux halves are nonempty");
         self.add_input(root, "FXA", *data_zero)?;
         self.add_input(root, "FXB", *data_one)?;
         self.add_input(root, "M", *select)?;
         self.add_output(root, "OFX", *output)?;
-        self.wide_lut_clusters
-            .push(vec![one[0], one[1], zero[0], zero[1]]);
+        let mut cluster = one;
+        cluster.extend(zero);
+        if self.pending_wide_muxes.insert(*output, cluster).is_some() {
+            return Err(AdapterError::InvalidWideLut {
+                cell: name.clone(),
+                reason: format!("L6MUX21 output wire {output} is repeated"),
+            });
+        }
         Ok(())
     }
 
@@ -1221,11 +1240,8 @@ impl Importer {
         }
         self.insert_carry_feedins()?;
         self.insert_carry_feedouts()?;
-        self.wide_lut_clusters.extend(
-            std::mem::take(&mut self.pending_pfu_muxes)
-                .into_values()
-                .map(Vec::from),
-        );
+        self.wide_lut_clusters
+            .extend(std::mem::take(&mut self.pending_wide_muxes).into_values());
         self.wide_lut_clusters
             .sort_unstable_by_key(|cluster| cluster.iter().copied().min());
         for (signal, mut sinks) in std::mem::take(&mut self.sinks) {
@@ -1742,6 +1758,68 @@ mod tests {
     }
 
     #[test]
+    fn absorbs_nested_l6mux21s_into_one_eight_lut_cluster() {
+        let mut source = Netlist::new("seven_input_parity");
+        let inputs = source.add_input_port("inputs", NonZeroU32::new(7).unwrap());
+        let parity = inputs[1..]
+            .iter()
+            .fold(inputs[0], |value, input| source.add_xor(value, *input));
+        source.add_output("result", parity);
+        let constraints = IoTimingConstraints::new()
+            .with_input_delay_ps("inputs", 0)
+            .with_output_delay_ps("result", 0);
+        let mapped = map_to_ecp5_with_constraints(
+            &source,
+            MappingOptions {
+                timing_goal_mhz: 1_500,
+                ..MappingOptions::default()
+            },
+            &constraints,
+        )
+        .unwrap();
+        assert_eq!(
+            mapped
+                .cells()
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::PfuMux { .. }))
+                .count(),
+            4
+        );
+        assert_eq!(
+            mapped
+                .cells()
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::L6Mux21 { .. }))
+                .count(),
+            3
+        );
+
+        let imported = import_ecp5(&mapped).unwrap();
+
+        let [cluster] = imported.wide_lut_clusters() else {
+            panic!("expected one LUT7 cluster")
+        };
+        assert_eq!(cluster.len(), 8);
+        let pin_names = cluster
+            .iter()
+            .map(|cell| {
+                imported.design().cells()[cell.0]
+                    .pins()
+                    .iter()
+                    .map(|pin| imported.design().pins()[pin.0].name.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for &index in &[0, 2, 4, 6] {
+            assert!(pin_names[index].ends_with(&["F1", "M", "OFX"]));
+        }
+        for &index in &[1, 3, 5] {
+            assert!(pin_names[index].ends_with(&["FXA", "FXB", "M", "OFX"]));
+        }
+        assert_eq!(&pin_names[7][..5], &["A", "B", "C", "D", "F"]);
+    }
+
+    #[test]
     fn clones_a_pfumx_root_whose_f_output_has_other_fanout() {
         let root = Ecp5Cell::Lut4 {
             name: "root".into(),
@@ -1774,7 +1852,8 @@ mod tests {
         importer.add_primitive(&consumer).unwrap();
         importer.add_pfu_mux(&pfu).unwrap();
 
-        let [clone, child] = importer.pending_pfu_muxes[&12];
+        let [clone, child]: [CellId; 2] =
+            importer.pending_wide_muxes[&12].clone().try_into().unwrap();
         assert_eq!(child, CellId(1));
         assert_ne!(clone, CellId(0));
         assert_eq!(importer.metadata[&clone], importer.metadata[&CellId(0)]);
