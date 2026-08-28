@@ -220,7 +220,7 @@ exercises the fully simulation-signed-off path:
 cargo build --release --locked -p texo-cli
 /usr/bin/python3 tools/build_ecp5_txdb.py --device LFE5UM5G-85F
 cargo run --release -p texo-cli --example design-specific-flows -- axi4-pnr \
-  artifacts/architecture/texo-LFE5UM5G-85F-schema6-cache5.txdb CABGA381 8 \
+  artifacts/architecture/texo-LFE5UM5G-85F-schema7-cache5.txdb CABGA381 8 \
   examples/axi4-self-test/lfe5um5g-85f-evn-250mhz.lpf \
   artifacts/axi4.checkpoint.json
 cargo run --release -- bitgen artifacts/axi4.checkpoint.json \

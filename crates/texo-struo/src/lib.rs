@@ -427,7 +427,20 @@ impl Importer {
         else {
             unreachable!("dispatch guarantees PFUMX")
         };
+        let lut_false_wire = wide_mux_wire(name, *lut_false, "BLUT")?;
         let root = self.wide_lut_driver(name, *lut_false, "BLUT", "F")?;
+        // F and OFX alias one fabric-facing wire. If the BLUT result also has
+        // an ordinary consumer, preserve that F cell and replicate only its
+        // truth table/input plane for the dedicated PFUMX root.
+        let root = if self
+            .sinks
+            .get(&MappedSignal::Wire(lut_false_wire))
+            .is_some_and(|sinks| !sinks.is_empty())
+        {
+            self.clone_wide_lut_root(name, root)?
+        } else {
+            root
+        };
         let child = self.wide_lut_driver(name, *lut_true, "ALUT", "F")?;
         if root == child {
             return Err(AdapterError::InvalidWideLut {
@@ -449,6 +462,60 @@ impl Importer {
             });
         }
         Ok(())
+    }
+
+    fn clone_wide_lut_root(
+        &mut self,
+        wide_cell: &str,
+        source: CellId,
+    ) -> Result<CellId, AdapterError> {
+        let source_cell = &self.design.cells()[source.0];
+        let metadata =
+            self.metadata
+                .get(&source)
+                .cloned()
+                .ok_or_else(|| AdapterError::InvalidWideLut {
+                    cell: wide_cell.into(),
+                    reason: "BLUT driver has no LUT4 metadata".into(),
+                })?;
+        if !matches!(metadata, PrimitiveMetadata::Lut4 { .. }) {
+            return Err(AdapterError::InvalidWideLut {
+                cell: wide_cell.into(),
+                reason: "BLUT driver metadata is not LUT4".into(),
+            });
+        }
+        let source_name = source_cell.name.clone();
+        let inputs = source_cell
+            .pins()
+            .iter()
+            .copied()
+            .filter(|pin| self.design.pins()[pin.0].direction == PinDirection::Input)
+            .map(|pin| {
+                let source_pin = &self.design.pins()[pin.0];
+                let signal = self
+                    .sinks
+                    .iter()
+                    .find_map(|(&signal, sinks)| sinks.contains(&pin).then_some(signal))
+                    .ok_or_else(|| AdapterError::InvalidWideLut {
+                        cell: wide_cell.into(),
+                        reason: format!("BLUT input {} has no mapped signal", source_pin.name),
+                    })?;
+                Ok((source_pin.name.clone(), signal))
+            })
+            .collect::<Result<Vec<_>, AdapterError>>()?;
+        let absorbed = self.absorbed_inputs.get(&source).cloned();
+        let clone = self.add_cell(
+            format!("{source_name}$wide_mux_clone"),
+            ResourceKind::Lut(4),
+            metadata,
+        );
+        for (name, signal) in inputs {
+            self.add_signal_input(clone, name, signal)?;
+        }
+        if let Some(absorbed) = absorbed {
+            self.absorbed_inputs.insert(clone, absorbed);
+        }
+        Ok(clone)
     }
 
     fn add_l6_mux(&mut self, primitive: &Ecp5Cell) -> Result<(), AdapterError> {
@@ -1355,7 +1422,7 @@ mod tests {
     use texo_model::{CellId, ResourceKind};
 
     use super::{
-        ActiveLevel, ClockEdge, PortDirection, PrimitiveMetadata, ResetMetadata,
+        ActiveLevel, ClockEdge, Importer, PortDirection, PrimitiveMetadata, ResetMetadata,
         celox_frontend_artifact, fold_lut_input, import_ecp5, pack_carry_inputs,
     };
 
@@ -1672,6 +1739,58 @@ mod tests {
         assert!(pin_names[1].ends_with(&["FXA", "FXB", "M", "OFX"]));
         assert!(pin_names[2].ends_with(&["F1", "M", "OFX"]));
         assert_eq!(&pin_names[3][..5], &["A", "B", "C", "D", "F"]);
+    }
+
+    #[test]
+    fn clones_a_pfumx_root_whose_f_output_has_other_fanout() {
+        let root = Ecp5Cell::Lut4 {
+            name: "root".into(),
+            inputs: [Bit::Wire(0), Bit::Wire(1), Bit::Zero, Bit::Zero],
+            output: 10,
+            init: 0x6996,
+        };
+        let child = Ecp5Cell::Lut4 {
+            name: "child".into(),
+            inputs: [Bit::Wire(2), Bit::Wire(3), Bit::Zero, Bit::Zero],
+            output: 11,
+            init: 0x9669,
+        };
+        let consumer = Ecp5Cell::Lut4 {
+            name: "consumer".into(),
+            inputs: [Bit::Wire(10), Bit::Zero, Bit::Zero, Bit::Zero],
+            output: 13,
+            init: 0xaaaa,
+        };
+        let pfu = Ecp5Cell::PfuMux {
+            name: "pfu".into(),
+            lut_true: Bit::Wire(11),
+            lut_false: Bit::Wire(10),
+            select: Bit::Wire(4),
+            output: 12,
+        };
+        let mut importer = Importer::new();
+        importer.add_primitive(&root).unwrap();
+        importer.add_primitive(&child).unwrap();
+        importer.add_primitive(&consumer).unwrap();
+        importer.add_pfu_mux(&pfu).unwrap();
+
+        let [clone, child] = importer.pending_pfu_muxes[&12];
+        assert_eq!(child, CellId(1));
+        assert_ne!(clone, CellId(0));
+        assert_eq!(importer.metadata[&clone], importer.metadata[&CellId(0)]);
+        assert!(
+            importer.design.cells()[CellId(0).0]
+                .pins()
+                .iter()
+                .any(|pin| importer.design.pins()[pin.0].name == "F")
+        );
+        let clone_pins = importer.design.cells()[clone.0]
+            .pins()
+            .iter()
+            .map(|pin| importer.design.pins()[pin.0].name.as_str())
+            .collect::<Vec<_>>();
+        assert!(clone_pins.ends_with(&["F1", "M", "OFX"]));
+        assert!(!clone_pins.contains(&"F"));
     }
 
     #[test]

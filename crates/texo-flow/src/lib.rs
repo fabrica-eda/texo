@@ -3907,7 +3907,7 @@ fn ecp5_timing_model(
                 model.add_cell_arc(from, to, delay)?;
             }
         }
-        add_wide_lut_timing_arcs(&mut model, design, cell_id, record, &speed_grade.name)?;
+        add_wide_lut_timing_arcs(&mut model, design, cell_id, &records, &speed_grade.name)?;
         add_setup_hold_timing(
             &mut model,
             design,
@@ -3968,95 +3968,37 @@ fn add_setup_hold_timing(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-struct WideLutTiming {
-    pfu_data: DelayRange,
-    pfu_select: DelayRange,
-    l6_data: DelayRange,
-    l6_select: DelayRange,
-}
-
-fn wide_lut_timing(speed_grade: &str) -> Option<WideLutTiming> {
-    let range = DelayRange::from_independent_corners;
-    match speed_grade {
-        "6" => Some(WideLutTiming {
-            pfu_data: range(68, 165),
-            pfu_select: range(187, 256),
-            l6_data: range(189, 242),
-            l6_select: range(186, 252),
-        }),
-        "7" => Some(WideLutTiming {
-            pfu_data: range(58, 146),
-            pfu_select: range(166, 225),
-            l6_data: range(166, 211),
-            l6_select: range(166, 221),
-        }),
-        "8" => Some(WideLutTiming {
-            pfu_data: range(47, 126),
-            pfu_select: range(145, 193),
-            l6_data: range(142, 180),
-            l6_select: range(145, 190),
-        }),
-        "8_5G" => Some(WideLutTiming {
-            pfu_data: range(37, 98),
-            pfu_select: range(113, 151),
-            l6_data: range(111, 141),
-            l6_select: range(113, 148),
-        }),
-        _ => None,
-    }
-}
-
 fn add_wide_lut_timing_arcs(
     model: &mut TimingModel,
     design: &Design,
     cell: CellId,
-    record: &texo_target_ecp5::CellTimingRecord,
+    records: &BTreeMap<&str, &texo_target_ecp5::CellTimingRecord>,
     speed_grade: &str,
 ) -> Result<(), Ecp5FlowError> {
-    let Some(ofx) = find_cell_pin(design, cell, "OFX") else {
+    if find_cell_pin(design, cell, "OFX").is_none() {
         return Ok(());
-    };
-    let timing = wide_lut_timing(speed_grade).ok_or_else(|| Ecp5FlowError::MissingCellTiming {
-        speed_grade: speed_grade.into(),
-        cell_type: "TRELLIS_WIDE_LUT".into(),
-    })?;
-    if let Some(f1) = find_cell_pin(design, cell, "F1") {
-        model.add_cell_arc(f1, ofx, timing.pfu_data)?;
-        if let Some(select) = find_cell_pin(design, cell, "M") {
-            model.add_cell_arc(select, ofx, timing.pfu_select)?;
-        }
-        for pin_name in ["A", "B", "C", "D"] {
-            let Some(from) = find_cell_pin(design, cell, pin_name) else {
-                continue;
-            };
-            let Some(lut_arc) = record
-                .arcs
-                .iter()
-                .find(|arc| arc.from_pin == pin_name && arc.to_pin == "F")
-            else {
-                continue;
-            };
-            let lut = timing_delay(lut_arc.delay)?;
-            let delay = DelayRange::from_independent_corners(
-                lut.min_ps
-                    .checked_add(timing.pfu_data.min_ps)
-                    .ok_or(Ecp5FlowError::TimingDelayOverflow)?,
-                lut.max_ps
-                    .checked_add(timing.pfu_data.max_ps)
-                    .ok_or(Ecp5FlowError::TimingDelayOverflow)?,
-            );
-            model.add_cell_arc(from, ofx, delay)?;
-        }
+    }
+    let cell_type = if find_cell_pin(design, cell, "F1").is_some() {
+        "TRELLIS_PFUMX"
     } else {
-        for pin_name in ["FXA", "FXB"] {
-            if let Some(from) = find_cell_pin(design, cell, pin_name) {
-                model.add_cell_arc(from, ofx, timing.l6_data)?;
-            }
-        }
-        if let Some(select) = find_cell_pin(design, cell, "M") {
-            model.add_cell_arc(select, ofx, timing.l6_select)?;
-        }
+        "TRELLIS_L6MUX21"
+    };
+    let record =
+        records
+            .get(cell_type)
+            .copied()
+            .ok_or_else(|| Ecp5FlowError::MissingCellTiming {
+                speed_grade: speed_grade.into(),
+                cell_type: cell_type.into(),
+            })?;
+    for arc in &record.arcs {
+        let Some(from) = find_cell_pin(design, cell, &arc.from_pin) else {
+            continue;
+        };
+        let Some(to) = find_cell_pin(design, cell, &arc.to_pin) else {
+            continue;
+        };
+        model.add_cell_arc(from, to, timing_delay(arc.delay)?)?;
     }
     Ok(())
 }
@@ -4429,6 +4371,13 @@ mod tests {
         assert_eq!(
             model.cell_arc(
                 find_cell_pin(imported.design(), l6, "FXA").unwrap(),
+                find_cell_pin(imported.design(), l6, "OFX").unwrap(),
+            ),
+            Some(DelayRange::from_independent_corners(189, 239))
+        );
+        assert_eq!(
+            model.cell_arc(
+                find_cell_pin(imported.design(), l6, "FXB").unwrap(),
                 find_cell_pin(imported.design(), l6, "OFX").unwrap(),
             ),
             Some(DelayRange::from_independent_corners(189, 242))

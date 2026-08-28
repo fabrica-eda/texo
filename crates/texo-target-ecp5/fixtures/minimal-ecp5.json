@@ -1,5 +1,5 @@
 {
-  "schema_version": 6,
+  "schema_version": 7,
   "provenance": {
     "project_trellis_revision": "3afe7b52b30f4b4417ee98f03016767a502006e3",
     "database_revision": "015e0330630d7c238c0e4f2cdd9c8157eb78c54a",
@@ -454,6 +454,27 @@
             { "from_pin": "B", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
             { "from_pin": "C", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
             { "from_pin": "D", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } }
+          ],
+          "setup_holds": []
+        },
+        {
+          "cell_type": "TRELLIS_PFUMX",
+          "arcs": [
+            { "from_pin": "A", "to_pin": "OFX", "delay": { "min_ps": 268, "max_ps": 401 } },
+            { "from_pin": "B", "to_pin": "OFX", "delay": { "min_ps": 268, "max_ps": 401 } },
+            { "from_pin": "C", "to_pin": "OFX", "delay": { "min_ps": 268, "max_ps": 401 } },
+            { "from_pin": "D", "to_pin": "OFX", "delay": { "min_ps": 268, "max_ps": 401 } },
+            { "from_pin": "F1", "to_pin": "OFX", "delay": { "min_ps": 68, "max_ps": 165 } },
+            { "from_pin": "M", "to_pin": "OFX", "delay": { "min_ps": 187, "max_ps": 256 } }
+          ],
+          "setup_holds": []
+        },
+        {
+          "cell_type": "TRELLIS_L6MUX21",
+          "arcs": [
+            { "from_pin": "FXA", "to_pin": "OFX", "delay": { "min_ps": 189, "max_ps": 239 } },
+            { "from_pin": "FXB", "to_pin": "OFX", "delay": { "min_ps": 189, "max_ps": 242 } },
+            { "from_pin": "M", "to_pin": "OFX", "delay": { "min_ps": 186, "max_ps": 252 } }
           ],
           "setup_holds": []
         },

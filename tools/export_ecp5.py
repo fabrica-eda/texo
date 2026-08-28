@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 DIRECTIONS = {0: "input", 1: "output", 2: "inout"}
 SPEED_GRADES = ["6", "7", "8", "8_5G"]
 
@@ -204,6 +204,7 @@ def export_cell_timings(cell_database):
     # clock-launched ports, which is also how nextpnr models this primitive.
     block_ram = cell_database["DP16KD:REGMODE_A=NOREG,REGMODE_B=NOREG"]
     lut_arcs = {}
+    slogic_arcs = {}
     raw_carry_arcs = {}
     ff_arcs = {}
     ff_checks = {}
@@ -211,6 +212,10 @@ def export_cell_timings(cell_database):
         if entry["type"] == "IOPath":
             source = entry["from_pin"]
             destination = entry["to_pin"]
+            key = (source, destination)
+            slogic_arcs[key] = merge_range(
+                slogic_arcs.get(key), delay_range(entry)
+            )
             if source in {"A0", "B0", "C0", "D0"} and destination == "F0":
                 key = (source[0], "F")
                 lut_arcs[key] = merge_range(lut_arcs.get(key), delay_range(entry))
@@ -230,6 +235,28 @@ def export_cell_timings(cell_database):
                 "setup": merge_range(None if previous is None else previous["setup"], setup),
                 "hold": merge_range(None if previous is None else previous["hold"], hold),
             }
+
+    # A packed PFUMX root replaces its ordinary F output with OFX, so its LUT
+    # input arcs use the complete SLOGICB LUT-to-OFX paths. F1->OFX is only the
+    # dedicated mux remainder after the child LUT's F1 delay. L6MUX21 inputs
+    # are already isolated mux paths in the Trellis timing database.
+    pfu_arcs = {}
+    for source in "ABCD":
+        for slice_index in range(2):
+            raw_source = f"{source}{slice_index}"
+            key = (source, "OFX")
+            pfu_arcs[key] = merge_range(
+                pfu_arcs.get(key), slogic_arcs[(raw_source, "OFX0")]
+            )
+    pfu_arcs[("F1", "OFX")] = subtract_range(
+        slogic_arcs[("A1", "OFX0")], slogic_arcs[("A1", "F1")]
+    )
+    pfu_arcs[("M", "OFX")] = slogic_arcs[("M0", "OFX0")]
+    l6_arcs = {
+        ("FXA", "OFX"): slogic_arcs[("FXA", "OFX1")],
+        ("FXB", "OFX"): slogic_arcs[("FXB", "OFX1")],
+        ("M", "OFX"): slogic_arcs[("M1", "OFX1")],
+    }
 
     for entry in carry:
         if entry["type"] != "IOPath":
@@ -325,6 +352,16 @@ def export_cell_timings(cell_database):
         {
             "cell_type": "TRELLIS_COMB",
             "arcs": arcs(lut_arcs),
+            "setup_holds": [],
+        },
+        {
+            "cell_type": "TRELLIS_PFUMX",
+            "arcs": arcs(pfu_arcs),
+            "setup_holds": [],
+        },
+        {
+            "cell_type": "TRELLIS_L6MUX21",
+            "arcs": arcs(l6_arcs),
             "setup_holds": [],
         },
         {
