@@ -392,6 +392,7 @@ fn checkpoint_timing(result: &Ecp5FlowResult) -> Value {
                 "arrival_ps": check.arrival_ps,
                 "clock_arrival_ps": check.clock_arrival_ps,
                 "setup_ps": check.setup_ps,
+                "uncertainty_ps": check.uncertainty_ps,
                 "required_ps": check.required_ps,
                 "slack_ps": check.slack_ps,
             })
@@ -430,7 +431,7 @@ fn checkpoint_timing(result: &Ecp5FlowResult) -> Value {
         .collect::<Vec<_>>();
     let unchecked_endpoints = checkpoint_unchecked_endpoints(result);
     json!({
-        "delay_model": "project_trellis_speed_grade_min_max_ps",
+        "delay_model": "project_trellis_speed_grade_min_max_ps_with_setup_uncertainty",
         "net_delays": net_delays,
         "net_setup_slacks": net_setup_slacks,
         "setup_checks": setup_checks,

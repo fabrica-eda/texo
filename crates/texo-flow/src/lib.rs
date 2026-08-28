@@ -3705,6 +3705,13 @@ fn ecp5_timing_constraints(
     design: &Design,
     packing: &Ecp5Packing,
 ) -> Result<TimingConstraints, Ecp5FlowError> {
+    // Project Trellis timing is an empirical, reverse-engineered model rather
+    // than a sign-off speed file. A routed LFE5UM5G-85F design measured on
+    // hardware failed with 152 ps of reported setup slack at 124 MHz and
+    // passed with 418 ps at 120 MHz. Reserve 250 ps inside that measured
+    // transition interval so marginal routes are repaired instead of being
+    // reported as closed.
+    const ECP5_SETUP_UNCERTAINTY_PS: u64 = 250;
     let mut constraints = TimingConstraints::new();
     for (&cell_id, &frequency_hz) in packing.clock_frequencies_hz() {
         let cell = &design.cells()[cell_id.0];
@@ -3740,6 +3747,14 @@ fn ecp5_timing_constraints(
         if let Some(&period_ps) = constraints.clock_periods_ps().get(&clock.source_net) {
             insert_clock_period(&mut constraints, clock.global_net, period_ps)?;
         }
+    }
+    for net in constraints
+        .clock_periods_ps()
+        .keys()
+        .copied()
+        .collect::<Vec<_>>()
+    {
+        constraints.set_setup_uncertainty_ps(net, ECP5_SETUP_UNCERTAINTY_PS);
     }
     Ok(constraints)
 }
@@ -5143,6 +5158,13 @@ mod tests {
         assert_eq!(packing.clock_frequencies_hz().len(), 1);
         assert_eq!(constraints.clock_periods_ps().len(), 2);
         assert_eq!(constraints.clock_periods_ps()[&global_net], 40_000);
+        assert_eq!(constraints.setup_uncertainties_ps().len(), 2);
+        assert!(
+            constraints
+                .setup_uncertainties_ps()
+                .values()
+                .all(|&uncertainty_ps| uncertainty_ps == 250)
+        );
         assert_eq!(timing_model.clock_to_q(ff_q).unwrap().1.max_ps, 525);
         assert_eq!(timing_model.setup_hold(ff_data).unwrap().2.min_ps, 233);
         assert!(timing_model.setup_hold(ff_lsr).is_none());

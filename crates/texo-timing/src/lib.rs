@@ -22,6 +22,7 @@ pub const PICOSECONDS_PER_SECOND: u64 = 1_000_000_000_000;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TimingConstraints {
     clock_periods_ps: BTreeMap<NetId, u64>,
+    setup_uncertainties_ps: BTreeMap<NetId, u64>,
 }
 
 impl TimingConstraints {
@@ -30,6 +31,7 @@ impl TimingConstraints {
     pub const fn new() -> Self {
         Self {
             clock_periods_ps: BTreeMap::new(),
+            setup_uncertainties_ps: BTreeMap::new(),
         }
     }
 
@@ -42,6 +44,27 @@ impl TimingConstraints {
     #[must_use]
     pub const fn clock_periods_ps(&self) -> &BTreeMap<NetId, u64> {
         &self.clock_periods_ps
+    }
+
+    /// Sets or replaces the setup uncertainty for one clock in picoseconds.
+    ///
+    /// Setup uncertainty reserves timing margin for clock jitter and residual
+    /// error in characterized delay models. It reduces the available data-path
+    /// time without changing the nominal clock period.
+    pub fn set_setup_uncertainty_ps(&mut self, net: NetId, uncertainty_ps: u64) {
+        self.setup_uncertainties_ps.insert(net, uncertainty_ps);
+    }
+
+    /// Per-clock setup uncertainties in stable net-ID order.
+    #[must_use]
+    pub const fn setup_uncertainties_ps(&self) -> &BTreeMap<NetId, u64> {
+        &self.setup_uncertainties_ps
+    }
+
+    /// Setup uncertainty for one clock, or zero when none was specified.
+    #[must_use]
+    pub fn setup_uncertainty_ps(&self, net: NetId) -> u64 {
+        self.setup_uncertainties_ps.get(&net).copied().unwrap_or(0)
     }
 }
 
@@ -235,6 +258,8 @@ pub struct SetupCheck {
     pub clock_arrival_ps: u64,
     /// Latest characterized setup requirement.
     pub setup_ps: u64,
+    /// Reserved setup uncertainty for this clock domain.
+    pub uncertainty_ps: u64,
     /// Required arrival after setup uncertainty.
     pub required_ps: i128,
     /// Required minus actual arrival.
@@ -477,6 +502,7 @@ fn timing_report_from_net_delays(
             data_pin,
             clock_net,
             period_ps,
+            uncertainty_ps: constraints.setup_uncertainty_ps(clock_net),
             arrival,
             clock_arrival,
             common_clock_arrival,
@@ -512,6 +538,7 @@ struct EndpointCheckContext<'a> {
     data_pin: CellPinId,
     clock_net: NetId,
     period_ps: u64,
+    uncertainty_ps: u64,
     arrival: DelayRange,
     clock_arrival: DelayRange,
     common_clock_arrival: DelayRange,
@@ -525,6 +552,7 @@ fn endpoint_checks(context: EndpointCheckContext<'_>) -> (SetupCheck, HoldCheck)
         data_pin,
         clock_net,
         period_ps,
+        uncertainty_ps,
         arrival,
         clock_arrival,
         common_clock_arrival,
@@ -540,7 +568,8 @@ fn endpoint_checks(context: EndpointCheckContext<'_>) -> (SetupCheck, HoldCheck)
         i128::from(common_clock_arrival.max_ps) - i128::from(common_clock_arrival.min_ps);
     let setup_required_ps =
         i128::from(period_ps) + i128::from(clock_arrival.min_ps) + common_clock_pessimism_ps
-            - i128::from(setup.max_ps);
+            - i128::from(setup.max_ps)
+            - i128::from(uncertainty_ps);
     let hold_required_ps =
         i128::from(clock_arrival.max_ps) + i128::from(hold.max_ps) - common_clock_pessimism_ps;
     (
@@ -551,6 +580,7 @@ fn endpoint_checks(context: EndpointCheckContext<'_>) -> (SetupCheck, HoldCheck)
             arrival_ps: arrival.max_ps,
             clock_arrival_ps: clock_arrival.min_ps,
             setup_ps: setup.max_ps,
+            uncertainty_ps,
             required_ps: setup_required_ps,
             slack_ps: setup_required_ps - i128::from(arrival.max_ps),
         },
@@ -1053,6 +1083,26 @@ mod tests {
                 .all(|edge| edge.slack_ps == 10)
         );
         assert!(passed.met_timing());
+
+        constraints.set_setup_uncertainty_ps(clock_net, 20);
+        let guarded = analyze_timing(
+            &design,
+            &device,
+            &implementation,
+            &pip_delays,
+            &model,
+            &constraints,
+        )
+        .unwrap();
+        assert_eq!(guarded.setup_checks[0].uncertainty_ps, 20);
+        assert_eq!(guarded.worst_slack_ps, Some(-10));
+        assert!(
+            guarded
+                .net_setup_slacks
+                .iter()
+                .all(|edge| edge.slack_ps == -10)
+        );
+        assert!(!guarded.met_timing());
     }
 
     #[test]
