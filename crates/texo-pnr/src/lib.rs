@@ -4674,6 +4674,8 @@ fn route(
     let mut routing_order = routing_order(design, constraints, costs);
     routing_order.sort_unstable();
     let mut dirty = BTreeMap::<usize, BTreeSet<CellPinId>>::new();
+    let mut escape_priority = BTreeSet::<usize>::new();
+    let mut repeated_victims = 0_u32;
     for (index, (net, route)) in design.nets().iter().zip(&routes).enumerate() {
         let route = route.as_ref();
         for &sink in &net.sinks {
@@ -4757,15 +4759,20 @@ fn route(
                 present_factor,
             );
         }
-        let mut ordinal = 0;
-        for &(_, index) in &routing_order {
-            if !dirty.contains_key(&index) {
-                continue;
-            }
-            ordinal += 1;
+        let mut iteration_order = routing_order
+            .iter()
+            .copied()
+            .filter(|&(_, index)| dirty.contains_key(&index))
+            .collect::<Vec<_>>();
+        if !escape_priority.is_empty() {
+            iteration_order
+                .sort_unstable_by_key(|&(key, index)| (!escape_priority.contains(&index), key));
+        }
+        escape_priority.clear();
+        for (ordinal, (_, index)) in iteration_order.into_iter().enumerate() {
             progress(RoutingProgress::Net {
                 iteration,
-                ordinal,
+                ordinal: ordinal + 1,
                 total: dirty.len(),
                 net: NetId(index),
             });
@@ -4847,7 +4854,7 @@ fn route(
                 .map(|route| route.expect("every net was routed in this iteration"))
                 .collect());
         }
-        dirty = if overuse
+        let mut next_dirty = if overuse
             .wires
             .iter()
             .all(|&wire| metadata.wire_capacities[wire] == 1)
@@ -4875,14 +4882,104 @@ fn route(
                 connection_owners,
             )
         };
+        if next_dirty == dirty {
+            repeated_victims += 1;
+        } else {
+            repeated_victims = 0;
+        }
+        if repeated_victims >= ROUTING_STALL_ESCAPE_ITERATIONS {
+            escape_priority.extend(next_dirty.keys().copied());
+            mark_all_connection_owners(&connection_owners.wires, constraints, &mut next_dirty);
+            mark_all_connection_owners(&connection_owners.pips, constraints, &mut next_dirty);
+            repeated_victims = 0;
+        }
+        dirty = next_dirty;
         resource_owners.resolve_conflicts(&routes, &dirty);
     }
 
+    if std::env::var_os("TEXO_PNR_METRICS").is_some() {
+        for &index in &overuse.wires {
+            let wire = WireId(index);
+            let owners = routes
+                .iter()
+                .flatten()
+                .filter(|route| route.wire_ref_count(wire) != 0)
+                .map(|route| {
+                    let net = &design.nets()[route.net.0];
+                    let driver_pin = &design.pins()[net.driver.0];
+                    let driver_cell = &design.cells()[driver_pin.cell.0];
+                    let driver_bel = placement.bel(driver_pin.cell).map_or("<unplaced>", |bel| {
+                        graph.device().bels()[bel.0].name.as_str()
+                    });
+                    let affected_sinks = route
+                        .arcs
+                        .iter()
+                        .filter(|arc| arc.wires.contains(&wire))
+                        .filter_map(|arc| arc.sink)
+                        .map(|sink| {
+                            let pin = &design.pins()[sink.0];
+                            let cell = &design.cells()[pin.cell.0];
+                            let bel = placement.bel(pin.cell).map_or("<unplaced>", |bel| {
+                                graph.device().bels()[bel.0].name.as_str()
+                            });
+                            format!("{}.{}/{}", cell.name, pin.name, bel)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    format!(
+                        "{}:{} driver={}.{}/{} sinks={}{}",
+                        route.net.0,
+                        net.name,
+                        driver_cell.name,
+                        driver_pin.name,
+                        driver_bel,
+                        affected_sinks,
+                        if dirty.contains_key(&route.net.0) {
+                            " (dirty)"
+                        } else {
+                            " (preserved)"
+                        }
+                    )
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "[metrics] unresolved_wire id={} name={} point={:?} occupancy={} capacity={} owners=[{}]",
+                index,
+                graph.device().wires()[index].name,
+                graph.device().wires()[index].point,
+                wire_occupancy[index],
+                metadata.wire_capacities[index],
+                owners.join(", ")
+            );
+        }
+    }
     Err(PnrError::CongestionNotResolved {
         iterations: max_iterations,
         overused_wires: overuse.wires.len(),
         overused_pips: overuse.pips.len(),
     })
+}
+
+const ROUTING_STALL_ESCAPE_ITERATIONS: u32 = 4;
+
+fn mark_all_connection_owners(
+    records: &[ConnectionOwner],
+    constraints: &RoutingConstraints,
+    dirty: &mut BTreeMap<usize, BTreeSet<CellPinId>>,
+) {
+    for owner in records {
+        let Some(sink) = owner.sink else {
+            continue;
+        };
+        if constraints
+            .routes()
+            .get(&owner.net)
+            .is_some_and(|route| route.arc(sink).is_some())
+        {
+            continue;
+        }
+        dirty.entry(owner.net.0).or_default().insert(sink);
+    }
 }
 
 fn increment_occupancy(occupancy: &mut [u16], touched: &mut Vec<usize>, index: usize) {
@@ -7324,6 +7421,131 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn stalled_victim_reroutes_the_incumbent_with_an_escape_path() {
+        let mut design = Design::new();
+        let movable_source = design.add_cell("source_a", ResourceKind::Logic);
+        let movable_output = design
+            .add_pin(movable_source, "O", PinDirection::Output)
+            .unwrap();
+        let movable_sink = design.add_cell("sink_a", ResourceKind::Register);
+        let movable_input = design
+            .add_pin(movable_sink, "I", PinDirection::Input)
+            .unwrap();
+        let bottlenecked_source = design.add_cell("source_b", ResourceKind::Logic);
+        let bottlenecked_output = design
+            .add_pin(bottlenecked_source, "O", PinDirection::Output)
+            .unwrap();
+        let bottlenecked_sink = design.add_cell("sink_b", ResourceKind::Register);
+        let bottlenecked_input = design
+            .add_pin(bottlenecked_sink, "I", PinDirection::Input)
+            .unwrap();
+        design
+            .add_net("movable", movable_output, [movable_input])
+            .unwrap();
+        design
+            .add_net("bottlenecked", bottlenecked_output, [bottlenecked_input])
+            .unwrap();
+
+        let mut device = Device::new("stall-escape", 7, 1).unwrap();
+        let movable_source_wire = device.add_wire("source_a", Point::new(0, 0), 1).unwrap();
+        let bottlenecked_source_wire = device.add_wire("source_b", Point::new(1, 0), 1).unwrap();
+        let shared = device.add_wire("shared", Point::new(2, 0), 1).unwrap();
+        let alternate_a = device.add_wire("alternate_a", Point::new(3, 0), 1).unwrap();
+        let alternate_b = device.add_wire("alternate_b", Point::new(4, 0), 1).unwrap();
+        let movable_sink_wire = device.add_wire("sink_a", Point::new(5, 0), 1).unwrap();
+        let bottlenecked_sink_wire = device.add_wire("sink_b", Point::new(6, 0), 1).unwrap();
+
+        let movable_source_bel = device
+            .add_bel("source_a", ResourceKind::Logic, Point::new(0, 0))
+            .unwrap();
+        device
+            .add_bel_pin(
+                movable_source_bel,
+                "O",
+                PinDirection::Output,
+                movable_source_wire,
+            )
+            .unwrap();
+        let movable_sink_bel = device
+            .add_bel("sink_a", ResourceKind::Register, Point::new(5, 0))
+            .unwrap();
+        device
+            .add_bel_pin(
+                movable_sink_bel,
+                "I",
+                PinDirection::Input,
+                movable_sink_wire,
+            )
+            .unwrap();
+        let bottlenecked_source_bel = device
+            .add_bel("source_b", ResourceKind::Logic, Point::new(1, 0))
+            .unwrap();
+        device
+            .add_bel_pin(
+                bottlenecked_source_bel,
+                "O",
+                PinDirection::Output,
+                bottlenecked_source_wire,
+            )
+            .unwrap();
+        let bottlenecked_sink_bel = device
+            .add_bel("sink_b", ResourceKind::Register, Point::new(6, 0))
+            .unwrap();
+        device
+            .add_bel_pin(
+                bottlenecked_sink_bel,
+                "I",
+                PinDirection::Input,
+                bottlenecked_sink_wire,
+            )
+            .unwrap();
+
+        device
+            .add_pip(movable_source_wire, shared, false, 1)
+            .unwrap();
+        device.add_pip(shared, movable_sink_wire, false, 1).unwrap();
+        device
+            .add_pip(movable_source_wire, alternate_a, false, 1)
+            .unwrap();
+        device.add_pip(alternate_a, alternate_b, false, 1).unwrap();
+        device
+            .add_pip(alternate_b, movable_sink_wire, false, 1)
+            .unwrap();
+        device
+            .add_pip(bottlenecked_source_wire, shared, false, 1)
+            .unwrap();
+        device
+            .add_pip(shared, bottlenecked_sink_wire, false, 1)
+            .unwrap();
+
+        let bindings = BTreeMap::from([
+            (movable_source, movable_source_bel),
+            (movable_sink, movable_sink_bel),
+            (bottlenecked_source, bottlenecked_source_bel),
+            (bottlenecked_sink, bottlenecked_sink_bel),
+        ]);
+        let placement = placement_from_partial_bindings(
+            &design,
+            &device,
+            &PlacementConstraints::new(),
+            &bindings,
+        )
+        .unwrap();
+        let routed = route_with_placement_and_progress(
+            &design,
+            &device,
+            placement,
+            &RoutingConstraints::new(),
+            |_| {},
+        )
+        .unwrap();
+
+        assert!(!routed.routes[0].wires().any(|wire| wire == shared));
+        assert!(routed.routes[1].wires().any(|wire| wire == shared));
     }
 
     #[test]
