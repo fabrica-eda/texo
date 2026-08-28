@@ -684,14 +684,14 @@ impl Ecp5Packing {
         &self.constraints
     }
 
-    /// LUT4 cells packed into dedicated ECP5 LUT5/LUT6 cascades.
+    /// LUT4 cells packed into dedicated ECP5 LUT5/LUT6/LUT7 cascades.
     #[must_use]
     pub fn wide_lut_clusters(&self) -> &[Vec<CellId>] {
         self.wide_lut_clusters.as_deref().unwrap_or_default()
     }
 
-    /// Constrains two- and four-LUT clusters to the `PFUMX`/`L6MUX21`
-    /// dedicated topology used by nextpnr-ecp5.
+    /// Constrains two-, four-, and eight-LUT clusters to the
+    /// `PFUMX`/`L6MUX21` dedicated topology used by nextpnr-ecp5.
     ///
     /// # Errors
     ///
@@ -710,7 +710,7 @@ impl Ecp5Packing {
         let mut packed = Vec::new();
         let mut assignments_by_size = BTreeMap::<usize, Arc<[Vec<BelId>]>>::new();
         for cluster in clusters {
-            if !matches!(cluster.len(), 2 | 4) {
+            if !matches!(cluster.len(), 2 | 4 | 8) {
                 return Err(PackingError::InvalidWideLutClusterSize(cluster.len()));
             }
             for &cell in &cluster {
@@ -2040,6 +2040,19 @@ fn wide_lut_assignments(architecture: &Ecp5Architecture, cluster_size: usize) ->
                 &["A", "B", "C", "D", "F"],
             ],
         ),
+        8 => (
+            32,
+            &[
+                &["A", "B", "C", "D", "F", "F1", "M", "OFX"],
+                &["A", "B", "C", "D", "F", "FXA", "FXB", "M", "OFX"],
+                &["A", "B", "C", "D", "F", "F1", "M", "OFX"],
+                &["A", "B", "C", "D", "F", "FXA", "FXB", "M", "OFX"],
+                &["A", "B", "C", "D", "F", "F1", "M", "OFX"],
+                &["A", "B", "C", "D", "F", "FXA", "FXB", "M", "OFX"],
+                &["A", "B", "C", "D", "F", "F1", "M", "OFX"],
+                &["A", "B", "C", "D", "F"],
+            ],
+        ),
         _ => return Vec::new(),
     };
     let mut assignments = Vec::new();
@@ -2089,6 +2102,30 @@ fn valid_wide_lut_cluster(design: &Design, cluster: &[CellId]) -> bool {
                 && drives(*zero_child, "F", *zero_root, "F1")
                 && drives(*zero_root, "OFX", *l6_root, "FXA")
                 && drives(*one_root, "OFX", *l6_root, "FXB")
+        }
+        [
+            one_one_root,
+            one_l6_root,
+            one_zero_root,
+            l7_root,
+            zero_one_root,
+            zero_l6_root,
+            zero_zero_root,
+            zero_zero_child,
+        ] => {
+            valid_wide_lut_cluster(
+                design,
+                &[*one_one_root, *one_l6_root, *one_zero_root, *l7_root],
+            ) && valid_wide_lut_cluster(
+                design,
+                &[
+                    *zero_one_root,
+                    *zero_l6_root,
+                    *zero_zero_root,
+                    *zero_zero_child,
+                ],
+            ) && drives(*zero_l6_root, "OFX", *l7_root, "FXA")
+                && drives(*one_l6_root, "OFX", *l7_root, "FXB")
         }
         _ => false,
     }
@@ -2680,7 +2717,7 @@ pub enum PackingError {
     },
     /// Wide-LUT packing was invoked more than once.
     WideLutsAlreadyPacked,
-    /// A wide-LUT cluster contained neither two nor four LUT4 cells.
+    /// A wide-LUT cluster contained neither two, four, nor eight LUT4 cells.
     InvalidWideLutClusterSize(usize),
     /// A wide-LUT requirement referenced an unknown cell.
     UnknownWideLutCell(CellId),
@@ -3867,7 +3904,8 @@ mod tests {
         MemoryCell, Netlist, RegisterCell,
     };
     use struo_target_ecp5::{
-        ArithmeticMapping, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
+        ArithmeticMapping, IoTimingConstraints, MappingOptions, map_to_ecp5,
+        map_to_ecp5_with_constraints, map_to_ecp5_with_options,
     };
     use texo_model::{
         BelId, CellId, Design, PinDirection, PipId, Point, ResourceKind, UnifiedGraph, WireId,
@@ -3879,11 +3917,11 @@ mod tests {
 
     use super::{
         ArchitectureFile, BlockRamRequirement, BlockedGlobalResources, CompactIncomingPips,
-        GlobalClockRequirement, GlobalReverseSearch, ImportError, LogicalPort, LutFfPair,
-        PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, TileRecord, expand,
-        find_bel_pin, find_global_clock_requirements, logical_carry_chains, pack_lut_ffs,
+        Ecp5Packing, GlobalClockRequirement, GlobalReverseSearch, ImportError, LogicalPort,
+        LutFfPair, PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, TileRecord,
+        expand, find_bel_pin, find_global_clock_requirements, logical_carry_chains, pack_lut_ffs,
         pack_lut_ffs_excluding, pack_lut_ffs_with_pairs, parse_lpf, read_architecture,
-        read_architecture_cache, resolve_lpf_port_cells, resolve_lpf_ports,
+        read_architecture_cache, resolve_lpf_port_cells, resolve_lpf_ports, valid_wide_lut_cluster,
         write_architecture_cache,
     };
 
@@ -4211,6 +4249,58 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 4, 8, 12]
         );
+    }
+
+    #[test]
+    fn accepts_a_nested_l6mux21_lut7_cluster() {
+        let mut source = Netlist::new("seven_input_parity");
+        let inputs = source.add_input_port("inputs", NonZeroU32::new(7).unwrap());
+        let parity = inputs[1..]
+            .iter()
+            .fold(inputs[0], |value, input| source.add_xor(value, *input));
+        source.add_output("result", parity);
+        let constraints = IoTimingConstraints::new()
+            .with_input_delay_ps("inputs", 0)
+            .with_output_delay_ps("result", 0);
+        let mapped = map_to_ecp5_with_constraints(
+            &source,
+            MappingOptions {
+                timing_goal_mhz: 1_500,
+                ..MappingOptions::default()
+            },
+            &constraints,
+        )
+        .unwrap();
+        let imported = import_ecp5(&mapped).unwrap();
+        let [cluster] = imported.wide_lut_clusters() else {
+            panic!("expected one LUT7 cluster")
+        };
+        assert!(valid_wide_lut_cluster(imported.design(), cluster));
+
+        // The compact fixture models only half a PLC. Extend its repeated
+        // logic-cell pattern to the eight slots exposed by a complete PLC.
+        let mut file: ArchitectureFile = serde_json::from_str(FIXTURE).unwrap();
+        let tail = file.location_types[0].bels[..4].to_vec();
+        let top_mux_pins = tail[1]
+            .pins
+            .iter()
+            .filter(|pin| matches!(pin.name.as_str(), "FXA" | "FXB" | "M" | "OFX"))
+            .cloned()
+            .collect::<Vec<_>>();
+        file.location_types[0].bels[3].pins.extend(top_mux_pins);
+        for (index, mut bel) in tail.into_iter().enumerate() {
+            bel.name = format!("LUT7.EXTRA{index}");
+            bel.z += 16;
+            file.location_types[0].bels.push(bel);
+        }
+        let architecture = expand(file).unwrap();
+        let mut packing = Ecp5Packing::default();
+
+        packing
+            .pack_wide_luts(imported.design(), &architecture, [cluster.clone()])
+            .unwrap();
+
+        assert_eq!(packing.wide_lut_clusters(), std::slice::from_ref(cluster));
     }
 
     #[test]
