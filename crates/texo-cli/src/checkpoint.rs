@@ -260,6 +260,12 @@ fn checkpoint_absorbed_inputs(result: &Ecp5FlowResult) -> Vec<Value> {
 }
 
 fn checkpoint_packing(result: &Ecp5FlowResult) -> Value {
+    let wide_lut_clusters = result
+        .packing
+        .wide_lut_clusters()
+        .iter()
+        .map(|cluster| cluster.iter().map(|cell| cell.0).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
     let lut_ff_pairs = result
         .packing
         .lut_ff_pairs()
@@ -335,6 +341,7 @@ fn checkpoint_packing(result: &Ecp5FlowResult) -> Value {
         })
         .collect::<Vec<_>>();
     json!({
+        "wide_lut_clusters": wide_lut_clusters,
         "lut_ff_pairs": lut_ff_pairs,
         "carry_pairs": carry_pairs,
         "general_routing_ffs": result.packing.general_routing_ffs().iter().map(|cell| cell.0).collect::<Vec<_>>(),
