@@ -1722,6 +1722,42 @@ impl<'a> PlacementRefiner<'a> {
             &self.units,
             &self.spatial_indexes,
             sink_weights,
+            None,
+        )
+    }
+
+    /// Re-solves analytical placement while softly anchoring every movable
+    /// unit to a previously legalized placement.
+    ///
+    /// The anchor prevents timing feedback from replacing a good placement
+    /// basin wholesale. Successive solve/legalize iterations can therefore
+    /// adjust critical connectivity continuously. `iteration` starts at one
+    /// and strengthens the anchor as the iteration progresses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the anchor is incompatible with this placement
+    /// problem or when the resulting analytical placement cannot be legalized.
+    pub fn place_analytically_anchored(
+        &self,
+        sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
+        anchor: &Placement,
+        iteration: u32,
+    ) -> Result<Placement, PnrError> {
+        let _ = validate_refinement_start(
+            &self.graph,
+            self.constraints,
+            &self.units,
+            anchor.clone(),
+            Some(&self.spatial_indexes),
+        )?;
+        analytical_place(
+            &self.graph,
+            self.constraints,
+            &self.units,
+            &self.spatial_indexes,
+            sink_weights,
+            Some((anchor, iteration.max(1))),
         )
     }
 
@@ -2861,8 +2897,10 @@ fn analytical_place(
     units: &[PlacementUnit],
     spatial_indexes: &BTreeMap<(u8, usize), Arc<SpatialChoiceIndex>>,
     sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
+    anchor: Option<(&Placement, u32)>,
 ) -> Result<Placement, PnrError> {
     const CENTER_WEIGHT: f64 = 0.01;
+    const ANCHOR_ALPHA: f64 = 0.1;
     let design = graph.design();
     let device = graph.device();
     let (_, neighbors) = placement_neighbors(design, None, Some(sink_weights), None);
@@ -2939,6 +2977,28 @@ fn analytical_place(
     let initial_y = vec![f64::from(center.y); units.len()];
     let mut solved_x = solve_quadratic(&diagonal, &adjacency, &rhs_x, initial_x);
     let mut solved_y = solve_quadratic(&diagonal, &adjacency, &rhs_y, initial_y);
+    if let Some((anchor, iteration)) = anchor {
+        for (index, unit) in units.iter().enumerate() {
+            if fixed[index].is_some() {
+                continue;
+            }
+            let anchor_bel = anchor.bindings()[unit.cells[0].0];
+            let anchor_point = device.bels()[anchor_bel.0].point;
+            let distance = (solved_x[index] - f64::from(anchor_point.x)).abs()
+                + (solved_y[index] - f64::from(anchor_point.y)).abs();
+            // Placement edges use a fanout-normalized integer scale (a
+            // one-sink edge is 64), so express the anchor relative to this
+            // unit's diagonal instead of relying on an architecture-specific
+            // absolute coefficient.
+            let weight =
+                diagonal[index].max(1.0) * ANCHOR_ALPHA * f64::from(iteration) / distance.max(1.0);
+            diagonal[index] += weight;
+            rhs_x[index] += weight * f64::from(anchor_point.x);
+            rhs_y[index] += weight * f64::from(anchor_point.y);
+        }
+        solved_x = solve_quadratic(&diagonal, &adjacency, &rhs_x, solved_x);
+        solved_y = solve_quadratic(&diagonal, &adjacency, &rhs_y, solved_y);
+    }
     for density_weight in [0.05, 0.10, 0.20, 0.40] {
         let (target_x, target_y) =
             analytic_spread_targets(units, &fixed, device, solved_x.clone(), solved_y.clone());
@@ -6563,6 +6623,32 @@ mod tests {
 
         assert_eq!(first, second);
         assert_ne!(first.bindings()[0], first.bindings()[1]);
+    }
+
+    #[test]
+    fn anchored_analytical_placement_stays_near_the_legalized_incumbent() {
+        let design = two_cell_design();
+        let device = Device::rectangular_logic(9, 1).unwrap();
+        let mut constraints = PlacementConstraints::new();
+        constraints.add_group([CellId(1)], [vec![BelId(8)]]);
+        let refiner = PlacementRefiner::new(&design, &device, &constraints).unwrap();
+        let anchor = Placement {
+            bindings: vec![BelId(0), BelId(8)],
+            pin_bindings: BTreeMap::new(),
+        };
+
+        let unanchored = refiner.place_analytically(&BTreeMap::new()).unwrap();
+        let anchored = refiner
+            .place_analytically_anchored(&BTreeMap::new(), &anchor, 100)
+            .unwrap();
+        let anchor_point = device.bels()[anchor.bindings()[0].0].point;
+        let unanchored_point = device.bels()[unanchored.bindings()[0].0].point;
+        let anchored_point = device.bels()[anchored.bindings()[0].0].point;
+
+        assert!(
+            anchored_point.manhattan(anchor_point) < unanchored_point.manhattan(anchor_point),
+            "anchor={anchor_point:?}, anchored={anchored_point:?}, unanchored={unanchored_point:?}"
+        );
     }
 
     #[test]

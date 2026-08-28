@@ -1275,7 +1275,8 @@ impl TimingDrivenContext<'_, '_, '_> {
         }
         routing_costs
             .set_sink_criticalities(timing_arc_weights(&initial_timing, self.timing_constraints));
-        let timed_candidate = self.timing_driven_seed(&initial_timing, routing_costs, progress)?;
+        let initial = (&initial_implementation, &initial_timing);
+        let timed_candidate = self.timing_driven_seed(initial, routing_costs, progress)?;
         let mut seeds = vec![(initial_implementation, initial_timing)];
         if let Some(candidate) = timed_candidate {
             seeds.push(candidate);
@@ -1408,39 +1409,67 @@ impl TimingDrivenContext<'_, '_, '_> {
         Ok(archive)
     }
 
-    /// Routes an independently solved timing-weighted placement seed.
+    /// Iterates timing-weighted analytical placement from a legalized anchor.
     ///
-    /// A connectivity-only analytical solve is a strong default for sparse
-    /// logic, but fixed resources such as BRAMs can leave it in a placement
-    /// basin that local refinement cannot escape. Measured STA still selects
-    /// between the two seeds, and failure to route this speculative alternative
-    /// does not invalidate the already legal initial implementation.
+    /// Each accepted route becomes the next anchor and supplies fresh timing
+    /// weights. This keeps the solve in the incumbent's placement basin while
+    /// letting timing feedback move it continuously; real routed STA gates
+    /// every iteration, so a regressing speculative solve cannot replace the
+    /// already legal implementation.
     fn timing_driven_seed(
         &mut self,
-        initial_timing: &TimingReport,
-        routing_costs: &RoutingCosts,
+        initial: (&PnrResult, &TimingReport),
+        routing_costs: &mut RoutingCosts,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<Option<TimingCandidate>, Ecp5FlowError> {
-        let placement =
-            self.placement_refiner
-                .place_analytically(&timing_placement_weights_with_exponent(
-                    initial_timing,
-                    self.timing_constraints,
-                    self.placement_weight_exponent,
-                ))?;
-        progress(Ecp5FlowStage::TimingDrivenPlaced);
-        let routing = self.packing.global_routing_constraints_cached(
-            self.design,
-            self.architecture,
-            &placement,
-            self.global_routing_cache,
-        )?;
-        progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
-        match self.route_and_analyze(placement, &routing, Some(routing_costs), progress) {
-            Ok(candidate) => Ok(Some(candidate)),
-            Err(Ecp5FlowError::Pnr(_)) => Ok(None),
-            Err(error) => Err(error),
+        let (initial_implementation, initial_timing) = initial;
+        let mut anchor = initial_implementation.placement.clone();
+        let mut feedback = initial_timing.clone();
+        let mut best_score = timing_score(initial_timing);
+        let mut best = None;
+        for iteration in 1..=MAX_ANCHORED_PLACEMENT_ROUNDS {
+            let weights = timing_placement_weights_with_exponent(
+                &feedback,
+                self.timing_constraints,
+                self.placement_weight_exponent,
+            );
+            let placement = self
+                .placement_refiner
+                .place_analytically_anchored(&weights, &anchor, iteration)?;
+            progress(Ecp5FlowStage::TimingDrivenPlaced);
+            if placement == anchor {
+                break;
+            }
+            let routing = self.packing.global_routing_constraints_cached(
+                self.design,
+                self.architecture,
+                &placement,
+                self.global_routing_cache,
+            )?;
+            progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
+            routing_costs
+                .set_net_criticalities(timing_net_weights(&feedback, self.timing_constraints));
+            routing_costs
+                .set_sink_criticalities(timing_arc_weights(&feedback, self.timing_constraints));
+            routing_costs.set_sink_min_delays_ps(BTreeMap::new());
+            let candidate =
+                match self.route_and_analyze(placement, &routing, Some(routing_costs), progress) {
+                    Ok(candidate) => candidate,
+                    Err(Ecp5FlowError::Pnr(_)) => break,
+                    Err(error) => return Err(error),
+                };
+            let score = timing_score(&candidate.1);
+            let improves_objective = score > best_score;
+            progress(Ecp5FlowStage::TimingTrialDecision { improves_objective });
+            if !improves_objective {
+                break;
+            }
+            best_score = score;
+            anchor = candidate.0.placement.clone();
+            feedback = candidate.1.clone();
+            best = Some(candidate);
         }
+        Ok(best)
     }
 
     /// Nets touching a cell whose BEL differs between the two placements.
@@ -2858,6 +2887,7 @@ const LOCAL_CRITICAL_BATCH_MIN_WNS_GAIN_PS: i128 = 32;
 const LOCAL_BATCH_RECOVERY_WNS_PS: i128 = -800;
 const LOCAL_BATCH_NEAR_CLOSURE_WNS_PS: i128 = -400;
 const MAX_PROJECTED_PATH_CELL_CANDIDATES: usize = 4;
+const MAX_ANCHORED_PLACEMENT_ROUNDS: u32 = 4;
 const MAX_CRITICAL_CLOSURE_ROUNDS: usize = 4;
 const MAX_FMAX_CLOSURE_ROUNDS: usize = 4;
 const MAX_CRITICAL_PATH_VERTEX_REFINEMENTS: usize = 4;
