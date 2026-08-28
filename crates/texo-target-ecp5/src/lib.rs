@@ -653,6 +653,7 @@ pub const ECP5_GLOBAL_CLOCK_COUNT: usize = 16;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Ecp5Packing {
     constraints: PlacementConstraints,
+    wide_lut_clusters: Option<Vec<Vec<CellId>>>,
     carry_pairs: Vec<[CellId; 2]>,
     carry_pairs_packed: bool,
     lut_ff_pairs: Vec<LutFfPair>,
@@ -681,6 +682,74 @@ impl Ecp5Packing {
     #[must_use]
     pub const fn constraints(&self) -> &PlacementConstraints {
         &self.constraints
+    }
+
+    /// LUT4 cells packed into dedicated ECP5 LUT5/LUT6 cascades.
+    #[must_use]
+    pub fn wide_lut_clusters(&self) -> &[Vec<CellId>] {
+        self.wide_lut_clusters.as_deref().unwrap_or_default()
+    }
+
+    /// Constrains two- and four-LUT clusters to the `PFUMX`/`L6MUX21`
+    /// dedicated topology used by nextpnr-ecp5.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for repeated, unknown, overlapping, or structurally
+    /// incompatible cells, an unavailable physical cluster, or a second call.
+    pub fn pack_wide_luts(
+        &mut self,
+        design: &Design,
+        architecture: &Ecp5Architecture,
+        clusters: impl IntoIterator<Item = Vec<CellId>>,
+    ) -> Result<(), PackingError> {
+        if self.wide_lut_clusters.is_some() {
+            return Err(PackingError::WideLutsAlreadyPacked);
+        }
+        let mut occupied = BTreeSet::new();
+        let mut packed = Vec::new();
+        let mut assignments_by_size = BTreeMap::<usize, Arc<[Vec<BelId>]>>::new();
+        for cluster in clusters {
+            if !matches!(cluster.len(), 2 | 4) {
+                return Err(PackingError::InvalidWideLutClusterSize(cluster.len()));
+            }
+            for &cell in &cluster {
+                let Some(logical) = design.cells().get(cell.0) else {
+                    return Err(PackingError::UnknownWideLutCell(cell));
+                };
+                if logical.kind != ResourceKind::Lut(4) {
+                    return Err(PackingError::CellIsNotWideLut {
+                        cell: logical.name.clone(),
+                    });
+                }
+                if !occupied.insert(cell) {
+                    return Err(PackingError::DuplicateWideLutCell {
+                        cell: logical.name.clone(),
+                    });
+                }
+            }
+            if !valid_wide_lut_cluster(design, &cluster) {
+                return Err(PackingError::InvalidWideLutStructure {
+                    cell: design.cells()[cluster[0].0].name.clone(),
+                });
+            }
+            let assignments = assignments_by_size
+                .entry(cluster.len())
+                .or_insert_with(|| Arc::from(wide_lut_assignments(architecture, cluster.len())));
+            if assignments.is_empty() {
+                return Err(PackingError::MissingWideLutCluster {
+                    cell: design.cells()[cluster[0].0].name.clone(),
+                    size: cluster.len(),
+                });
+            }
+            self.constraints.add_group_with_shared_assignments(
+                cluster.iter().copied(),
+                Arc::clone(assignments),
+            );
+            packed.push(cluster);
+        }
+        self.wide_lut_clusters = Some(packed);
+        Ok(())
     }
 
     /// Constrains both FFs in each ECP5 slice to one compatible CE control set.
@@ -1946,6 +2015,85 @@ fn physical_carry_pairs(architecture: &Ecp5Architecture) -> Vec<[BelId; 2]> {
     assignments
 }
 
+fn wide_lut_assignments(architecture: &Ecp5Architecture, cluster_size: usize) -> Vec<Vec<BelId>> {
+    let mut comb_by_slot = BTreeMap::new();
+    for &bel in architecture.device().bels_of_kind(ResourceKind::Lut(4)) {
+        let metadata = architecture.bel_metadata(bel);
+        if metadata.bel_type == "TRELLIS_COMB" {
+            comb_by_slot.insert((architecture.device().bels()[bel.0].point, metadata.z), bel);
+        }
+    }
+    let (alignment, required_pins): (i32, &[&[&str]]) = match cluster_size {
+        2 => (
+            8,
+            &[
+                &["A", "B", "C", "D", "F", "F1", "M", "OFX"],
+                &["A", "B", "C", "D", "F"],
+            ],
+        ),
+        4 => (
+            16,
+            &[
+                &["A", "B", "C", "D", "F", "F1", "M", "OFX"],
+                &["A", "B", "C", "D", "F", "FXA", "FXB", "M", "OFX"],
+                &["A", "B", "C", "D", "F", "F1", "M", "OFX"],
+                &["A", "B", "C", "D", "F"],
+            ],
+        ),
+        _ => return Vec::new(),
+    };
+    let mut assignments = Vec::new();
+    for &(point, z) in comb_by_slot.keys() {
+        if z.rem_euclid(alignment) != 0 {
+            continue;
+        }
+        let Some(bels) = (0..cluster_size)
+            .map(|index| {
+                let offset = i32::try_from(index).ok()?.checked_mul(4)?;
+                comb_by_slot.get(&(point, z.checked_add(offset)?)).copied()
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if bels.iter().zip(required_pins).all(|(&bel, pins)| {
+            pins.iter()
+                .all(|pin| find_bel_pin(architecture.device(), bel, pin).is_some())
+        }) {
+            assignments.push(bels);
+        }
+    }
+    assignments
+}
+
+fn valid_wide_lut_cluster(design: &Design, cluster: &[CellId]) -> bool {
+    let drives = |source: CellId, output: &str, sink: CellId, input: &str| {
+        let Some(sink_pin) = design.cells()[sink.0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == input)
+        else {
+            return false;
+        };
+        let Some(net) = design.pins()[sink_pin.0].net() else {
+            return false;
+        };
+        let driver = &design.pins()[design.nets()[net.0].driver.0];
+        driver.cell == source && driver.name == output
+    };
+    match cluster {
+        [root, child] => drives(*child, "F", *root, "F1"),
+        [one_root, l6_root, zero_root, zero_child] => {
+            drives(*l6_root, "F", *one_root, "F1")
+                && drives(*zero_child, "F", *zero_root, "F1")
+                && drives(*zero_root, "OFX", *l6_root, "FXA")
+                && drives(*one_root, "OFX", *l6_root, "FXB")
+        }
+        _ => false,
+    }
+}
+
 fn carry_chain_assignments(architecture: &Ecp5Architecture, pair_count: usize) -> Vec<Vec<BelId>> {
     let pairs = physical_carry_pairs(architecture);
     if pair_count == 0 {
@@ -2277,6 +2425,7 @@ pub fn pack_lut_ffs_excluding(
 
     Ok(Ecp5Packing {
         constraints,
+        wide_lut_clusters: None,
         carry_pairs: Vec::new(),
         carry_pairs_packed: false,
         lut_ff_pairs,
@@ -2440,6 +2589,7 @@ pub fn pack_lut_ffs_with_pairs(
 
     Ok(Ecp5Packing {
         constraints,
+        wide_lut_clusters: None,
         carry_pairs: Vec::new(),
         carry_pairs_packed: false,
         lut_ff_pairs,
@@ -2527,6 +2677,34 @@ pub enum PackingError {
         ff: String,
         /// Structural reason.
         reason: String,
+    },
+    /// Wide-LUT packing was invoked more than once.
+    WideLutsAlreadyPacked,
+    /// A wide-LUT cluster contained neither two nor four LUT4 cells.
+    InvalidWideLutClusterSize(usize),
+    /// A wide-LUT requirement referenced an unknown cell.
+    UnknownWideLutCell(CellId),
+    /// A wide-LUT requirement referenced a non-LUT4 cell.
+    CellIsNotWideLut {
+        /// Logical cell name.
+        cell: String,
+    },
+    /// One LUT4 occurred in more than one wide-LUT cluster.
+    DuplicateWideLutCell {
+        /// Logical cell name.
+        cell: String,
+    },
+    /// A wide-LUT cluster did not contain the required F/F1/OFX/FX topology.
+    InvalidWideLutStructure {
+        /// First logical LUT name.
+        cell: String,
+    },
+    /// No physical PFUMX/L6MUX21 cluster can implement the requirement.
+    MissingWideLutCluster {
+        /// First logical LUT name.
+        cell: String,
+        /// Required LUT4 count.
+        size: usize,
     },
     /// Carry-pair packing was invoked more than once.
     CarryPairsAlreadyPacked,
@@ -2701,6 +2879,27 @@ impl fmt::Display for PackingError {
             Self::InvalidLutFfPair { lut, ff, reason } => {
                 write!(f, "invalid LUT/FF pair `{lut}` -> `{ff}`: {reason}")
             }
+            Self::WideLutsAlreadyPacked => write!(f, "wide LUTs were already packed"),
+            Self::InvalidWideLutClusterSize(size) => {
+                write!(f, "wide-LUT cluster has unsupported size {size}")
+            }
+            Self::UnknownWideLutCell(cell) => {
+                write!(f, "unknown wide-LUT cell ID {}", cell.0)
+            }
+            Self::CellIsNotWideLut { cell } => {
+                write!(f, "cell `{cell}` is not a LUT4 in a wide-LUT cluster")
+            }
+            Self::DuplicateWideLutCell { cell } => {
+                write!(f, "LUT4 `{cell}` occurs in more than one wide-LUT cluster")
+            }
+            Self::InvalidWideLutStructure { cell } => write!(
+                f,
+                "wide-LUT cluster beginning at `{cell}` has an invalid dedicated-mux topology"
+            ),
+            Self::MissingWideLutCluster { cell, size } => write!(
+                f,
+                "{size}-LUT cluster beginning at `{cell}` has no compatible PFUMX/L6MUX21 BEL sequence"
+            ),
             Self::CarryPairsAlreadyPacked => write!(f, "carry pairs were already packed"),
             Self::UnknownCarryCell(cell) => write!(f, "unknown carry cell ID {}", cell.0),
             Self::CellIsNotCarrySlice { cell } => {
@@ -2816,6 +3015,13 @@ impl Error for PackingError {
             Self::MissingFfDataPin { .. }
             | Self::MissingGeneralDataPin { .. }
             | Self::InvalidLutFfPair { .. }
+            | Self::WideLutsAlreadyPacked
+            | Self::InvalidWideLutClusterSize(_)
+            | Self::UnknownWideLutCell(_)
+            | Self::CellIsNotWideLut { .. }
+            | Self::DuplicateWideLutCell { .. }
+            | Self::InvalidWideLutStructure { .. }
+            | Self::MissingWideLutCluster { .. }
             | Self::CarryPairsAlreadyPacked
             | Self::UnknownCarryCell(_)
             | Self::CellIsNotCarrySlice { .. }
@@ -3688,7 +3894,7 @@ mod tests {
         let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
 
         assert_eq!(architecture.device().name(), "LFE5UM5G-85F-test");
-        assert_eq!(architecture.device().bels().len(), 12);
+        assert_eq!(architecture.device().bels().len(), 14);
         assert_eq!(architecture.device().wires().len(), 63);
         assert_eq!(architecture.device().pips().len(), 14);
         assert_eq!(architecture.packages()[0].pins.len(), 3);
@@ -3820,7 +4026,7 @@ mod tests {
             .unwrap();
         let graph = UnifiedGraph::new(imported.design(), architecture.device());
 
-        assert_eq!(graph.placement_candidates(lut).unwrap().len(), 4);
+        assert_eq!(graph.placement_candidates(lut).unwrap().len(), 6);
         for (index, cell) in imported.design().cells().iter().enumerate() {
             if cell.kind == ResourceKind::Io {
                 assert_eq!(graph.placement_candidates(CellId(index)).unwrap().len(), 3);
@@ -3885,6 +4091,125 @@ mod tests {
         assert_eq!(
             architecture.bel_metadata(lut_bel).z + 1,
             architecture.bel_metadata(ff_bel).z
+        );
+    }
+
+    #[test]
+    fn packs_a_pfumx_pair_into_one_physical_slice() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let root = design.add_cell("wide0", ResourceKind::Lut(4));
+        for name in ["A", "B", "C", "D"] {
+            design.add_pin(root, name, PinDirection::Input).unwrap();
+        }
+        design.add_pin(root, "F", PinDirection::Output).unwrap();
+        design.add_pin(root, "F1", PinDirection::Input).unwrap();
+        design.add_pin(root, "M", PinDirection::Input).unwrap();
+        design.add_pin(root, "OFX", PinDirection::Output).unwrap();
+        let child = design.add_cell("wide1", ResourceKind::Lut(4));
+        for name in ["A", "B", "C", "D"] {
+            design.add_pin(child, name, PinDirection::Input).unwrap();
+        }
+        design.add_pin(child, "F", PinDirection::Output).unwrap();
+        let child_f = design.cells()[child.0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == "F")
+            .unwrap();
+        let root_f1 = design.cells()[root.0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == "F1")
+            .unwrap();
+        design.add_net("wide_f1", child_f, [root_f1]).unwrap();
+
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+        packing
+            .pack_wide_luts(&design, &architecture, [vec![root, child]])
+            .unwrap();
+        let placement =
+            place_with_constraints(&design, architecture.device(), packing.constraints()).unwrap();
+        let root_bel = placement.bel(root).unwrap();
+        let child_bel = placement.bel(child).unwrap();
+
+        assert_eq!(packing.wide_lut_clusters(), &[vec![root, child]]);
+        assert_eq!(
+            architecture.device().bels()[root_bel.0].point,
+            architecture.device().bels()[child_bel.0].point
+        );
+        assert_eq!(
+            architecture.bel_metadata(root_bel).z + 4,
+            architecture.bel_metadata(child_bel).z
+        );
+    }
+
+    #[test]
+    fn packs_an_l6mux21_cluster_into_two_adjacent_slices() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let mut add_lut = |name: &str, extra_inputs: &[&str], ofx: bool| {
+            let cell = design.add_cell(name, ResourceKind::Lut(4));
+            for pin in ["A", "B", "C", "D"]
+                .into_iter()
+                .chain(extra_inputs.iter().copied())
+            {
+                design.add_pin(cell, pin, PinDirection::Input).unwrap();
+            }
+            design.add_pin(cell, "F", PinDirection::Output).unwrap();
+            if ofx {
+                design.add_pin(cell, "OFX", PinDirection::Output).unwrap();
+            }
+            cell
+        };
+        let one_root = add_lut("one0", &["F1", "M"], true);
+        let l6_root = add_lut("one1", &["FXA", "FXB", "M"], true);
+        let zero_root = add_lut("zero0", &["F1", "M"], true);
+        let zero_child = add_lut("zero1", &[], false);
+        let cluster = vec![one_root, l6_root, zero_root, zero_child];
+        let pin = |cell: CellId, name: &str| {
+            design.cells()[cell.0]
+                .pins()
+                .iter()
+                .copied()
+                .find(|pin| design.pins()[pin.0].name == name)
+                .unwrap()
+        };
+        let one_f = pin(l6_root, "F");
+        let one_f1 = pin(one_root, "F1");
+        let zero_f = pin(zero_child, "F");
+        let zero_f1 = pin(zero_root, "F1");
+        let zero_ofx = pin(zero_root, "OFX");
+        let fxa = pin(l6_root, "FXA");
+        let one_ofx = pin(one_root, "OFX");
+        let fxb = pin(l6_root, "FXB");
+        design.add_net("one_f1", one_f, [one_f1]).unwrap();
+        design.add_net("zero_f1", zero_f, [zero_f1]).unwrap();
+        design.add_net("l6_fxa", zero_ofx, [fxa]).unwrap();
+        design.add_net("l6_fxb", one_ofx, [fxb]).unwrap();
+
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+        packing
+            .pack_wide_luts(&design, &architecture, [cluster.clone()])
+            .unwrap();
+        let placement =
+            place_with_constraints(&design, architecture.device(), packing.constraints()).unwrap();
+        let bels = cluster
+            .iter()
+            .map(|cell| placement.bel(*cell).unwrap())
+            .collect::<Vec<_>>();
+        let point = architecture.device().bels()[bels[0].0].point;
+
+        assert!(
+            bels.iter()
+                .all(|bel| architecture.device().bels()[bel.0].point == point)
+        );
+        assert_eq!(
+            bels.iter()
+                .map(|bel| architecture.bel_metadata(*bel).z)
+                .collect::<Vec<_>>(),
+            [0, 4, 8, 12]
         );
     }
 

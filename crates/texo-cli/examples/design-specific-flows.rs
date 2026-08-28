@@ -318,6 +318,8 @@ fn duplicate_nextpnr_cell(cell: &Ecp5Cell) -> Result<Value, Box<dyn Error>> {
 fn ecp5_cell_name(cell: &Ecp5Cell) -> &str {
     match cell {
         Ecp5Cell::Lut4 { name, .. }
+        | Ecp5Cell::PfuMux { name, .. }
+        | Ecp5Cell::L6Mux21 { name, .. }
         | Ecp5Cell::Ccu2c { name, .. }
         | Ecp5Cell::FlipFlop { name, .. }
         | Ecp5Cell::BlockRam { name, .. }

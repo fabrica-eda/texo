@@ -353,12 +353,36 @@ pub fn implement_struo_ecp5_with_progress(
             matches!(metadata, PrimitiveMetadata::Constant { .. }).then_some(cell)
         })
         .collect::<BTreeSet<_>>();
+    let wide_luts = imported
+        .wide_lut_clusters()
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
     let mut packing = match options.lut_ff_pairs {
         Some(pairs) => {
-            pack_lut_ffs_with_pairs(&design, architecture, named_lut_ff_pairs(&design, pairs)?)?
+            let pairs = named_lut_ff_pairs(&design, pairs)?;
+            if let Some(pair) = pairs.iter().find(|pair| wide_luts.contains(&pair.lut)) {
+                return Err(PackingError::InvalidLutFfPair {
+                    lut: design.cells()[pair.lut.0].name.clone(),
+                    ff: design.cells()[pair.ff.0].name.clone(),
+                    reason: "wide-LUT members cannot use the ordinary LUT/FF path".into(),
+                }
+                .into());
+            }
+            pack_lut_ffs_with_pairs(&design, architecture, pairs)?
         }
-        None => pack_lut_ffs_excluding(&design, architecture, constant_luts.iter().copied())?,
+        None => pack_lut_ffs_excluding(
+            &design,
+            architecture,
+            constant_luts.iter().chain(&wide_luts).copied(),
+        )?,
     };
+    packing.pack_wide_luts(
+        &design,
+        architecture,
+        imported.wide_lut_clusters().iter().cloned(),
+    )?;
     packing.pack_carry_pairs(
         &design,
         architecture,
@@ -3883,49 +3907,158 @@ fn ecp5_timing_model(
                 model.add_cell_arc(from, to, delay)?;
             }
         }
-        for check in &record.setup_holds {
-            // ECP5 LSR is an asynchronous set/reset input. Its characterized
-            // recovery/removal values must not become synchronous data
-            // setup/hold checks or constrain the register-to-register Fmax.
-            if check.signal_pin == "LSR" {
-                continue;
-            }
-            let using_general_routing = general_routing_ffs.contains(&cell_id);
-            if (check.signal_pin == "DI" && using_general_routing)
-                || (check.signal_pin == "M" && !using_general_routing)
-            {
-                continue;
-            }
-            let logical_signal = if check.signal_pin == "M" {
-                "DI"
-            } else {
-                &check.signal_pin
-            };
-            let Some(signal) = find_cell_pin(design, cell_id, logical_signal) else {
-                continue;
-            };
-            // A directly driven constant cannot launch a transition, so it is
-            // not a setup/hold endpoint. Keeping these checks made the hold
-            // repairer search enormous constant fanout nets for delay that has
-            // no physical meaning.
-            if design.pins()[signal.0]
-                .net()
-                .is_some_and(|net| constant_nets.contains(&net))
-            {
-                continue;
-            }
-            let Some(clock) = find_cell_pin(design, cell_id, &check.clock_pin) else {
-                continue;
-            };
-            model.add_setup_hold(
-                clock,
-                signal,
-                timing_delay(check.setup)?,
-                timing_delay(check.hold)?,
-            )?;
-        }
+        add_wide_lut_timing_arcs(&mut model, design, cell_id, record, &speed_grade.name)?;
+        add_setup_hold_timing(
+            &mut model,
+            design,
+            cell_id,
+            record,
+            general_routing_ffs.contains(&cell_id),
+            &constant_nets,
+        )?;
     }
     Ok(model)
+}
+
+fn add_setup_hold_timing(
+    model: &mut TimingModel,
+    design: &Design,
+    cell: CellId,
+    record: &texo_target_ecp5::CellTimingRecord,
+    using_general_routing: bool,
+    constant_nets: &BTreeSet<NetId>,
+) -> Result<(), Ecp5FlowError> {
+    for check in &record.setup_holds {
+        // ECP5 LSR is an asynchronous set/reset input. Its characterized
+        // recovery/removal values must not become synchronous data setup/hold
+        // checks or constrain the register-to-register Fmax.
+        if check.signal_pin == "LSR"
+            || (check.signal_pin == "DI" && using_general_routing)
+            || (check.signal_pin == "M" && !using_general_routing)
+        {
+            continue;
+        }
+        let logical_signal = if check.signal_pin == "M" {
+            "DI"
+        } else {
+            &check.signal_pin
+        };
+        let Some(signal) = find_cell_pin(design, cell, logical_signal) else {
+            continue;
+        };
+        // A directly driven constant cannot launch a transition, so it is not
+        // a setup/hold endpoint. Keeping these checks made the hold repairer
+        // search enormous constant fanout nets for meaningless delay.
+        if design.pins()[signal.0]
+            .net()
+            .is_some_and(|net| constant_nets.contains(&net))
+        {
+            continue;
+        }
+        let Some(clock) = find_cell_pin(design, cell, &check.clock_pin) else {
+            continue;
+        };
+        model.add_setup_hold(
+            clock,
+            signal,
+            timing_delay(check.setup)?,
+            timing_delay(check.hold)?,
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct WideLutTiming {
+    pfu_data: DelayRange,
+    pfu_select: DelayRange,
+    l6_data: DelayRange,
+    l6_select: DelayRange,
+}
+
+fn wide_lut_timing(speed_grade: &str) -> Option<WideLutTiming> {
+    let range = DelayRange::from_independent_corners;
+    match speed_grade {
+        "6" => Some(WideLutTiming {
+            pfu_data: range(68, 165),
+            pfu_select: range(187, 256),
+            l6_data: range(189, 242),
+            l6_select: range(186, 252),
+        }),
+        "7" => Some(WideLutTiming {
+            pfu_data: range(58, 146),
+            pfu_select: range(166, 225),
+            l6_data: range(166, 211),
+            l6_select: range(166, 221),
+        }),
+        "8" => Some(WideLutTiming {
+            pfu_data: range(47, 126),
+            pfu_select: range(145, 193),
+            l6_data: range(142, 180),
+            l6_select: range(145, 190),
+        }),
+        "8_5G" => Some(WideLutTiming {
+            pfu_data: range(37, 98),
+            pfu_select: range(113, 151),
+            l6_data: range(111, 141),
+            l6_select: range(113, 148),
+        }),
+        _ => None,
+    }
+}
+
+fn add_wide_lut_timing_arcs(
+    model: &mut TimingModel,
+    design: &Design,
+    cell: CellId,
+    record: &texo_target_ecp5::CellTimingRecord,
+    speed_grade: &str,
+) -> Result<(), Ecp5FlowError> {
+    let Some(ofx) = find_cell_pin(design, cell, "OFX") else {
+        return Ok(());
+    };
+    let timing = wide_lut_timing(speed_grade).ok_or_else(|| Ecp5FlowError::MissingCellTiming {
+        speed_grade: speed_grade.into(),
+        cell_type: "TRELLIS_WIDE_LUT".into(),
+    })?;
+    if let Some(f1) = find_cell_pin(design, cell, "F1") {
+        model.add_cell_arc(f1, ofx, timing.pfu_data)?;
+        if let Some(select) = find_cell_pin(design, cell, "M") {
+            model.add_cell_arc(select, ofx, timing.pfu_select)?;
+        }
+        for pin_name in ["A", "B", "C", "D"] {
+            let Some(from) = find_cell_pin(design, cell, pin_name) else {
+                continue;
+            };
+            let Some(lut_arc) = record
+                .arcs
+                .iter()
+                .find(|arc| arc.from_pin == pin_name && arc.to_pin == "F")
+            else {
+                continue;
+            };
+            let lut = timing_delay(lut_arc.delay)?;
+            let delay = DelayRange::from_independent_corners(
+                lut.min_ps
+                    .checked_add(timing.pfu_data.min_ps)
+                    .ok_or(Ecp5FlowError::TimingDelayOverflow)?,
+                lut.max_ps
+                    .checked_add(timing.pfu_data.max_ps)
+                    .ok_or(Ecp5FlowError::TimingDelayOverflow)?,
+            );
+            model.add_cell_arc(from, ofx, delay)?;
+        }
+    } else {
+        for pin_name in ["FXA", "FXB"] {
+            if let Some(from) = find_cell_pin(design, cell, pin_name) {
+                model.add_cell_arc(from, ofx, timing.l6_data)?;
+            }
+        }
+        if let Some(select) = find_cell_pin(design, cell, "M") {
+            model.add_cell_arc(select, ofx, timing.l6_select)?;
+        }
+    }
+    Ok(())
 }
 
 fn timing_delay(record: DelayRangeRecord) -> Result<DelayRange, TimingError> {
@@ -4177,12 +4310,14 @@ impl Error for MissingEvidence {}
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::num::NonZeroU32;
     use std::sync::Arc;
 
     use struo_celox::ecp5_simulator;
     use struo_ir::{ActiveLevel, ClockEdge, Netlist, RegisterCell, ResetControl};
     use struo_target_ecp5::{
-        Ecp5Netlist, OpenDrainIo, map_to_ecp5, map_to_ecp5_with_open_drain_ios,
+        Ecp5Netlist, IoTimingConstraints, MappingOptions, OpenDrainIo, map_to_ecp5,
+        map_to_ecp5_with_constraints, map_to_ecp5_with_open_drain_ios,
     };
     use texo_model::{
         BelId, CellId, Design, Device, NetId, PinDirection, PipId, Point, ResourceKind,
@@ -4200,6 +4335,7 @@ mod tests {
         TimingCornersRecord, expand, find_global_clock_requirements, pack_lut_ffs,
         pack_lut_ffs_excluding, parse_lpf, read_architecture, resolve_lpf_port_cells,
     };
+    use texo_timing::DelayRange;
 
     use super::{
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, PostMapSimulationPolicy,
@@ -4218,6 +4354,92 @@ mod tests {
         assert_eq!(project_trellis_speed_grade("LFE5UM5G-85F", "8"), "8_5G");
         assert_eq!(project_trellis_speed_grade("LFE5UM-85F", "8"), "8");
         assert_eq!(project_trellis_speed_grade("LFE5UM5G-85F", "7"), "7");
+    }
+
+    #[test]
+    fn models_characterized_pfumx_and_l6mux21_arcs() {
+        let mut source = Netlist::new("six_input_parity");
+        let inputs = source.add_input_port("inputs", NonZeroU32::new(6).unwrap());
+        let parity = inputs[1..]
+            .iter()
+            .fold(inputs[0], |value, input| source.add_xor(value, *input));
+        source.add_output("result", parity);
+        let constraints = IoTimingConstraints::new()
+            .with_input_delay_ps("inputs", 0)
+            .with_output_delay_ps("result", 0);
+        let mapped = map_to_ecp5_with_constraints(
+            &source,
+            MappingOptions {
+                timing_goal_mhz: 1_500,
+                ..MappingOptions::default()
+            },
+            &constraints,
+        )
+        .unwrap();
+        let imported = import_ecp5(&mapped).unwrap();
+        let architecture = read_architecture(ECP5_FIXTURE.as_bytes()).unwrap();
+        let packing = pack_lut_ffs_excluding(
+            imported.design(),
+            &architecture,
+            imported.wide_lut_clusters().iter().flatten().copied(),
+        )
+        .unwrap();
+        let speed_grade = &architecture.speed_grades()["6"];
+        let model =
+            ecp5_timing_model(imported.design(), &packing, speed_grade, &BTreeSet::new()).unwrap();
+        let pfu = imported
+            .design()
+            .cells()
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| {
+                cell.pins()
+                    .iter()
+                    .any(|pin| imported.design().pins()[pin.0].name == "F1")
+                    .then_some(CellId(index))
+            })
+            .unwrap();
+        let l6 = imported
+            .design()
+            .cells()
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| {
+                cell.pins()
+                    .iter()
+                    .any(|pin| imported.design().pins()[pin.0].name == "FXA")
+                    .then_some(CellId(index))
+            })
+            .unwrap();
+
+        assert_eq!(
+            model.cell_arc(
+                find_cell_pin(imported.design(), pfu, "F1").unwrap(),
+                find_cell_pin(imported.design(), pfu, "OFX").unwrap(),
+            ),
+            Some(DelayRange::from_independent_corners(68, 165))
+        );
+        assert_eq!(
+            model.cell_arc(
+                find_cell_pin(imported.design(), pfu, "M").unwrap(),
+                find_cell_pin(imported.design(), pfu, "OFX").unwrap(),
+            ),
+            Some(DelayRange::from_independent_corners(187, 256))
+        );
+        assert_eq!(
+            model.cell_arc(
+                find_cell_pin(imported.design(), l6, "FXA").unwrap(),
+                find_cell_pin(imported.design(), l6, "OFX").unwrap(),
+            ),
+            Some(DelayRange::from_independent_corners(189, 242))
+        );
+        assert_eq!(
+            model.cell_arc(
+                find_cell_pin(imported.design(), l6, "M").unwrap(),
+                find_cell_pin(imported.design(), l6, "OFX").unwrap(),
+            ),
+            Some(DelayRange::from_independent_corners(186, 252))
+        );
     }
 
     #[test]
