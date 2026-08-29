@@ -162,16 +162,6 @@ pub enum PostMapSimulationPolicy {
     AllowMissing,
 }
 
-/// Coordination point between route closure and equivalent physical rewrites.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum PhysicalFeedbackPolicy {
-    /// Complete route-level timing closure before returning the implementation.
-    #[default]
-    CompleteClosure,
-    /// Return after local closure so an outer loop can rewrite the netlist.
-    HandoffAfterLocal,
-}
-
 /// Configuration for the complete Struo-to-ECP5 physical implementation flow.
 #[derive(Clone, Copy, Debug)]
 pub struct Ecp5FlowOptions<'a> {
@@ -198,9 +188,6 @@ pub struct Ecp5FlowOptions<'a> {
     /// Previous equivalent implementation used as a mutable route seed after
     /// an incremental physical-synthesis rewrite.
     pub incremental_seed: Option<&'a Ecp5FlowResult>,
-    /// Return after local closure so an outer physical-synthesis loop can
-    /// rewrite the netlist before expensive critical-vertex search.
-    pub physical_feedback: PhysicalFeedbackPolicy,
     /// Optional explicit dedicated-path LUT-to-FF pairs, named as
     /// `LUT -> FF`. This must accompany placements imported after packing.
     pub lut_ff_pairs: Option<&'a BTreeMap<String, String>>,
@@ -225,7 +212,6 @@ impl Default for Ecp5FlowOptions<'_> {
             placement_weight_exponent: 1,
             initial_placement: None,
             incremental_seed: None,
-            physical_feedback: PhysicalFeedbackPolicy::default(),
             lut_ff_pairs: None,
             initial_timing_reroute: false,
             optimize_timing: true,
@@ -635,10 +621,6 @@ pub fn implement_struo_ecp5_with_progress(
             placement_weight_exponent: options.placement_weight_exponent,
             routing_workspace: &mut routing_workspace,
             use_routed_timing_seed,
-            physical_feedback_handoff: matches!(
-                options.physical_feedback,
-                PhysicalFeedbackPolicy::HandoffAfterLocal
-            ),
             global_ripup_attempted: false,
             critical_move_trials: BTreeSet::new(),
             critical_refined_seeds: BTreeSet::new(),
@@ -926,7 +908,6 @@ fn repair_hold_with_dedicated_edge_release(
                     placement_weight_exponent: 1,
                     routing_workspace,
                     use_routed_timing_seed: true,
-                    physical_feedback_handoff: false,
                     global_ripup_attempted: true,
                     critical_move_trials: BTreeSet::new(),
                     critical_refined_seeds: BTreeSet::new(),
@@ -1352,9 +1333,6 @@ struct TimingDrivenContext<'a, 'work, 'cache> {
     /// placement seed. Pre-route STA normally supplies this before the first
     /// route; imported placements retain the routed fallback.
     use_routed_timing_seed: bool,
-    /// Whether an outer equivalent-netlist rewrite should receive control
-    /// before wide critical placement begins.
-    physical_feedback_handoff: bool,
     /// Whether the post-global-placement data routes have already received
     /// their one full-chip timing renegotiation. Later critical moves reroute
     /// every affected net incrementally and must not reopen the entire chip.
@@ -1427,9 +1405,6 @@ impl TimingDrivenContext<'_, '_, '_> {
         }
         report_metric_phase("closure_local_connections", &mut phase_started);
         emit_archive_metric("closure_local", self, &archive);
-        if self.should_handoff_to_physical_feedback(&archive) {
-            return Ok(self.finish_physical_feedback_handoff(archive));
-        }
         archive =
             self.close_setup_critically(archive, placement_refiner, routing_costs, progress)?;
         report_metric_phase("closure_critical_vertices", &mut phase_started);
@@ -1476,25 +1451,6 @@ impl TimingDrivenContext<'_, '_, '_> {
             Some(&final_timing),
         );
         Ok((final_implementation, final_timing))
-    }
-
-    fn finish_physical_feedback_handoff(&self, archive: Vec<TimingCandidate>) -> TimingCandidate {
-        let (implementation, timing) = select_final_timing_candidate(archive);
-        emit_placement_metric(
-            "physical_feedback_handoff",
-            self.design,
-            self.architecture.device(),
-            &implementation.placement,
-            Some(&timing),
-        );
-        (implementation, timing)
-    }
-
-    fn should_handoff_to_physical_feedback(&self, archive: &[TimingCandidate]) -> bool {
-        self.physical_feedback_handoff
-            && !archive
-                .iter()
-                .any(|(_, timing)| timing.worst_slack_ps.is_some_and(|slack| slack >= 0))
     }
 
     fn repair_setup_and_reenter_critical(
