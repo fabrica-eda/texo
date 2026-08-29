@@ -2928,10 +2928,7 @@ fn analytical_place(
         })
         .collect::<Vec<_>>();
     let center = Point::new(device.width() / 2, device.height() / 2);
-    let mut diagonal = vec![CENTER_WEIGHT; units.len()];
-    let mut rhs_x = vec![CENTER_WEIGHT * f64::from(center.x); units.len()];
-    let mut rhs_y = vec![CENTER_WEIGHT * f64::from(center.y); units.len()];
-    let mut adjacency = vec![Vec::<(usize, f64)>::new(); units.len()];
+    let mut analytical_edges = Vec::new();
     for (cell_index, edges) in neighbors.iter().enumerate() {
         let left = unit_by_cell[cell_index];
         for edge in edges {
@@ -2940,43 +2937,50 @@ fn analytical_place(
             if left >= right {
                 continue;
             }
-            let weight =
-                f64::from(u32::try_from(edge.weight).expect("placement edge weight fits u32"));
-            let (left_offset_x, left_offset_y) = macro_offset_by_cell[cell_index];
-            let (right_offset_x, right_offset_y) = macro_offset_by_cell[right_cell];
-            match (fixed[left], fixed[right]) {
-                (Some(_), Some(_)) => {}
-                (Some(_), None) => {
-                    let left_bel = units[left].choices.assignment(0)[column_by_cell[cell_index]];
-                    let point = device.bels()[left_bel.0].point;
-                    diagonal[right] += weight;
-                    rhs_x[right] += weight * (f64::from(point.x) - right_offset_x);
-                    rhs_y[right] += weight * (f64::from(point.y) - right_offset_y);
-                }
-                (None, Some(_)) => {
-                    let right_bel = units[right].choices.assignment(0)[column_by_cell[right_cell]];
-                    let point = device.bels()[right_bel.0].point;
-                    diagonal[left] += weight;
-                    rhs_x[left] += weight * (f64::from(point.x) - left_offset_x);
-                    rhs_y[left] += weight * (f64::from(point.y) - left_offset_y);
-                }
-                (None, None) => {
-                    diagonal[left] += weight;
-                    diagonal[right] += weight;
-                    adjacency[left].push((right, weight));
-                    adjacency[right].push((left, weight));
-                    rhs_x[left] += weight * (right_offset_x - left_offset_x);
-                    rhs_x[right] += weight * (left_offset_x - right_offset_x);
-                    rhs_y[left] += weight * (right_offset_y - left_offset_y);
-                    rhs_y[right] += weight * (left_offset_y - right_offset_y);
-                }
-            }
+            analytical_edges.push(AnalyticalPlacementEdge {
+                left,
+                right,
+                left_cell: CellId(cell_index),
+                right_cell: edge.cell,
+                weight: f64::from(
+                    u32::try_from(edge.weight).expect("placement edge weight fits u32"),
+                ),
+            });
         }
     }
     let initial_x = vec![f64::from(center.x); units.len()];
     let initial_y = vec![f64::from(center.y); units.len()];
-    let mut solved_x = solve_quadratic(&diagonal, &adjacency, &rhs_x, initial_x);
-    let mut solved_y = solve_quadratic(&diagonal, &adjacency, &rhs_y, initial_y);
+    let (mut diagonal_x, adjacency_x, mut rhs_x) = analytical_axis_system(
+        units,
+        device,
+        &fixed,
+        &column_by_cell,
+        &macro_offset_by_cell,
+        &analytical_edges,
+        false,
+        center.x,
+        CENTER_WEIGHT,
+        None,
+    );
+    let (mut diagonal_y, adjacency_y, mut rhs_y) = analytical_axis_system(
+        units,
+        device,
+        &fixed,
+        &column_by_cell,
+        &macro_offset_by_cell,
+        &analytical_edges,
+        true,
+        center.y,
+        CENTER_WEIGHT,
+        None,
+    );
+    let anchor_scale_x = diagonal_x.clone();
+    let anchor_scale_y = diagonal_y.clone();
+    let mut solved_x = solve_quadratic(&diagonal_x, &adjacency_x, &rhs_x, initial_x);
+    let mut solved_y = solve_quadratic(&diagonal_y, &adjacency_y, &rhs_y, initial_y);
+    let mut anchor_weights_x = vec![0.0; units.len()];
+    let mut anchor_weights_y = vec![0.0; units.len()];
+    let mut anchor_targets = vec![Point::new(0, 0); units.len()];
     if let Some((anchor, iteration)) = anchor {
         for (index, unit) in units.iter().enumerate() {
             if fixed[index].is_some() {
@@ -2990,32 +2994,80 @@ fn analytical_place(
             // one-sink edge is 64), so express the anchor relative to this
             // unit's diagonal instead of relying on an architecture-specific
             // absolute coefficient.
-            let weight =
-                diagonal[index].max(1.0) * ANCHOR_ALPHA * f64::from(iteration) / distance.max(1.0);
-            diagonal[index] += weight;
-            rhs_x[index] += weight * f64::from(anchor_point.x);
-            rhs_y[index] += weight * f64::from(anchor_point.y);
+            let x_weight = anchor_scale_x[index].max(1.0) * ANCHOR_ALPHA * f64::from(iteration)
+                / distance.max(1.0);
+            let y_weight = anchor_scale_y[index].max(1.0) * ANCHOR_ALPHA * f64::from(iteration)
+                / distance.max(1.0);
+            diagonal_x[index] += x_weight;
+            diagonal_y[index] += y_weight;
+            rhs_x[index] += x_weight * f64::from(anchor_point.x);
+            rhs_y[index] += y_weight * f64::from(anchor_point.y);
+            anchor_weights_x[index] = x_weight;
+            anchor_weights_y[index] = y_weight;
+            anchor_targets[index] = anchor_point;
         }
-        solved_x = solve_quadratic(&diagonal, &adjacency, &rhs_x, solved_x);
-        solved_y = solve_quadratic(&diagonal, &adjacency, &rhs_y, solved_y);
+        solved_x = solve_quadratic(&diagonal_x, &adjacency_x, &rhs_x, solved_x);
+        solved_y = solve_quadratic(&diagonal_y, &adjacency_y, &rhs_y, solved_y);
     }
     for density_weight in [0.05, 0.10, 0.20, 0.40] {
         let (target_x, target_y) =
             analytic_spread_targets(units, &fixed, device, solved_x.clone(), solved_y.clone());
-        let mut spread_diagonal = diagonal.clone();
-        let mut spread_rhs_x = rhs_x.clone();
-        let mut spread_rhs_y = rhs_y.clone();
+        // Reweight each connection by inverse coordinate separation while
+        // density targets progressively spread the solution. This is an IRLS
+        // approximation of linear wirelength: it avoids letting the squared
+        // quadratic objective dominate long connections, and coupling the
+        // update to spreading keeps the unconstrained solve from collapsing.
+        let (mut spread_diagonal_x, spread_adjacency_x, mut spread_rhs_x) = analytical_axis_system(
+            units,
+            device,
+            &fixed,
+            &column_by_cell,
+            &macro_offset_by_cell,
+            &analytical_edges,
+            false,
+            center.x,
+            CENTER_WEIGHT,
+            Some(&solved_x),
+        );
+        let (mut spread_diagonal_y, spread_adjacency_y, mut spread_rhs_y) = analytical_axis_system(
+            units,
+            device,
+            &fixed,
+            &column_by_cell,
+            &macro_offset_by_cell,
+            &analytical_edges,
+            true,
+            center.y,
+            CENTER_WEIGHT,
+            Some(&solved_y),
+        );
         for index in 0..units.len() {
             if fixed[index].is_some() {
                 continue;
             }
-            let anchor_weight = diagonal[index].max(1.0) * density_weight;
-            spread_diagonal[index] += anchor_weight;
-            spread_rhs_x[index] += anchor_weight * target_x[index];
-            spread_rhs_y[index] += anchor_weight * target_y[index];
+            spread_diagonal_x[index] += anchor_weights_x[index];
+            spread_diagonal_y[index] += anchor_weights_y[index];
+            spread_rhs_x[index] += anchor_weights_x[index] * f64::from(anchor_targets[index].x);
+            spread_rhs_y[index] += anchor_weights_y[index] * f64::from(anchor_targets[index].y);
+            let x_weight = spread_diagonal_x[index].max(1.0) * density_weight;
+            let y_weight = spread_diagonal_y[index].max(1.0) * density_weight;
+            spread_diagonal_x[index] += x_weight;
+            spread_diagonal_y[index] += y_weight;
+            spread_rhs_x[index] += x_weight * target_x[index];
+            spread_rhs_y[index] += y_weight * target_y[index];
         }
-        solved_x = solve_quadratic(&spread_diagonal, &adjacency, &spread_rhs_x, solved_x);
-        solved_y = solve_quadratic(&spread_diagonal, &adjacency, &spread_rhs_y, solved_y);
+        solved_x = solve_quadratic(
+            &spread_diagonal_x,
+            &spread_adjacency_x,
+            &spread_rhs_x,
+            solved_x,
+        );
+        solved_y = solve_quadratic(
+            &spread_diagonal_y,
+            &spread_adjacency_y,
+            &spread_rhs_y,
+            solved_y,
+        );
     }
 
     let mut placed = vec![None; design.cells().len()];
@@ -3105,6 +3157,83 @@ fn analytical_place(
         update_point_usage(device, assignment, &mut point_usage);
     }
     finish_placement(graph, constraints, placed)
+}
+
+#[derive(Clone, Copy)]
+struct AnalyticalPlacementEdge {
+    left: usize,
+    right: usize,
+    left_cell: CellId,
+    right_cell: CellId,
+    weight: f64,
+}
+
+type AnalyticalAxisSystem = (Vec<f64>, Vec<Vec<(usize, f64)>>, Vec<f64>);
+
+#[allow(clippy::too_many_arguments)]
+fn analytical_axis_system(
+    units: &[PlacementUnit],
+    device: &Device,
+    fixed: &[Option<Point>],
+    column_by_cell: &[usize],
+    macro_offset_by_cell: &[(f64, f64)],
+    edges: &[AnalyticalPlacementEdge],
+    y_axis: bool,
+    center: u32,
+    center_weight: f64,
+    positions: Option<&[f64]>,
+) -> AnalyticalAxisSystem {
+    let mut diagonal = vec![center_weight; units.len()];
+    let mut adjacency = vec![Vec::<(usize, f64)>::new(); units.len()];
+    let mut rhs = vec![center_weight * f64::from(center); units.len()];
+    let offset = |cell: CellId| {
+        let offsets = macro_offset_by_cell[cell.0];
+        if y_axis { offsets.1 } else { offsets.0 }
+    };
+    let fixed_coordinate = |unit: usize, cell: CellId| {
+        let bel = units[unit].choices.assignment(0)[column_by_cell[cell.0]];
+        let point = device.bels()[bel.0].point;
+        f64::from(if y_axis { point.y } else { point.x })
+    };
+    for edge in edges {
+        let left_offset = offset(edge.left_cell);
+        let right_offset = offset(edge.right_cell);
+        let weight = positions.map_or(edge.weight, |positions| {
+            let left = if fixed[edge.left].is_some() {
+                fixed_coordinate(edge.left, edge.left_cell)
+            } else {
+                positions[edge.left] + left_offset
+            };
+            let right = if fixed[edge.right].is_some() {
+                fixed_coordinate(edge.right, edge.right_cell)
+            } else {
+                positions[edge.right] + right_offset
+            };
+            edge.weight / (left - right).abs().max(1.0)
+        });
+        match (fixed[edge.left], fixed[edge.right]) {
+            (Some(_), Some(_)) => {}
+            (Some(_), None) => {
+                diagonal[edge.right] += weight;
+                rhs[edge.right] +=
+                    weight * (fixed_coordinate(edge.left, edge.left_cell) - right_offset);
+            }
+            (None, Some(_)) => {
+                diagonal[edge.left] += weight;
+                rhs[edge.left] +=
+                    weight * (fixed_coordinate(edge.right, edge.right_cell) - left_offset);
+            }
+            (None, None) => {
+                diagonal[edge.left] += weight;
+                diagonal[edge.right] += weight;
+                adjacency[edge.left].push((edge.right, weight));
+                adjacency[edge.right].push((edge.left, weight));
+                rhs[edge.left] += weight * (right_offset - left_offset);
+                rhs[edge.right] += weight * (left_offset - right_offset);
+            }
+        }
+    }
+    (diagonal, adjacency, rhs)
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
