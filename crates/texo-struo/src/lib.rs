@@ -909,6 +909,7 @@ impl Importer {
             read_address,
             read_data,
             read_enable,
+            clock_enable,
             clock,
             edge,
             second_port,
@@ -940,10 +941,12 @@ impl Importer {
             *write_enable,
             read_address,
             *read_enable,
+            *clock_enable,
             *clock,
             second_port.as_ref().map(|port| port.address.as_ref()),
             second_port.as_ref().map(|port| port.write_data.as_slice()),
             second_port.as_ref().map(|port| port.write_enable),
+            second_port.as_ref().and_then(|port| port.clock_enable),
             second_port.as_ref().map(|port| port.clock),
         )?;
         let primary_output = if second_port.is_some() { "DOA" } else { "DOB" };
@@ -967,10 +970,12 @@ impl Importer {
         write_enable: Control,
         read_address: &[Bit; 14],
         read_enable: Option<Control>,
+        clock_enable: Option<Control>,
         clock: Bit,
         second_address: Option<&[Bit; 14]>,
         second_write_data: Option<&[Bit]>,
         second_write_enable: Option<Control>,
+        second_clock_enable: Option<Control>,
         second_clock: Option<Bit>,
     ) -> Result<(), AdapterError> {
         for (index, bit) in write_address.iter().copied().enumerate() {
@@ -984,7 +989,10 @@ impl Importer {
             )?;
         }
         for (name, bit) in [
-            ("CEA", Bit::One),
+            (
+                "CEA",
+                clock_enable.map_or(Bit::One, |control| control.signal),
+            ),
             ("OCEA", Bit::One),
             ("CLKA", clock),
             ("WEA", write_enable.signal),
@@ -1013,7 +1021,7 @@ impl Importer {
                 "CEB",
                 second_address.map_or_else(
                     || read_enable.map_or(Bit::One, |control| control.signal),
-                    |_| Bit::One,
+                    |_| second_clock_enable.map_or(Bit::One, |control| control.signal),
                 ),
             ),
             ("OCEB", Bit::One),
@@ -2342,12 +2350,15 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn imports_true_dual_port_dp16kd_pins_and_edges() {
         let mut source = Netlist::new("true_dual_memory");
         let clock_a = source.add_input("clock_a");
         let clock_b = source.add_input("clock_b");
         let write_enable_a = source.add_input("write_enable_a");
         let write_enable_b = source.add_input("write_enable_b");
+        let read_enable_a = source.add_input("read_enable_a");
+        let read_enable_b = source.add_input("read_enable_b");
         let address_a = (0..2)
             .map(|index| source.add_input(format!("address_a_{index}")))
             .collect::<Vec<_>>();
@@ -2372,7 +2383,10 @@ mod tests {
                 4,
                 address_a.clone(),
                 read_data_a.clone(),
-                None,
+                Some(EnableControl {
+                    signal: read_enable_a,
+                    active: StruoActiveLevel::High,
+                }),
                 address_a,
                 write_data_a,
                 EnableControl {
@@ -2385,7 +2399,10 @@ mod tests {
             .with_second_port(MemoryPort::new(
                 address_b.clone(),
                 read_data_b.clone(),
-                None,
+                Some(EnableControl {
+                    signal: read_enable_b,
+                    active: StruoActiveLevel::Low,
+                }),
                 address_b,
                 write_data_b,
                 EnableControl {
@@ -2421,6 +2438,8 @@ mod tests {
         assert!(pin_names.iter().any(|name| name.starts_with("DOB")));
         assert!(pin_names.contains(&"CLKA"));
         assert!(pin_names.contains(&"CLKB"));
+        assert!(pin_names.contains(&"CEA"));
+        assert!(pin_names.contains(&"CEB"));
         assert!(pin_names.contains(&"WEA"));
         assert!(pin_names.contains(&"WEB"));
         assert_eq!(
@@ -2431,11 +2450,11 @@ mod tests {
                 physical_width: 2,
                 edge: ClockEdge::Falling,
                 write_enable: ActiveLevel::High,
-                read_enable: None,
+                read_enable: Some(ActiveLevel::High),
                 second_port: Some(BlockRamPortMetadata {
                     edge: ClockEdge::Rising,
                     write_enable: ActiveLevel::Low,
-                    read_enable: None,
+                    read_enable: Some(ActiveLevel::Low),
                 }),
             }
         );
