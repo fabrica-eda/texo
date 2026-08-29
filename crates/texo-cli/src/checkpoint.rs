@@ -519,6 +519,7 @@ fn primitive_metadata_json(
             edge,
             write_enable,
             read_enable,
+            second_port,
         } => json!({
             "kind": "block_ram",
             "depth": depth,
@@ -527,6 +528,11 @@ fn primitive_metadata_json(
             "edge": clock_edge_name(*edge),
             "write_enable": active_level_name(*write_enable),
             "read_enable": read_enable.map(active_level_name),
+            "second_port": second_port.map(|port| json!({
+                "edge": clock_edge_name(port.edge),
+                "write_enable": active_level_name(port.write_enable),
+                "read_enable": port.read_enable.map(active_level_name),
+            })),
         }),
         PrimitiveMetadata::Jtagg {
             extension_register_1,
