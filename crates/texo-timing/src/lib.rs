@@ -431,6 +431,29 @@ pub fn analyze_timing(
     timing_report_from_net_delays(design, model, constraints, net_delays)
 }
 
+/// Analyzes timing from caller-supplied per-sink net-delay estimates.
+///
+/// This is the placement-time counterpart to [`analyze_timing`]. It runs the
+/// same cell-delay propagation, clock-domain checks, required-time
+/// propagation, and per-edge slack calculation without requiring a physical
+/// route. Callers can therefore drive placement from a complete timing graph
+/// instead of using routed trials as the placement objective.
+///
+/// # Errors
+///
+/// Returns an error for invalid constraints or model data, missing net-edge
+/// estimates, arithmetic overflow, or a combinational cycle.
+pub fn analyze_timing_from_net_delays(
+    design: &Design,
+    model: &TimingModel,
+    constraints: &TimingConstraints,
+    net_delays: Vec<NetDelay>,
+) -> Result<TimingReport, TimingError> {
+    validate_constraints(design, constraints)?;
+    validate_model(design, model)?;
+    timing_report_from_net_delays(design, model, constraints, net_delays)
+}
+
 /// Estimates one net-edge routing delay from placement geometry.
 ///
 /// Driver-to-sink Manhattan distance times `ps_per_tile_ps` plus
@@ -1126,7 +1149,7 @@ mod tests {
 
     use super::{
         ClockEdge, DelayRange, NetDelay, TimingConstraints, TimingModel, UncheckedEndpointReason,
-        analyze_timing, timing_report_from_net_delays,
+        analyze_timing, analyze_timing_from_net_delays, timing_report_from_net_delays,
     };
 
     #[test]
@@ -1255,7 +1278,7 @@ mod tests {
             .unwrap();
 
         let report =
-            timing_report_from_net_delays(&design, &model, &TimingConstraints::new(), Vec::new())
+            analyze_timing_from_net_delays(&design, &model, &TimingConstraints::new(), Vec::new())
                 .unwrap();
 
         assert_eq!(report.modeled_endpoint_count(), 1);
