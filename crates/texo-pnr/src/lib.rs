@@ -823,7 +823,6 @@ impl RoutingWorkspace {
         device: &Device,
         net_count: usize,
         constraints: &RoutingConstraints,
-        seeds: &[Arc<NetRoute>],
     ) -> Vec<Option<Arc<NetRoute>>> {
         if self.device_identity != std::ptr::from_ref(device) as usize
             || self.wire_occupancy.len() != device.wires().len()
@@ -838,9 +837,6 @@ impl RoutingWorkspace {
             self.pip_history[index] = 0;
         }
         let mut target = vec![None; net_count];
-        for route in seeds {
-            target[route.net.0] = Some(route.clone());
-        }
         for (&net, route) in constraints.routes() {
             target[net.0] = Some(route.clone());
         }
@@ -1109,7 +1105,6 @@ pub fn route_with_placement_and_progress(
         placement,
         routing_constraints,
         None,
-        &[],
         &mut workspace,
         &mut progress,
     )
@@ -1134,7 +1129,6 @@ pub fn route_with_timing_costs_and_progress(
         placement,
         routing_constraints,
         Some(routing_costs),
-        &[],
         &mut workspace,
         &mut progress,
     )
@@ -1158,37 +1152,6 @@ pub fn route_with_workspace_and_progress(
         placement,
         routing_constraints,
         None,
-        &[],
-        workspace,
-        &mut progress,
-    )
-}
-
-/// Routes from mutable incumbent net trees using reusable device-sized state.
-///
-/// Unlike target routing constraints, seeded trees remain eligible for
-/// negotiated rip-up. Missing branches and nets are routed normally. This is
-/// intended for incremental physical synthesis where most placement and
-/// connectivity survived an equivalent netlist rewrite.
-///
-/// # Errors
-///
-/// Returns an invalid route, cost, placement, or routability error.
-pub fn route_with_seeded_routes_workspace_and_progress(
-    design: &Design,
-    device: &Device,
-    placement: Placement,
-    routing_constraints: &RoutingConstraints,
-    seed_routes: &[Arc<NetRoute>],
-    workspace: &mut RoutingWorkspace,
-    mut progress: impl FnMut(RoutingProgress),
-) -> Result<PnrResult, PnrError> {
-    finish_routing_with_workspace(
-        &UnifiedGraph::new(design, device),
-        placement,
-        routing_constraints,
-        None,
-        seed_routes,
         workspace,
         &mut progress,
     )
@@ -1213,7 +1176,6 @@ pub fn route_with_timing_costs_workspace_and_progress(
         placement,
         routing_constraints,
         Some(routing_costs),
-        &[],
         workspace,
         &mut progress,
     )
@@ -1232,7 +1194,6 @@ fn finish_routing(
         placement,
         routing_constraints,
         routing_costs,
-        &[],
         &mut workspace,
         progress,
     )
@@ -1243,25 +1204,16 @@ fn finish_routing_with_workspace(
     placement: Placement,
     routing_constraints: &RoutingConstraints,
     routing_costs: Option<&RoutingCosts>,
-    seed_routes: &[Arc<NetRoute>],
     workspace: &mut RoutingWorkspace,
     progress: &mut impl FnMut(RoutingProgress),
 ) -> Result<PnrResult, PnrError> {
     let pin_wires = PinWireCache::build(graph, &placement);
     validate_routing_constraints(graph, &placement, &pin_wires, routing_constraints)?;
-    let mut seeded_constraints = routing_constraints.clone();
-    for route in seed_routes {
-        if !routing_constraints.routes().contains_key(&route.net) {
-            seeded_constraints.add_route(route.clone());
-        }
-    }
-    validate_routing_constraints(graph, &placement, &pin_wires, &seeded_constraints)?;
     validate_routing_costs(graph, routing_costs)?;
     let routes = workspace.prepare_routes(
         graph.device(),
         graph.design().nets().len(),
         routing_constraints,
-        seed_routes,
     );
     let routes = route(
         graph,
@@ -1448,84 +1400,6 @@ pub fn placement_from_partial_bindings(
     }
 
     finish_placement(&graph, constraints, placed)
-}
-
-/// Completes caller-selected bindings with connectivity-driven analytical placement.
-///
-/// Every placement unit touched by `bindings` is fixed to the unique legal
-/// assignment matching those bindings. Untouched units are solved and
-/// legalized around that fixed boundary. This is intended for incremental
-/// physical feedback where most cells retain their prior BEL and a small
-/// number of newly synthesized cells need useful initial locations.
-///
-/// # Errors
-///
-/// Returns an error for unknown IDs, incompatible partial group bindings, or
-/// a placement that cannot be legalized around the fixed boundary.
-pub fn place_analytically_from_partial_bindings(
-    design: &Design,
-    device: &Device,
-    constraints: &PlacementConstraints,
-    bindings: &BTreeMap<CellId, BelId>,
-) -> Result<Placement, PnrError> {
-    let graph = UnifiedGraph::new(design, device);
-    for (&cell, &bel) in bindings {
-        if cell.0 >= design.cells().len() {
-            return Err(PnrError::InvalidPlacement {
-                reason: format!("binding names unknown cell {}", cell.0),
-            });
-        }
-        if bel.0 >= device.bels().len() {
-            return Err(PnrError::InvalidPlacement {
-                reason: format!("binding names unknown BEL {}", bel.0),
-            });
-        }
-    }
-
-    let mut candidate_cache = BTreeMap::new();
-    let mut units = placement_units(&graph, constraints, &mut candidate_cache)?;
-    for unit in &mut units {
-        if !unit.cells.iter().any(|cell| bindings.contains_key(cell)) {
-            continue;
-        }
-        let assignment = (0..unit.choices.len())
-            .map(|index| unit.choices.assignment(index))
-            .find(|assignment| {
-                unit.cells
-                    .iter()
-                    .zip(*assignment)
-                    .all(|(&cell, &bel)| bindings.get(&cell).is_none_or(|wanted| *wanted == bel))
-            })
-            .ok_or_else(|| PnrError::InvalidPlacement {
-                reason: format!(
-                    "cell group beginning at {} has no assignment matching the supplied bindings",
-                    unit.cells[0].0
-                ),
-            })?
-            .to_vec();
-        unit.choices = if assignment.len() == 1 {
-            PlacementChoices::SingleCell(vec![assignment[0]].into())
-        } else {
-            PlacementChoices::Shared(vec![assignment].into())
-        };
-    }
-    let spatial_indexes = units
-        .iter()
-        .map(|unit| {
-            (
-                unit.choices.cache_key(),
-                Arc::new(SpatialChoiceIndex::new(&unit.choices, device)),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    analytical_place(
-        &graph,
-        constraints,
-        &units,
-        &spatial_indexes,
-        &BTreeMap::new(),
-        None,
-    )
 }
 
 /// Swaps two same-kind cells in an otherwise unchanged legal placement and
@@ -2560,6 +2434,7 @@ fn local_connection_projected_cost_from_starts(
     net: NetId,
     projection: &RouteCapacityProjection,
 ) -> Option<u64> {
+    const MAX_LOCAL_HOPS: u8 = 16;
     const LOCAL_MARGIN: u32 = 1;
     let device = graph.device();
     let start_point = starts
@@ -2573,22 +2448,18 @@ fn local_connection_projected_cost_from_starts(
         LOCAL_MARGIN,
     );
     let mut queue = BinaryHeap::new();
-    let mut best = HashMap::<WireId, [u64; LOCAL_HOP_STATES]>::new();
+    let mut best = HashMap::new();
     for &start in starts {
         if point_inside_corridor(device.wires()[start.0].point, corridor) {
             queue.push(Reverse((0_u64, 0_u8, start)));
-            best.insert(start, [0; LOCAL_HOP_STATES]);
+            best.insert((start, 0_u8), 0_u64);
         }
     }
     while let Some(Reverse((cost, hops, wire))) = queue.pop() {
         if wire == goal {
             return Some(cost);
         }
-        if hops == MAX_LOCAL_HOPS
-            || best
-                .get(&wire)
-                .is_some_and(|known| known[usize::from(hops)] < cost)
-        {
+        if hops == MAX_LOCAL_HOPS || best.get(&(wire, hops)).is_some_and(|known| *known < cost) {
             continue;
         }
         for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
@@ -2622,15 +2493,11 @@ fn local_connection_projected_cost_from_starts(
             let next_cost = cost
                 .saturating_add(u64::from(pip_delays_ps[pip.0]))
                 .saturating_add(conflict);
-            let next_hop_index = usize::from(next_hops);
-            let known = best.entry(neighbor).or_insert([u64::MAX; LOCAL_HOP_STATES]);
-            if known[next_hop_index] <= next_cost {
-                continue;
+            let key = (neighbor, next_hops);
+            if best.get(&key).is_none_or(|known| next_cost < *known) {
+                best.insert(key, next_cost);
+                queue.push(Reverse((next_cost, next_hops, neighbor)));
             }
-            for known in &mut known[next_hop_index..] {
-                *known = (*known).min(next_cost);
-            }
-            queue.push(Reverse((next_cost, next_hops, neighbor)));
         }
     }
     None
@@ -6843,12 +6710,11 @@ mod tests {
         RouteSearch, RoutingConstraints, RoutingCosts, RoutingResourceMetadata, RoutingWorkspace,
         congested_route_arcs, congested_route_arcs_indexed, fanout_placement_weight,
         local_connection_projected_cost_from_starts, ordered_sinks,
-        place_analytically_from_partial_bindings, place_analytically_with_net_sink_weights,
-        place_and_route, place_with_constraints, placement_from_partial_bindings,
-        placement_neighbors, projected_release_scope_penalty, projected_resource_penalty,
-        refine_placement_with_net_sink_weights_limited, refine_placement_with_net_weights,
-        refinement_edge_cost, retain_route_for_sinks, route_reaches_all_sinks,
-        route_with_placement_and_progress, route_with_seeded_routes_workspace_and_progress,
+        place_analytically_with_net_sink_weights, place_and_route, place_with_constraints,
+        placement_from_partial_bindings, placement_neighbors, projected_release_scope_penalty,
+        projected_resource_penalty, refine_placement_with_net_sink_weights_limited,
+        refine_placement_with_net_weights, refinement_edge_cost, retain_route_for_sinks,
+        route_reaches_all_sinks, route_with_placement_and_progress,
         route_with_timing_costs_and_progress, route_with_workspace_and_progress, routing_corridor,
         routing_step_cost, routing_transition_cost, timing_tree_cost,
     };
@@ -6898,33 +6764,6 @@ mod tests {
     }
 
     #[test]
-    fn mutable_route_seeds_preserve_a_legal_incumbent() {
-        let design = two_cell_design();
-        let device = Device::rectangular_logic(4, 4).unwrap();
-        let incumbent = place_and_route(&design, &device).unwrap();
-        let mut workspace = RoutingWorkspace::new(&device);
-        let mut first_iteration_nets = None;
-
-        let seeded = route_with_seeded_routes_workspace_and_progress(
-            &design,
-            &device,
-            incumbent.placement.clone(),
-            &RoutingConstraints::new(),
-            &incumbent.routes,
-            &mut workspace,
-            |event| {
-                if let super::RoutingProgress::Iteration { iteration: 0, nets } = event {
-                    first_iteration_nets = Some(nets);
-                }
-            },
-        )
-        .unwrap();
-
-        assert_eq!(first_iteration_nets, Some(0));
-        assert_eq!(seeded, incumbent);
-    }
-
-    #[test]
     fn analytical_placement_is_deterministic_and_legal() {
         let design = two_cell_design();
         let device = Device::rectangular_logic(4, 4).unwrap();
@@ -6947,26 +6786,6 @@ mod tests {
 
         assert_eq!(first, second);
         assert_ne!(first.bindings()[0], first.bindings()[1]);
-    }
-
-    #[test]
-    fn analytical_partial_placement_keeps_bindings_and_places_neighbors_nearby() {
-        let design = two_cell_design();
-        let device = Device::rectangular_logic(9, 1).unwrap();
-        let constraints = PlacementConstraints::new();
-
-        let placement = place_analytically_from_partial_bindings(
-            &design,
-            &device,
-            &constraints,
-            &BTreeMap::from([(CellId(0), BelId(8))]),
-        )
-        .unwrap();
-
-        assert_eq!(placement.bindings()[0], BelId(8));
-        let source = device.bels()[placement.bindings()[0].0].point;
-        let sink = device.bels()[placement.bindings()[1].0].point;
-        assert_eq!(source.manhattan(sink), 1);
     }
 
     #[test]
