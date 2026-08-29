@@ -23,7 +23,8 @@ use texo_cli::{
 };
 use texo_flow::{
     Ecp5FlowError, Ecp5FlowOptions, Ecp5FlowResult, Ecp5FlowStage, Evidence, Gate,
-    PostMapSimulationPolicy, RoutingProgress, implement_struo_ecp5_with_progress,
+    PhysicalFeedbackPolicy, PostMapSimulationPolicy, RoutingProgress,
+    implement_struo_ecp5_with_progress,
 };
 use texo_pnr::PnrError;
 use texo_struo::import_ecp5;
@@ -381,6 +382,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         allow_unconstrained_io: args.allow_unconstrained_io,
         placement_weight_exponent: args.placement_weight_exponent.get(),
         optimize_timing: !args.no_timing_optimization,
+        physical_feedback: PhysicalFeedbackPolicy::HandoffAfterLocal,
         ..Ecp5FlowOptions::default()
     };
     if let Some(fanout) = args.global_clock_fanout {
@@ -453,6 +455,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
             let refined_options = Ecp5FlowOptions {
                 initial_placement: Some(&inherited_placement),
                 incremental_seed: Some(&result),
+                physical_feedback: PhysicalFeedbackPolicy::CompleteClosure,
                 ..options
             };
             phase_started = Instant::now();
@@ -497,6 +500,52 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
             println!("physical synthesis round {round}: no equivalent rewrite candidate");
             break;
         }
+    }
+
+    if matches!(
+        options.physical_feedback,
+        PhysicalFeedbackPolicy::HandoffAfterLocal
+    ) && !result.timing.met_timing()
+    {
+        println!("physical synthesis handoff did not close timing; resuming critical closure");
+        let resumed_imported = import_ecp5(&mapped)?;
+        let resumed_cell_names = resumed_imported
+            .design()
+            .cells()
+            .iter()
+            .map(|cell| cell.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let resumed_placement = result
+            .design
+            .cells()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| {
+                resumed_cell_names.contains(cell.name.as_str()).then(|| {
+                    let bel = result
+                        .implementation
+                        .placement
+                        .bel(texo_model::CellId(index))?;
+                    Some((
+                        cell.name.clone(),
+                        architecture.device().bels()[bel.0].name.clone(),
+                    ))
+                })?
+            })
+            .collect::<BTreeMap<_, _>>();
+        phase_started = Instant::now();
+        result = implement_struo_ecp5_with_progress(
+            &resumed_imported,
+            &architecture,
+            Ecp5FlowOptions {
+                initial_placement: Some(&resumed_placement),
+                incremental_seed: Some(&result),
+                physical_feedback: PhysicalFeedbackPolicy::CompleteClosure,
+                ..options
+            },
+            &mut evidence,
+            |stage| report_flow_stage(stage, &mut phase_started),
+        )?;
     }
 
     write_checkpoint(
