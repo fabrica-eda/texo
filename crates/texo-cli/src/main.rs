@@ -1,6 +1,5 @@
 //! Texo command-line entry point.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
 use std::fs::File;
@@ -13,8 +12,7 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand};
 use struo_synth::synthesize;
 use struo_target_ecp5::{
-    ECP5_QOR_TARGET_MHZ, Ecp5Netlist, JtaggBinding, MappingOptions, OpenDrainIo, PhysicalFeedback,
-    PhysicalLocation, PhysicalNetTiming, PhysicalTimingEndpoint, PllBinding,
+    ECP5_QOR_TARGET_MHZ, Ecp5Netlist, JtaggBinding, MappingOptions, OpenDrainIo, PllBinding,
     map_to_ecp5_with_options,
 };
 use texo_cli::{
@@ -22,18 +20,14 @@ use texo_cli::{
     install_ecp5_target_pack, load_veryl_project, resolve_ecp5_target, write_checkpoint_visualizer,
 };
 use texo_flow::{
-    Ecp5FlowError, Ecp5FlowOptions, Ecp5FlowResult, Ecp5FlowStage, Evidence, Gate,
-    PhysicalFeedbackPolicy, PostMapSimulationPolicy, RoutingProgress,
-    implement_struo_ecp5_with_progress,
+    Ecp5FlowOptions, Ecp5FlowResult, Ecp5FlowStage, Evidence, Gate, PostMapSimulationPolicy,
+    RoutingProgress, implement_struo_ecp5_with_progress,
 };
-use texo_pnr::PnrError;
 use texo_struo::import_ecp5;
 use texo_target_ecp5::{
     Ecp5Architecture, parse_lpf, read_architecture, read_architecture_cache,
     write_architecture_cache,
 };
-
-const MAX_PHYSICAL_SYNTHESIS_ROUNDS: usize = 3;
 
 /// Native ECP5 place and route.
 #[derive(Debug, Parser)]
@@ -382,171 +376,19 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         allow_unconstrained_io: args.allow_unconstrained_io,
         placement_weight_exponent: args.placement_weight_exponent.get(),
         optimize_timing: !args.no_timing_optimization,
-        physical_feedback: PhysicalFeedbackPolicy::HandoffAfterLocal,
         ..Ecp5FlowOptions::default()
     };
     if let Some(fanout) = args.global_clock_fanout {
         options.global_clock_fanout = fanout;
     }
     let mut phase_started = Instant::now();
-    let mut result = implement_struo_ecp5_with_progress(
+    let result = implement_struo_ecp5_with_progress(
         &imported,
         &architecture,
         options,
         &mut evidence,
         |stage| report_flow_stage(stage, &mut phase_started),
     )?;
-
-    for round in 1..=MAX_PHYSICAL_SYNTHESIS_ROUNDS {
-        if !options.optimize_timing || result.timing.met_timing() {
-            break;
-        }
-        if physical_rewrite_is_coarser_than_remaining_miss(result.timing.worst_slack_ps) {
-            println!(
-                "physical synthesis: retained route-level near-closure result (WNS {})",
-                format_slack(result.timing.worst_slack_ps)
-            );
-            break;
-        }
-        let feedback =
-            native_physical_feedback(&result, &architecture, args.synthesis_goal_mhz.get());
-        let mut physical_candidates = mapped.physical_feedback_candidates(&feedback).into_iter();
-        if let Some(refined) = physical_candidates.next() {
-            println!(
-                "physical synthesis round {round}: {} equivalent logic replicas, {} physical rewires",
-                refined
-                    .retiming()
-                    .equivalent_logic_replications
-                    .saturating_sub(mapped.retiming().equivalent_logic_replications),
-                refined
-                    .retiming()
-                    .equivalent_physical_rewires
-                    .saturating_sub(mapped.retiming().equivalent_physical_rewires),
-            );
-            let refined_imported = import_ecp5(&refined)?;
-            let refined_cell_names = refined_imported
-                .design()
-                .cells()
-                .iter()
-                .map(|cell| cell.name.as_str())
-                .collect::<BTreeSet<_>>();
-            let inherited_placement = result
-                .design
-                .cells()
-                .iter()
-                .enumerate()
-                .filter_map(|(index, cell)| {
-                    refined_cell_names.contains(cell.name.as_str()).then(|| {
-                        let bel = result
-                            .implementation
-                            .placement
-                            .bel(texo_model::CellId(index))?;
-                        Some((
-                            cell.name.clone(),
-                            architecture.device().bels()[bel.0].name.clone(),
-                        ))
-                    })?
-                })
-                .collect::<BTreeMap<_, _>>();
-            println!(
-                "physical synthesis round {round}: inherited {} stable cell placements",
-                inherited_placement.len()
-            );
-            let refined_options = Ecp5FlowOptions {
-                initial_placement: Some(&inherited_placement),
-                incremental_seed: Some(&result),
-                physical_feedback: PhysicalFeedbackPolicy::CompleteClosure,
-                ..options
-            };
-            phase_started = Instant::now();
-            let refined_result = match implement_struo_ecp5_with_progress(
-                &refined_imported,
-                &architecture,
-                refined_options,
-                &mut evidence,
-                |stage| report_flow_stage(stage, &mut phase_started),
-            ) {
-                Ok(result) => result,
-                Err(Ecp5FlowError::Pnr(PnrError::InvalidPlacement { reason })) => {
-                    eprintln!(
-                        "physical synthesis round {round}: inherited placement rejected ({reason}); retrying native placement"
-                    );
-                    phase_started = Instant::now();
-                    implement_struo_ecp5_with_progress(
-                        &refined_imported,
-                        &architecture,
-                        options,
-                        &mut evidence,
-                        |stage| report_flow_stage(stage, &mut phase_started),
-                    )?
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let incumbent_wns = result.timing.worst_slack_ps.unwrap_or(i128::MIN);
-            let refined_wns = refined_result.timing.worst_slack_ps.unwrap_or(i128::MIN);
-            if refined_wns > incumbent_wns {
-                mapped = refined;
-                result = refined_result;
-                println!(
-                    "physical synthesis round {round}: accepted (WNS {incumbent_wns} ps -> {refined_wns} ps)"
-                );
-            } else {
-                println!(
-                    "physical synthesis round {round}: rejected (WNS {incumbent_wns} ps -> {refined_wns} ps)"
-                );
-                break;
-            }
-        } else {
-            println!("physical synthesis round {round}: no equivalent rewrite candidate");
-            break;
-        }
-    }
-
-    if matches!(
-        options.physical_feedback,
-        PhysicalFeedbackPolicy::HandoffAfterLocal
-    ) && !result.timing.met_timing()
-    {
-        println!("physical synthesis handoff did not close timing; resuming critical closure");
-        let resumed_imported = import_ecp5(&mapped)?;
-        let resumed_cell_names = resumed_imported
-            .design()
-            .cells()
-            .iter()
-            .map(|cell| cell.name.as_str())
-            .collect::<BTreeSet<_>>();
-        let resumed_placement = result
-            .design
-            .cells()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, cell)| {
-                resumed_cell_names.contains(cell.name.as_str()).then(|| {
-                    let bel = result
-                        .implementation
-                        .placement
-                        .bel(texo_model::CellId(index))?;
-                    Some((
-                        cell.name.clone(),
-                        architecture.device().bels()[bel.0].name.clone(),
-                    ))
-                })?
-            })
-            .collect::<BTreeMap<_, _>>();
-        phase_started = Instant::now();
-        result = implement_struo_ecp5_with_progress(
-            &resumed_imported,
-            &architecture,
-            Ecp5FlowOptions {
-                initial_placement: Some(&resumed_placement),
-                incremental_seed: Some(&result),
-                physical_feedback: PhysicalFeedbackPolicy::CompleteClosure,
-                ..options
-            },
-            &mut evidence,
-            |stage| report_flow_stage(stage, &mut phase_started),
-        )?;
-    }
 
     write_checkpoint(
         &output,
@@ -581,99 +423,6 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         "verification: mapping equivalence passed; post-map functional simulation not supplied"
     );
     Ok(())
-}
-
-fn native_physical_feedback(
-    result: &Ecp5FlowResult,
-    architecture: &Ecp5Architecture,
-    timing_goal_mhz: u32,
-) -> PhysicalFeedback {
-    let placement = &result.implementation.placement;
-    let placements = result
-        .design
-        .cells()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, cell)| {
-            let point = placement.point(texo_model::CellId(index), architecture.device())?;
-            Some((
-                cell.name.clone(),
-                PhysicalLocation {
-                    x: i32::try_from(point.x).ok()?,
-                    y: i32::try_from(point.y).ok()?,
-                },
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let bels = result
-        .design
-        .cells()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, cell)| {
-            let bel = placement.bel(texo_model::CellId(index))?;
-            Some((
-                cell.name.clone(),
-                architecture.device().bels()[bel.0].name.clone(),
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let slacks = result
-        .timing
-        .net_setup_slacks
-        .iter()
-        .map(|edge| ((edge.net, edge.sink), edge.slack_ps))
-        .collect::<BTreeMap<_, _>>();
-    let mut net_timings = BTreeMap::<texo_model::NetId, PhysicalNetTiming>::new();
-    for delay in &result.timing.net_delays {
-        let net = &result.design.nets()[delay.net.0];
-        let driver = &result.design.pins()[net.driver.0];
-        let sink = &result.design.pins()[delay.sink.0];
-        let delay_ps = u32::try_from(delay.delay.max_ps).unwrap_or(u32::MAX);
-        let slack_ps = slacks.get(&(delay.net, delay.sink)).copied().unwrap_or(0);
-        let deficit_ps = u64::try_from(slack_ps.unsigned_abs()).unwrap_or(u64::MAX);
-        let budget_ps = if slack_ps < 0 {
-            delay
-                .delay
-                .max_ps
-                .saturating_sub(deficit_ps)
-                .max(delay.delay.max_ps / 2)
-        } else {
-            delay.delay.max_ps
-        };
-        net_timings
-            .entry(delay.net)
-            .or_insert_with(|| PhysicalNetTiming {
-                driver: result.design.cells()[driver.cell.0].name.clone(),
-                net: net.name.clone(),
-                endpoints: Vec::new(),
-            })
-            .endpoints
-            .push(PhysicalTimingEndpoint {
-                cell: result.design.cells()[sink.cell.0].name.clone(),
-                port: sink.name.clone(),
-                delay_ps,
-                budget_ps: u32::try_from(budget_ps).unwrap_or(u32::MAX),
-            });
-    }
-    let goal_khz = timing_goal_mhz.saturating_mul(1_000).max(1);
-    let goal_period_ps = 1_000_000_000_u64 / u64::from(goal_khz);
-    let worst_slack_ps = result.timing.worst_slack_ps.unwrap_or(0);
-    let achieved_period_ps = if worst_slack_ps < 0 {
-        goal_period_ps
-            .saturating_add(u64::try_from(worst_slack_ps.unsigned_abs()).unwrap_or(u64::MAX))
-    } else {
-        goal_period_ps.saturating_sub(u64::try_from(worst_slack_ps).unwrap_or(u64::MAX))
-    }
-    .max(1);
-    let achieved_khz = u32::try_from(1_000_000_000_u64 / achieved_period_ps).unwrap_or(u32::MAX);
-    PhysicalFeedback::from_observations(
-        placements,
-        bels,
-        net_timings.into_values().collect(),
-        Vec::new(),
-        BTreeMap::from([("native".into(), (achieved_khz, goal_khz))]),
-    )
 }
 
 fn prepare_veryl_input(args: &PnrArgs) -> Result<(VerylProject, PathBuf), Box<dyn Error>> {
@@ -792,12 +541,6 @@ fn report_flow_stage(stage: Ecp5FlowStage, started: &mut Instant) {
 
 fn format_slack(slack: Option<i128>) -> String {
     slack.map_or_else(|| "n/a".into(), |value| format!("{value} ps"))
-}
-
-fn physical_rewrite_is_coarser_than_remaining_miss(worst_slack_ps: Option<i128>) -> bool {
-    let route_refinement_window_ps =
-        i128::from(texo_pnr::ROUTING_DELAY_QUANTUM_PS.saturating_mul(2));
-    worst_slack_ps.is_some_and(|slack| (-route_refinement_window_ps..0).contains(&slack))
 }
 
 fn load_architecture(path: &Path) -> Result<Ecp5Architecture, Box<dyn Error>> {
@@ -947,25 +690,7 @@ mod tests {
 
     use clap::{CommandFactory, Parser as _};
 
-    use super::{
-        Cli, Command, ensure_distinct_paths, jtagg_binding,
-        physical_rewrite_is_coarser_than_remaining_miss,
-    };
-
-    #[test]
-    fn physical_rewrites_defer_to_near_closure_route_repair() {
-        let window = i128::from(texo_pnr::ROUTING_DELAY_QUANTUM_PS * 2);
-
-        assert!(!physical_rewrite_is_coarser_than_remaining_miss(None));
-        assert!(physical_rewrite_is_coarser_than_remaining_miss(Some(
-            -window
-        )));
-        assert!(physical_rewrite_is_coarser_than_remaining_miss(Some(
-            -window + 1
-        )));
-        assert!(physical_rewrite_is_coarser_than_remaining_miss(Some(-1)));
-        assert!(!physical_rewrite_is_coarser_than_remaining_miss(Some(0)));
-    }
+    use super::{Cli, Command, ensure_distinct_paths, jtagg_binding};
 
     #[test]
     fn parses_documented_pnr_command() {
