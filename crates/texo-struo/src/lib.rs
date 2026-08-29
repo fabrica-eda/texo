@@ -637,6 +637,7 @@ impl Importer {
             reference_clock,
             feedback_clock,
             output_clock,
+            additional_output_clocks,
             locked,
             fabric_output,
             feedback_output,
@@ -674,6 +675,9 @@ impl Importer {
             self.add_input(cell, name, bit)?;
         }
         self.add_output(cell, fabric_output.port(), *output_clock)?;
+        for (output, wire) in additional_output_clocks {
+            self.add_output(cell, PllOutput::from(*output).port(), *wire)?;
+        }
         if fabric_output != feedback_output {
             self.add_output(cell, feedback_output.port(), *feedback_clock)?;
         }
@@ -1627,6 +1631,7 @@ mod tests {
         let mut source = Netlist::new("pll_top");
         source.add_input("clk");
         source.add_input("clk_250");
+        source.add_input("clk_125");
         let locked = source.add_input("pll_locked");
         source.add_output("locked", locked);
         let mut binding = PllBinding::new(
@@ -1637,6 +1642,9 @@ mod tests {
             StruoPllOutput::Clkop,
         );
         binding.parameters.insert("CLKI_DIV".into(), "3".into());
+        binding
+            .additional_output_clock_ports
+            .insert("clk_125".into(), StruoPllOutput::Clkos2);
         binding
             .attributes
             .insert("FREQUENCY_PIN_CLKOS".into(), "250".into());
@@ -1682,6 +1690,7 @@ mod tests {
                 ("PLLWAKESYNC", texo_model::PinDirection::Input),
                 ("ENCLKOP", texo_model::PinDirection::Input),
                 ("CLKOS", texo_model::PinDirection::Output),
+                ("CLKOS2", texo_model::PinDirection::Output),
                 ("CLKOP", texo_model::PinDirection::Output),
                 ("LOCK", texo_model::PinDirection::Output),
             ]
