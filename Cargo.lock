@@ -3340,6 +3340,7 @@ dependencies = [
  "struo-target-ecp5",
  "texo-flow",
  "texo-model",
+ "texo-pnr",
  "texo-struo",
  "texo-target-ecp5",
  "ureq",

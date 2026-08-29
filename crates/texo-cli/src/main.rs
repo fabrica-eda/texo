@@ -1,6 +1,6 @@
 //! Texo command-line entry point.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
 use std::fs::File;
@@ -22,9 +22,10 @@ use texo_cli::{
     install_ecp5_target_pack, load_veryl_project, resolve_ecp5_target, write_checkpoint_visualizer,
 };
 use texo_flow::{
-    Ecp5FlowOptions, Ecp5FlowResult, Ecp5FlowStage, Evidence, Gate, PostMapSimulationPolicy,
-    RoutingProgress, implement_struo_ecp5_with_progress,
+    Ecp5FlowError, Ecp5FlowOptions, Ecp5FlowResult, Ecp5FlowStage, Evidence, Gate,
+    PostMapSimulationPolicy, RoutingProgress, implement_struo_ecp5_with_progress,
 };
+use texo_pnr::PnrError;
 use texo_struo::import_ecp5;
 use texo_target_ecp5::{
     Ecp5Architecture, parse_lpf, read_architecture, read_architecture_cache,
@@ -398,6 +399,13 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         if !options.optimize_timing || result.timing.met_timing() {
             break;
         }
+        if physical_rewrite_is_coarser_than_remaining_miss(result.timing.worst_slack_ps) {
+            println!(
+                "physical synthesis: retained route-level near-closure result (WNS {})",
+                format_slack(result.timing.worst_slack_ps)
+            );
+            break;
+        }
         let feedback =
             native_physical_feedback(&result, &architecture, args.synthesis_goal_mhz.get());
         let mut physical_candidates = mapped.physical_feedback_candidates(&feedback).into_iter();
@@ -414,14 +422,62 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
                     .saturating_sub(mapped.retiming().equivalent_physical_rewires),
             );
             let refined_imported = import_ecp5(&refined)?;
+            let refined_cell_names = refined_imported
+                .design()
+                .cells()
+                .iter()
+                .map(|cell| cell.name.as_str())
+                .collect::<BTreeSet<_>>();
+            let inherited_placement = result
+                .design
+                .cells()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, cell)| {
+                    refined_cell_names.contains(cell.name.as_str()).then(|| {
+                        let bel = result
+                            .implementation
+                            .placement
+                            .bel(texo_model::CellId(index))?;
+                        Some((
+                            cell.name.clone(),
+                            architecture.device().bels()[bel.0].name.clone(),
+                        ))
+                    })?
+                })
+                .collect::<BTreeMap<_, _>>();
+            println!(
+                "physical synthesis round {round}: inherited {} stable cell placements",
+                inherited_placement.len()
+            );
+            let refined_options = Ecp5FlowOptions {
+                initial_placement: Some(&inherited_placement),
+                ..options
+            };
             phase_started = Instant::now();
-            let refined_result = implement_struo_ecp5_with_progress(
+            let refined_result = match implement_struo_ecp5_with_progress(
                 &refined_imported,
                 &architecture,
-                options,
+                refined_options,
                 &mut evidence,
                 |stage| report_flow_stage(stage, &mut phase_started),
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(Ecp5FlowError::Pnr(PnrError::InvalidPlacement { reason })) => {
+                    eprintln!(
+                        "physical synthesis round {round}: inherited placement rejected ({reason}); retrying native placement"
+                    );
+                    phase_started = Instant::now();
+                    implement_struo_ecp5_with_progress(
+                        &refined_imported,
+                        &architecture,
+                        options,
+                        &mut evidence,
+                        |stage| report_flow_stage(stage, &mut phase_started),
+                    )?
+                }
+                Err(error) => return Err(error.into()),
+            };
             let incumbent_wns = result.timing.worst_slack_ps.unwrap_or(i128::MIN);
             let refined_wns = refined_result.timing.worst_slack_ps.unwrap_or(i128::MIN);
             if refined_wns > incumbent_wns {
@@ -688,6 +744,12 @@ fn format_slack(slack: Option<i128>) -> String {
     slack.map_or_else(|| "n/a".into(), |value| format!("{value} ps"))
 }
 
+fn physical_rewrite_is_coarser_than_remaining_miss(worst_slack_ps: Option<i128>) -> bool {
+    let route_refinement_window_ps =
+        i128::from(texo_pnr::ROUTING_DELAY_QUANTUM_PS.saturating_mul(2));
+    worst_slack_ps.is_some_and(|slack| (-route_refinement_window_ps..0).contains(&slack))
+}
+
 fn load_architecture(path: &Path) -> Result<Ecp5Architecture, Box<dyn Error>> {
     let reader = BufReader::new(File::open(path)?);
     if path.extension().and_then(|extension| extension.to_str()) == Some("txdb") {
@@ -835,7 +897,25 @@ mod tests {
 
     use clap::{CommandFactory, Parser as _};
 
-    use super::{Cli, Command, ensure_distinct_paths, jtagg_binding};
+    use super::{
+        Cli, Command, ensure_distinct_paths, jtagg_binding,
+        physical_rewrite_is_coarser_than_remaining_miss,
+    };
+
+    #[test]
+    fn physical_rewrites_defer_to_near_closure_route_repair() {
+        let window = i128::from(texo_pnr::ROUTING_DELAY_QUANTUM_PS * 2);
+
+        assert!(!physical_rewrite_is_coarser_than_remaining_miss(None));
+        assert!(physical_rewrite_is_coarser_than_remaining_miss(Some(
+            -window
+        )));
+        assert!(physical_rewrite_is_coarser_than_remaining_miss(Some(
+            -window + 1
+        )));
+        assert!(physical_rewrite_is_coarser_than_remaining_miss(Some(-1)));
+        assert!(!physical_rewrite_is_coarser_than_remaining_miss(Some(0)));
+    }
 
     #[test]
     fn parses_documented_pnr_command() {

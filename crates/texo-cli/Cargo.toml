@@ -20,6 +20,7 @@ struo-synth.workspace = true
 struo-target-ecp5.workspace = true
 texo-flow.workspace = true
 texo-model.workspace = true
+texo-pnr.workspace = true
 texo-struo.workspace = true
 texo-target-ecp5.workspace = true
 ureq.workspace = true
