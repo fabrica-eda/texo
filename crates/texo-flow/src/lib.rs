@@ -460,7 +460,7 @@ pub fn implement_struo_ecp5_with_progress(
         &constant_luts,
         imported.metadata(),
     )?;
-    let mut timing_constraints = ecp5_timing_constraints(&design, &packing, speed_grade)?;
+    let mut timing_constraints = ecp5_timing_constraints(&design, &packing)?;
     let mut initial_timing = analyze_ecp5_implementation(
         &design,
         architecture,
@@ -542,7 +542,7 @@ pub fn implement_struo_ecp5_with_progress(
             &constant_luts,
             imported.metadata(),
         )?;
-        timing_constraints = ecp5_timing_constraints(&design, &packing, speed_grade)?;
+        timing_constraints = ecp5_timing_constraints(&design, &packing)?;
         costs.set_net_criticalities(timing_net_weights(&initial_timing, &timing_constraints));
         costs.set_sink_criticalities(timing_arc_weights(&initial_timing, &timing_constraints));
     }
@@ -769,7 +769,7 @@ fn repair_hold_with_dedicated_edge_release(
                 constant_cells,
                 metadata,
             )?;
-            let trial_constraints = ecp5_timing_constraints(design, &trial_packing, speed_grade)?;
+            let trial_constraints = ecp5_timing_constraints(design, &trial_packing)?;
             let requested_minimums = BTreeMap::from([(key, minimum_ps)]);
             let Some((mut trial_implementation, mut trial_timing)) = route_hold_trial(
                 design,
@@ -906,7 +906,7 @@ fn repair_hold_with_dedicated_edge_release(
     // general-routing hold arcs together. This also handles designs whose
     // violations never involved a dedicated edge.
     let model = ecp5_timing_model(design, packing, speed_grade, constant_cells, metadata)?;
-    let constraints = ecp5_timing_constraints(design, packing, speed_grade)?;
+    let constraints = ecp5_timing_constraints(design, packing)?;
     let mut rolling_implementation = implementation.clone();
     let mut rolling_timing = timing.clone();
     let mut best_score = timing_score(timing);
@@ -1224,8 +1224,7 @@ fn optimize_dedicated_lut_ff_edge(
             constant_cells,
             metadata,
         )?;
-        let trial_timing_constraints =
-            ecp5_timing_constraints(design, &trial_packing, speed_grade)?;
+        let trial_timing_constraints = ecp5_timing_constraints(design, &trial_packing)?;
         let trial_timing = analyze_ecp5_implementation(
             design,
             architecture,
@@ -3764,23 +3763,11 @@ fn select_timing_candidates(
 fn ecp5_timing_constraints(
     design: &Design,
     packing: &Ecp5Packing,
-    speed_grade: &SpeedGradeRecord,
 ) -> Result<TimingConstraints, Ecp5FlowError> {
-    // Texo models the DCCA insertion delay but not the sink-to-sink skew of the
-    // primary clock tree. Lattice's ECP5/ECP5-5G Family Data Sheet,
-    // FPGA-DS-02012 section 3.18, specifies the following maximum primary-clock
-    // skew. Treat it as setup uncertainty instead of inventing an empirical
-    // design-wide margin.
-    let primary_clock_skew_ps = match speed_grade.name.as_str() {
-        "8" | "8_5G" => 420,
-        "7" | "7_5G" => 462,
-        "6" => 505,
-        _ => {
-            return Err(Ecp5FlowError::MissingPrimaryClockSkew {
-                speed_grade: speed_grade.name.clone(),
-            });
-        }
-    };
+    // Match nextpnr's ECP5 QoR model: constraints provide only the nominal
+    // period. Project Trellis cell/PIP min/max values are applied by STA, but
+    // clock-tree skew, PLL jitter, and additional setup uncertainty are not
+    // deducted from that period.
     let mut constraints = TimingConstraints::new();
     for (&cell_id, &frequency_hz) in packing.clock_frequencies_hz() {
         let cell = &design.cells()[cell_id.0];
@@ -3816,33 +3803,6 @@ fn ecp5_timing_constraints(
         if let Some(&period_ps) = constraints.clock_periods_ps().get(&clock.source_net) {
             insert_clock_period(&mut constraints, clock.global_net, period_ps)?;
         }
-    }
-    for net in constraints
-        .clock_periods_ps()
-        .keys()
-        .copied()
-        .collect::<Vec<_>>()
-    {
-        constraints.set_setup_uncertainty_ps(net, primary_clock_skew_ps);
-    }
-    // PLL period jitter changes the separation between adjacent launch and
-    // capture edges and is independent of primary-tree sink skew. The ECP5
-    // data sheet specifies 100 ps p-p at 100 MHz and above, and 0.025 UI p-p
-    // below 100 MHz.
-    for (&net, &period_ps) in packing.generated_clock_periods_ps() {
-        let pll_period_jitter_ps = if period_ps <= 10_000 {
-            100
-        } else {
-            period_ps.div_ceil(40)
-        };
-        let uncertainty_ps = primary_clock_skew_ps
-            .checked_add(pll_period_jitter_ps)
-            .ok_or(Ecp5FlowError::TimingDelayOverflow)?;
-        constraints.set_setup_uncertainty_ps(net, uncertainty_ps);
-    }
-    for clock in packing.global_clocks() {
-        let source_uncertainty_ps = constraints.setup_uncertainty_ps(clock.source_net);
-        constraints.set_setup_uncertainty_ps(clock.global_net, source_uncertainty_ps);
     }
     Ok(constraints)
 }
@@ -4248,11 +4208,6 @@ pub enum Ecp5FlowError {
         /// Missing cell type.
         cell_type: String,
     },
-    /// The official primary-clock skew is not specified for this speed grade.
-    MissingPrimaryClockSkew {
-        /// Speed-grade name.
-        speed_grade: String,
-    },
     /// Speed-grade delay arithmetic overflowed.
     TimingDelayOverflow,
     /// A frequency-constrained IO cell does not drive exactly one net.
@@ -4350,10 +4305,6 @@ impl fmt::Display for Ecp5FlowError {
                 f,
                 "ECP5 speed grade `{speed_grade}` has no cell timing for `{cell_type}`"
             ),
-            Self::MissingPrimaryClockSkew { speed_grade } => write!(
-                f,
-                "ECP5 speed grade `{speed_grade}` has no specified primary-clock skew"
-            ),
             Self::TimingDelayOverflow => write!(f, "ECP5 timing delay arithmetic overflowed"),
             Self::ClockIoNet { cell } => write!(
                 f,
@@ -4411,7 +4362,6 @@ impl Error for Ecp5FlowError {
             | Self::UnknownSpeedGrade(_)
             | Self::MissingPipTimingClass { .. }
             | Self::MissingCellTiming { .. }
-            | Self::MissingPrimaryClockSkew { .. }
             | Self::TimingDelayOverflow
             | Self::ClockIoNet { .. }
             | Self::ClockFrequencyOutOfRange { .. }
@@ -5362,8 +5312,7 @@ mod tests {
             .apply_resolved_lpf(&design, &architecture, "CABGA381", &resolved)
             .unwrap();
 
-        let constraints =
-            ecp5_timing_constraints(&design, &packing, &architecture.speed_grades()["6"]).unwrap();
+        let constraints = ecp5_timing_constraints(&design, &packing).unwrap();
         let timing_model = ecp5_timing_model(
             &design,
             &packing,
@@ -5386,13 +5335,7 @@ mod tests {
         assert_eq!(packing.clock_frequencies_hz().len(), 1);
         assert_eq!(constraints.clock_periods_ps().len(), 2);
         assert_eq!(constraints.clock_periods_ps()[&global_net], 40_000);
-        assert_eq!(constraints.setup_uncertainties_ps().len(), 2);
-        assert!(
-            constraints
-                .setup_uncertainties_ps()
-                .values()
-                .all(|&uncertainty_ps| uncertainty_ps == 505)
-        );
+        assert!(constraints.setup_uncertainties_ps().is_empty());
         assert_eq!(timing_model.clock_to_q(ff_q).unwrap().2.max_ps, 525);
         assert_eq!(timing_model.setup_hold(ff_data).unwrap().3.min_ps, 233);
         assert!(timing_model.setup_hold(ff_lsr).is_none());

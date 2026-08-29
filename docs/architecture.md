@@ -192,9 +192,11 @@ keyed by the same stable IDs. Schema v3 also contains timing tables for speed
 grades `6`, `7`, `8`, and `8_5G`: interconnect base/fanout coefficients plus
 split `TRELLIS_COMB`, `TRELLIS_FF`, and DCCA cell arcs. Interconnect
 coefficients retain Project Trellis's independently fitted `min/typ/max`
-corners without sorting them. Those fitted values are not necessarily
-monotonic; setup propagation selects `max`, while hold propagation selects
-`min`, matching the ECP5 timing database semantics used by nextpnr.
+corners without sorting them. Exactly as in nextpnr's ECP5 chipdb importer,
+Texo multiplies only each interconnect class's base-delay corners by 1.1;
+fanout adders and cell/setup/hold records remain unscaled. Those fitted values
+are not necessarily monotonic; setup propagation selects `max`, while hold
+propagation selects `min`.
 
 Generate a snapshot from local, revision-controlled Project Trellis source and
 database checkouts:
@@ -245,7 +247,9 @@ selected PIP tree and characterized cell arcs. ECP5 STA includes PIP timing
 class and enabled-source fanout, LUT input-to-output delay, DCCA propagation,
 FF clock-to-Q, setup, and hold. Setup uses late data versus early capture clock;
 hold uses early data versus late capture clock. The speed grade is mandatory
-and recorded in the checkpoint. A report with no constrained sequential
+and recorded in the checkpoint. For nextpnr-compatible ECP5 QoR, no additional
+clock skew, PLL jitter, or setup uncertainty is deducted from the nominal
+period. A report with no constrained sequential
 endpoint, negative setup slack, or negative hold slack does not satisfy the
 timing-closure gate. BRAM timing, generated clocks, multicycle paths, and false
 paths remain future work.
