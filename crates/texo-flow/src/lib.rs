@@ -4001,16 +4001,7 @@ fn ecp5_timing_model(
     let mut model = TimingModel::new();
     for (index, cell) in design.cells().iter().enumerate() {
         let cell_id = CellId(index);
-        let clock_edge = metadata
-            .get(&cell_id)
-            .and_then(|primitive| match primitive {
-                PrimitiveMetadata::FlipFlop { edge, .. }
-                | PrimitiveMetadata::BlockRam { edge, .. } => Some(match edge {
-                    texo_struo::ClockEdge::Rising => TimingClockEdge::Rising,
-                    texo_struo::ClockEdge::Falling => TimingClockEdge::Falling,
-                }),
-                _ => None,
-            });
+        let primitive_metadata = metadata.get(&cell_id);
         let cell_type = if let Some(&cell_type) = carry_slices.get(&cell_id) {
             cell_type
         } else {
@@ -4045,7 +4036,8 @@ fn ecp5_timing_model(
                 model.add_clock_to_q(
                     from,
                     to,
-                    clock_edge.unwrap_or(TimingClockEdge::Rising),
+                    primitive_clock_edge(primitive_metadata, &arc.from_pin)
+                        .unwrap_or(TimingClockEdge::Rising),
                     delay,
                 )?;
             } else {
@@ -4060,7 +4052,7 @@ fn ecp5_timing_model(
             record,
             general_routing_ffs.contains(&cell_id),
             &constant_nets,
-            clock_edge.unwrap_or(TimingClockEdge::Rising),
+            primitive_metadata,
         )?;
     }
     Ok(model)
@@ -4073,7 +4065,7 @@ fn add_setup_hold_timing(
     record: &texo_target_ecp5::CellTimingRecord,
     using_general_routing: bool,
     constant_nets: &BTreeSet<NetId>,
-    clock_edge: TimingClockEdge,
+    metadata: Option<&PrimitiveMetadata>,
 ) -> Result<(), Ecp5FlowError> {
     for check in &record.setup_holds {
         // ECP5 LSR is an asynchronous set/reset input. Its characterized
@@ -4108,12 +4100,35 @@ fn add_setup_hold_timing(
         model.add_setup_hold(
             clock,
             signal,
-            clock_edge,
+            primitive_clock_edge(metadata, &check.clock_pin).unwrap_or(TimingClockEdge::Rising),
             timing_delay(check.setup)?,
             timing_delay(check.hold)?,
         )?;
     }
     Ok(())
+}
+
+fn primitive_clock_edge(
+    metadata: Option<&PrimitiveMetadata>,
+    clock_pin: &str,
+) -> Option<TimingClockEdge> {
+    let edge = match metadata? {
+        PrimitiveMetadata::FlipFlop { edge, .. } => *edge,
+        PrimitiveMetadata::BlockRam {
+            edge, second_port, ..
+        } => {
+            if clock_pin == "CLKB" {
+                second_port.map_or(*edge, |port| port.edge)
+            } else {
+                *edge
+            }
+        }
+        _ => return None,
+    };
+    Some(match edge {
+        texo_struo::ClockEdge::Rising => TimingClockEdge::Rising,
+        texo_struo::ClockEdge::Falling => TimingClockEdge::Falling,
+    })
 }
 
 fn add_wide_lut_timing_arcs(
@@ -4442,15 +4457,15 @@ mod tests {
         placement_from_partial_bindings, rebind_placement_pins,
     };
     use texo_struo::{
-        ActiveLevel as ImportedActiveLevel, ClockEdge as ImportedClockEdge, PrimitiveMetadata,
-        import_ecp5,
+        ActiveLevel as ImportedActiveLevel, BlockRamPortMetadata, ClockEdge as ImportedClockEdge,
+        PrimitiveMetadata, import_ecp5,
     };
     use texo_target_ecp5::{
         ArchitectureFile, Ecp5Packing, PipClassTimingRecord, PipRecord, RelativeRef,
         TimingCornersRecord, expand, find_global_clock_requirements, pack_lut_ffs,
         pack_lut_ffs_excluding, parse_lpf, read_architecture, resolve_lpf_port_cells,
     };
-    use texo_timing::DelayRange;
+    use texo_timing::{ClockEdge as TimingClockEdge, DelayRange};
 
     use super::{
         Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, PostMapSimulationPolicy,
@@ -4458,9 +4473,9 @@ mod tests {
         delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, ff_ce_control_sets,
         ff_clock_control_sets, find_cell_pin, freeze_route_sinks_except, freeze_unchanged_routes,
         implement, implement_struo_ecp5, implement_with_constraints, next_wns_regression_streak,
-        pip_class_delay, project_trellis_speed_grade, ranked_critical_path_cells,
-        retain_projection_timing_frontier, slack_violations, staged_timing_score,
-        verify_post_map_with_celox,
+        pip_class_delay, primitive_clock_edge, project_trellis_speed_grade,
+        ranked_critical_path_cells, retain_projection_timing_frontier, slack_violations,
+        staged_timing_score, verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -4665,6 +4680,32 @@ mod tests {
         assert_eq!(sets[&rising_a], sets[&rising_b]);
         assert_ne!(sets[&rising_a], sets[&falling]);
         assert_ne!(sets[&rising_a], sets[&other]);
+    }
+
+    #[test]
+    fn true_dual_port_ram_uses_each_physical_clock_edge() {
+        let metadata = PrimitiveMetadata::BlockRam {
+            depth: 4,
+            word_width: 2,
+            physical_width: 2,
+            edge: ImportedClockEdge::Falling,
+            write_enable: ImportedActiveLevel::High,
+            read_enable: None,
+            second_port: Some(BlockRamPortMetadata {
+                edge: ImportedClockEdge::Rising,
+                write_enable: ImportedActiveLevel::High,
+                read_enable: None,
+            }),
+        };
+
+        assert_eq!(
+            primitive_clock_edge(Some(&metadata), "CLKA"),
+            Some(TimingClockEdge::Falling)
+        );
+        assert_eq!(
+            primitive_clock_edge(Some(&metadata), "CLKB"),
+            Some(TimingClockEdge::Rising)
+        );
     }
 
     #[test]

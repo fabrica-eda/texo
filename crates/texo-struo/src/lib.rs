@@ -125,6 +125,17 @@ pub struct ResetMetadata {
     pub value: bool,
 }
 
+/// Independently clocked second-port configuration of a true-dual-port RAM.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockRamPortMetadata {
+    /// Active clock edge.
+    pub edge: ClockEdge,
+    /// Write-enable assertion level.
+    pub write_enable: ActiveLevel,
+    /// Optional read-enable assertion level.
+    pub read_enable: Option<ActiveLevel>,
+}
+
 /// Direction of a top-level package port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PortDirection {
@@ -176,6 +187,8 @@ pub enum PrimitiveMetadata {
         write_enable: ActiveLevel,
         /// Optional read-enable assertion level.
         read_enable: Option<ActiveLevel>,
+        /// Independently clocked second port, when this is true dual port.
+        second_port: Option<BlockRamPortMetadata>,
     },
     /// Dedicated ECP5 JTAG TAP access block.
     Jtagg {
@@ -898,6 +911,7 @@ impl Importer {
             read_enable,
             clock,
             edge,
+            second_port,
         } = primitive
         else {
             unreachable!("dispatch guarantees BlockRam")
@@ -912,6 +926,11 @@ impl Importer {
                 edge: (*edge).into(),
                 write_enable: write_enable.active.into(),
                 read_enable: read_enable.map(|control| control.active.into()),
+                second_port: second_port.as_ref().map(|port| BlockRamPortMetadata {
+                    edge: port.edge.into(),
+                    write_enable: port.write_enable.active.into(),
+                    read_enable: port.read_enable.map(|control| control.active.into()),
+                }),
             },
         );
         self.add_block_ram_inputs(
@@ -922,9 +941,19 @@ impl Importer {
             read_address,
             *read_enable,
             *clock,
+            second_port.as_ref().map(|port| port.address.as_ref()),
+            second_port.as_ref().map(|port| port.write_data.as_slice()),
+            second_port.as_ref().map(|port| port.write_enable),
+            second_port.as_ref().map(|port| port.clock),
         )?;
+        let primary_output = if second_port.is_some() { "DOA" } else { "DOB" };
         for (index, wire) in read_data.iter().copied().enumerate() {
-            self.add_output(cell, format!("DOB{index}"), wire)?;
+            self.add_output(cell, format!("{primary_output}{index}"), wire)?;
+        }
+        if let Some(port) = second_port {
+            for (index, wire) in port.read_data.iter().copied().enumerate() {
+                self.add_output(cell, format!("DOB{index}"), wire)?;
+            }
         }
         Ok(())
     }
@@ -939,6 +968,10 @@ impl Importer {
         read_address: &[Bit; 14],
         read_enable: Option<Control>,
         clock: Bit,
+        second_address: Option<&[Bit; 14]>,
+        second_write_data: Option<&[Bit]>,
+        second_write_enable: Option<Control>,
+        second_clock: Option<Bit>,
     ) -> Result<(), AdapterError> {
         for (index, bit) in write_address.iter().copied().enumerate() {
             self.add_absorbable_input(cell, format!("ADA{index}"), bit)?;
@@ -962,20 +995,33 @@ impl Importer {
         for index in 0..3 {
             self.add_absorbable_input(cell, format!("CSA{index}"), Bit::Zero)?;
         }
-        for (index, bit) in read_address.iter().copied().enumerate() {
+        let port_b_address = second_address.unwrap_or(read_address);
+        for (index, bit) in port_b_address.iter().copied().enumerate() {
             self.add_absorbable_input(cell, format!("ADB{index}"), bit)?;
         }
         for index in 0..18 {
-            self.add_absorbable_input(cell, format!("DIB{index}"), Bit::Zero)?;
+            self.add_absorbable_input(
+                cell,
+                format!("DIB{index}"),
+                second_write_data
+                    .and_then(|data| data.get(index).copied())
+                    .unwrap_or(Bit::Zero),
+            )?;
         }
         for (name, bit) in [
             (
                 "CEB",
-                read_enable.map_or(Bit::One, |control| control.signal),
+                second_address.map_or_else(
+                    || read_enable.map_or(Bit::One, |control| control.signal),
+                    |_| Bit::One,
+                ),
             ),
             ("OCEB", Bit::One),
-            ("CLKB", clock),
-            ("WEB", Bit::Zero),
+            ("CLKB", second_clock.unwrap_or(clock)),
+            (
+                "WEB",
+                second_write_enable.map_or(Bit::Zero, |enable| enable.signal),
+            ),
             ("RSTB", Bit::Zero),
         ] {
             self.add_absorbable_input(cell, name, bit)?;
@@ -1432,7 +1478,7 @@ mod tests {
 
     use struo_ir::{
         ActiveLevel as StruoActiveLevel, ArithmeticOp, ClockEdge as StruoClockEdge, ComparisonOp,
-        EnableControl, MemoryCell, Netlist, RegisterCell, ResetControl,
+        EnableControl, MemoryCell, MemoryPort, Netlist, RegisterCell, ResetControl,
     };
     use struo_target_ecp5::{
         Bit, Ecp5Cell, IoTimingConstraints, JtaggBinding, MappingOptions, OpenDrainIo, PllBinding,
@@ -1442,8 +1488,8 @@ mod tests {
     use texo_model::{CellId, ResourceKind};
 
     use super::{
-        ActiveLevel, ClockEdge, Importer, PortDirection, PrimitiveMetadata, ResetMetadata,
-        celox_frontend_artifact, fold_lut_input, import_ecp5, pack_carry_inputs,
+        ActiveLevel, BlockRamPortMetadata, ClockEdge, Importer, PortDirection, PrimitiveMetadata,
+        ResetMetadata, celox_frontend_artifact, fold_lut_input, import_ecp5, pack_carry_inputs,
     };
 
     fn mapped_xor() -> struo_target_ecp5::Ecp5Netlist {
@@ -2293,5 +2339,105 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn imports_true_dual_port_dp16kd_pins_and_edges() {
+        let mut source = Netlist::new("true_dual_memory");
+        let clock_a = source.add_input("clock_a");
+        let clock_b = source.add_input("clock_b");
+        let write_enable_a = source.add_input("write_enable_a");
+        let write_enable_b = source.add_input("write_enable_b");
+        let address_a = (0..2)
+            .map(|index| source.add_input(format!("address_a_{index}")))
+            .collect::<Vec<_>>();
+        let address_b = (0..2)
+            .map(|index| source.add_input(format!("address_b_{index}")))
+            .collect::<Vec<_>>();
+        let write_data_a = (0..2)
+            .map(|index| source.add_input(format!("write_data_a_{index}")))
+            .collect::<Vec<_>>();
+        let write_data_b = (0..2)
+            .map(|index| source.add_input(format!("write_data_b_{index}")))
+            .collect::<Vec<_>>();
+        let read_data_a = (0..2)
+            .map(|index| source.add_memory_output(format!("read_data_a_{index}")))
+            .collect::<Vec<_>>();
+        let read_data_b = (0..2)
+            .map(|index| source.add_memory_output(format!("read_data_b_{index}")))
+            .collect::<Vec<_>>();
+        source.add_memory(
+            MemoryCell::new(
+                "words",
+                4,
+                address_a.clone(),
+                read_data_a.clone(),
+                None,
+                address_a,
+                write_data_a,
+                EnableControl {
+                    signal: write_enable_a,
+                    active: StruoActiveLevel::High,
+                },
+                clock_a,
+                StruoClockEdge::Falling,
+            )
+            .with_second_port(MemoryPort::new(
+                address_b.clone(),
+                read_data_b.clone(),
+                None,
+                address_b,
+                write_data_b,
+                EnableControl {
+                    signal: write_enable_b,
+                    active: StruoActiveLevel::Low,
+                },
+                clock_b,
+                StruoClockEdge::Rising,
+            )),
+        );
+        for (index, output) in read_data_a.into_iter().enumerate() {
+            source.add_output(format!("read_data_a_{index}"), output);
+        }
+        for (index, output) in read_data_b.into_iter().enumerate() {
+            source.add_output(format!("read_data_b_{index}"), output);
+        }
+
+        let imported = import_ecp5(&map_to_ecp5(&source).unwrap()).unwrap();
+        let block_ram = imported
+            .design()
+            .cells()
+            .iter()
+            .position(|cell| cell.kind == ResourceKind::Memory)
+            .map(CellId)
+            .unwrap();
+        let pin_names = imported.design().cells()[block_ram.0]
+            .pins()
+            .iter()
+            .map(|pin| imported.design().pins()[pin.0].name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(pin_names.iter().any(|name| name.starts_with("DOA")));
+        assert!(pin_names.iter().any(|name| name.starts_with("DOB")));
+        assert!(pin_names.contains(&"CLKA"));
+        assert!(pin_names.contains(&"CLKB"));
+        assert!(pin_names.contains(&"WEA"));
+        assert!(pin_names.contains(&"WEB"));
+        assert_eq!(
+            imported.metadata()[&block_ram],
+            PrimitiveMetadata::BlockRam {
+                depth: 4,
+                word_width: 2,
+                physical_width: 2,
+                edge: ClockEdge::Falling,
+                write_enable: ActiveLevel::High,
+                read_enable: None,
+                second_port: Some(BlockRamPortMetadata {
+                    edge: ClockEdge::Rising,
+                    write_enable: ActiveLevel::Low,
+                    read_enable: None,
+                }),
+            }
+        );
     }
 }
