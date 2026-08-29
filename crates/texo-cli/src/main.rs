@@ -452,6 +452,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
             );
             let refined_options = Ecp5FlowOptions {
                 initial_placement: Some(&inherited_placement),
+                incremental_seed: Some(&result),
                 ..options
             };
             phase_started = Instant::now();

@@ -15,11 +15,13 @@ use texo_model::{
 pub use texo_pnr::RoutingProgress;
 use texo_pnr::{
     NetRoute, Placement, PlacementConnectionDelayWorkspace, PlacementConstraints,
-    PlacementRefinementWorkspace, PlacementRefiner, PnrError, PnrResult, RouteCapacityProjection,
-    RoutingConstraints, RoutingCosts, RoutingWorkspace, place_analytically_with_net_sink_weights,
-    place_and_route_with_constraints, placement_from_partial_bindings, rebind_placement_pins,
-    retain_route_for_sinks, route_with_timing_costs_workspace_and_progress,
-    route_with_workspace_and_progress, swap_placement_cells,
+    PlacementRefinementWorkspace, PlacementRefiner, PnrError, PnrResult, RouteArc,
+    RouteCapacityProjection, RoutingConstraints, RoutingCosts, RoutingWorkspace,
+    place_analytically_from_partial_bindings, place_analytically_with_net_sink_weights,
+    place_and_route_with_constraints, rebind_placement_pins, retain_route_for_sinks,
+    route_with_seeded_routes_workspace_and_progress,
+    route_with_timing_costs_workspace_and_progress, route_with_workspace_and_progress,
+    swap_placement_cells,
 };
 use texo_struo::{ActiveLevel, ImportedEcp5Design, PrimitiveMetadata};
 use texo_target_ecp5::{
@@ -183,6 +185,9 @@ pub struct Ecp5FlowOptions<'a> {
     /// Optional cell-name to BEL-name bindings used instead of native initial
     /// placement. Missing synthetic cells are completed from packing groups.
     pub initial_placement: Option<&'a BTreeMap<String, String>>,
+    /// Previous equivalent implementation used as a mutable route seed after
+    /// an incremental physical-synthesis rewrite.
+    pub incremental_seed: Option<&'a Ecp5FlowResult>,
     /// Optional explicit dedicated-path LUT-to-FF pairs, named as
     /// `LUT -> FF`. This must accompany placements imported after packing.
     pub lut_ff_pairs: Option<&'a BTreeMap<String, String>>,
@@ -206,6 +211,7 @@ impl Default for Ecp5FlowOptions<'_> {
             global_clock_fanout: DEFAULT_GLOBAL_CLOCK_FANOUT,
             placement_weight_exponent: 1,
             initial_placement: None,
+            incremental_seed: None,
             lut_ff_pairs: None,
             initial_timing_reroute: false,
             optimize_timing: true,
@@ -464,14 +470,39 @@ pub fn implement_struo_ecp5_with_progress(
     progress(Ecp5FlowStage::GlobalClocksRouted);
     report_metric_phase("initial_global_routing", &mut phase_started);
     let mut routing_workspace = RoutingWorkspace::new(architecture.device());
-    let mut initial_implementation = route_with_workspace_and_progress(
-        &design,
-        architecture.device(),
-        placement,
-        &routing,
-        &mut routing_workspace,
-        |event| progress(Ecp5FlowStage::Routing(event)),
-    )?;
+    let seed_routes = options.incremental_seed.map_or_else(Vec::new, |seed| {
+        inherited_route_seed(seed, &design, &placement)
+    });
+    if metrics_enabled() && options.incremental_seed.is_some() {
+        let arcs = seed_routes
+            .iter()
+            .map(|route| route.arcs.len())
+            .sum::<usize>();
+        eprintln!(
+            "[metrics] incremental_route_seed nets={} arcs={arcs}",
+            seed_routes.len()
+        );
+    }
+    let mut initial_implementation = if seed_routes.is_empty() {
+        route_with_workspace_and_progress(
+            &design,
+            architecture.device(),
+            placement,
+            &routing,
+            &mut routing_workspace,
+            |event| progress(Ecp5FlowStage::Routing(event)),
+        )?
+    } else {
+        route_with_seeded_routes_workspace_and_progress(
+            &design,
+            architecture.device(),
+            placement,
+            &routing,
+            &seed_routes,
+            &mut routing_workspace,
+            |event| progress(Ecp5FlowStage::Routing(event)),
+        )?
+    };
     progress(Ecp5FlowStage::Routed);
     let mut initial_timing = analyze_ecp5_implementation(
         &design,
@@ -523,6 +554,11 @@ pub fn implement_struo_ecp5_with_progress(
     if let Some(costs) = closure_routing_costs.as_mut() {
         costs.set_sink_criticalities(timing_arc_weights(&initial_timing, &timing_constraints));
     }
+    let use_routed_timing_seed = options.incremental_seed.is_none()
+        && (!used_preroute_timing_placement
+            || initial_timing
+                .worst_slack_ps
+                .is_some_and(|slack| slack <= ROUTED_TIMING_SEED_TRIGGER_PS));
 
     if options.optimize_timing
         && options.initial_placement.is_none()
@@ -584,9 +620,10 @@ pub fn implement_struo_ecp5_with_progress(
             timing_constraints: &timing_constraints,
             placement_weight_exponent: options.placement_weight_exponent,
             routing_workspace: &mut routing_workspace,
-            use_routed_timing_seed: !used_preroute_timing_placement,
+            use_routed_timing_seed,
             global_ripup_attempted: false,
             critical_move_trials: BTreeSet::new(),
+            critical_refined_seeds: BTreeSet::new(),
         }
         .optimize(initial_implementation, initial_timing, costs, &mut progress)?;
         drop(placement_refiner);
@@ -873,6 +910,7 @@ fn repair_hold_with_dedicated_edge_release(
                     use_routed_timing_seed: true,
                     global_ripup_attempted: true,
                     critical_move_trials: BTreeSet::new(),
+                    critical_refined_seeds: BTreeSet::new(),
                 }
                 .refine_critical_path_vertices(
                     vec![(trial_implementation, trial_timing)],
@@ -1303,6 +1341,10 @@ struct TimingDrivenContext<'a, 'work, 'cache> {
     /// negotiated route and STA. Closure rounds often rediscover the same
     /// move; only a changed route topology makes it worth evaluating again.
     critical_move_trials: BTreeSet<(u64, u64)>,
+    /// Seed-route and radius pairs whose deterministic proposal portfolio has
+    /// already been exhausted. This rejects repeats before candidate routing
+    /// projections are recomputed.
+    critical_refined_seeds: BTreeSet<(u64, u64)>,
 }
 
 impl TimingDrivenContext<'_, '_, '_> {
@@ -1622,6 +1664,11 @@ impl TimingDrivenContext<'_, '_, '_> {
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
         for _ in 0..MAX_CRITICAL_CLOSURE_ROUNDS {
+            let incumbent = archive
+                .iter()
+                .map(|(_, timing)| timing_score(timing))
+                .max()
+                .expect("the timing archive is non-empty");
             archive = self.refine_critical_path_vertices(
                 archive,
                 placement_refiner,
@@ -1637,11 +1684,23 @@ impl TimingDrivenContext<'_, '_, '_> {
             if setup_closed {
                 return Ok(archive);
             }
+            let improved = archive
+                .iter()
+                .map(|(_, timing)| timing_score(timing))
+                .max()
+                .is_some_and(|score| score > incumbent);
+            if !improved {
+                // Candidate generation is deterministic for an unchanged
+                // placement/route/timing seed. Re-entering this loop merely
+                // rebuilds the same expensive radius-16 projection before
+                // the transposition table rejects every route trial.
+                break;
+            }
         }
         // Aggregate closure deliberately rejects some WNS gains to protect
-        // TNS. Revisit those physical proposals under an explicitly Fmax-first
-        // objective only after the established trajectory has completed.
-        self.critical_move_trials.clear();
+        // TNS. Those routed Fmax alternatives are retained in the timing
+        // frontier below, so the Fmax walk can continue from them without
+        // routing an identical seed/topology/placement tuple a second time.
         for _ in 0..MAX_FMAX_CLOSURE_ROUNDS {
             let incumbent = archive
                 .iter()
@@ -1802,6 +1861,20 @@ impl TimingDrivenContext<'_, '_, '_> {
                     })
                     .expect("the timing archive is non-empty")
                     .clone();
+                let refined_seed_key = (
+                    implementation_topology_fingerprint(self.design, &seed.0),
+                    move_distance,
+                );
+                if self.critical_refined_seeds.contains(&refined_seed_key) {
+                    if metrics_enabled() {
+                        let objective = if prefer_fmax { "fmax" } else { "aggregate" };
+                        eprintln!(
+                            "[metrics] critical_transition objective={objective} distance={move_distance} round={} skipped=exhausted_seed",
+                            refinement_round + 1,
+                        );
+                    }
+                    break;
+                }
                 if !setup_eco_attempted
                     && seed
                         .1
@@ -1839,24 +1912,26 @@ impl TimingDrivenContext<'_, '_, '_> {
                     prefer_fmax,
                     progress,
                 )?;
+                self.critical_refined_seeds.insert(refined_seed_key);
                 let aggregate_refinement = candidates
                     .iter()
                     .max_by_key(|(_, timing)| timing_score(timing))
                     .filter(|(_, timing)| timing_score(timing) > timing_score(&seed.1))
                     .cloned();
                 let fmax_refinement = candidates
-                    .into_iter()
+                    .iter()
                     .max_by_key(|(implementation, timing)| {
                         setup_closure_score(implementation, timing)
                     })
                     .filter(|(implementation, timing)| {
                         setup_closure_score(implementation, timing)
                             > setup_closure_score(&seed.0, &seed.1)
-                    });
+                    })
+                    .cloned();
                 let refinement = if prefer_fmax {
-                    fmax_refinement
+                    fmax_refinement.clone()
                 } else {
-                    aggregate_refinement
+                    aggregate_refinement.clone()
                 };
                 if metrics_enabled() {
                     let objective = if prefer_fmax { "fmax" } else { "aggregate" };
@@ -1873,6 +1948,20 @@ impl TimingDrivenContext<'_, '_, '_> {
                         )
                         .total_negative_slack_ps()),
                     );
+                }
+                if !prefer_fmax
+                    && let Some(fmax_alternative) = fmax_refinement
+                    && aggregate_refinement
+                        .as_ref()
+                        .is_none_or(|aggregate| aggregate != &fmax_alternative)
+                {
+                    // The two-entry archive is explicitly an aggregate/Fmax
+                    // frontier. Preserve the already-routed WNS winner even
+                    // when this aggregate round descends through another
+                    // candidate; otherwise the later Fmax phase has to
+                    // rediscover and reroute the same physical move.
+                    archive.push(fmax_alternative);
+                    archive = select_timing_frontier(archive);
                 }
                 let Some(improved) = refinement else { break };
                 let regresses_wns = improved
@@ -2896,6 +2985,11 @@ const MAX_CONSECUTIVE_MONOTONIC_WNS_REGRESSIONS: usize = 2;
 const LOCAL_TRIAL_ROUTING_ITERATIONS: u32 = 5;
 const MAX_HOLD_ROUTE_FEEDBACKS: usize = 2;
 const LOCAL_SETUP_ECO_TRIGGER_PS: i128 = 12;
+// A geometry-only pre-route timing solve is intentionally cheap, but on
+// heterogeneous designs its delay estimate can land in a poor physical basin.
+// One routed analytical feedback pass costs much less than repairing a
+// multi-nanosecond miss through hundreds of local ECO trials.
+const ROUTED_TIMING_SEED_TRIGGER_PS: i128 = -1_000;
 const LOCAL_SETUP_REPAIR_QUANTA_PS: [u64; 4] = [50, 50, 10, 1];
 const MAX_GENERAL_HOLD_REPAIRS: usize = 6;
 const MAX_HOLD_SETUP_RECOVERY_PS: i128 = 100;
@@ -3621,7 +3715,7 @@ fn named_initial_placement(
                 })?;
         bindings.insert(cell, bel);
     }
-    let placement = placement_from_partial_bindings(
+    let placement = place_analytically_from_partial_bindings(
         design,
         architecture.device(),
         packing.constraints(),
@@ -3635,6 +3729,110 @@ fn named_initial_placement(
         None,
     );
     Ok(placement)
+}
+
+fn inherited_route_seed(
+    previous: &Ecp5FlowResult,
+    design: &Design,
+    placement: &Placement,
+) -> Vec<Arc<NetRoute>> {
+    inherited_route_seed_from(
+        &previous.design,
+        &previous.implementation,
+        design,
+        placement,
+    )
+}
+
+fn inherited_route_seed_from(
+    previous_design: &Design,
+    previous_implementation: &PnrResult,
+    design: &Design,
+    placement: &Placement,
+) -> Vec<Arc<NetRoute>> {
+    let pin_keys = design
+        .pins()
+        .iter()
+        .enumerate()
+        .map(|(index, pin)| {
+            (
+                (design.cells()[pin.cell.0].name.as_str(), pin.name.as_str()),
+                CellPinId(index),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let nets = design
+        .nets()
+        .iter()
+        .enumerate()
+        .map(|(index, net)| (net.name.as_str(), NetId(index)))
+        .collect::<BTreeMap<_, _>>();
+
+    previous_implementation
+        .routes
+        .iter()
+        .filter_map(|route| {
+            let previous_net = &previous_design.nets()[route.net.0];
+            let net_id = nets.get(previous_net.name.as_str()).copied()?;
+            let net = &design.nets()[net_id.0];
+            if !pins_have_same_physical_binding(
+                previous_design,
+                &previous_implementation.placement,
+                previous_net.driver,
+                design,
+                placement,
+                net.driver,
+            ) {
+                return None;
+            }
+
+            let arcs = route
+                .arcs
+                .iter()
+                .filter_map(|arc| {
+                    let previous_sink = arc.sink?;
+                    let previous_pin = &previous_design.pins()[previous_sink.0];
+                    let key = (
+                        previous_design.cells()[previous_pin.cell.0].name.as_str(),
+                        previous_pin.name.as_str(),
+                    );
+                    let sink = pin_keys.get(&key).copied()?;
+                    if !net.sinks.contains(&sink)
+                        || !pins_have_same_physical_binding(
+                            previous_design,
+                            &previous_implementation.placement,
+                            previous_sink,
+                            design,
+                            placement,
+                            sink,
+                        )
+                    {
+                        return None;
+                    }
+                    Some(RouteArc {
+                        sink: Some(sink),
+                        wires: arc.wires.clone(),
+                        pips: arc.pips.clone(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            (!arcs.is_empty()).then(|| Arc::new(NetRoute::new(net_id, arcs)))
+        })
+        .collect()
+}
+
+fn pins_have_same_physical_binding(
+    previous_design: &Design,
+    previous_placement: &Placement,
+    previous_pin: CellPinId,
+    design: &Design,
+    placement: &Placement,
+    pin: CellPinId,
+) -> bool {
+    let previous_cell = previous_design.pins()[previous_pin.0].cell;
+    let cell = design.pins()[pin.0].cell;
+    previous_placement.bel(previous_cell) == placement.bel(cell)
+        && previous_placement.pin_binding(previous_pin) == placement.pin_binding(pin)
 }
 
 fn named_lut_ff_pairs(
@@ -4595,10 +4793,10 @@ mod tests {
         accumulate_hold_minimums, criticality_weight, decimal_mhz_period_ps,
         delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, ff_ce_control_sets,
         ff_clock_control_sets, find_cell_pin, freeze_route_sinks_except, freeze_unchanged_routes,
-        implement, implement_struo_ecp5, implement_with_constraints, next_wns_regression_streak,
-        pip_class_delay, primitive_clock_edge, project_trellis_speed_grade,
-        ranked_critical_path_cells, retain_projection_timing_frontier, slack_violations,
-        staged_timing_score, verify_post_map_with_celox,
+        implement, implement_struo_ecp5, implement_with_constraints, inherited_route_seed_from,
+        next_wns_regression_streak, pip_class_delay, primitive_clock_edge,
+        project_trellis_speed_grade, ranked_critical_path_cells, retain_projection_timing_frontier,
+        slack_violations, staged_timing_score, verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -5111,6 +5309,59 @@ mod tests {
         assert_eq!(implementation.placement.pin_binding(input), Some(di_pin));
         assert_eq!(rebound.pin_binding(input), Some(m_pin));
         assert!(!frozen.routes().contains_key(&net));
+    }
+
+    #[test]
+    fn incremental_seed_remaps_stable_pin_ids_and_keeps_the_route() {
+        let mut previous_design = Design::new();
+        let previous_source = previous_design.add_cell("source", ResourceKind::Logic);
+        let previous_output = previous_design
+            .add_pin(previous_source, "out", PinDirection::Output)
+            .unwrap();
+        let previous_sink = previous_design.add_cell("sink", ResourceKind::Logic);
+        let previous_input = previous_design
+            .add_pin(previous_sink, "in", PinDirection::Input)
+            .unwrap();
+        previous_design
+            .add_net("stable", previous_output, [previous_input])
+            .unwrap();
+        let device = Device::rectangular_logic(4, 4).unwrap();
+        let previous = place_and_route(&previous_design, &device).unwrap();
+
+        let mut design = Design::new();
+        let inserted = design.add_cell("inserted", ResourceKind::Logic);
+        let source = design.add_cell("source", ResourceKind::Logic);
+        let output = design.add_pin(source, "out", PinDirection::Output).unwrap();
+        let sink = design.add_cell("sink", ResourceKind::Logic);
+        let input = design.add_pin(sink, "in", PinDirection::Input).unwrap();
+        design.add_net("stable", output, [input]).unwrap();
+        let used = BTreeSet::from([
+            previous.placement.bel(previous_source).unwrap(),
+            previous.placement.bel(previous_sink).unwrap(),
+        ]);
+        let inserted_bel = (0..device.bels().len())
+            .map(BelId)
+            .find(|bel| !used.contains(bel))
+            .unwrap();
+        let placement = placement_from_partial_bindings(
+            &design,
+            &device,
+            &PlacementConstraints::new(),
+            &BTreeMap::from([
+                (inserted, inserted_bel),
+                (source, previous.placement.bel(previous_source).unwrap()),
+                (sink, previous.placement.bel(previous_sink).unwrap()),
+            ]),
+        )
+        .unwrap();
+
+        let routes = inherited_route_seed_from(&previous_design, &previous, &design, &placement);
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].arcs.len(), 1);
+        assert_eq!(routes[0].arcs[0].sink, Some(input));
+        assert_eq!(routes[0].arcs[0].wires, previous.routes[0].arcs[0].wires);
+        assert_eq!(routes[0].arcs[0].pips, previous.routes[0].arcs[0].pips);
     }
 
     #[test]
