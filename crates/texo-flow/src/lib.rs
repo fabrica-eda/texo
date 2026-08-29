@@ -29,8 +29,9 @@ use texo_target_ecp5::{
     pack_lut_ffs_excluding, pack_lut_ffs_with_pairs, resolve_lpf_port_cells,
 };
 use texo_timing::{
-    ClockEdge as TimingClockEdge, DelayRange, PICOSECONDS_PER_SECOND, TimingConstraints,
-    TimingError, TimingModel, TimingReport, analyze_timing, estimate_edge_delay,
+    ClockEdge as TimingClockEdge, DelayRange, NetDelay, PICOSECONDS_PER_SECOND, TimingConstraints,
+    TimingError, TimingModel, TimingReport, analyze_timing, analyze_timing_from_net_delays,
+    estimate_edge_delay,
 };
 
 /// Evidence required before a programmable artifact may be released.
@@ -418,9 +419,19 @@ pub fn implement_struo_ecp5_with_progress(
     report_metric_phase("packing", &mut phase_started);
 
     let mut placement_refinement_workspace = PlacementRefinementWorkspace::new();
+    let mut timing_model = ecp5_timing_model(
+        &design,
+        &packing,
+        speed_grade,
+        &constant_luts,
+        imported.metadata(),
+    )?;
+    let mut timing_constraints = ecp5_timing_constraints(&design, &packing)?;
 
     let mut staged_evidence = evidence.clone();
     staged_evidence.record(Gate::MappedNetlistComplete);
+    let used_preroute_timing_placement =
+        options.optimize_timing && options.initial_placement.is_none();
     let placement = if let Some(bindings) = options.initial_placement {
         named_initial_placement(&design, architecture, &packing, bindings)?
     } else {
@@ -430,7 +441,16 @@ pub fn implement_struo_ecp5_with_progress(
             packing.constraints(),
             &mut placement_refinement_workspace,
         )?;
-        initial_analytical_placement(&design, architecture, &placement_refiner)?
+        initial_analytical_placement(
+            &design,
+            architecture,
+            &placement_refiner,
+            options.optimize_timing.then_some((
+                &timing_model,
+                &timing_constraints,
+                options.placement_weight_exponent,
+            )),
+        )?
     };
     progress(Ecp5FlowStage::Placed);
     report_metric_phase("initial_placement", &mut phase_started);
@@ -453,14 +473,6 @@ pub fn implement_struo_ecp5_with_progress(
         |event| progress(Ecp5FlowStage::Routing(event)),
     )?;
     progress(Ecp5FlowStage::Routed);
-    let mut timing_model = ecp5_timing_model(
-        &design,
-        &packing,
-        speed_grade,
-        &constant_luts,
-        imported.metadata(),
-    )?;
-    let mut timing_constraints = ecp5_timing_constraints(&design, &packing)?;
     let mut initial_timing = analyze_ecp5_implementation(
         &design,
         architecture,
@@ -572,6 +584,7 @@ pub fn implement_struo_ecp5_with_progress(
             timing_constraints: &timing_constraints,
             placement_weight_exponent: options.placement_weight_exponent,
             routing_workspace: &mut routing_workspace,
+            use_routed_timing_seed: !used_preroute_timing_placement,
             global_ripup_attempted: false,
             critical_move_trials: BTreeSet::new(),
         }
@@ -857,6 +870,7 @@ fn repair_hold_with_dedicated_edge_release(
                     timing_constraints: &trial_constraints,
                     placement_weight_exponent: 1,
                     routing_workspace,
+                    use_routed_timing_seed: true,
                     global_ripup_attempted: true,
                     critical_move_trials: BTreeSet::new(),
                 }
@@ -1277,6 +1291,10 @@ struct TimingDrivenContext<'a, 'work, 'cache> {
     /// An exponent of one preserves the historical weighting exactly.
     placement_weight_exponent: u32,
     routing_workspace: &'work mut RoutingWorkspace,
+    /// Whether timing closure still needs a physical-route-driven global
+    /// placement seed. Pre-route STA normally supplies this before the first
+    /// route; imported placements retain the routed fallback.
+    use_routed_timing_seed: bool,
     /// Whether the post-global-placement data routes have already received
     /// their one full-chip timing renegotiation. Later critical moves reroute
     /// every affected net incrementally and must not reopen the entire chip.
@@ -1301,8 +1319,15 @@ impl TimingDrivenContext<'_, '_, '_> {
         }
         routing_costs
             .set_sink_criticalities(timing_arc_weights(&initial_timing, self.timing_constraints));
-        let initial = (&initial_implementation, &initial_timing);
-        let timed_candidate = self.timing_driven_seed(initial, routing_costs, progress)?;
+        let timed_candidate = if self.use_routed_timing_seed {
+            self.timing_driven_seed(
+                (&initial_implementation, &initial_timing),
+                routing_costs,
+                progress,
+            )?
+        } else {
+            None
+        };
         let mut seeds = vec![(initial_implementation, initial_timing)];
         if let Some(candidate) = timed_candidate {
             seeds.push(candidate);
@@ -1375,21 +1400,7 @@ impl TimingDrivenContext<'_, '_, '_> {
         archive.extend(hold_repairs);
         report_metric_phase("closure_hold_repair", &mut phase_started);
         archive = select_timing_frontier(archive);
-        // A timing-clean implementation always wins. Before closure, report
-        // the best achieved period instead of silently replacing it with an
-        // aggregate-slack candidate from the parallel search trajectory.
-        let timing_closed = archive.iter().any(|(_, timing)| timing.met_timing());
-        let (final_implementation, final_timing) = archive
-            .into_iter()
-            .filter(|(_, timing)| !timing_closed || timing.met_timing())
-            .max_by_key(|(_, timing)| {
-                if timing_closed {
-                    (None, timing_score(timing))
-                } else {
-                    (timing.worst_slack_ps, timing_score(timing))
-                }
-            })
-            .expect("the timing archive is non-empty");
+        let (final_implementation, final_timing) = select_final_timing_candidate(archive);
         emit_placement_metric(
             "final",
             self.design,
@@ -2928,6 +2939,7 @@ const LOCAL_CRITICAL_BATCH_MIN_WNS_GAIN_PS: i128 = 32;
 const LOCAL_BATCH_RECOVERY_WNS_PS: i128 = -800;
 const LOCAL_BATCH_NEAR_CLOSURE_WNS_PS: i128 = -400;
 const MAX_PROJECTED_PATH_CELL_CANDIDATES: usize = 4;
+const MAX_PREROUTE_TIMING_PLACEMENT_ROUNDS: u32 = 16;
 const MAX_ANCHORED_PLACEMENT_ROUNDS: u32 = 4;
 const MAX_CRITICAL_CLOSURE_ROUNDS: usize = 4;
 const MAX_FMAX_CLOSURE_ROUNDS: usize = 4;
@@ -3468,8 +3480,50 @@ fn initial_analytical_placement(
     design: &Design,
     architecture: &Ecp5Architecture,
     placement_refiner: &PlacementRefiner<'_>,
+    timing: Option<(&TimingModel, &TimingConstraints, u32)>,
 ) -> Result<Placement, Ecp5FlowError> {
-    let placement = placement_refiner.place_analytically(&BTreeMap::new())?;
+    let mut placement = placement_refiner.place_analytically(&BTreeMap::new())?;
+    if let Some((timing_model, timing_constraints, weight_exponent)) = timing {
+        let mut best = placement.clone();
+        let mut best_wns = None;
+        for iteration in 1..=MAX_PREROUTE_TIMING_PLACEMENT_ROUNDS {
+            let estimate = estimated_placement_timing(
+                design,
+                architecture.device(),
+                &placement,
+                timing_model,
+                timing_constraints,
+            )?;
+            let Some(estimated_wns) = estimate.worst_slack_ps else {
+                break;
+            };
+            if best_wns.is_some_and(|known| estimated_wns <= known) {
+                break;
+            }
+            best_wns = Some(estimated_wns);
+            best = placement.clone();
+            let weights = timing_placement_weights_with_exponent(
+                &estimate,
+                timing_constraints,
+                weight_exponent,
+            );
+            let refined =
+                placement_refiner.place_analytically_anchored(&weights, &placement, iteration)?;
+            if metrics_enabled() {
+                eprintln!(
+                    "[metrics] preroute_timing iteration={iteration} estimated_wns={:?} hpwl_before={} hpwl_after={}",
+                    estimate.worst_slack_ps,
+                    placement_hpwl(design, architecture.device(), &placement),
+                    placement_hpwl(design, architecture.device(), &refined),
+                );
+            }
+            if refined == placement {
+                break;
+            }
+            placement = refined;
+        }
+        placement = best;
+    }
     emit_placement_metric(
         "initial_place",
         design,
@@ -3478,6 +3532,57 @@ fn initial_analytical_placement(
         None,
     );
     Ok(placement)
+}
+
+/// Runs the complete timing graph on inexpensive placement-delay estimates.
+///
+/// Clock distribution is treated as ideal before global routing. Data edges
+/// use the same geometry scale as route-trial pre-screening, so analytical
+/// placement receives path slack and per-sink criticality without requiring a
+/// speculative physical route.
+fn estimated_placement_timing(
+    design: &Design,
+    device: &Device,
+    placement: &Placement,
+    timing_model: &TimingModel,
+    timing_constraints: &TimingConstraints,
+) -> Result<TimingReport, Ecp5FlowError> {
+    let clock_nets = timing_constraints
+        .clock_periods_ps()
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut delays = Vec::new();
+    for (index, net) in design.nets().iter().enumerate() {
+        let net_id = NetId(index);
+        for &sink in &net.sinks {
+            let delay_ps = if clock_nets.contains(&net_id) {
+                0
+            } else {
+                estimate_edge_delay(
+                    design,
+                    device,
+                    placement,
+                    net.driver,
+                    sink,
+                    PRESCREEN_PS_PER_TILE_PS,
+                    PRESCREEN_HOP_OVERHEAD_PS,
+                )
+                .unwrap_or(0)
+            };
+            delays.push(NetDelay {
+                net: net_id,
+                sink,
+                delay: DelayRange::from_independent_corners(delay_ps / 2, delay_ps),
+            });
+        }
+    }
+    Ok(analyze_timing_from_net_delays(
+        design,
+        timing_model,
+        timing_constraints,
+        delays,
+    )?)
 }
 
 fn named_initial_placement(
@@ -3714,6 +3819,24 @@ fn global_clock_endpoints_unchanged(
 
 fn select_timing_frontier(candidates: Vec<TimingCandidate>) -> Vec<TimingCandidate> {
     select_timing_candidates(candidates, TIMING_FRONTIER_WIDTH)
+}
+
+fn select_final_timing_candidate(archive: Vec<TimingCandidate>) -> TimingCandidate {
+    // A timing-clean implementation always wins. Before closure, report the
+    // best achieved period instead of silently replacing it with an
+    // aggregate-slack candidate from the parallel search trajectory.
+    let timing_closed = archive.iter().any(|(_, timing)| timing.met_timing());
+    archive
+        .into_iter()
+        .filter(|(_, timing)| !timing_closed || timing.met_timing())
+        .max_by_key(|(_, timing)| {
+            if timing_closed {
+                (None, timing_score(timing))
+            } else {
+                (timing.worst_slack_ps, timing_score(timing))
+            }
+        })
+        .expect("the timing archive is non-empty")
 }
 
 fn select_timing_candidates(
