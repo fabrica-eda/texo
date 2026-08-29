@@ -29,8 +29,8 @@ use texo_target_ecp5::{
     pack_lut_ffs_excluding, pack_lut_ffs_with_pairs, resolve_lpf_port_cells,
 };
 use texo_timing::{
-    DelayRange, PICOSECONDS_PER_SECOND, TimingConstraints, TimingError, TimingModel, TimingReport,
-    analyze_timing, estimate_edge_delay,
+    ClockEdge as TimingClockEdge, DelayRange, PICOSECONDS_PER_SECOND, TimingConstraints,
+    TimingError, TimingModel, TimingReport, analyze_timing, estimate_edge_delay,
 };
 
 /// Evidence required before a programmable artifact may be released.
@@ -453,8 +453,14 @@ pub fn implement_struo_ecp5_with_progress(
         |event| progress(Ecp5FlowStage::Routing(event)),
     )?;
     progress(Ecp5FlowStage::Routed);
-    let mut timing_model = ecp5_timing_model(&design, &packing, speed_grade, &constant_luts)?;
-    let mut timing_constraints = ecp5_timing_constraints(&design, &packing)?;
+    let mut timing_model = ecp5_timing_model(
+        &design,
+        &packing,
+        speed_grade,
+        &constant_luts,
+        imported.metadata(),
+    )?;
+    let mut timing_constraints = ecp5_timing_constraints(&design, &packing, speed_grade)?;
     let mut initial_timing = analyze_ecp5_implementation(
         &design,
         architecture,
@@ -519,6 +525,7 @@ pub fn implement_struo_ecp5_with_progress(
             &initial_implementation,
             &initial_timing,
             &constant_luts,
+            imported.metadata(),
             costs,
             &mut global_routing_cache,
             &mut routing_workspace,
@@ -528,8 +535,14 @@ pub fn implement_struo_ecp5_with_progress(
         packing = candidate.packing;
         initial_implementation = candidate.implementation;
         initial_timing = candidate.timing;
-        timing_model = ecp5_timing_model(&design, &packing, speed_grade, &constant_luts)?;
-        timing_constraints = ecp5_timing_constraints(&design, &packing)?;
+        timing_model = ecp5_timing_model(
+            &design,
+            &packing,
+            speed_grade,
+            &constant_luts,
+            imported.metadata(),
+        )?;
+        timing_constraints = ecp5_timing_constraints(&design, &packing, speed_grade)?;
         costs.set_net_criticalities(timing_net_weights(&initial_timing, &timing_constraints));
         costs.set_sink_criticalities(timing_arc_weights(&initial_timing, &timing_constraints));
     }
@@ -577,6 +590,7 @@ pub fn implement_struo_ecp5_with_progress(
             architecture,
             speed_grade,
             &constant_luts,
+            imported.metadata(),
             &mut packing,
             &mut implementation,
             &mut timing,
@@ -707,6 +721,7 @@ fn repair_hold_with_dedicated_edge_release(
     architecture: &Ecp5Architecture,
     speed_grade: &SpeedGradeRecord,
     constant_cells: &BTreeSet<CellId>,
+    metadata: &BTreeMap<CellId, PrimitiveMetadata>,
     packing: &mut Ecp5Packing,
     implementation: &mut PnrResult,
     timing: &mut TimingReport,
@@ -747,9 +762,14 @@ fn repair_hold_with_dedicated_edge_release(
             };
             let mut trial_packing = packing.clone();
             trial_packing.release_lut_ff_pair(design, pair.lut, pair.ff)?;
-            let trial_model =
-                ecp5_timing_model(design, &trial_packing, speed_grade, constant_cells)?;
-            let trial_constraints = ecp5_timing_constraints(design, &trial_packing)?;
+            let trial_model = ecp5_timing_model(
+                design,
+                &trial_packing,
+                speed_grade,
+                constant_cells,
+                metadata,
+            )?;
+            let trial_constraints = ecp5_timing_constraints(design, &trial_packing, speed_grade)?;
             let requested_minimums = BTreeMap::from([(key, minimum_ps)]);
             let Some((mut trial_implementation, mut trial_timing)) = route_hold_trial(
                 design,
@@ -885,8 +905,8 @@ fn repair_hold_with_dedicated_edge_release(
     // Once dedicated blockers have been released, repair all remaining
     // general-routing hold arcs together. This also handles designs whose
     // violations never involved a dedicated edge.
-    let model = ecp5_timing_model(design, packing, speed_grade, constant_cells)?;
-    let constraints = ecp5_timing_constraints(design, packing)?;
+    let model = ecp5_timing_model(design, packing, speed_grade, constant_cells, metadata)?;
+    let constraints = ecp5_timing_constraints(design, packing, speed_grade)?;
     let mut rolling_implementation = implementation.clone();
     let mut rolling_timing = timing.clone();
     let mut best_score = timing_score(timing);
@@ -1066,6 +1086,7 @@ fn optimize_dedicated_lut_ff_edge(
     implementation: &PnrResult,
     timing: &TimingReport,
     constant_cells: &BTreeSet<CellId>,
+    metadata: &BTreeMap<CellId, PrimitiveMetadata>,
     routing_costs: &mut RoutingCosts,
     global_routing_cache: &mut Ecp5GlobalRoutingCache<'_>,
     routing_workspace: &mut RoutingWorkspace,
@@ -1196,9 +1217,15 @@ fn optimize_dedicated_lut_ff_edge(
             }
         };
         progress(Ecp5FlowStage::TimingDrivenRouted);
-        let trial_timing_model =
-            ecp5_timing_model(design, &trial_packing, speed_grade, constant_cells)?;
-        let trial_timing_constraints = ecp5_timing_constraints(design, &trial_packing)?;
+        let trial_timing_model = ecp5_timing_model(
+            design,
+            &trial_packing,
+            speed_grade,
+            constant_cells,
+            metadata,
+        )?;
+        let trial_timing_constraints =
+            ecp5_timing_constraints(design, &trial_packing, speed_grade)?;
         let trial_timing = analyze_ecp5_implementation(
             design,
             architecture,
@@ -2359,8 +2386,12 @@ impl TimingDrivenContext<'_, '_, '_> {
         // excluding them froze the driving FF of the worst carry-cluster feed
         // and the sink FF behind it in place, leaving their general-routing
         // hops permanently over budget.
-        let mut cells = by_cell.into_iter().collect::<Vec<_>>();
-        cells.sort_unstable_by_key(|(cell, (delay, _, _))| (Reverse(*delay), *cell));
+        let internal_cell_limit = if worst_slack_ps >= EXPANDED_CRITICAL_PATH_TRIGGER_PS {
+            MAX_NEAR_CLOSURE_CRITICAL_INTERNAL_CELLS
+        } else {
+            MAX_CRITICAL_INTERNAL_CELLS
+        };
+        let cells = ranked_critical_path_cells(by_cell, internal_cell_limit);
         let critical_sinks = worst_connections
             .iter()
             .map(|(net, _, sink)| (*net, *sink))
@@ -2499,7 +2530,7 @@ impl TimingDrivenContext<'_, '_, '_> {
                 }
             }
         }
-        for (cell, (_, connections, targets)) in cells.into_iter().take(MAX_CRITICAL_PATH_CELLS) {
+        for (cell, (_, connections, targets)) in cells {
             let proposal_started = Instant::now();
             let proposals = placement_refiner.refine_cell_connection_delays_with_cache(
                 placement.clone(),
@@ -2878,7 +2909,18 @@ const DETAILED_ROUTING_QUANTA_PS: [u64; 1] = [10];
 // The second 1 ps quantum measured as a pure extra full renegotiation on the
 // AXI4 self-test: final WNS and placement were bit-identical without it while
 // each multiresolution round paid one more ~30 s global ripup.
-const MAX_CRITICAL_PATH_CELLS: usize = 6;
+// Internal vertices are ranked by their incident routed delay. Launch and
+// capture endpoints have only one incident path edge and consequently rank
+// below almost every internal vertex; reserve a separate budget so the
+// truncation cannot silently make those FF-to-route access hops immutable.
+const MAX_CRITICAL_INTERNAL_CELLS: usize = 6;
+// Once placement is within one routing quantum of closure, inspect the whole
+// internal chain found on current ECP5 critical paths instead of leaving its
+// lower-delay vertices frozen. Keeping this conditional avoids paying the
+// broader routed-trial portfolio during coarse convergence.
+const MAX_NEAR_CLOSURE_CRITICAL_INTERNAL_CELLS: usize = 10;
+const EXPANDED_CRITICAL_PATH_TRIGGER_PS: i128 = -100;
+const MAX_CRITICAL_ENDPOINT_CELLS: usize = 4;
 // Retain one accepted local route in place, then rebase the next move onto the
 // pass seed so collateral nets periodically regain coarse topology freedom.
 const MAX_ROLLING_CRITICAL_MOVES: usize = 1;
@@ -2904,6 +2946,24 @@ const SPECULATIVE_FULL_ROUTING_ITERATIONS: u32 = 8;
 // it is not a random restart or a whole-design perturbation.
 const CRITICAL_PATH_MOVE_DISTANCES: [u64; 3] = [1, 2, 16];
 const MAX_RELEASED_CRITICAL_NETS: usize = 64;
+
+type CriticalCellConnections = (u64, Vec<(CellPinId, CellPinId)>, Vec<u64>);
+
+fn ranked_critical_path_cells(
+    by_cell: BTreeMap<CellId, CriticalCellConnections>,
+    internal_cell_limit: usize,
+) -> Vec<(CellId, CriticalCellConnections)> {
+    let (mut endpoints, mut internal): (Vec<_>, Vec<_>) = by_cell
+        .into_iter()
+        .partition(|(_, (_, connections, _))| connections.len() == 1);
+    let rank = |(cell, (delay, _, _)): &(CellId, CriticalCellConnections)| (Reverse(*delay), *cell);
+    endpoints.sort_unstable_by_key(rank);
+    internal.sort_unstable_by_key(rank);
+    endpoints.truncate(MAX_CRITICAL_ENDPOINT_CELLS);
+    internal.truncate(internal_cell_limit);
+    internal.extend(endpoints);
+    internal
+}
 
 fn next_wns_regression_streak(
     current: usize,
@@ -3704,14 +3764,23 @@ fn select_timing_candidates(
 fn ecp5_timing_constraints(
     design: &Design,
     packing: &Ecp5Packing,
+    speed_grade: &SpeedGradeRecord,
 ) -> Result<TimingConstraints, Ecp5FlowError> {
-    // Project Trellis timing is an empirical, reverse-engineered model rather
-    // than a sign-off speed file. A routed LFE5UM5G-85F design measured on
-    // hardware failed with 152 ps of reported setup slack at 124 MHz and
-    // passed with 418 ps at 120 MHz. Reserve 250 ps inside that measured
-    // transition interval so marginal routes are repaired instead of being
-    // reported as closed.
-    const ECP5_SETUP_UNCERTAINTY_PS: u64 = 250;
+    // Texo models the DCCA insertion delay but not the sink-to-sink skew of the
+    // primary clock tree. Lattice's ECP5/ECP5-5G Family Data Sheet,
+    // FPGA-DS-02012 section 3.18, specifies the following maximum primary-clock
+    // skew. Treat it as setup uncertainty instead of inventing an empirical
+    // design-wide margin.
+    let primary_clock_skew_ps = match speed_grade.name.as_str() {
+        "8" | "8_5G" => 420,
+        "7" | "7_5G" => 462,
+        "6" => 505,
+        _ => {
+            return Err(Ecp5FlowError::MissingPrimaryClockSkew {
+                speed_grade: speed_grade.name.clone(),
+            });
+        }
+    };
     let mut constraints = TimingConstraints::new();
     for (&cell_id, &frequency_hz) in packing.clock_frequencies_hz() {
         let cell = &design.cells()[cell_id.0];
@@ -3754,7 +3823,26 @@ fn ecp5_timing_constraints(
         .copied()
         .collect::<Vec<_>>()
     {
-        constraints.set_setup_uncertainty_ps(net, ECP5_SETUP_UNCERTAINTY_PS);
+        constraints.set_setup_uncertainty_ps(net, primary_clock_skew_ps);
+    }
+    // PLL period jitter changes the separation between adjacent launch and
+    // capture edges and is independent of primary-tree sink skew. The ECP5
+    // data sheet specifies 100 ps p-p at 100 MHz and above, and 0.025 UI p-p
+    // below 100 MHz.
+    for (&net, &period_ps) in packing.generated_clock_periods_ps() {
+        let pll_period_jitter_ps = if period_ps <= 10_000 {
+            100
+        } else {
+            period_ps.div_ceil(40)
+        };
+        let uncertainty_ps = primary_clock_skew_ps
+            .checked_add(pll_period_jitter_ps)
+            .ok_or(Ecp5FlowError::TimingDelayOverflow)?;
+        constraints.set_setup_uncertainty_ps(net, uncertainty_ps);
+    }
+    for clock in packing.global_clocks() {
+        let source_uncertainty_ps = constraints.setup_uncertainty_ps(clock.source_net);
+        constraints.set_setup_uncertainty_ps(clock.global_net, source_uncertainty_ps);
     }
     Ok(constraints)
 }
@@ -3767,12 +3855,48 @@ fn constrain_pll_outputs(
     for (&cell, primitive) in metadata {
         let PrimitiveMetadata::Pll {
             fabric_output,
+            parameters,
             attributes,
             ..
         } = primitive
         else {
             continue;
         };
+        let cell_name = design.cells()[cell.0].name.clone();
+        let input_attribute = "FREQUENCY_PIN_CLKI";
+        let input_frequency_mhz = attributes.get(input_attribute).ok_or_else(|| {
+            Ecp5FlowError::MissingPllOutputFrequency {
+                cell: cell_name.clone(),
+                attribute: input_attribute.into(),
+            }
+        })?;
+        let input_period_ps = decimal_mhz_period_ps(input_frequency_mhz).ok_or_else(|| {
+            Ecp5FlowError::InvalidPllOutputFrequency {
+                cell: cell_name.clone(),
+                attribute: input_attribute.into(),
+                value: input_frequency_mhz.clone(),
+            }
+        })?;
+        let input_divider = parameters
+            .get("CLKI_DIV")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|divider| *divider != 0)
+            .ok_or_else(|| Ecp5FlowError::InvalidPllInputDivider {
+                cell: cell_name.clone(),
+                value: parameters.get("CLKI_DIV").cloned(),
+            })?;
+        let phase_detector_period_ps = input_period_ps
+            .checked_mul(input_divider)
+            .ok_or(Ecp5FlowError::TimingDelayOverflow)?;
+        // FPGA-DS-02012 guarantees the published period/cycle jitter only for
+        // fPFD > 10 MHz. Without a bounded jitter value Texo cannot sign off
+        // the generated clock.
+        if phase_detector_period_ps >= 100_000 {
+            return Err(Ecp5FlowError::PllPhaseDetectorTooSlow {
+                cell: cell_name,
+                period_ps: phase_detector_period_ps,
+            });
+        }
         let attribute = format!("FREQUENCY_PIN_{}", fabric_output.port());
         let frequency_mhz =
             attributes
@@ -3887,6 +4011,7 @@ fn ecp5_timing_model(
     packing: &Ecp5Packing,
     speed_grade: &SpeedGradeRecord,
     constant_cells: &BTreeSet<CellId>,
+    metadata: &BTreeMap<CellId, PrimitiveMetadata>,
 ) -> Result<TimingModel, Ecp5FlowError> {
     let records = speed_grade
         .cells
@@ -3916,6 +4041,16 @@ fn ecp5_timing_model(
     let mut model = TimingModel::new();
     for (index, cell) in design.cells().iter().enumerate() {
         let cell_id = CellId(index);
+        let clock_edge = metadata
+            .get(&cell_id)
+            .and_then(|primitive| match primitive {
+                PrimitiveMetadata::FlipFlop { edge, .. }
+                | PrimitiveMetadata::BlockRam { edge, .. } => Some(match edge {
+                    texo_struo::ClockEdge::Rising => TimingClockEdge::Rising,
+                    texo_struo::ClockEdge::Falling => TimingClockEdge::Falling,
+                }),
+                _ => None,
+            });
         let cell_type = if let Some(&cell_type) = carry_slices.get(&cell_id) {
             cell_type
         } else {
@@ -3947,7 +4082,12 @@ fn ecp5_timing_model(
                 || (cell.kind == ResourceKind::Memory
                     && matches!(arc.from_pin.as_str(), "CLKA" | "CLKB"))
             {
-                model.add_clock_to_q(from, to, delay)?;
+                model.add_clock_to_q(
+                    from,
+                    to,
+                    clock_edge.unwrap_or(TimingClockEdge::Rising),
+                    delay,
+                )?;
             } else {
                 model.add_cell_arc(from, to, delay)?;
             }
@@ -3960,6 +4100,7 @@ fn ecp5_timing_model(
             record,
             general_routing_ffs.contains(&cell_id),
             &constant_nets,
+            clock_edge.unwrap_or(TimingClockEdge::Rising),
         )?;
     }
     Ok(model)
@@ -3972,6 +4113,7 @@ fn add_setup_hold_timing(
     record: &texo_target_ecp5::CellTimingRecord,
     using_general_routing: bool,
     constant_nets: &BTreeSet<NetId>,
+    clock_edge: TimingClockEdge,
 ) -> Result<(), Ecp5FlowError> {
     for check in &record.setup_holds {
         // ECP5 LSR is an asynchronous set/reset input. Its characterized
@@ -4006,6 +4148,7 @@ fn add_setup_hold_timing(
         model.add_setup_hold(
             clock,
             signal,
+            clock_edge,
             timing_delay(check.setup)?,
             timing_delay(check.hold)?,
         )?;
@@ -4105,6 +4248,11 @@ pub enum Ecp5FlowError {
         /// Missing cell type.
         cell_type: String,
     },
+    /// The official primary-clock skew is not specified for this speed grade.
+    MissingPrimaryClockSkew {
+        /// Speed-grade name.
+        speed_grade: String,
+    },
     /// Speed-grade delay arithmetic overflowed.
     TimingDelayOverflow,
     /// A frequency-constrained IO cell does not drive exactly one net.
@@ -4154,6 +4302,20 @@ pub enum Ecp5FlowError {
         /// Expected primitive output pin.
         pin: String,
     },
+    /// A PLL input divider is absent, zero, or not an integer.
+    InvalidPllInputDivider {
+        /// Logical PLL cell name.
+        cell: String,
+        /// Raw divider value, when present.
+        value: Option<String>,
+    },
+    /// The PLL phase detector is outside the range with guaranteed jitter.
+    PllPhaseDetectorTooSlow {
+        /// Logical PLL cell name.
+        cell: String,
+        /// Phase-detector period in picoseconds.
+        period_ps: u64,
+    },
     /// Static timing analysis failed.
     Timing(TimingError),
 }
@@ -4188,6 +4350,10 @@ impl fmt::Display for Ecp5FlowError {
                 f,
                 "ECP5 speed grade `{speed_grade}` has no cell timing for `{cell_type}`"
             ),
+            Self::MissingPrimaryClockSkew { speed_grade } => write!(
+                f,
+                "ECP5 speed grade `{speed_grade}` has no specified primary-clock skew"
+            ),
             Self::TimingDelayOverflow => write!(f, "ECP5 timing delay arithmetic overflowed"),
             Self::ClockIoNet { cell } => write!(
                 f,
@@ -4218,6 +4384,15 @@ impl fmt::Display for Ecp5FlowError {
             Self::MissingPllOutputNet { cell, pin } => {
                 write!(f, "PLL `{cell}` output pin `{pin}` does not drive a net")
             }
+            Self::InvalidPllInputDivider { cell, value } => write!(
+                f,
+                "PLL `{cell}` has invalid CLKI_DIV value {}",
+                value.as_deref().unwrap_or("<missing>")
+            ),
+            Self::PllPhaseDetectorTooSlow { cell, period_ps } => write!(
+                f,
+                "PLL `{cell}` phase-detector period {period_ps} ps is not below the 100000 ps guaranteed-jitter limit"
+            ),
             Self::Timing(error) => write!(f, "ECP5 static timing analysis failed: {error}"),
         }
     }
@@ -4236,6 +4411,7 @@ impl Error for Ecp5FlowError {
             | Self::UnknownSpeedGrade(_)
             | Self::MissingPipTimingClass { .. }
             | Self::MissingCellTiming { .. }
+            | Self::MissingPrimaryClockSkew { .. }
             | Self::TimingDelayOverflow
             | Self::ClockIoNet { .. }
             | Self::ClockFrequencyOutOfRange { .. }
@@ -4243,7 +4419,9 @@ impl Error for Ecp5FlowError {
             | Self::MissingPllOutputFrequency { .. }
             | Self::InvalidPllOutputFrequency { .. }
             | Self::MissingPllOutputPin { .. }
-            | Self::MissingPllOutputNet { .. } => None,
+            | Self::MissingPllOutputNet { .. }
+            | Self::InvalidPllInputDivider { .. }
+            | Self::PllPhaseDetectorTooSlow { .. } => None,
         }
     }
 }
@@ -4307,7 +4485,7 @@ mod tests {
         map_to_ecp5_with_constraints, map_to_ecp5_with_open_drain_ios,
     };
     use texo_model::{
-        BelId, CellId, Design, Device, NetId, PinDirection, PipId, Point, ResourceKind,
+        BelId, CellId, CellPinId, Design, Device, NetId, PinDirection, PipId, Point, ResourceKind,
     };
     use texo_pnr::{
         NetRoute, PlacementConstraints, PnrResult, RouteArc, RoutingConstraints, place_and_route,
@@ -4330,8 +4508,9 @@ mod tests {
         delay_weighted_criticality, ecp5_timing_constraints, ecp5_timing_model, ff_ce_control_sets,
         ff_clock_control_sets, find_cell_pin, freeze_route_sinks_except, freeze_unchanged_routes,
         implement, implement_struo_ecp5, implement_with_constraints, next_wns_regression_streak,
-        pip_class_delay, project_trellis_speed_grade, retain_projection_timing_frontier,
-        slack_violations, staged_timing_score, verify_post_map_with_celox,
+        pip_class_delay, project_trellis_speed_grade, ranked_critical_path_cells,
+        retain_projection_timing_frontier, slack_violations, staged_timing_score,
+        verify_post_map_with_celox,
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
@@ -4372,8 +4551,14 @@ mod tests {
         )
         .unwrap();
         let speed_grade = &architecture.speed_grades()["6"];
-        let model =
-            ecp5_timing_model(imported.design(), &packing, speed_grade, &BTreeSet::new()).unwrap();
+        let model = ecp5_timing_model(
+            imported.design(),
+            &packing,
+            speed_grade,
+            &BTreeSet::new(),
+            imported.metadata(),
+        )
+        .unwrap();
         let pfu = imported
             .design()
             .cells()
@@ -4555,6 +4740,47 @@ mod tests {
         assert_eq!(delay_weighted_criticality(64, 500, 4_000), 32);
         assert_eq!(delay_weighted_criticality(64, 1_000, 4_000), 64);
         assert_eq!(delay_weighted_criticality(64, 2_000, 4_000), 64);
+    }
+
+    #[test]
+    fn critical_path_ranking_reserves_launch_and_capture_endpoints() {
+        let connections = |count: usize| {
+            (
+                (0..count)
+                    .map(|index| (CellPinId(index), CellPinId(index + 1)))
+                    .collect::<Vec<_>>(),
+                vec![1; count],
+            )
+        };
+        let mut by_cell = BTreeMap::new();
+        for index in 0..8 {
+            let (edges, targets) = connections(2);
+            by_cell.insert(CellId(index), (1_000 - index as u64, edges, targets));
+        }
+        for index in 8..13 {
+            let (edges, targets) = connections(1);
+            by_cell.insert(CellId(index), (1_000 - index as u64, edges, targets));
+        }
+
+        let selected = ranked_critical_path_cells(by_cell.clone(), 6)
+            .into_iter()
+            .map(|(cell, _)| cell)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(selected.len(), 10);
+        assert!((0..6).all(|index| selected.contains(&CellId(index))));
+        assert!((8..12).all(|index| selected.contains(&CellId(index))));
+        assert!(!selected.contains(&CellId(6)));
+        assert!(!selected.contains(&CellId(12)));
+
+        let expanded = ranked_critical_path_cells(by_cell, 10)
+            .into_iter()
+            .map(|(cell, _)| cell)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(expanded.len(), 12);
+        assert!((0..8).all(|index| expanded.contains(&CellId(index))));
+        assert!((8..12).all(|index| expanded.contains(&CellId(index))));
+        assert!(!expanded.contains(&CellId(12)));
     }
 
     #[test]
@@ -5136,12 +5362,14 @@ mod tests {
             .apply_resolved_lpf(&design, &architecture, "CABGA381", &resolved)
             .unwrap();
 
-        let constraints = ecp5_timing_constraints(&design, &packing).unwrap();
+        let constraints =
+            ecp5_timing_constraints(&design, &packing, &architecture.speed_grades()["6"]).unwrap();
         let timing_model = ecp5_timing_model(
             &design,
             &packing,
             &architecture.speed_grades()["6"],
             &BTreeSet::new(),
+            imported.metadata(),
         )
         .unwrap();
         let global_net = packing.global_clocks()[0].global_net;
@@ -5163,10 +5391,10 @@ mod tests {
             constraints
                 .setup_uncertainties_ps()
                 .values()
-                .all(|&uncertainty_ps| uncertainty_ps == 250)
+                .all(|&uncertainty_ps| uncertainty_ps == 505)
         );
-        assert_eq!(timing_model.clock_to_q(ff_q).unwrap().1.max_ps, 525);
-        assert_eq!(timing_model.setup_hold(ff_data).unwrap().2.min_ps, 233);
+        assert_eq!(timing_model.clock_to_q(ff_q).unwrap().2.max_ps, 525);
+        assert_eq!(timing_model.setup_hold(ff_data).unwrap().3.min_ps, 233);
         assert!(timing_model.setup_hold(ff_lsr).is_none());
     }
 
@@ -5207,6 +5435,7 @@ mod tests {
             &packing,
             &architecture.speed_grades()["6"],
             &constant_cells,
+            imported.metadata(),
         )
         .unwrap();
         let register = imported
@@ -5243,6 +5472,7 @@ mod tests {
             &Ecp5Packing::default(),
             &architecture.speed_grades()["6"],
             &BTreeSet::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         let clkb = find_cell_pin(&design, memory, "CLKB").unwrap();
@@ -5251,12 +5481,12 @@ mod tests {
         let read_address = find_cell_pin(&design, memory, "ADB0").unwrap();
 
         assert_eq!(model.clock_to_q(output).unwrap().0, clkb);
-        assert_eq!(model.clock_to_q(output).unwrap().1.max_ps, 5830);
-        assert_eq!(model.setup_hold(write_data).unwrap().1.max_ps, 220);
-        assert_eq!(model.setup_hold(write_data).unwrap().2.max_ps, 43);
+        assert_eq!(model.clock_to_q(output).unwrap().2.max_ps, 5830);
+        assert_eq!(model.setup_hold(write_data).unwrap().2.max_ps, 220);
+        assert_eq!(model.setup_hold(write_data).unwrap().3.max_ps, 43);
         assert_eq!(model.setup_hold(read_address).unwrap().0, clkb);
-        assert_eq!(model.setup_hold(read_address).unwrap().1.max_ps, 251);
-        assert_eq!(model.setup_hold(read_address).unwrap().2.max_ps, 123);
+        assert_eq!(model.setup_hold(read_address).unwrap().2.max_ps, 251);
+        assert_eq!(model.setup_hold(read_address).unwrap().3.max_ps, 123);
     }
 
     #[test]
@@ -5314,6 +5544,7 @@ mod tests {
             &packing,
             &architecture.speed_grades()["6"],
             &BTreeSet::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         let second_carry_out = find_cell_pin(&design, second, "FCO").unwrap();

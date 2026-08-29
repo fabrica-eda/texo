@@ -18,6 +18,27 @@ use texo_pnr::{NetRoute, Placement, PnrResult};
 /// One trillion picoseconds per second.
 pub const PICOSECONDS_PER_SECOND: u64 = 1_000_000_000_000;
 
+/// Active edge of a sequential timing arc.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ClockEdge {
+    /// Rising-edge triggered.
+    #[default]
+    Rising,
+    /// Falling-edge triggered.
+    Falling,
+}
+
+impl ClockEdge {
+    /// Stable lowercase name for reports and checkpoints.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rising => "rising",
+            Self::Falling => "falling",
+        }
+    }
+}
+
 /// Clock periods applied to logical clock nets.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TimingConstraints {
@@ -128,8 +149,8 @@ impl DelayRange {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TimingModel {
     cell_arcs: BTreeMap<(CellPinId, CellPinId), DelayRange>,
-    clock_to_q: BTreeMap<CellPinId, (CellPinId, DelayRange)>,
-    setup_holds: BTreeMap<CellPinId, (CellPinId, DelayRange, DelayRange)>,
+    clock_to_q: BTreeMap<CellPinId, (CellPinId, ClockEdge, DelayRange)>,
+    setup_holds: BTreeMap<CellPinId, (CellPinId, ClockEdge, DelayRange, DelayRange)>,
 }
 
 impl TimingModel {
@@ -170,9 +191,14 @@ impl TimingModel {
         &mut self,
         clock: CellPinId,
         output: CellPinId,
+        edge: ClockEdge,
         delay: DelayRange,
     ) -> Result<(), TimingError> {
-        if self.clock_to_q.insert(output, (clock, delay)).is_some() {
+        if self
+            .clock_to_q
+            .insert(output, (clock, edge, delay))
+            .is_some()
+        {
             Err(TimingError::DuplicateClockToQ(output))
         } else {
             Ok(())
@@ -188,12 +214,13 @@ impl TimingModel {
         &mut self,
         clock: CellPinId,
         signal: CellPinId,
+        edge: ClockEdge,
         setup: DelayRange,
         hold: DelayRange,
     ) -> Result<(), TimingError> {
         if self
             .setup_holds
-            .insert(signal, (clock, setup, hold))
+            .insert(signal, (clock, edge, setup, hold))
             .is_some()
         {
             Err(TimingError::DuplicateSetupHold(signal))
@@ -210,13 +237,16 @@ impl TimingModel {
 
     /// Clock pin and delay for one sequential output.
     #[must_use]
-    pub fn clock_to_q(&self, output: CellPinId) -> Option<(CellPinId, DelayRange)> {
+    pub fn clock_to_q(&self, output: CellPinId) -> Option<(CellPinId, ClockEdge, DelayRange)> {
         self.clock_to_q.get(&output).copied()
     }
 
     /// Clock pin, setup, and hold ranges for one sequential input.
     #[must_use]
-    pub fn setup_hold(&self, signal: CellPinId) -> Option<(CellPinId, DelayRange, DelayRange)> {
+    pub fn setup_hold(
+        &self,
+        signal: CellPinId,
+    ) -> Option<(CellPinId, ClockEdge, DelayRange, DelayRange)> {
         self.setup_holds.get(&signal).copied()
     }
 }
@@ -252,6 +282,10 @@ pub struct SetupCheck {
     pub data_pin: CellPinId,
     /// Constrained clock net.
     pub clock_net: NetId,
+    /// Active edge that launches the worst setup path.
+    pub launch_edge: ClockEdge,
+    /// Active edge of the capture endpoint.
+    pub capture_edge: ClockEdge,
     /// Longest combinational arrival at the data pin.
     pub arrival_ps: u64,
     /// Earliest clock arrival at this register.
@@ -275,6 +309,10 @@ pub struct HoldCheck {
     pub data_pin: CellPinId,
     /// Constrained clock net.
     pub clock_net: NetId,
+    /// Active edge that launches the worst hold path.
+    pub launch_edge: ClockEdge,
+    /// Active edge of the capture endpoint.
+    pub capture_edge: ClockEdge,
     /// Earliest data arrival at the input.
     pub arrival_ps: u64,
     /// Latest clock arrival at this register.
@@ -423,6 +461,7 @@ pub fn estimate_edge_delay(
 }
 
 /// Builds the full setup/hold report from a set of per-sink net delays.
+#[allow(clippy::too_many_lines)]
 fn timing_report_from_net_delays(
     design: &Design,
     model: &TimingModel,
@@ -434,22 +473,23 @@ fn timing_report_from_net_delays(
         .map(|delay| ((delay.net, delay.sink), delay.delay))
         .collect::<BTreeMap<_, _>>();
     let clock_arrivals = pin_arrivals(design, &delays_by_sink, model, &BTreeMap::new(), true)?;
-    let mut register_starts_by_clock = BTreeMap::<NetId, BTreeMap<CellPinId, DelayRange>>::new();
-    for (&output, &(clock, delay)) in &model.clock_to_q {
+    let mut register_starts_by_clock =
+        BTreeMap::<(NetId, ClockEdge), BTreeMap<CellPinId, DelayRange>>::new();
+    for (&output, &(clock, edge, delay)) in &model.clock_to_q {
         let Some(clock_net) = design.pins()[clock.0].net() else {
             continue;
         };
         let clock_arrival = clock_arrivals[clock.0].unwrap_or(DelayRange::zero());
         register_starts_by_clock
-            .entry(clock_net)
+            .entry((clock_net, edge))
             .or_default()
             .insert(output, clock_arrival.checked_add(delay)?);
     }
     let arrivals_by_clock = register_starts_by_clock
         .iter()
-        .map(|(&clock_net, starts)| {
+        .map(|(&clock, starts)| {
             Ok((
-                clock_net,
+                clock,
                 pin_arrivals(design, &delays_by_sink, model, starts, false)?,
             ))
         })
@@ -458,7 +498,7 @@ fn timing_report_from_net_delays(
     let mut setup_checks = Vec::new();
     let mut hold_checks = Vec::new();
     let mut unchecked_endpoints = Vec::new();
-    for (&data_pin, &(clock_pin, setup, hold)) in &model.setup_holds {
+    for (&data_pin, &(clock_pin, capture_edge, setup, hold)) in &model.setup_holds {
         let Some(clock_net) = design.pins()[clock_pin.0].net() else {
             unchecked_endpoints.push(unchecked_endpoint(
                 design,
@@ -479,10 +519,8 @@ fn timing_report_from_net_delays(
             ));
             continue;
         };
-        let Some(arrival) = arrivals_by_clock
-            .get(&clock_net)
-            .and_then(|arrivals| arrivals[data_pin.0])
-        else {
+        let launch_arrivals = synchronous_launch_arrivals(&arrivals_by_clock, clock_net, data_pin);
+        if launch_arrivals.is_empty() {
             // Primary-input and cross-clock paths need explicit timing
             // constraints. Do not invent a synchronous launch at time zero.
             unchecked_endpoints.push(unchecked_endpoint(
@@ -493,22 +531,27 @@ fn timing_report_from_net_delays(
                 UncheckedEndpointReason::NoSynchronousLaunch,
             ));
             continue;
-        };
+        }
         let clock_arrival = clock_arrivals[clock_pin.0].unwrap_or(DelayRange::zero());
         let common_clock_arrival =
             clock_arrivals[design.nets()[clock_net.0].driver.0].unwrap_or(DelayRange::zero());
-        let (setup_check, hold_check) = endpoint_checks(EndpointCheckContext {
-            design,
-            data_pin,
-            clock_net,
-            period_ps,
-            uncertainty_ps: constraints.setup_uncertainty_ps(clock_net),
-            arrival,
-            clock_arrival,
-            common_clock_arrival,
-            setup,
-            hold,
+        let checks = launch_arrivals.into_iter().map(|(launch_edge, arrival)| {
+            endpoint_checks(EndpointCheckContext {
+                design,
+                data_pin,
+                clock_net,
+                period_ps,
+                uncertainty_ps: constraints.setup_uncertainty_ps(clock_net),
+                arrival,
+                clock_arrival,
+                common_clock_arrival,
+                setup,
+                hold,
+                launch_edge,
+                capture_edge,
+            })
         });
+        let (setup_check, hold_check) = select_worst_edge_checks(checks);
         setup_checks.push(setup_check);
         hold_checks.push(hold_check);
     }
@@ -532,6 +575,44 @@ fn timing_report_from_net_delays(
     })
 }
 
+fn synchronous_launch_arrivals(
+    arrivals_by_clock: &BTreeMap<(NetId, ClockEdge), Vec<Option<DelayRange>>>,
+    clock_net: NetId,
+    data_pin: CellPinId,
+) -> Vec<(ClockEdge, DelayRange)> {
+    [ClockEdge::Rising, ClockEdge::Falling]
+        .into_iter()
+        .filter_map(|launch_edge| {
+            arrivals_by_clock
+                .get(&(clock_net, launch_edge))
+                .and_then(|arrivals| arrivals[data_pin.0])
+                .map(|arrival| (launch_edge, arrival))
+        })
+        .collect()
+}
+
+fn select_worst_edge_checks(
+    checks: impl IntoIterator<Item = (SetupCheck, HoldCheck)>,
+) -> (SetupCheck, HoldCheck) {
+    checks
+        .into_iter()
+        .reduce(|(setup_best, hold_best), (setup, hold)| {
+            (
+                if setup.slack_ps < setup_best.slack_ps {
+                    setup
+                } else {
+                    setup_best
+                },
+                if hold.slack_ps < hold_best.slack_ps {
+                    hold
+                } else {
+                    hold_best
+                },
+            )
+        })
+        .expect("at least one synchronous launch was checked")
+}
+
 #[derive(Clone, Copy)]
 struct EndpointCheckContext<'a> {
     design: &'a Design,
@@ -544,6 +625,8 @@ struct EndpointCheckContext<'a> {
     common_clock_arrival: DelayRange,
     setup: DelayRange,
     hold: DelayRange,
+    launch_edge: ClockEdge,
+    capture_edge: ClockEdge,
 }
 
 fn endpoint_checks(context: EndpointCheckContext<'_>) -> (SetupCheck, HoldCheck) {
@@ -558,6 +641,8 @@ fn endpoint_checks(context: EndpointCheckContext<'_>) -> (SetupCheck, HoldCheck)
         common_clock_arrival,
         setup,
         hold,
+        launch_edge,
+        capture_edge,
     } = context;
     // Every launch in this analysis group and the capture endpoint share the
     // path up to the constrained clock net's driver. Its corner range is
@@ -566,10 +651,21 @@ fn endpoint_checks(context: EndpointCheckContext<'_>) -> (SetupCheck, HoldCheck)
     // so the correction must remain signed.
     let common_clock_pessimism_ps =
         i128::from(common_clock_arrival.max_ps) - i128::from(common_clock_arrival.min_ps);
-    let setup_required_ps =
-        i128::from(period_ps) + i128::from(clock_arrival.min_ps) + common_clock_pessimism_ps
-            - i128::from(setup.max_ps)
-            - i128::from(uncertainty_ps);
+    let setup_edge_separation_ps = if launch_edge == capture_edge {
+        period_ps
+    } else {
+        period_ps / 2
+    };
+    let hold_launch_offset_ps = if launch_edge == capture_edge {
+        0
+    } else {
+        period_ps / 2
+    };
+    let setup_required_ps = i128::from(setup_edge_separation_ps)
+        + i128::from(clock_arrival.min_ps)
+        + common_clock_pessimism_ps
+        - i128::from(setup.max_ps)
+        - i128::from(uncertainty_ps);
     let hold_required_ps =
         i128::from(clock_arrival.max_ps) + i128::from(hold.max_ps) - common_clock_pessimism_ps;
     (
@@ -577,6 +673,8 @@ fn endpoint_checks(context: EndpointCheckContext<'_>) -> (SetupCheck, HoldCheck)
             cell: design.pins()[data_pin.0].cell,
             data_pin,
             clock_net,
+            launch_edge,
+            capture_edge,
             arrival_ps: arrival.max_ps,
             clock_arrival_ps: clock_arrival.min_ps,
             setup_ps: setup.max_ps,
@@ -588,11 +686,14 @@ fn endpoint_checks(context: EndpointCheckContext<'_>) -> (SetupCheck, HoldCheck)
             cell: design.pins()[data_pin.0].cell,
             data_pin,
             clock_net,
-            arrival_ps: arrival.min_ps,
+            launch_edge,
+            capture_edge,
+            arrival_ps: arrival.min_ps.saturating_add(hold_launch_offset_ps),
             clock_arrival_ps: clock_arrival.max_ps,
             hold_ps: hold.max_ps,
             required_ps: hold_required_ps,
-            slack_ps: i128::from(arrival.min_ps) - hold_required_ps,
+            slack_ps: i128::from(arrival.min_ps) + i128::from(hold_launch_offset_ps)
+                - hold_required_ps,
         },
     )
 }
@@ -617,7 +718,7 @@ fn net_setup_slacks(
     design: &Design,
     net_delays: &[NetDelay],
     model: &TimingModel,
-    arrivals_by_clock: &BTreeMap<NetId, Vec<Option<DelayRange>>>,
+    arrivals_by_clock: &BTreeMap<(NetId, ClockEdge), Vec<Option<DelayRange>>>,
     setup_checks: &[SetupCheck],
 ) -> Result<Vec<NetSetupSlack>, TimingError> {
     let mut edges = vec![Vec::<(CellPinId, u64)>::new(); design.pins().len()];
@@ -653,11 +754,11 @@ fn net_setup_slacks(
     }
 
     let mut slacks = BTreeMap::<(NetId, CellPinId), i128>::new();
-    for (&clock_net, arrivals) in arrivals_by_clock {
+    for (&(clock_net, launch_edge), arrivals) in arrivals_by_clock {
         let mut required = vec![None::<i128>; design.pins().len()];
         for check in setup_checks
             .iter()
-            .filter(|check| check.clock_net == clock_net)
+            .filter(|check| check.clock_net == clock_net && check.launch_edge == launch_edge)
         {
             let entry = &mut required[check.data_pin.0];
             *entry = Some(entry.map_or(check.required_ps, |known| known.min(check.required_ps)));
@@ -701,10 +802,10 @@ fn validate_model(design: &Design, model: &TimingModel) -> Result<(), TimingErro
     for &(from, to) in model.cell_arcs.keys() {
         validate_pin_pair(design, from, to)?;
     }
-    for (&output, &(clock, _)) in &model.clock_to_q {
+    for (&output, &(clock, _, _)) in &model.clock_to_q {
         validate_pin_pair(design, clock, output)?;
     }
-    for (&signal, &(clock, _, _)) in &model.setup_holds {
+    for (&signal, &(clock, _, _, _)) in &model.setup_holds {
         validate_pin_pair(design, clock, signal)?;
     }
     Ok(())
@@ -1024,7 +1125,7 @@ mod tests {
     use texo_pnr::place_and_route;
 
     use super::{
-        DelayRange, NetDelay, TimingConstraints, TimingModel, UncheckedEndpointReason,
+        ClockEdge, DelayRange, NetDelay, TimingConstraints, TimingModel, UncheckedEndpointReason,
         analyze_timing, timing_report_from_net_delays,
     };
 
@@ -1106,6 +1207,35 @@ mod tests {
     }
 
     #[test]
+    fn opposite_edge_path_uses_half_a_clock_period() {
+        let (design, device, clock_net, model) =
+            registered_path_edges(10, ClockEdge::Falling, ClockEdge::Rising);
+        let implementation = place_and_route(&design, &device).unwrap();
+        let pip_delays = device
+            .pips()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| (texo_model::PipId(index), DelayRange::new(100, 100).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        let mut constraints = TimingConstraints::new();
+        constraints.set_clock_period_ps(clock_net, 300);
+
+        let report = analyze_timing(
+            &design,
+            &device,
+            &implementation,
+            &pip_delays,
+            &model,
+            &constraints,
+        )
+        .unwrap();
+
+        assert_eq!(report.worst_slack_ps, Some(-140));
+        assert_eq!(report.setup_checks[0].launch_edge, ClockEdge::Falling);
+        assert_eq!(report.setup_checks[0].capture_edge, ClockEdge::Rising);
+    }
+
+    #[test]
     fn reports_why_modeled_endpoints_are_unchecked() {
         let mut design = Design::new();
         let register = design.add_cell("register", ResourceKind::Register);
@@ -1118,6 +1248,7 @@ mod tests {
             .add_setup_hold(
                 clock,
                 data,
+                ClockEdge::Rising,
                 DelayRange::new(10, 10).unwrap(),
                 DelayRange::new(10, 10).unwrap(),
             )
@@ -1157,6 +1288,7 @@ mod tests {
             .add_setup_hold(
                 clock,
                 data,
+                ClockEdge::Rising,
                 DelayRange::new(10, 10).unwrap(),
                 DelayRange::new(10, 10).unwrap(),
             )
@@ -1285,12 +1417,18 @@ mod tests {
             .add_cell_arc(buffer_a, buffer_f, DelayRange::new(100, 500).unwrap())
             .unwrap();
         model
-            .add_clock_to_q(register_clk, register_q, DelayRange::new(40, 50).unwrap())
+            .add_clock_to_q(
+                register_clk,
+                register_q,
+                ClockEdge::Rising,
+                DelayRange::new(40, 50).unwrap(),
+            )
             .unwrap();
         model
             .add_setup_hold(
                 register_clk,
                 register_di,
+                ClockEdge::Rising,
                 DelayRange::new(10, 10).unwrap(),
                 DelayRange::new(100, 100).unwrap(),
             )
@@ -1332,12 +1470,18 @@ mod tests {
             )
             .unwrap();
         inverted_model
-            .add_clock_to_q(register_clk, register_q, DelayRange::new(40, 50).unwrap())
+            .add_clock_to_q(
+                register_clk,
+                register_q,
+                ClockEdge::Rising,
+                DelayRange::new(40, 50).unwrap(),
+            )
             .unwrap();
         inverted_model
             .add_setup_hold(
                 register_clk,
                 register_di,
+                ClockEdge::Rising,
                 DelayRange::new(10, 10).unwrap(),
                 DelayRange::new(100, 100).unwrap(),
             )
@@ -1361,6 +1505,14 @@ mod tests {
     }
 
     fn registered_path(hold_ps: u64) -> (Design, Device, texo_model::NetId, TimingModel) {
+        registered_path_edges(hold_ps, ClockEdge::Rising, ClockEdge::Rising)
+    }
+
+    fn registered_path_edges(
+        hold_ps: u64,
+        launch_edge: ClockEdge,
+        capture_edge: ClockEdge,
+    ) -> (Design, Device, texo_model::NetId, TimingModel) {
         let mut design = Design::new();
         let input = design.add_cell("input", ResourceKind::Io);
         let input_o = design.add_pin(input, "O", PinDirection::Output).unwrap();
@@ -1390,23 +1542,35 @@ mod tests {
             .add_cell_arc(lut_a, lut_f, DelayRange::new(20, 30).unwrap())
             .unwrap();
         model
-            .add_clock_to_q(launch_clk, launch_q, DelayRange::new(40, 50).unwrap())
+            .add_clock_to_q(
+                launch_clk,
+                launch_q,
+                launch_edge,
+                DelayRange::new(40, 50).unwrap(),
+            )
             .unwrap();
         model
             .add_setup_hold(
                 launch_clk,
                 launch_di,
+                launch_edge,
                 DelayRange::new(10, 10).unwrap(),
                 DelayRange::new(hold_ps, hold_ps).unwrap(),
             )
             .unwrap();
         model
-            .add_clock_to_q(capture_clk, capture_q, DelayRange::new(40, 50).unwrap())
+            .add_clock_to_q(
+                capture_clk,
+                capture_q,
+                capture_edge,
+                DelayRange::new(40, 50).unwrap(),
+            )
             .unwrap();
         model
             .add_setup_hold(
                 capture_clk,
                 capture_di,
+                capture_edge,
                 DelayRange::new(10, 10).unwrap(),
                 DelayRange::new(hold_ps, hold_ps).unwrap(),
             )

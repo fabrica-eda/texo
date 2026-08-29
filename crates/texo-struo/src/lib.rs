@@ -67,6 +67,8 @@ pub enum ClockEdge {
 /// One clock output of an ECP5 `EHXPLLL` primitive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PllOutput {
+    /// Dedicated internal feedback output (`CLKINTFB`).
+    Clkintfb,
     /// Primary output (`CLKOP`).
     Clkop,
     /// Secondary output (`CLKOS`).
@@ -82,6 +84,7 @@ impl PllOutput {
     #[must_use]
     pub const fn port(self) -> &'static str {
         match self {
+            Self::Clkintfb => "CLKINTFB",
             Self::Clkop => "CLKOP",
             Self::Clkos => "CLKOS",
             Self::Clkos2 => "CLKOS2",
@@ -93,6 +96,7 @@ impl PllOutput {
 impl From<StruoPllOutput> for PllOutput {
     fn from(value: StruoPllOutput) -> Self {
         match value {
+            StruoPllOutput::Clkintfb => Self::Clkintfb,
             StruoPllOutput::Clkop => Self::Clkop,
             StruoPllOutput::Clkos => Self::Clkos,
             StruoPllOutput::Clkos2 => Self::Clkos2,
