@@ -1313,29 +1313,12 @@ impl TimingDrivenContext<'_, '_, '_> {
             self.refine_setup_monotonically(archive, placement_refiner, routing_costs, progress)?;
         report_metric_phase("closure_monotonic_refinement", &mut phase_started);
         emit_archive_metric("closure_monotonic", self, &archive);
-        for _ in 0..MAX_LOCAL_CONNECTION_REFINEMENTS {
-            let seed = archive
-                .iter()
-                .max_by_key(|(_, timing)| timing_score(timing))
-                .expect("the timing archive is non-empty")
-                .clone();
-            let refinements = self.refine_local_connections(
-                &seed.0,
-                &seed.1,
-                placement_refiner,
-                routing_costs,
-                progress,
-            )?;
-            let Some(improved) = refinements
-                .into_iter()
-                .max_by_key(|(_, timing)| timing_score(timing))
-                .filter(|(_, timing)| timing_score(timing) > timing_score(&seed.1))
-            else {
-                break;
-            };
-            archive.push(improved);
-            archive = select_timing_frontier(archive);
-        }
+        archive = self.refine_local_connections_until_setup_closed(
+            archive,
+            placement_refiner,
+            routing_costs,
+            progress,
+        )?;
         report_metric_phase("closure_local_connections", &mut phase_started);
         emit_archive_metric("closure_local", self, &archive);
         archive =
@@ -1398,6 +1381,47 @@ impl TimingDrivenContext<'_, '_, '_> {
             Some(&final_timing),
         );
         Ok((final_implementation, final_timing))
+    }
+
+    /// Refines individual connections only while setup closure still needs it.
+    ///
+    /// Positive setup margin is not optimized speculatively here: hold repair
+    /// remains an independent later phase, while extra route+STA trials cannot
+    /// change an already passing setup result.
+    fn refine_local_connections_until_setup_closed(
+        &mut self,
+        mut archive: Vec<TimingCandidate>,
+        placement_refiner: &PlacementRefiner<'_>,
+        routing_costs: &mut RoutingCosts,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<Vec<TimingCandidate>, Ecp5FlowError> {
+        if archive.iter().any(|(_, timing)| setup_closed(timing)) {
+            return Ok(archive);
+        }
+        for _ in 0..MAX_LOCAL_CONNECTION_REFINEMENTS {
+            let seed = archive
+                .iter()
+                .max_by_key(|(_, timing)| timing_score(timing))
+                .expect("the timing archive is non-empty")
+                .clone();
+            let refinements = self.refine_local_connections(
+                &seed.0,
+                &seed.1,
+                placement_refiner,
+                routing_costs,
+                progress,
+            )?;
+            let Some(improved) = refinements
+                .into_iter()
+                .max_by_key(|(_, timing)| timing_score(timing))
+                .filter(|(_, timing)| timing_score(timing) > timing_score(&seed.1))
+            else {
+                break;
+            };
+            archive.push(improved);
+            archive = select_timing_frontier(archive);
+        }
+        Ok(archive)
     }
 
     fn repair_setup_and_reenter_critical(
@@ -1466,6 +1490,21 @@ impl TimingDrivenContext<'_, '_, '_> {
             if placement == anchor {
                 break;
             }
+            // The first timing-weighted seed is deliberately routed because
+            // it supplies the large global correction missing from the
+            // connectivity placement.  Later anchored solves are diminishing
+            // refinements.  Reject a geometrically dominated follow-up before
+            // another whole-chip route; local routed refinement can continue
+            // from the accepted seed instead.
+            let net_weights = timing_net_weights(&feedback, self.timing_constraints);
+            if iteration > 1 && self.estimate_rejects(&anchor, &placement, &net_weights) {
+                if metrics_enabled() {
+                    eprintln!(
+                        "[metrics] anchored_placement iteration={iteration} rejected=prescreen"
+                    );
+                }
+                break;
+            }
             let routing = self.packing.global_routing_constraints_cached(
                 self.design,
                 self.architecture,
@@ -1473,8 +1512,7 @@ impl TimingDrivenContext<'_, '_, '_> {
                 self.global_routing_cache,
             )?;
             progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
-            routing_costs
-                .set_net_criticalities(timing_net_weights(&feedback, self.timing_constraints));
+            routing_costs.set_net_criticalities(net_weights);
             routing_costs
                 .set_sink_criticalities(timing_arc_weights(&feedback, self.timing_constraints));
             routing_costs.set_sink_min_delays_ps(BTreeMap::new());
@@ -1494,6 +1532,22 @@ impl TimingDrivenContext<'_, '_, '_> {
             anchor = candidate.0.placement.clone();
             feedback = candidate.1.clone();
             best = Some(candidate);
+            // A nearly closed global seed has already done its job.  Another
+            // whole-design analytical solve and full route is much more
+            // expensive than the incremental refinement that follows, and it
+            // tends to perturb an otherwise useful near-closure basin.
+            if feedback
+                .worst_slack_ps
+                .is_some_and(|slack| slack >= ANCHORED_PLACEMENT_HANDOFF_PS)
+            {
+                if metrics_enabled() {
+                    eprintln!(
+                        "[metrics] anchored_placement iteration={iteration} transition=local wns={:?}",
+                        feedback.worst_slack_ps
+                    );
+                }
+                break;
+            }
         }
         Ok(best)
     }
@@ -2929,6 +2983,7 @@ const LOCAL_BATCH_RECOVERY_WNS_PS: i128 = -800;
 const LOCAL_BATCH_NEAR_CLOSURE_WNS_PS: i128 = -400;
 const MAX_PROJECTED_PATH_CELL_CANDIDATES: usize = 4;
 const MAX_ANCHORED_PLACEMENT_ROUNDS: u32 = 4;
+const ANCHORED_PLACEMENT_HANDOFF_PS: i128 = -100;
 const MAX_CRITICAL_CLOSURE_ROUNDS: usize = 4;
 const MAX_FMAX_CLOSURE_ROUNDS: usize = 4;
 const MAX_CRITICAL_PATH_VERTEX_REFINEMENTS: usize = 4;
@@ -3714,6 +3769,10 @@ fn global_clock_endpoints_unchanged(
 
 fn select_timing_frontier(candidates: Vec<TimingCandidate>) -> Vec<TimingCandidate> {
     select_timing_candidates(candidates, TIMING_FRONTIER_WIDTH)
+}
+
+fn setup_closed(timing: &TimingReport) -> bool {
+    timing.worst_slack_ps.is_some_and(|slack| slack >= 0)
 }
 
 fn select_timing_candidates(
