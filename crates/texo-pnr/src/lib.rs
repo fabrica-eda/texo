@@ -3550,18 +3550,37 @@ fn placement_neighbors(
             .and_then(|weights| weights.get(&NetId(net_index)))
             .copied()
             .unwrap_or(1);
-        let fanout_weight = (64_u64 / net.sinks.len().max(1) as u64).max(1);
+        let fanout_weight = fanout_placement_weight(net.sinks.len());
+        // Wide nets stay out of the star model, but discarding every edge also
+        // discards sink-local STA feedback. Retain only the strongest timed
+        // sink(s); restoring every non-unit weight collapses a broad decode
+        // tree around its driver and recreates the original congestion.
+        let strongest_sink_weight = (net.sinks.len() > MAX_PLACEMENT_FANOUT)
+            .then(|| {
+                sink_weights.and_then(|weights| {
+                    net.sinks
+                        .iter()
+                        .filter_map(|sink| weights.get(&(NetId(net_index), *sink)))
+                        .copied()
+                        .filter(|&weight| weight > 1)
+                        .max()
+                })
+            })
+            .flatten();
         for &sink_pin in &net.sinks {
-            let timing_weight = sink_weights
+            let sink_timing_weight = sink_weights
                 .and_then(|weights| weights.get(&(NetId(net_index), sink_pin)))
-                .copied()
-                .unwrap_or(net_timing_weight);
+                .copied();
+            let timing_weight = sink_timing_weight.unwrap_or(net_timing_weight);
             let budget = sink_budgets
                 .and_then(|budgets| budgets.get(&(NetId(net_index), sink_pin)))
                 .copied()
                 .unwrap_or(0);
+            let retains_high_fanout_sink = sink_timing_weight
+                .zip(strongest_sink_weight)
+                .is_some_and(|(weight, strongest)| weight == strongest);
             let edge_weight = if design.cells()[driver.0].kind == texo_model::ResourceKind::Clock
-                || net.sinks.len() > MAX_PLACEMENT_FANOUT
+                || (net.sinks.len() > MAX_PLACEMENT_FANOUT && !retains_high_fanout_sink)
             {
                 0
             } else {
@@ -3592,6 +3611,21 @@ fn placement_neighbors(
 }
 
 const MAX_PLACEMENT_FANOUT: usize = 256;
+
+/// Per-sink star-model weight with square-root fanout normalization.
+///
+/// Dividing by the full fanout made a wide net's *total* placement influence
+/// constant: one outlying sink on a 64-way decode net cost no more than 1/64
+/// of an ordinary edge, and sink-local timing feedback was diluted by the same
+/// factor. No normalization makes wide control nets dominate the solve. The
+/// square-root model keeps their aggregate influence proportional to
+/// `sqrt(fanout)` while preserving the historical 64-point scale.
+fn fanout_placement_weight(fanout: usize) -> u64 {
+    let fanout = u64::try_from(fanout.max(1)).expect("fanout fits u64");
+    let root = fanout.isqrt();
+    let divisor = root + u64::from(root.saturating_mul(root) < fanout);
+    (64 / divisor).max(1)
+}
 
 #[allow(clippy::too_many_arguments)]
 fn choose_assignment<'a>(
@@ -6674,7 +6708,7 @@ mod tests {
         PlacementConstraints, PlacementNeighbor, PlacementRefinementWorkspace, PlacementRefiner,
         PnrError, ResourceOwnerIndex, RouteArc, RouteCapacityProjection, RouteQueueEntry,
         RouteSearch, RoutingConstraints, RoutingCosts, RoutingResourceMetadata, RoutingWorkspace,
-        congested_route_arcs, congested_route_arcs_indexed,
+        congested_route_arcs, congested_route_arcs_indexed, fanout_placement_weight,
         local_connection_projected_cost_from_starts, ordered_sinks,
         place_analytically_with_net_sink_weights, place_and_route, place_with_constraints,
         placement_from_partial_bindings, placement_neighbors, projected_release_scope_penalty,
@@ -6939,6 +6973,53 @@ mod tests {
         assert!(critical_edge.timing_driven);
         assert_eq!(ordinary_edge.weight, 32);
         assert!(!ordinary_edge.timing_driven);
+    }
+
+    #[test]
+    fn fanout_weight_preserves_square_root_aggregate_influence() {
+        assert_eq!(fanout_placement_weight(1), 64);
+        assert_eq!(fanout_placement_weight(2), 32);
+        assert_eq!(fanout_placement_weight(4), 32);
+        assert_eq!(fanout_placement_weight(5), 21);
+        assert_eq!(fanout_placement_weight(64), 8);
+        assert_eq!(fanout_placement_weight(65), 7);
+        assert_eq!(fanout_placement_weight(256), 4);
+    }
+
+    #[test]
+    fn timing_critical_sink_survives_the_high_fanout_cutoff() {
+        let mut design = Design::new();
+        let source = design.add_cell("source", ResourceKind::Logic);
+        let source_out = design.add_pin(source, "out", PinDirection::Output).unwrap();
+        let mut sinks = Vec::new();
+        for index in 0..=super::MAX_PLACEMENT_FANOUT {
+            let sink = design.add_cell(format!("sink{index}"), ResourceKind::Logic);
+            sinks.push((
+                sink,
+                design.add_pin(sink, "in", PinDirection::Input).unwrap(),
+            ));
+        }
+        design
+            .add_net("wide_fanout", source_out, sinks.iter().map(|&(_, pin)| pin))
+            .unwrap();
+        let critical = sinks[0];
+        let secondary = sinks[1];
+
+        let (_, neighbors) = placement_neighbors(
+            &design,
+            None,
+            Some(&BTreeMap::from([
+                ((NetId(0), critical.1), 64),
+                ((NetId(0), secondary.1), 32),
+            ])),
+            None,
+        );
+
+        assert_eq!(neighbors[source.0].len(), 1);
+        assert_eq!(neighbors[source.0][0].cell, critical.0);
+        assert_eq!(neighbors[source.0][0].weight, 192);
+        assert!(neighbors[source.0][0].timing_driven);
+        assert!(neighbors[secondary.0.0].is_empty());
     }
 
     #[test]
