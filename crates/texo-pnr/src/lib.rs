@@ -3168,6 +3168,8 @@ struct AnalyticalPlacementEdge {
     weight: f64,
 }
 
+type AnalyticalAxisSystem = (Vec<f64>, Vec<Vec<(usize, f64)>>, Vec<f64>);
+
 #[allow(clippy::too_many_arguments)]
 fn analytical_axis_system(
     units: &[PlacementUnit],
@@ -3180,7 +3182,7 @@ fn analytical_axis_system(
     center: u32,
     center_weight: f64,
     positions: Option<&[f64]>,
-) -> (Vec<f64>, Vec<Vec<(usize, f64)>>, Vec<f64>) {
+) -> AnalyticalAxisSystem {
     let mut diagonal = vec![center_weight; units.len()];
     let mut adjacency = vec![Vec::<(usize, f64)>::new(); units.len()];
     let mut rhs = vec![center_weight * f64::from(center); units.len()];
