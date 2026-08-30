@@ -1,6 +1,5 @@
 //! Texo command-line entry point.
 
-use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fs::File;
@@ -13,8 +12,7 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand};
 use struo_synth::synthesize;
 use struo_target_ecp5::{
-    ECP5_QOR_TARGET_MHZ, Ecp5Netlist, JtaggBinding, MappingOptions, OpenDrainIo, PhysicalFeedback,
-    PhysicalLocation, PhysicalNetTiming, PhysicalTimingEndpoint, PllBinding,
+    ECP5_QOR_TARGET_MHZ, Ecp5Netlist, JtaggBinding, MappingOptions, OpenDrainIo, PllBinding,
     map_to_ecp5_with_options,
 };
 use texo_cli::{
@@ -30,8 +28,6 @@ use texo_target_ecp5::{
     Ecp5Architecture, parse_lpf, read_architecture, read_architecture_cache,
     write_architecture_cache,
 };
-
-const MAX_PHYSICAL_SYNTHESIS_ROUNDS: usize = 3;
 
 /// Native ECP5 place and route.
 #[derive(Debug, Parser)]
@@ -386,61 +382,13 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         options.global_clock_fanout = fanout;
     }
     let mut phase_started = Instant::now();
-    let mut result = implement_struo_ecp5_with_progress(
+    let result = implement_struo_ecp5_with_progress(
         &imported,
         &architecture,
         options,
         &mut evidence,
         |stage| report_flow_stage(stage, &mut phase_started),
     )?;
-
-    for round in 1..=MAX_PHYSICAL_SYNTHESIS_ROUNDS {
-        if !options.optimize_timing || result.timing.met_timing() {
-            break;
-        }
-        let feedback =
-            native_physical_feedback(&result, &architecture, args.synthesis_goal_mhz.get());
-        let mut physical_candidates = mapped.physical_feedback_candidates(&feedback).into_iter();
-        if let Some(refined) = physical_candidates.next() {
-            println!(
-                "physical synthesis round {round}: {} equivalent logic replicas, {} physical rewires",
-                refined
-                    .retiming()
-                    .equivalent_logic_replications
-                    .saturating_sub(mapped.retiming().equivalent_logic_replications),
-                refined
-                    .retiming()
-                    .equivalent_physical_rewires
-                    .saturating_sub(mapped.retiming().equivalent_physical_rewires),
-            );
-            let refined_imported = import_ecp5(&refined)?;
-            phase_started = Instant::now();
-            let refined_result = implement_struo_ecp5_with_progress(
-                &refined_imported,
-                &architecture,
-                options,
-                &mut evidence,
-                |stage| report_flow_stage(stage, &mut phase_started),
-            )?;
-            let incumbent_wns = result.timing.worst_slack_ps.unwrap_or(i128::MIN);
-            let refined_wns = refined_result.timing.worst_slack_ps.unwrap_or(i128::MIN);
-            if refined_wns > incumbent_wns {
-                mapped = refined;
-                result = refined_result;
-                println!(
-                    "physical synthesis round {round}: accepted (WNS {incumbent_wns} ps -> {refined_wns} ps)"
-                );
-            } else {
-                println!(
-                    "physical synthesis round {round}: rejected (WNS {incumbent_wns} ps -> {refined_wns} ps)"
-                );
-                break;
-            }
-        } else {
-            println!("physical synthesis round {round}: no equivalent rewrite candidate");
-            break;
-        }
-    }
 
     write_checkpoint(
         &output,
@@ -475,99 +423,6 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         "verification: mapping equivalence passed; post-map functional simulation not supplied"
     );
     Ok(())
-}
-
-fn native_physical_feedback(
-    result: &Ecp5FlowResult,
-    architecture: &Ecp5Architecture,
-    timing_goal_mhz: u32,
-) -> PhysicalFeedback {
-    let placement = &result.implementation.placement;
-    let placements = result
-        .design
-        .cells()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, cell)| {
-            let point = placement.point(texo_model::CellId(index), architecture.device())?;
-            Some((
-                cell.name.clone(),
-                PhysicalLocation {
-                    x: i32::try_from(point.x).ok()?,
-                    y: i32::try_from(point.y).ok()?,
-                },
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let bels = result
-        .design
-        .cells()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, cell)| {
-            let bel = placement.bel(texo_model::CellId(index))?;
-            Some((
-                cell.name.clone(),
-                architecture.device().bels()[bel.0].name.clone(),
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let slacks = result
-        .timing
-        .net_setup_slacks
-        .iter()
-        .map(|edge| ((edge.net, edge.sink), edge.slack_ps))
-        .collect::<BTreeMap<_, _>>();
-    let mut net_timings = BTreeMap::<texo_model::NetId, PhysicalNetTiming>::new();
-    for delay in &result.timing.net_delays {
-        let net = &result.design.nets()[delay.net.0];
-        let driver = &result.design.pins()[net.driver.0];
-        let sink = &result.design.pins()[delay.sink.0];
-        let delay_ps = u32::try_from(delay.delay.max_ps).unwrap_or(u32::MAX);
-        let slack_ps = slacks.get(&(delay.net, delay.sink)).copied().unwrap_or(0);
-        let deficit_ps = u64::try_from(slack_ps.unsigned_abs()).unwrap_or(u64::MAX);
-        let budget_ps = if slack_ps < 0 {
-            delay
-                .delay
-                .max_ps
-                .saturating_sub(deficit_ps)
-                .max(delay.delay.max_ps / 2)
-        } else {
-            delay.delay.max_ps
-        };
-        net_timings
-            .entry(delay.net)
-            .or_insert_with(|| PhysicalNetTiming {
-                driver: result.design.cells()[driver.cell.0].name.clone(),
-                net: net.name.clone(),
-                endpoints: Vec::new(),
-            })
-            .endpoints
-            .push(PhysicalTimingEndpoint {
-                cell: result.design.cells()[sink.cell.0].name.clone(),
-                port: sink.name.clone(),
-                delay_ps,
-                budget_ps: u32::try_from(budget_ps).unwrap_or(u32::MAX),
-            });
-    }
-    let goal_khz = timing_goal_mhz.saturating_mul(1_000).max(1);
-    let goal_period_ps = 1_000_000_000_u64 / u64::from(goal_khz);
-    let worst_slack_ps = result.timing.worst_slack_ps.unwrap_or(0);
-    let achieved_period_ps = if worst_slack_ps < 0 {
-        goal_period_ps
-            .saturating_add(u64::try_from(worst_slack_ps.unsigned_abs()).unwrap_or(u64::MAX))
-    } else {
-        goal_period_ps.saturating_sub(u64::try_from(worst_slack_ps).unwrap_or(u64::MAX))
-    }
-    .max(1);
-    let achieved_khz = u32::try_from(1_000_000_000_u64 / achieved_period_ps).unwrap_or(u32::MAX);
-    PhysicalFeedback::from_observations(
-        placements,
-        bels,
-        net_timings.into_values().collect(),
-        Vec::new(),
-        BTreeMap::from([("native".into(), (achieved_khz, goal_khz))]),
-    )
 }
 
 fn prepare_veryl_input(args: &PnrArgs) -> Result<(VerylProject, PathBuf), Box<dyn Error>> {

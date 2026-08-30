@@ -1242,6 +1242,19 @@ fn write_bram(
     }
 
     let rising = string(configuration, "edge")? == "rising";
+    let second_port = configuration
+        .get("second_port")
+        .filter(|port| !port.is_null());
+    let second_rising = second_port
+        .map(|port| string(port, "edge"))
+        .transpose()?
+        .map_or(rising, |edge| edge == "rising");
+    let second_write_enable = second_port
+        .map(|port| string(port, "write_enable"))
+        .transpose()?;
+    let second_read_enable = second_port
+        .and_then(|port| port.get("read_enable"))
+        .or_else(|| configuration.get("read_enable"));
     for (name, value) in [
         (
             format!("{ebr}.CLKAMUX"),
@@ -1249,7 +1262,7 @@ fn write_bram(
         ),
         (
             format!("{ebr}.CLKBMUX"),
-            if rising { "CLKB" } else { "INV" },
+            if second_rising { "CLKB" } else { "INV" },
         ),
         (format!("{ebr}.RSTAMUX"), "INV"),
         (format!("{ebr}.RSTBMUX"), "INV"),
@@ -1261,12 +1274,18 @@ fn write_bram(
                 "INV"
             },
         ),
-        (format!("{ebr}.WEBMUX"), "INV"),
+        (
+            format!("{ebr}.WEBMUX"),
+            if second_write_enable == Some("high") {
+                "WEB"
+            } else {
+                "INV"
+            },
+        ),
         (format!("{ebr}.CEAMUX"), "CEA"),
         (
             format!("{ebr}.CEBMUX"),
-            if configuration
-                .get("read_enable")
+            if second_read_enable
                 .and_then(Value::as_str)
                 .is_none_or(|level| level == "high")
             {
@@ -1860,6 +1879,43 @@ mod tests {
                 .contains(&("CIB.JCE0MUX".into(), "1".into()))
         );
         assert_eq!(config.bram_data[&3], vec![0; 2048]);
+        assert!(
+            config.tile_groups[0]
+                .1
+                .enums
+                .contains(&("EBR0.WEBMUX".into(), "INV".into()))
+        );
         assert_ne!(config.tile_groups[0].1, TileConfig::default());
+
+        let dual_port_configuration = json!({
+            "kind": "block_ram", "depth": 256, "word_width": 8,
+            "physical_width": 9, "edge": "rising", "write_enable": "high",
+            "read_enable": null,
+            "second_port": {
+                "edge": "falling", "write_enable": "high", "read_enable": null
+            }
+        });
+        let mut dual_port_config = ChipConfig::default();
+        write_bram(
+            &mut dual_port_config,
+            &architecture,
+            &placement,
+            &dual_port_configuration,
+            &packed,
+            &serde_json::Map::new(),
+        )
+        .unwrap();
+        assert!(
+            dual_port_config.tile_groups[0]
+                .1
+                .enums
+                .contains(&("EBR0.WEBMUX".into(), "WEB".into()))
+        );
+        assert!(
+            dual_port_config.tile_groups[0]
+                .1
+                .enums
+                .contains(&("EBR0.CLKBMUX".into(), "INV".into()))
+        );
     }
 }

@@ -1053,6 +1053,79 @@ impl Ecp5Packing {
         &self.global_clocks
     }
 
+    /// Locks promoted clock buffers to the DCCA inputs with the shortest
+    /// physical paths from their already placed sources.
+    ///
+    /// Coarse placement geometry does not describe the dedicated connectivity
+    /// between PLL outputs and the regional DCCA inputs. This performs a
+    /// small, exact bipartite assignment after source placement and narrows
+    /// each buffer's legal placement group to the selected DCCA.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a source or DCCA input is unavailable, or no
+    /// injective source-to-DCCA assignment is routable.
+    pub fn lock_global_clock_buffers_to_shortest_sources(
+        &mut self,
+        design: &Design,
+        architecture: &Ecp5Architecture,
+        placement: &Placement,
+    ) -> Result<BTreeMap<CellId, BelId>, PackingError> {
+        if self.global_clocks.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let device = architecture.device();
+        let graph = UnifiedGraph::new(design, device);
+        let candidates = compatible_dcca_bels(architecture);
+        let mut costs = Vec::with_capacity(self.global_clocks.len());
+        for clock in &self.global_clocks {
+            let net = &design.nets()[clock.source_net.0];
+            let source = placed_pin_wire(&graph, placement, net.driver)?;
+            let distances = forward_route_distances(device, source);
+            let row = candidates
+                .iter()
+                .copied()
+                .map(|bel| {
+                    let pin = find_bel_pin(device, bel, "CLKI")?;
+                    let target = device.bel_pins()[pin.0].wire;
+                    (distances[target.0] != usize::MAX).then_some(distances[target.0])
+                })
+                .collect::<Vec<_>>();
+            costs.push(row);
+        }
+        let reachable = costs
+            .iter()
+            .map(|row| row.iter().flatten().count())
+            .collect::<Vec<_>>();
+        let assignment = minimum_injective_assignment(&costs).ok_or_else(|| {
+            global_route_error(
+                &design.nets()[self.global_clocks[0].source_net.0],
+                format!(
+                    "no injective source-to-DCCA assignment is routable (reachable candidates per source: {reachable:?})"
+                ),
+            )
+        })?;
+        let selected = self
+            .global_clocks
+            .iter()
+            .zip(assignment)
+            .map(|(clock, candidate)| (clock.buffer, (candidates[candidate], clock.source_net)))
+            .collect::<BTreeMap<_, _>>();
+        for (&buffer, &(bel, source_net)) in &selected {
+            if !self.constraints.remove_group(&[buffer]) {
+                return Err(global_route_error(
+                    &design.nets()[source_net.0],
+                    "promoted clock buffer has no placement group",
+                ));
+            }
+            self.constraints.add_group([buffer], [vec![bel]]);
+        }
+        Ok(selected
+            .into_iter()
+            .map(|(buffer, (bel, _))| (buffer, bel))
+            .collect())
+    }
+
     /// LPF `IOBUF` attributes resolved to logical IO cells.
     #[must_use]
     pub const fn io_attributes(&self) -> &BTreeMap<CellId, BTreeMap<String, String>> {
@@ -1724,6 +1797,92 @@ fn global_route_error(net: &texo_model::Net, reason: impl Into<String>) -> Packi
     }
 }
 
+fn minimum_injective_assignment(costs: &[Vec<Option<usize>>]) -> Option<Vec<usize>> {
+    let candidate_count = costs.first().map_or(0, Vec::len);
+    if costs.is_empty() {
+        return Some(Vec::new());
+    }
+    if costs.len() > candidate_count || costs.iter().any(|row| row.len() != candidate_count) {
+        return None;
+    }
+    // Rectangular Hungarian assignment. ECP5 exposes more regional DCCA BELs
+    // than global clocks, so a subset bitmask would scale with the wrong side
+    // of the problem (56 candidates on the 85K device).
+    let rows = costs.len();
+    let columns = candidate_count;
+    let infinity = i64::MAX / 8;
+    let mut row_potential = vec![0_i64; rows + 1];
+    let mut column_potential = vec![0_i64; columns + 1];
+    let mut matched_row = vec![0_usize; columns + 1];
+    let mut predecessor = vec![0_usize; columns + 1];
+    for row in 1..=rows {
+        matched_row[0] = row;
+        let mut column = 0_usize;
+        let mut minimum = vec![infinity; columns + 1];
+        let mut used = vec![false; columns + 1];
+        loop {
+            used[column] = true;
+            let active_row = matched_row[column];
+            let mut delta = infinity;
+            let mut next_column = 0_usize;
+            for candidate in 1..=columns {
+                if used[candidate] {
+                    continue;
+                }
+                let edge = costs[active_row - 1][candidate - 1]
+                    .and_then(|cost| i64::try_from(cost).ok())
+                    .unwrap_or(infinity);
+                let reduced = edge
+                    .saturating_sub(row_potential[active_row])
+                    .saturating_sub(column_potential[candidate]);
+                if reduced < minimum[candidate] {
+                    minimum[candidate] = reduced;
+                    predecessor[candidate] = column;
+                }
+                if minimum[candidate] < delta {
+                    delta = minimum[candidate];
+                    next_column = candidate;
+                }
+            }
+            if delta == infinity || next_column == 0 {
+                return None;
+            }
+            for candidate in 0..=columns {
+                if used[candidate] {
+                    row_potential[matched_row[candidate]] =
+                        row_potential[matched_row[candidate]].saturating_add(delta);
+                    column_potential[candidate] = column_potential[candidate].saturating_sub(delta);
+                } else {
+                    minimum[candidate] = minimum[candidate].saturating_sub(delta);
+                }
+            }
+            column = next_column;
+            if matched_row[column] == 0 {
+                break;
+            }
+        }
+        loop {
+            let previous = predecessor[column];
+            matched_row[column] = matched_row[previous];
+            column = previous;
+            if column == 0 {
+                break;
+            }
+        }
+    }
+    let mut assignment = vec![usize::MAX; rows];
+    for (column, &row) in matched_row.iter().enumerate().skip(1) {
+        if row != 0 {
+            assignment[row - 1] = column - 1;
+        }
+    }
+    assignment
+        .iter()
+        .enumerate()
+        .all(|(row, &column)| column != usize::MAX && costs[row][column].is_some())
+        .then_some(assignment)
+}
+
 fn ensure_global_route_disjoint(
     net: &texo_model::Net,
     device: &Device,
@@ -1797,6 +1956,25 @@ fn forward_route(
         }
     }
     None
+}
+
+fn forward_route_distances(device: &Device, source: WireId) -> Vec<usize> {
+    let mut distances = vec![usize::MAX; device.wires().len()];
+    let mut queue = VecDeque::from([source]);
+    distances[source.0] = 0;
+    while let Some(wire) = queue.pop_front() {
+        let next_distance = distances[wire.0].saturating_add(1);
+        let Ok(neighbors) = device.routing_neighbors(wire) else {
+            continue;
+        };
+        for (next, _) in neighbors {
+            if distances[next.0] == usize::MAX {
+                distances[next.0] = next_distance;
+                queue.push_back(next);
+            }
+        }
+    }
+    distances
 }
 
 #[derive(Debug)]
@@ -3919,9 +4097,10 @@ mod tests {
         ArchitectureFile, BlockRamRequirement, BlockedGlobalResources, CompactIncomingPips,
         Ecp5Packing, GlobalClockRequirement, GlobalReverseSearch, ImportError, LogicalPort,
         LutFfPair, PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, TileRecord,
-        expand, find_bel_pin, find_global_clock_requirements, logical_carry_chains, pack_lut_ffs,
-        pack_lut_ffs_excluding, pack_lut_ffs_with_pairs, parse_lpf, read_architecture,
-        read_architecture_cache, resolve_lpf_port_cells, resolve_lpf_ports, valid_wide_lut_cluster,
+        expand, find_bel_pin, find_global_clock_requirements, logical_carry_chains,
+        minimum_injective_assignment, pack_lut_ffs, pack_lut_ffs_excluding,
+        pack_lut_ffs_with_pairs, parse_lpf, read_architecture, read_architecture_cache,
+        resolve_lpf_port_cells, resolve_lpf_ports, valid_wide_lut_cluster,
         write_architecture_cache,
     };
 
@@ -5054,6 +5233,20 @@ mod tests {
         );
         assert_eq!(result.routes.len(), 2);
         assert_eq!(result.total_pips, 2);
+    }
+
+    #[test]
+    fn global_clock_assignment_minimizes_total_source_route_cost() {
+        let costs = vec![
+            vec![Some(20), Some(2), Some(8)],
+            vec![Some(3), Some(30), Some(4)],
+        ];
+
+        assert_eq!(minimum_injective_assignment(&costs), Some(vec![1, 0]));
+        assert_eq!(
+            minimum_injective_assignment(&[vec![Some(1)], vec![Some(2)]]),
+            None
+        );
     }
 
     #[test]
