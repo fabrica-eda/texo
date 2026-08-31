@@ -2695,11 +2695,7 @@ impl<'a> Ecp5EcoTimingSession<'a> {
         })
     }
 
-    fn analyze(
-        &mut self,
-        design: &Design,
-        implementation: &PnrResult,
-    ) -> Result<TimingReport, Ecp5FlowError> {
+    fn analyze(&mut self, implementation: &PnrResult) -> Result<TimingReport, Ecp5FlowError> {
         for pip in self.touched_pips.drain(..) {
             self.selected[pip.0] = false;
         }
@@ -2707,6 +2703,9 @@ impl<'a> Ecp5EcoTimingSession<'a> {
             self.source_fanout[wire.0] = 0;
         }
         for pip in implementation.routes.iter().flat_map(|route| route.pips()) {
+            if pip.0 >= self.selected.len() {
+                return Err(TimingError::UnknownRoutedPip(pip).into());
+            }
             if !self.selected[pip.0] {
                 self.selected[pip.0] = true;
                 self.touched_pips.push(pip);
@@ -2739,36 +2738,11 @@ impl<'a> Ecp5EcoTimingSession<'a> {
                 )?,
             );
         }
-        let mut routes = vec![None; design.nets().len()];
-        for route in &implementation.routes {
-            routes[route.net.0] = Some(route);
-        }
-        let mut net_delays = Vec::new();
-        for (index, net) in design.nets().iter().enumerate() {
-            let net_id = NetId(index);
-            let route = routes[index].ok_or(TimingError::MissingRoute(net_id))?;
-            for &sink in &net.sinks {
-                let arc = route
-                    .arc(sink)
-                    .ok_or(TimingError::UnreachableSink { net: net_id, sink })?;
-                let mut min_ps = 0_u64;
-                let mut max_ps = 0_u64;
-                for pip in &arc.pips {
-                    min_ps = min_ps
-                        .checked_add(self.pip_delays[pip].min_ps)
-                        .ok_or(Ecp5FlowError::TimingDelayOverflow)?;
-                    max_ps = max_ps
-                        .checked_add(self.pip_delays[pip].max_ps)
-                        .ok_or(Ecp5FlowError::TimingDelayOverflow)?;
-                }
-                net_delays.push(NetDelay {
-                    net: net_id,
-                    sink,
-                    delay: DelayRange::from_independent_corners(min_ps, max_ps),
-                });
-            }
-        }
-        Ok(self.timing.analyze(net_delays)?)
+        Ok(self
+            .timing
+            .analyze_routed(self.architecture.device(), implementation, |pip| {
+                self.pip_delays.get(&pip).copied()
+            })?)
     }
 }
 
@@ -2846,7 +2820,7 @@ fn improve_worst_setup_net_route_ecos(
             continue;
         };
         let sta_started = Instant::now();
-        let candidate_timing = timing_session.analyze(design, &candidate_implementation)?;
+        let candidate_timing = timing_session.analyze(&candidate_implementation)?;
         let sta_elapsed = sta_started.elapsed();
         progress(timing_snapshot(&candidate_timing));
         let candidate_objective = timing_objective(&candidate_timing);
@@ -3672,19 +3646,20 @@ mod tests {
     };
     use texo_timing::{
         ClockEdge as TimingClockEdge, DelayRange, NetDelay, NetSetupCriticality, NetSetupSlack,
-        SetupCheck, TimingModel, TimingReport, analyze_timing_from_net_delays,
+        SetupCheck, TimingConstraints, TimingError, TimingModel, TimingReport,
+        analyze_timing_from_net_delays,
     };
 
     use super::{
-        Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate, GeneratedClockRelations,
-        PostMapSimulationPolicy, WorstSetupNetRouteEcoCandidate, WorstSetupRouteEcoWorklist,
-        accumulate_hold_minimums, commit_strict_route_eco_candidate, constrain_pll_outputs,
-        criticality_weight, ecp5_placement_criticality_weight, ecp5_timing_constraints,
-        ecp5_timing_model, ecp5_timing_placement_weights, ff_ce_control_sets,
-        ff_clock_control_sets, ff_lsr_control_sets, find_cell_pin, freeze_unchanged_routes,
-        implement, implement_struo_ecp5, implement_with_constraints, is_ecp5_span6_continuation,
-        pip_class_delay, placement_bbox_hpwl, placement_identity, placement_star_length,
-        predicted_setup_candidate_is_pareto_dominated, primitive_clock_edge,
+        Ecp5EcoTimingSession, Ecp5FlowError, Ecp5FlowOptions, Evidence, Gate,
+        GeneratedClockRelations, PostMapSimulationPolicy, WorstSetupNetRouteEcoCandidate,
+        WorstSetupRouteEcoWorklist, accumulate_hold_minimums, commit_strict_route_eco_candidate,
+        constrain_pll_outputs, criticality_weight, ecp5_placement_criticality_weight,
+        ecp5_timing_constraints, ecp5_timing_model, ecp5_timing_placement_weights,
+        ff_ce_control_sets, ff_clock_control_sets, ff_lsr_control_sets, find_cell_pin,
+        freeze_unchanged_routes, implement, implement_struo_ecp5, implement_with_constraints,
+        is_ecp5_span6_continuation, pip_class_delay, placement_bbox_hpwl, placement_identity,
+        placement_star_length, predicted_setup_candidate_is_pareto_dominated, primitive_clock_edge,
         project_trellis_speed_grade, run_setup_feedback_fallback, slack_violations,
         staged_timing_objective, strictly_improves_timing_objective, verify_post_map_with_celox,
         worst_setup_net_route_eco_candidates, worst_setup_route_eco_cohort,
@@ -5133,6 +5108,55 @@ mod tests {
         ));
         assert_eq!(implementation, before_implementation);
         assert_eq!(timing, before_timing);
+    }
+
+    #[test]
+    fn eco_timing_session_rejects_unknown_pips_without_panicking() {
+        let architecture = read_architecture(ECP5_FIXTURE.as_bytes()).unwrap();
+        let mut design = Design::new();
+        let source = design.add_cell("source", ResourceKind::Logic);
+        let driver = design
+            .add_pin(source, "driver", PinDirection::Output)
+            .unwrap();
+        let target = design.add_cell("target", ResourceKind::Logic);
+        let sink = design.add_pin(target, "sink", PinDirection::Input).unwrap();
+        let net = design.add_net("invalid_route", driver, [sink]).unwrap();
+        let empty_design = Design::new();
+        let placement = placement_from_partial_bindings(
+            &empty_design,
+            architecture.device(),
+            &PlacementConstraints::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let unknown = PipId(usize::MAX);
+        let implementation = PnrResult {
+            placement,
+            routes: vec![Arc::new(NetRoute::new(
+                net,
+                vec![RouteArc {
+                    sink: Some(sink),
+                    wires: Vec::new(),
+                    pips: vec![unknown],
+                }],
+            ))],
+            total_pips: 1,
+        };
+        let model = TimingModel::new();
+        let constraints = TimingConstraints::new();
+        let mut session = Ecp5EcoTimingSession::new(
+            &design,
+            &architecture,
+            &architecture.speed_grades()["6"],
+            &model,
+            &constraints,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            session.analyze(&implementation),
+            Err(Ecp5FlowError::Timing(TimingError::UnknownRoutedPip(pip))) if pip == unknown
+        ));
     }
 
     #[test]

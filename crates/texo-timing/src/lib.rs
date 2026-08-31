@@ -554,6 +554,7 @@ impl<'a> TimingAnalysisSession<'a> {
             };
             if delay.net.0 >= self.design.nets().len()
                 || pin.net() != Some(delay.net)
+                || !self.topology.logical_sinks[delay.sink.0]
                 || std::mem::replace(&mut seen[delay.sink.0], true)
             {
                 return Err(TimingError::MissingNetDelay {
@@ -579,6 +580,26 @@ impl<'a> TimingAnalysisSession<'a> {
             Some(&self.topology),
         )
     }
+
+    /// Analyzes a routed implementation with caller-supplied PIP delays.
+    ///
+    /// The lookup is invoked for every PIP on a logical driver-to-sink arc.
+    /// Route ownership, endpoint wires, and duplicate or missing routes are
+    /// validated exactly as they are by [`analyze_timing`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed routes, missing PIP delays, incomplete
+    /// delay updates, or arithmetic overflow.
+    pub fn analyze_routed(
+        &self,
+        device: &Device,
+        implementation: &PnrResult,
+        pip_delay: impl FnMut(PipId) -> Option<DelayRange>,
+    ) -> Result<TimingReport, TimingError> {
+        let net_delays = routed_net_delays_with(self.design, device, implementation, pip_delay)?;
+        self.analyze(net_delays)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -590,6 +611,7 @@ enum TimingEdgeDelay {
 struct TimingTopology {
     edges: Vec<Vec<(CellPinId, TimingEdgeDelay)>>,
     roots: Vec<bool>,
+    logical_sinks: Vec<bool>,
     order: Vec<CellPinId>,
 }
 
@@ -597,11 +619,13 @@ impl TimingTopology {
     fn new(design: &Design, model: &TimingModel) -> Result<Self, TimingError> {
         let mut edges = vec![Vec::new(); design.pins().len()];
         let mut indegree = vec![0_usize; design.pins().len()];
+        let mut logical_sinks = vec![false; design.pins().len()];
         for index in 0..design.nets().len() {
             let net = NetId(index);
             for &sink in &design.nets()[net.0].sinks {
                 edges[design.nets()[net.0].driver.0].push((sink, TimingEdgeDelay::Net(net, sink)));
                 indegree[sink.0] += 1;
+                logical_sinks[sink.0] = true;
             }
         }
         for (&(from, to), &delay) in &model.cell_arcs {
@@ -633,6 +657,7 @@ impl TimingTopology {
         Ok(Self {
             edges,
             roots,
+            logical_sinks,
             order,
         })
     }
@@ -1334,6 +1359,17 @@ fn routed_net_delays(
     implementation: &PnrResult,
     pip_delays: &BTreeMap<PipId, DelayRange>,
 ) -> Result<Vec<NetDelay>, TimingError> {
+    routed_net_delays_with(design, device, implementation, |pip| {
+        pip_delays.get(&pip).copied()
+    })
+}
+
+fn routed_net_delays_with(
+    design: &Design,
+    device: &Device,
+    implementation: &PnrResult,
+    mut pip_delay: impl FnMut(PipId) -> Option<DelayRange>,
+) -> Result<Vec<NetDelay>, TimingError> {
     let mut routes = BTreeMap::new();
     for route in &implementation.routes {
         if route.net.0 >= design.nets().len() {
@@ -1354,7 +1390,8 @@ fn routed_net_delays(
         let driver_wire = bound_wire(&graph, &implementation.placement, net.driver, device)?;
         for &sink in &net.sinks {
             let sink_wire = bound_wire(&graph, &implementation.placement, sink, device)?;
-            let delay = route_arc_delay(route, net_id, sink, driver_wire, sink_wire, pip_delays)?;
+            let delay =
+                route_arc_delay(route, net_id, sink, driver_wire, sink_wire, &mut pip_delay)?;
             result.push(NetDelay {
                 net: net_id,
                 sink,
@@ -1394,7 +1431,7 @@ fn route_arc_delay(
     sink: CellPinId,
     source: WireId,
     sink_wire: WireId,
-    pip_delays: &BTreeMap<PipId, DelayRange>,
+    pip_delay: &mut impl FnMut(PipId) -> Option<DelayRange>,
 ) -> Result<DelayRange, TimingError> {
     let arc = route
         .arc(sink)
@@ -1405,10 +1442,7 @@ fn route_arc_delay(
         .ok_or(TimingError::UnreachableSink { net, sink })?;
     let mut delay = DelayRange::zero();
     for &pip_id in &arc.pips {
-        let edge_delay = pip_delays
-            .get(&pip_id)
-            .copied()
-            .ok_or(TimingError::MissingPipDelay(pip_id))?;
+        let edge_delay = pip_delay(pip_id).ok_or(TimingError::MissingPipDelay(pip_id))?;
         delay = delay.checked_add(edge_delay)?;
     }
     Ok(delay)
@@ -1667,9 +1701,10 @@ impl From<ModelError> for TimingError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use texo_model::{Design, Device, PinDirection, Point, ResourceKind};
-    use texo_pnr::place_and_route;
+    use texo_pnr::{NetRoute, place_and_route};
 
     use super::{
         ClockEdge, DelayRange, NetDelay, TimingAnalysisSession, TimingConstraints, TimingModel,
@@ -1700,6 +1735,14 @@ mod tests {
         .unwrap();
         let session = TimingAnalysisSession::new(&design, &model, &constraints).unwrap();
         assert_eq!(session.analyze(routed.net_delays.clone()).unwrap(), routed);
+        assert_eq!(
+            session
+                .analyze_routed(&device, &implementation, |pip| {
+                    pip_delays.get(&pip).copied()
+                })
+                .unwrap(),
+            routed,
+        );
 
         let mut changed = routed.net_delays.clone();
         changed[0].delay = DelayRange::new(17, 31).unwrap();
@@ -1726,6 +1769,93 @@ mod tests {
                 ..
             })
         ));
+
+        let first_net = routed.net_delays[0].net;
+        let mut unexpected_driver = routed.net_delays.clone();
+        let driver = design.nets()[first_net.0].driver;
+        unexpected_driver.push(NetDelay {
+            net: first_net,
+            sink: driver,
+            delay: DelayRange::zero(),
+        });
+        assert_eq!(
+            session.analyze(unexpected_driver),
+            Err(super::TimingError::MissingNetDelay {
+                net: first_net,
+                sink: driver,
+            })
+        );
+    }
+
+    #[test]
+    fn reusable_session_retains_routed_input_validation() {
+        let (design, device, clock_net, model) = registered_path(10);
+        let implementation = place_and_route(&design, &device).unwrap();
+        let pip_delays = device
+            .pips()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| (texo_model::PipId(index), DelayRange::new(100, 100).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        let mut constraints = TimingConstraints::new();
+        constraints.set_clock_period_ps(clock_net, 300);
+        let session = TimingAnalysisSession::new(&design, &model, &constraints).unwrap();
+
+        let mut duplicate_route = implementation.clone();
+        duplicate_route
+            .routes
+            .push(implementation.routes[0].clone());
+        assert_eq!(
+            session.analyze_routed(&device, &duplicate_route, |pip| {
+                pip_delays.get(&pip).copied()
+            }),
+            Err(super::TimingError::DuplicateRoute(
+                implementation.routes[0].net
+            )),
+        );
+
+        let mut unknown_route = implementation.clone();
+        unknown_route.routes.push(Arc::new(NetRoute::new(
+            texo_model::NetId(design.nets().len()),
+            Vec::new(),
+        )));
+        assert_eq!(
+            session.analyze_routed(&device, &unknown_route, |pip| {
+                pip_delays.get(&pip).copied()
+            }),
+            Err(super::TimingError::UnknownRoutedNet(texo_model::NetId(
+                design.nets().len()
+            ))),
+        );
+
+        let mut bad_endpoint = implementation.clone();
+        let route = implementation
+            .routes
+            .iter()
+            .find(|route| route.arcs.iter().any(|arc| arc.sink.is_some()))
+            .unwrap();
+        let sink = route.arcs.iter().find_map(|arc| arc.sink).unwrap();
+        let mut arcs = route.arcs.clone();
+        arcs.iter_mut()
+            .find(|arc| arc.sink == Some(sink))
+            .unwrap()
+            .wires
+            .clear();
+        let index = bad_endpoint
+            .routes
+            .iter()
+            .position(|candidate| candidate.net == route.net)
+            .unwrap();
+        bad_endpoint.routes[index] = Arc::new(NetRoute::new(route.net, arcs));
+        assert_eq!(
+            session.analyze_routed(&device, &bad_endpoint, |pip| {
+                pip_delays.get(&pip).copied()
+            }),
+            Err(super::TimingError::UnreachableSink {
+                net: route.net,
+                sink,
+            }),
+        );
     }
 
     #[test]
