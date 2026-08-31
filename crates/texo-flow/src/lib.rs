@@ -6,9 +6,6 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -988,48 +985,6 @@ fn block_ram_requirements(imported: &ImportedEcp5Design) -> Vec<BlockRamRequirem
 }
 
 type PlacementIdentity = (Vec<BelId>, Vec<Option<BelPinId>>);
-
-/// Writes one complete legal cell-to-BEL assignment for isolated placement
-/// and routing A/B experiments. The output is deliberately name based so the
-/// ordinary `initial_placement` import path can consume it after remapping the
-/// same logical design; numeric IDs are retained to make identity checks cheap.
-pub(crate) fn export_placement_artifact(
-    stage: &str,
-    design: &Design,
-    device: &Device,
-    placement: &Placement,
-) -> Result<(), Ecp5FlowError> {
-    let Some(directory) = std::env::var_os("TEXO_PLACEMENT_ARTIFACT_DIR") else {
-        return Ok(());
-    };
-    let directory = PathBuf::from(directory);
-    fs::create_dir_all(&directory)?;
-    let path = directory.join(format!("{stage}.tsv"));
-    let mut output = BufWriter::new(File::create(&path)?);
-    writeln!(output, "# texo-placement-v1")?;
-    writeln!(output, "# stage\t{stage}")?;
-    writeln!(output, "# design_cells\t{}", design.cells().len())?;
-    writeln!(output, "# bindings\t{}", placement.bindings().len())?;
-    writeln!(output, "cell_id\tcell\tbel_id\tbel\tx\ty")?;
-    for (cell_id, &bel_id) in placement.bindings().iter().enumerate() {
-        let cell = &design.cells()[cell_id];
-        let bel = &device.bels()[bel_id.0];
-        writeln!(
-            output,
-            "{cell_id}\t{}\t{}\t{}\t{}\t{}",
-            cell.name, bel_id.0, bel.name, bel.point.x, bel.point.y,
-        )?;
-    }
-    output.flush()?;
-    if metrics_enabled() {
-        eprintln!(
-            "[metrics] placement_artifact stage={stage} path={} bindings={}",
-            path.display(),
-            placement.bindings().len(),
-        );
-    }
-    Ok(())
-}
 
 fn placement_identity(design: &Design, placement: &Placement) -> PlacementIdentity {
     (
@@ -2475,12 +2430,6 @@ fn initial_analytical_placement(
             &controls,
         )?;
     let eplace_elapsed = eplace_started.elapsed();
-    export_placement_artifact(
-        "eplace_candidate",
-        design,
-        architecture.device(),
-        &eplace_candidate,
-    )?;
     let eplace_estimate = estimated_placement_timing(
         design,
         &eplace_candidate,
@@ -3410,8 +3359,6 @@ pub enum Ecp5FlowError {
     },
     /// Static timing analysis failed.
     Timing(TimingError),
-    /// A requested placement A/B artifact could not be written.
-    PlacementArtifact(std::io::Error),
 }
 
 #[allow(deprecated, clippy::too_many_lines)]
@@ -3520,9 +3467,6 @@ impl fmt::Display for Ecp5FlowError {
                 "PLL `{cell}` output `{output}` has no exact generated-clock model: {reason}"
             ),
             Self::Timing(error) => write!(f, "ECP5 static timing analysis failed: {error}"),
-            Self::PlacementArtifact(error) => {
-                write!(f, "failed to write placement artifact: {error}")
-            }
         }
     }
 }
@@ -3536,7 +3480,6 @@ impl Error for Ecp5FlowError {
             Self::Pnr(error) => Some(error),
             Self::PlacementDelay(error) => Some(error),
             Self::Timing(error) => Some(error),
-            Self::PlacementArtifact(error) => Some(error),
             Self::MissingPostMapSimulation
             | Self::MissingPackageForLpf
             | Self::MissingSpeedGrade
@@ -3589,12 +3532,6 @@ impl From<Ecp5DelayPredictorError> for Ecp5FlowError {
 impl From<TimingError> for Ecp5FlowError {
     fn from(value: TimingError) -> Self {
         Self::Timing(value)
-    }
-}
-
-impl From<std::io::Error> for Ecp5FlowError {
-    fn from(value: std::io::Error) -> Self {
-        Self::PlacementArtifact(value)
     }
 }
 
