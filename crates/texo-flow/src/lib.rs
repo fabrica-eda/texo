@@ -3,7 +3,7 @@
 mod ecp5_pll;
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -2666,12 +2666,12 @@ struct Ecp5EcoTimingSession<'a> {
     timing: TimingAnalysisSession<'a>,
     architecture: &'a Ecp5Architecture,
     speed_grade: &'a SpeedGradeRecord,
-    pip_classes: Vec<Option<&'a PipClassTimingRecord>>,
+    pip_classes: HashMap<PipId, &'a PipClassTimingRecord>,
     selected: Vec<bool>,
     touched_pips: Vec<PipId>,
     source_fanout: Vec<u64>,
     touched_sources: Vec<WireId>,
-    pip_delays: Vec<DelayRange>,
+    pip_delays: HashMap<PipId, DelayRange>,
 }
 
 impl<'a> Ecp5EcoTimingSession<'a> {
@@ -2682,23 +2682,16 @@ impl<'a> Ecp5EcoTimingSession<'a> {
         model: &'a TimingModel,
         constraints: &'a TimingConstraints,
     ) -> Result<Self, Ecp5FlowError> {
-        let pip_classes = (0..architecture.device().pips().len())
-            .map(|index| {
-                speed_grade
-                    .pip_classes
-                    .get(architecture.pip_metadata(PipId(index)).timing_class)
-            })
-            .collect();
         Ok(Self {
             timing: TimingAnalysisSession::new(design, model, constraints)?,
             architecture,
             speed_grade,
-            pip_classes,
+            pip_classes: HashMap::new(),
             selected: vec![false; architecture.device().pips().len()],
             touched_pips: Vec::new(),
             source_fanout: vec![0; architecture.device().wires().len()],
             touched_sources: Vec::new(),
-            pip_delays: vec![DelayRange::zero(); architecture.device().pips().len()],
+            pip_delays: HashMap::new(),
         })
     }
 
@@ -2725,15 +2718,26 @@ impl<'a> Ecp5EcoTimingSession<'a> {
             }
         }
         for &pip in &self.touched_pips {
-            let class =
-                self.pip_classes[pip.0].ok_or_else(|| Ecp5FlowError::MissingPipTimingClass {
-                    speed_grade: self.speed_grade.name.clone(),
-                    timing_class: self.architecture.pip_metadata(pip).timing_class.to_owned(),
-                })?;
-            self.pip_delays[pip.0] = pip_class_delay(
-                class,
-                self.source_fanout[self.architecture.device().pips()[pip.0].from().0],
-            )?;
+            if !self.pip_classes.contains_key(&pip) {
+                let timing_class = self.architecture.pip_metadata(pip).timing_class;
+                let class = self
+                    .speed_grade
+                    .pip_classes
+                    .get(timing_class)
+                    .ok_or_else(|| Ecp5FlowError::MissingPipTimingClass {
+                        speed_grade: self.speed_grade.name.clone(),
+                        timing_class: timing_class.to_owned(),
+                    })?;
+                self.pip_classes.insert(pip, class);
+            }
+            let class = self.pip_classes[&pip];
+            self.pip_delays.insert(
+                pip,
+                pip_class_delay(
+                    class,
+                    self.source_fanout[self.architecture.device().pips()[pip.0].from().0],
+                )?,
+            );
         }
         let mut routes = vec![None; design.nets().len()];
         for route in &implementation.routes {
@@ -2751,10 +2755,10 @@ impl<'a> Ecp5EcoTimingSession<'a> {
                 let mut max_ps = 0_u64;
                 for pip in &arc.pips {
                     min_ps = min_ps
-                        .checked_add(self.pip_delays[pip.0].min_ps)
+                        .checked_add(self.pip_delays[pip].min_ps)
                         .ok_or(Ecp5FlowError::TimingDelayOverflow)?;
                     max_ps = max_ps
-                        .checked_add(self.pip_delays[pip.0].max_ps)
+                        .checked_add(self.pip_delays[pip].max_ps)
                         .ok_or(Ecp5FlowError::TimingDelayOverflow)?;
                 }
                 net_delays.push(NetDelay {
