@@ -12,13 +12,6 @@ use texo_model::{CellId, CellPinId, Design, NetId, ResourceKind};
 /// terms while the star model is replaced.
 const PLACEMENT_WEIGHT_SCALE: f64 = 64.0;
 
-/// Maximum smooth-wirelength underestimate of one two-dimensional hypernet.
-///
-/// Half a tile is the finest displacement that can change a rounded BEL
-/// target, so resolving a single net more accurately would not add useful
-/// information to global placement.
-const WEIGHTED_AVERAGE_NET_ERROR_TILES: f64 = 0.5;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HypergraphPin {
     unit: usize,
@@ -362,28 +355,6 @@ impl AnalyticalHypergraph {
         edges
     }
 
-    /// Evaluates one fixed weighted-average wirelength objective and gradient.
-    ///
-    /// Every retained non-clock net contributes one smooth HPWL term. Every
-    /// timing-critical sink additionally contributes its excess weight times
-    /// a two-pin term, matching [`Self::exact_objective`]. `unit_positions`
-    /// contains movable unit origins. Fixed cells use their exact coordinates;
-    /// movable macro members add their stable offsets to the owning origin.
-    #[must_use]
-    pub(super) fn weighted_average_objective(
-        &self,
-        unit_positions: &[(f64, f64)],
-        fixed_coordinates: &[Option<(f64, f64)>],
-        cell_offsets: &[(f64, f64)],
-    ) -> WeightedAverageObjective {
-        self.weighted_average_objective_with_gamma_by_net(
-            unit_positions,
-            fixed_coordinates,
-            cell_offsets,
-            weighted_average_gamma,
-        )
-    }
-
     /// Evaluates weighted-average wirelength with one placement-wide
     /// smoothing parameter.
     ///
@@ -491,71 +462,6 @@ impl AnalyticalHypergraph {
         (baseline, timing)
     }
 
-    fn weighted_average_objective_with_gamma_by_net(
-        &self,
-        unit_positions: &[(f64, f64)],
-        fixed_coordinates: &[Option<(f64, f64)>],
-        cell_offsets: &[(f64, f64)],
-        mut gamma_for_pin_count: impl FnMut(usize) -> f64,
-    ) -> WeightedAverageObjective {
-        let mut objective = empty_weighted_average_objective(unit_positions.len());
-        let mut scratch_x = WeightedAverageAxisScratch::default();
-        let mut scratch_y = WeightedAverageAxisScratch::default();
-        for net in &self.nets {
-            let gamma = gamma_for_pin_count(net.pins.len());
-            objective.value += add_weighted_average_axis(
-                &net.pins,
-                1.0,
-                gamma,
-                unit_positions,
-                fixed_coordinates,
-                cell_offsets,
-                false,
-                &mut objective.gradient_x,
-                &mut scratch_x,
-            );
-            objective.value += add_weighted_average_axis(
-                &net.pins,
-                1.0,
-                gamma,
-                unit_positions,
-                fixed_coordinates,
-                cell_offsets,
-                true,
-                &mut objective.gradient_y,
-                &mut scratch_y,
-            );
-        }
-        for arc in &self.timed_arcs {
-            let pins = [arc.driver, arc.sink];
-            let weight = u64_to_f64(arc.extra_weight);
-            let gamma = gamma_for_pin_count(pins.len());
-            objective.value += add_weighted_average_axis(
-                &pins,
-                weight,
-                gamma,
-                unit_positions,
-                fixed_coordinates,
-                cell_offsets,
-                false,
-                &mut objective.gradient_x,
-                &mut scratch_x,
-            );
-            objective.value += add_weighted_average_axis(
-                &pins,
-                weight,
-                gamma,
-                unit_positions,
-                fixed_coordinates,
-                cell_offsets,
-                true,
-                &mut objective.gradient_y,
-                &mut scratch_y,
-            );
-        }
-        objective
-    }
-
     /// Computes the exact discrete objective represented by this model.
     ///
     /// The common analytical scale of 64 cancels when comparing placements.
@@ -602,28 +508,6 @@ impl AnalyticalHypergraph {
             hpwl: hpwl_objective,
             total: objective,
         })
-    }
-}
-
-/// Chooses smoothing so one complete x/y net underestimates HPWL by at most
-/// half a tile.
-///
-/// For `n` pins, each weighted soft maximum or minimum differs from its hard
-/// counterpart by at most `gamma * ln(n)`. An axis span therefore differs by
-/// at most `2 * gamma * ln(n)`, and the two-dimensional net by at most
-/// `4 * gamma * ln(n)`. Solving that bound for the rounding-relevant error
-/// above gives this threshold-free, net-local value.
-fn weighted_average_gamma(pin_count: usize) -> f64 {
-    assert!(pin_count >= 2, "weighted-average net needs two pins");
-    let pin_count = u32::try_from(pin_count).expect("analytical net pin count fits u32");
-    WEIGHTED_AVERAGE_NET_ERROR_TILES / (4.0 * f64::from(pin_count).ln())
-}
-
-fn empty_weighted_average_objective(unit_count: usize) -> WeightedAverageObjective {
-    WeightedAverageObjective {
-        value: 0.0,
-        gradient_x: vec![0.0; unit_count],
-        gradient_y: vec![0.0; unit_count],
     }
 }
 
@@ -935,10 +819,11 @@ mod tests {
     use super::{
         AnalyticalHypergraph, AxisEdgeKind, LegalizedCoordinates,
         baseline_net_preconditioner_weight, legalized_coordinates, projected_mm_targets,
-        weighted_average_gamma,
     };
     use std::collections::BTreeMap;
     use texo_model::{Design, Device, NetId, PinDirection, Point, ResourceKind};
+
+    const TEST_GLOBAL_GAMMA: f64 = 0.25;
 
     fn wide_net(fanout: usize, critical_weight: Option<u64>) -> (AnalyticalHypergraph, Vec<f64>) {
         let mut design = Design::new();
@@ -997,16 +882,19 @@ mod tests {
     }
 
     #[test]
-    fn weighted_average_two_pin_value_matches_closed_form_and_error_bound() {
+    fn weighted_average_two_pin_value_matches_closed_form() {
         let (graph, _) = wide_net(1, None);
         let positions = [(0.0, 1.0), (4.0, -2.0)];
-        let objective =
-            graph.weighted_average_objective(&positions, &[None, None], &[(0.0, 0.0), (0.0, 0.0)]);
-        let gamma = weighted_average_gamma(2);
+        let objective = graph.weighted_average_objective_with_global_gamma(
+            &positions,
+            &[None, None],
+            &[(0.0, 0.0), (0.0, 0.0)],
+            TEST_GLOBAL_GAMMA,
+        );
+        let gamma = TEST_GLOBAL_GAMMA;
         let expected = 4.0 * (4.0 / (2.0 * gamma)).tanh() + 3.0 * (3.0 / (2.0 * gamma)).tanh();
 
         assert_close(objective.value, expected, 1.0e-14);
-        assert!(7.0 - objective.value <= super::WEIGHTED_AVERAGE_NET_ERROR_TILES);
         assert_close(objective.gradient_x.iter().sum(), 0.0, 1.0e-14);
         assert_close(objective.gradient_y.iter().sum(), 0.0, 1.0e-14);
     }
@@ -1023,15 +911,28 @@ mod tests {
         ];
         let fixed = vec![None; positions.len()];
         let offsets = vec![(0.0, 0.0); positions.len()];
-        let first = graph.weighted_average_objective(&positions, &fixed, &offsets);
-        let repeated = graph.weighted_average_objective(&positions, &fixed, &offsets);
+        let first = graph.weighted_average_objective_with_global_gamma(
+            &positions,
+            &fixed,
+            &offsets,
+            TEST_GLOBAL_GAMMA,
+        );
+        let repeated = graph.weighted_average_objective_with_global_gamma(
+            &positions,
+            &fixed,
+            &offsets,
+            TEST_GLOBAL_GAMMA,
+        );
         let translated = positions.map(|(x, y)| (x + 1_000_000.0, y - 2_000_000.0));
-        let shifted = graph.weighted_average_objective(&translated, &fixed, &offsets);
+        let shifted = graph.weighted_average_objective_with_global_gamma(
+            &translated,
+            &fixed,
+            &offsets,
+            TEST_GLOBAL_GAMMA,
+        );
 
         assert_eq!(first, repeated);
         assert_eq!(first, shifted);
-        let exact_hpwl = 31.0;
-        assert!(exact_hpwl - first.value <= super::WEIGHTED_AVERAGE_NET_ERROR_TILES + f64::EPSILON);
     }
 
     #[test]
@@ -1040,7 +941,12 @@ mod tests {
         let positions = [(0.00, 0.18), (0.08, 0.02), (0.15, 0.11), (0.22, 0.27)];
         let fixed = vec![None; positions.len()];
         let offsets = vec![(0.0, 0.0); positions.len()];
-        let objective = graph.weighted_average_objective(&positions, &fixed, &offsets);
+        let objective = graph.weighted_average_objective_with_global_gamma(
+            &positions,
+            &fixed,
+            &offsets,
+            TEST_GLOBAL_GAMMA,
+        );
         let step = 1.0e-6;
 
         for unit in 0..positions.len() {
@@ -1055,10 +961,20 @@ mod tests {
                     upper[unit].0 += step;
                 }
                 let lower_value = graph
-                    .weighted_average_objective(&lower, &fixed, &offsets)
+                    .weighted_average_objective_with_global_gamma(
+                        &lower,
+                        &fixed,
+                        &offsets,
+                        TEST_GLOBAL_GAMMA,
+                    )
                     .value;
                 let upper_value = graph
-                    .weighted_average_objective(&upper, &fixed, &offsets)
+                    .weighted_average_objective_with_global_gamma(
+                        &upper,
+                        &fixed,
+                        &offsets,
+                        TEST_GLOBAL_GAMMA,
+                    )
                     .value;
                 let finite_difference = (upper_value - lower_value) / (2.0 * step);
                 let analytical = if y_axis {
@@ -1092,13 +1008,19 @@ mod tests {
         let positions = [(2.0, 4.0), (99.0, 99.0), (7.0, 8.0)];
         let fixed = [None, None, Some((10.0, 5.0)), None];
         let offsets = [(0.0, 0.0), (3.0, -2.0), (0.0, 0.0), (-1.0, 1.0)];
-        let objective = graph.weighted_average_objective(&positions, &fixed, &offsets);
+        let objective = graph.weighted_average_objective_with_global_gamma(
+            &positions,
+            &fixed,
+            &offsets,
+            TEST_GLOBAL_GAMMA,
+        );
 
         let (reference, _) = wide_net(2, None);
-        let reference_objective = reference.weighted_average_objective(
+        let reference_objective = reference.weighted_average_objective_with_global_gamma(
             &[(5.0, 2.0), (0.0, 0.0), (6.0, 9.0)],
             &[None, Some((10.0, 5.0)), None],
             &[(0.0, 0.0); 3],
+            TEST_GLOBAL_GAMMA,
         );
         assert_close(objective.value, reference_objective.value, 1.0e-14);
         assert_close(
@@ -1130,7 +1052,12 @@ mod tests {
         changed_fixed_origin[1] = (-1_000.0, -1_000.0);
         assert_eq!(
             objective,
-            graph.weighted_average_objective(&changed_fixed_origin, &fixed, &offsets)
+            graph.weighted_average_objective_with_global_gamma(
+                &changed_fixed_origin,
+                &fixed,
+                &offsets,
+                TEST_GLOBAL_GAMMA,
+            )
         );
     }
 
@@ -1184,9 +1111,24 @@ mod tests {
         let positions = [(0.0, 0.0), (2.0, 1.0), (-1.0, 3.0)];
         let fixed = [None; 3];
         let offsets = [(0.0, 0.0); 3];
-        let baseline_objective = baseline.weighted_average_objective(&positions, &fixed, &offsets);
-        let critical_objective = critical.weighted_average_objective(&positions, &fixed, &offsets);
-        let arc = two_pin.weighted_average_objective(&positions[..2], &fixed[..2], &offsets[..2]);
+        let baseline_objective = baseline.weighted_average_objective_with_global_gamma(
+            &positions,
+            &fixed,
+            &offsets,
+            TEST_GLOBAL_GAMMA,
+        );
+        let critical_objective = critical.weighted_average_objective_with_global_gamma(
+            &positions,
+            &fixed,
+            &offsets,
+            TEST_GLOBAL_GAMMA,
+        );
+        let arc = two_pin.weighted_average_objective_with_global_gamma(
+            &positions[..2],
+            &fixed[..2],
+            &offsets[..2],
+            TEST_GLOBAL_GAMMA,
+        );
 
         assert_close(
             critical_objective.value - baseline_objective.value,

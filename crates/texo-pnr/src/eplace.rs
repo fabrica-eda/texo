@@ -1,7 +1,6 @@
 //! Heterogeneous electrostatic global placement.
 
 use std::collections::BTreeMap;
-use std::f64::consts::TAU;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use texo_model::{Device, Point, ResourceKind, UnifiedGraph};
@@ -129,7 +128,6 @@ const AREA_RESET_DENSITY_WEIGHT: f64 = 0.1;
 const MULTIPLIER_ALPHA_LOW: f64 = 1.05;
 const MULTIPLIER_ALPHA_HIGH: f64 = 1.06;
 const AREA_ADJUSTMENT_OVERFLOW_TARGET: f64 = 0.15;
-const PAPER_INITIALIZATION_STDDEV_FRACTION: f64 = 1.0e-3;
 // ePlace equation (38) uses `base = 8 * bin_width`.  The electrostatic
 // model's Poisson grid is the device tile grid, hence bin_width is one tile.
 const WIRELENGTH_GAMMA_BASE_TILES: f64 = 8.0;
@@ -139,7 +137,7 @@ impl ContinuousProblem<'_> {
     fn evaluate(
         &self,
         coordinates: &[f64],
-        global_gamma: Option<f64>,
+        global_gamma: f64,
     ) -> Result<ContinuousEvaluation, ElectrostaticError> {
         let started = std::time::Instant::now();
         debug_assert_eq!(
@@ -161,24 +159,14 @@ impl ContinuousProblem<'_> {
         let ((wirelength, wirelength_elapsed), (density, density_elapsed)) = rayon::join(
             || {
                 let started = std::time::Instant::now();
-                let objective = global_gamma.map_or_else(
-                    || {
-                        self.hypergraph.weighted_average_objective(
-                            &unit_positions,
-                            self.fixed_coordinates,
-                            self.cell_offsets,
-                        )
-                    },
-                    |gamma| {
-                        self.hypergraph
-                            .weighted_average_objective_with_global_gamma(
-                                &unit_positions,
-                                self.fixed_coordinates,
-                                self.cell_offsets,
-                                gamma,
-                            )
-                    },
-                );
+                let objective = self
+                    .hypergraph
+                    .weighted_average_objective_with_global_gamma(
+                        &unit_positions,
+                        self.fixed_coordinates,
+                        self.cell_offsets,
+                        global_gamma,
+                    );
                 (objective, started.elapsed())
             },
             || {
@@ -263,11 +251,8 @@ pub(super) fn place(
     register_controls: &[RegisterControlSet],
 ) -> Result<Vec<Point>, EplaceError> {
     let device = graph.device();
-    let include_special_density =
-        std::env::var_os("TEXO_PNR_EPLACE_INCLUDE_SPECIAL_DENSITY").is_some();
     let cell_pin_weights = hypergraph.baseline_cell_incidence_weights(graph.design().cells().len());
-    let density_gamma_weights =
-        density_gamma_weights(units, device, &cell_pin_weights, include_special_density);
+    let density_gamma_weights = density_gamma_weights(units, device, &cell_pin_weights);
     let mut fixed_occupancy = Vec::new();
     let mut movable_units = Vec::new();
     let mut density_units = Vec::new();
@@ -277,12 +262,10 @@ pub(super) fn place(
         if unit.choices.len() == 1 {
             fixed_occupancy.extend(assignment.iter().filter_map(|&bel| {
                 let physical = &device.bels()[bel.0];
-                density_kind_is_exchangeable(physical.kind, include_special_density).then_some(
-                    FixedOccupancy {
-                        kind: physical.kind,
-                        point: physical.point,
-                    },
-                )
+                density_kind_is_exchangeable(physical.kind).then_some(FixedOccupancy {
+                    kind: physical.kind,
+                    point: physical.point,
+                })
             }));
             continue;
         }
@@ -291,7 +274,7 @@ pub(super) fn place(
         let mut member_cells = Vec::new();
         for (&cell, &bel) in unit.cells.iter().zip(assignment) {
             let physical = &device.bels()[bel.0];
-            if density_kind_is_exchangeable(physical.kind, include_special_density) {
+            if density_kind_is_exchangeable(physical.kind) {
                 members.push(DensityMember {
                     kind: physical.kind,
                     offset_x: f64::from(physical.point.x) - f64::from(origin.x),
@@ -329,15 +312,6 @@ pub(super) fn place(
     let fillers = density_model.initial_fillers(&density_units)?;
     let (mut coordinates, bounds) =
         initial_coordinates_and_bounds(units, device, initial_x, initial_y, &fillers);
-    if std::env::var_os("TEXO_PNR_EPLACE_PAPER_INITIALIZATION").is_some() {
-        apply_paper_initialization(
-            &mut coordinates,
-            &bounds,
-            units,
-            device.width(),
-            device.height(),
-        );
-    }
     for (index, coordinate) in coordinates.iter_mut().enumerate() {
         *coordinate = coordinate.clamp(bounds.lower[index], bounds.upper[index]);
     }
@@ -370,7 +344,6 @@ pub(super) fn place(
         cell_offsets,
     };
 
-    let use_global_gamma = std::env::var_os("TEXO_PNR_EPLACE_LEGACY_NET_GAMMA").is_none();
     // Supplying characterized architecture capacity selects the routability-
     // driven solve. Callers that need the pure density objective omit it.
     let adjust_area = routing_capacity.is_some();
@@ -400,7 +373,6 @@ pub(super) fn place(
             units.len(),
             device.width(),
             device.height(),
-            use_global_gamma,
             density_scales.as_deref(),
             reset_after_area_adjustment,
             stop_criterion,
@@ -467,7 +439,6 @@ fn optimize_density_once(
     unit_count: usize,
     width: u32,
     height: u32,
-    use_global_gamma: bool,
     fixed_density_scales: Option<&[f64]>,
     reset_after_area_adjustment: bool,
     stop_criterion: DensityStopCriterion,
@@ -476,11 +447,9 @@ fn optimize_density_once(
     // Density is independent of wirelength smoothing. Probe it once per area
     // round, then rebuild all normalization, multiplier, and Nesterov state as
     // required by elfPlace equation (26).
-    let initial_probe = problem.evaluate(coordinates, Some(WIRELENGTH_GAMMA_BASE_TILES))?;
+    let initial_probe = problem.evaluate(coordinates, WIRELENGTH_GAMMA_BASE_TILES)?;
     validate_initial_evaluation(&initial_probe)?;
-    let initial_gamma = use_global_gamma
-        .then(|| adaptive_wirelength_gamma(problem, &initial_probe.density.fields))
-        .transpose()?;
+    let initial_gamma = adaptive_wirelength_gamma(problem, &initial_probe.density.fields)?;
     let initial = problem.evaluate(coordinates, initial_gamma)?;
     validate_initial_evaluation(&initial)?;
     let density_scales = fixed_density_scales.map_or_else(
@@ -502,10 +471,7 @@ fn optimize_density_once(
     } else {
         let initial_multiplier = initial_density_multiplier(problem, &initial, coordinates.len())?;
         let multipliers = vec![initial_multiplier; density_scales.len()];
-        let step = initial_multiplier_step(
-            &multipliers,
-            std::env::var_os("TEXO_PNR_EPLACE_SOURCE_MULTIPLIER_STEP").is_some(),
-        )?;
+        let step = MULTIPLIER_ALPHA_HIGH - 1.0;
         (multipliers, step)
     };
     let mut optimizer = DynamicNesterovState::new(coordinates, bounds);
@@ -525,9 +491,7 @@ fn optimize_density_once(
                 &current.density.fields,
             ));
         }
-        let global_gamma = use_global_gamma
-            .then(|| adaptive_wirelength_gamma(problem, &current.density.fields))
-            .transpose()?;
+        let global_gamma = adaptive_wirelength_gamma(problem, &current.density.fields)?;
         completed_iterations = completed_iterations
             .checked_add(1)
             .ok_or(EplaceError::InvalidNormalization)?;
@@ -1234,24 +1198,6 @@ fn area_adjusted_multiplier_step(multipliers: &[f64]) -> Result<f64, EplaceError
     }
 }
 
-fn initial_multiplier_step(multipliers: &[f64], source_scaled: bool) -> Result<f64, EplaceError> {
-    let step = if source_scaled {
-        let norm = multipliers
-            .iter()
-            .map(|multiplier| multiplier * multiplier)
-            .sum::<f64>()
-            .sqrt();
-        (MULTIPLIER_ALPHA_LOW - 1.0) * norm
-    } else {
-        MULTIPLIER_ALPHA_HIGH - 1.0
-    };
-    if step.is_finite() && step > 0.0 {
-        Ok(step)
-    } else {
-        Err(EplaceError::InvalidNormalization)
-    }
-}
-
 fn update_density_multipliers(
     multipliers: &mut [f64],
     step: f64,
@@ -1435,115 +1381,28 @@ fn density_stop_reached(fields: &[DensityFieldResult], criterion: DensityStopCri
     }
 }
 
-fn density_kind_is_exchangeable(kind: ResourceKind, include_special: bool) -> bool {
-    include_special
-        || matches!(
-            kind,
-            ResourceKind::Lut(_) | ResourceKind::Register | ResourceKind::Memory
-        )
+fn density_kind_is_exchangeable(kind: ResourceKind) -> bool {
+    matches!(
+        kind,
+        ResourceKind::Lut(_) | ResourceKind::Register | ResourceKind::Memory
+    )
 }
 
 fn density_gamma_weights(
     units: &[PlacementUnit],
     device: &Device,
     cell_pin_weights: &[f64],
-    include_special: bool,
 ) -> BTreeMap<ResourceKind, f64> {
     let mut weights = BTreeMap::<ResourceKind, f64>::new();
     for unit in units.iter().filter(|unit| unit.choices.len() > 1) {
         for (&cell, &bel) in unit.cells.iter().zip(unit.choices.assignment(0)) {
             let kind = device.bels()[bel.0].kind;
-            if density_kind_is_exchangeable(kind, include_special) {
+            if density_kind_is_exchangeable(kind) {
                 *weights.entry(kind).or_default() += cell_pin_weights[cell.0];
             }
         }
     }
     weights
-}
-
-fn apply_paper_initialization(
-    coordinates: &mut [f64],
-    bounds: &CoordinateBounds,
-    units: &[PlacementUnit],
-    device_width: u32,
-    device_height: u32,
-) {
-    let movable = units
-        .iter()
-        .enumerate()
-        .filter_map(|(index, unit)| (unit.choices.len() > 1).then_some(index))
-        .collect::<Vec<_>>();
-    let offsets = deterministic_gaussian_offsets(&movable, device_width, device_height);
-    apply_origin_offsets(coordinates, bounds, &movable, &offsets);
-}
-
-fn apply_origin_offsets(
-    coordinates: &mut [f64],
-    bounds: &CoordinateBounds,
-    movable_units: &[usize],
-    offsets: &[(f64, f64)],
-) {
-    debug_assert_eq!(movable_units.len(), offsets.len());
-    for (&unit, &(offset_x, offset_y)) in movable_units.iter().zip(offsets) {
-        let coordinate = 2 * unit;
-        coordinates[coordinate] = (coordinates[coordinate] + offset_x)
-            .clamp(bounds.lower[coordinate], bounds.upper[coordinate]);
-        coordinates[coordinate + 1] = (coordinates[coordinate + 1] + offset_y)
-            .clamp(bounds.lower[coordinate + 1], bounds.upper[coordinate + 1]);
-    }
-}
-
-/// Generates one Gaussian origin perturbation per placement unit.
-///
-/// Hashing only the stable unit index makes the sequence reproducible without
-/// a global PRNG state.  Removing each axis mean prevents the perturbation
-/// itself from translating the whole placement.  Atomic macro members never
-/// appear here: their shared origin receives exactly one `(dx, dy)` pair.
-fn deterministic_gaussian_offsets(
-    movable_units: &[usize],
-    device_width: u32,
-    device_height: u32,
-) -> Vec<(f64, f64)> {
-    if movable_units.is_empty() {
-        return Vec::new();
-    }
-    let standard_deviation_x = PAPER_INITIALIZATION_STDDEV_FRACTION * f64::from(device_width);
-    let standard_deviation_y = PAPER_INITIALIZATION_STDDEV_FRACTION * f64::from(device_height);
-    let mut offsets = movable_units
-        .iter()
-        .map(|&unit| {
-            let ordinal = u64::try_from(unit).expect("placement unit index fits u64");
-            let uniform_radius = open_unit_interval(splitmix64(ordinal ^ 0x243f_6a88_85a3_08d3));
-            let uniform_angle = open_unit_interval(splitmix64(ordinal ^ 0x1319_8a2e_0370_7344));
-            let radius = (-2.0 * uniform_radius.ln()).sqrt();
-            let angle = TAU * uniform_angle;
-            let (sine, cosine) = angle.sin_cos();
-            (
-                standard_deviation_x * radius * cosine,
-                standard_deviation_y * radius * sine,
-            )
-        })
-        .collect::<Vec<_>>();
-    let denominator = usize_as_f64(offsets.len());
-    let mean_x = offsets.iter().map(|(x, _)| x).sum::<f64>() / denominator;
-    let mean_y = offsets.iter().map(|(_, y)| y).sum::<f64>() / denominator;
-    for (x, y) in &mut offsets {
-        *x -= mean_x;
-        *y -= mean_y;
-    }
-    offsets
-}
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
-fn open_unit_interval(value: u64) -> f64 {
-    let upper = u32::try_from(value >> 32).expect("upper half of u64 fits u32");
-    (f64::from(upper) + 0.5) / (f64::from(u32::MAX) + 1.0)
 }
 
 fn initial_coordinates_and_bounds(
@@ -1635,10 +1494,6 @@ fn raw_positive_overflow(field: &DensityFieldResult) -> f64 {
     field.normalized_positive_overflow * field.real_area
 }
 
-fn usize_as_f64(value: usize) -> f64 {
-    f64::from(u32::try_from(value).expect("placement resource count fits u32"))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn report(
     outer_iteration: u128,
@@ -1646,19 +1501,15 @@ fn report(
     attained_stationarity: f64,
     coordinate_change: f64,
     line_search_trials: u128,
-    global_gamma: Option<f64>,
+    global_gamma: f64,
     wirelength: f64,
     fields: &[DensityFieldResult],
 ) {
     if std::env::var_os("TEXO_PNR_METRICS").is_none() {
         return;
     }
-    let gamma = global_gamma.map_or_else(
-        || "legacy-net-local".to_owned(),
-        |value| format!("{value:.9e}"),
-    );
     eprintln!(
-        "TEXO_PNR_METRICS eplace iteration={outer_iteration} objective={objective:.9e} stationarity={attained_stationarity:.9e} coordinate_change={coordinate_change:.9e} line_search_trials={line_search_trials} gamma={gamma} wa={wirelength:.9e}"
+        "TEXO_PNR_METRICS eplace iteration={outer_iteration} objective={objective:.9e} stationarity={attained_stationarity:.9e} coordinate_change={coordinate_change:.9e} line_search_trials={line_search_trials} gamma={global_gamma:.9e} wa={wirelength:.9e}"
     );
     for field in fields {
         eprintln!(
@@ -1678,7 +1529,7 @@ fn report_force_balance(
     outer_iteration: u128,
     problem: &ContinuousProblem<'_>,
     coordinates: &[f64],
-    global_gamma: Option<f64>,
+    global_gamma: f64,
     evaluation: &ContinuousEvaluation,
     density_scales: &[f64],
     multipliers: &[f64],
@@ -1686,9 +1537,6 @@ fn report_force_balance(
     if std::env::var_os("TEXO_PNR_METRICS").is_none() {
         return;
     }
-    let Some(gamma) = global_gamma else {
-        return;
-    };
     let unit_positions = coordinates[..2 * problem.unit_count]
         .as_chunks::<2>()
         .0
@@ -1701,7 +1549,7 @@ fn report_force_balance(
             &unit_positions,
             problem.fixed_coordinates,
             problem.cell_offsets,
-            gamma,
+            global_gamma,
         );
     let baseline_l1 = l1_norm(&wirelength_gradient(&baseline));
     let timing_l1 = l1_norm(&wirelength_gradient(&timing));
@@ -1730,7 +1578,7 @@ fn report_force_balance(
     }
     let density_l1 = l1_norm(&total_density_gradient);
     eprintln!(
-        "TEXO_PNR_METRICS eplace-force iteration={outer_iteration} gamma={gamma:.9e} baseline_l1={baseline_l1:.9e} timing_l1={timing_l1:.9e} wirelength_l1={wirelength_l1:.9e} density_l1={density_l1:.9e} timing_to_baseline={:.9e} density_to_wirelength={:.9e}",
+        "TEXO_PNR_METRICS eplace-force iteration={outer_iteration} gamma={global_gamma:.9e} baseline_l1={baseline_l1:.9e} timing_l1={timing_l1:.9e} wirelength_l1={wirelength_l1:.9e} density_l1={density_l1:.9e} timing_to_baseline={:.9e} density_to_wirelength={:.9e}",
         timing_l1 / baseline_l1.max(f64::MIN_POSITIVE),
         density_l1 / wirelength_l1.max(f64::MIN_POSITIVE),
     );
@@ -1746,15 +1594,13 @@ mod tests {
 
     use super::{
         AREA_ADJUSTMENT_OVERFLOW_TARGET, AUGMENTED_DENSITY_BETA, ContinuousEvaluation,
-        CoordinateBounds, DensityFieldResult, DensityResult, DynamicNesterovStatus,
-        MULTIPLIER_ALPHA_HIGH, MULTIPLIER_ALPHA_LOW, PlacementCheckpoint, WeightedAverageObjective,
-        apply_origin_offsets, area_adjusted_density_multipliers, area_adjusted_multiplier_step,
-        area_adjustment_is_ready, augmented_density_value_and_coefficient,
-        continuous_routing_demand, density_gamma_weights, density_is_converged,
-        density_kind_is_exchangeable, deterministic_gaussian_offsets,
-        eplace_iteration_limit_reached, field_wirelength_gamma, initial_multiplier_step,
-        multiplier_growth_from_logarithm, open_unit_interval, routability_adjusted_member_area,
-        splitmix64, stationary_target_is_fixed, usize_as_f64, weighted_gamma_mean,
+        DensityFieldResult, DensityResult, DynamicNesterovStatus, MULTIPLIER_ALPHA_HIGH,
+        MULTIPLIER_ALPHA_LOW, PlacementCheckpoint, WeightedAverageObjective,
+        area_adjusted_density_multipliers, area_adjusted_multiplier_step, area_adjustment_is_ready,
+        augmented_density_value_and_coefficient, continuous_routing_demand, density_gamma_weights,
+        density_is_converged, density_kind_is_exchangeable, eplace_iteration_limit_reached,
+        field_wirelength_gamma, multiplier_growth_from_logarithm, routability_adjusted_member_area,
+        stationary_target_is_fixed, weighted_gamma_mean,
     };
 
     fn assert_close(actual: f64, expected: f64, tolerance: f64) {
@@ -1773,7 +1619,7 @@ mod tests {
             kind,
             available_capacity: real_charge,
             real_charge,
-            real_area: usize_as_f64(real_charge),
+            real_area: f64::from(u32::try_from(real_charge).expect("test charge fits u32")),
             filler_charge: 0.0,
             density: Vec::new(),
             energy: 0.0,
@@ -1821,16 +1667,6 @@ mod tests {
         assert_eq!(MULTIPLIER_ALPHA_LOW.to_bits(), 1.05_f64.to_bits());
         assert_eq!(MULTIPLIER_ALPHA_HIGH.to_bits(), 1.06_f64.to_bits());
         assert_close(MULTIPLIER_ALPHA_HIGH - 1.0, 0.06, 1.0e-16);
-        assert_close(
-            initial_multiplier_step(&[3.0, 4.0], false).unwrap(),
-            0.06,
-            1.0e-16,
-        );
-        assert_close(
-            initial_multiplier_step(&[3.0, 4.0], true).unwrap(),
-            0.25,
-            1.0e-15,
-        );
         assert_close(
             area_adjusted_multiplier_step(&[3.0, 4.0]).unwrap(),
             0.30,
@@ -1993,37 +1829,6 @@ mod tests {
     }
 
     #[test]
-    fn paper_noise_is_deterministic_zero_mean_and_one_pair_per_unit() {
-        let movable = [7, 2, 91, 13, 42, 5, 1];
-        let first = deterministic_gaussian_offsets(&movable, 90, 70);
-        let second = deterministic_gaussian_offsets(&movable, 90, 70);
-        assert_eq!(first, second);
-        assert_eq!(first.len(), movable.len());
-        assert_close(first.iter().map(|(x, _)| x).sum(), 0.0, 1.0e-15);
-        assert_close(first.iter().map(|(_, y)| y).sum(), 0.0, 1.0e-15);
-        assert!(first.iter().all(|(x, y)| x.is_finite() && y.is_finite()));
-    }
-
-    #[test]
-    fn origin_noise_clamps_choice_bounds_and_does_not_touch_other_variables() {
-        let mut coordinates = vec![1.0, 2.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
-        let bounds = CoordinateBounds {
-            lower: vec![0.0, 0.0, 5.0, 15.0, 25.0, 35.0, 45.0, 55.0],
-            upper: vec![2.0, 3.0, 15.0, 25.0, 35.0, 45.0, 55.0, 65.0],
-        };
-        apply_origin_offsets(
-            &mut coordinates,
-            &bounds,
-            &[0, 2],
-            &[(100.0, -100.0), (-100.0, 100.0)],
-        );
-        assert_eq!(
-            coordinates,
-            vec![2.0, 0.0, 10.0, 20.0, 25.0, 45.0, 50.0, 60.0]
-        );
-    }
-
-    #[test]
     fn rigid_lut_register_unit_keeps_resource_specific_cell_pin_weights() {
         let mut device = Device::new("carry", 2, 1).unwrap();
         let lut0 = device
@@ -2043,7 +1848,7 @@ mod tests {
             choices: PlacementChoices::Shared(Arc::from([vec![lut0, ff0], vec![lut1, ff1]])),
         };
 
-        let weights = density_gamma_weights(&[unit], &device, &[10.0, 1.0], false);
+        let weights = density_gamma_weights(&[unit], &device, &[10.0, 1.0]);
         assert_eq!(weights[&ResourceKind::Lut(4)].to_bits(), 10.0_f64.to_bits());
         assert_eq!(
             weights[&ResourceKind::Register].to_bits(),
@@ -2053,24 +1858,12 @@ mod tests {
 
     #[test]
     fn only_interchangeable_ecp5_resource_classes_get_density_fields() {
-        assert!(density_kind_is_exchangeable(ResourceKind::Lut(4), false));
-        assert!(density_kind_is_exchangeable(ResourceKind::Register, false));
-        assert!(density_kind_is_exchangeable(ResourceKind::Memory, false));
-        assert!(!density_kind_is_exchangeable(ResourceKind::Clock, false));
-        assert!(!density_kind_is_exchangeable(ResourceKind::Logic, false));
-        assert!(!density_kind_is_exchangeable(ResourceKind::Io, false));
-        assert!(!density_kind_is_exchangeable(ResourceKind::Constant, false));
-    }
-
-    #[test]
-    fn box_muller_uniform_inputs_are_strictly_open_and_repeatable() {
-        for index in 0..1_000_u64 {
-            let value = open_unit_interval(splitmix64(index));
-            assert!(value > 0.0 && value < 1.0);
-            assert_eq!(
-                value.to_bits(),
-                open_unit_interval(splitmix64(index)).to_bits()
-            );
-        }
+        assert!(density_kind_is_exchangeable(ResourceKind::Lut(4)));
+        assert!(density_kind_is_exchangeable(ResourceKind::Register));
+        assert!(density_kind_is_exchangeable(ResourceKind::Memory));
+        assert!(!density_kind_is_exchangeable(ResourceKind::Clock));
+        assert!(!density_kind_is_exchangeable(ResourceKind::Logic));
+        assert!(!density_kind_is_exchangeable(ResourceKind::Io));
+        assert!(!density_kind_is_exchangeable(ResourceKind::Constant));
     }
 }
