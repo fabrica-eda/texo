@@ -9498,7 +9498,28 @@ struct RouteSearch {
     alternate_source_improvements: u64,
 }
 
-type RouteQueueEntry = (u32, u32, u32, u32);
+/// Lexicographically ordered `(estimate, distance, arrival, wire)` A* key.
+///
+/// Packing the four `u32` fields most-significant-field first preserves the
+/// tuple's exact ordering while reducing each heap comparison to at most two
+/// 64-bit comparisons on 64-bit targets instead of up to four field
+/// comparisons. The entry remains 16 bytes, so queue capacity growth has the
+/// same byte footprint.
+type RouteQueueEntry = u128;
+
+#[inline]
+fn route_queue_entry(estimate: u32, distance: u32, arrival: u32, wire: u32) -> RouteQueueEntry {
+    (u128::from(estimate) << 96)
+        | (u128::from(distance) << 64)
+        | (u128::from(arrival) << 32)
+        | u128::from(wire)
+}
+
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+fn route_queue_payload(entry: RouteQueueEntry) -> (u32, u32, u32) {
+    ((entry >> 64) as u32, (entry >> 32) as u32, entry as u32)
+}
 
 fn compact_route_value(value: u64) -> u32 {
     value
@@ -9749,7 +9770,7 @@ impl RouteSearch {
             } else {
                 distance
             };
-            self.queue.push(Reverse((
+            self.queue.push(Reverse(route_queue_entry(
                 compact_route_value(estimate),
                 compact_distance,
                 compact_arrival,
@@ -9757,9 +9778,8 @@ impl RouteSearch {
             )));
         }
 
-        while let Some(Reverse((_, compact_distance, compact_arrival, compact_wire))) =
-            self.queue.pop()
-        {
+        while let Some(Reverse(entry)) = self.queue.pop() {
+            let (compact_distance, compact_arrival, compact_wire) = route_queue_payload(entry);
             let wire = WireId(compact_wire as usize);
             if self.seen[wire.0] != epoch
                 || (self.distance[wire.0], self.arrival_ps[wire.0])
@@ -9851,7 +9871,7 @@ impl RouteSearch {
                 } else {
                     next_distance
                 };
-                self.queue.push(Reverse((
+                self.queue.push(Reverse(route_queue_entry(
                     compact_route_value(estimate),
                     compact_next_distance,
                     compact_next_arrival,
@@ -10334,11 +10354,11 @@ mod tests {
         placement_neighbors, polish_legal_timing_routes, prioritize_cycle_connections,
         projected_release_scope_penalty, projected_resource_penalty,
         refine_placement_with_net_sink_weights_limited, refine_placement_with_net_weights,
-        refinement_edge_cost, retain_route_for_sinks, rounded_coordinate, route_reaches_all_sinks,
-        route_with_placement_and_progress, route_with_timing_costs_and_progress,
-        route_with_workspace_and_progress, routing_corridor, routing_step_cost,
-        routing_transition_cost, solve_analytical_axis, solve_quadratic, timing_tree_cost,
-        unloaded_arc_cost,
+        refinement_edge_cost, retain_route_for_sinks, rounded_coordinate, route_queue_entry,
+        route_queue_payload, route_reaches_all_sinks, route_with_placement_and_progress,
+        route_with_timing_costs_and_progress, route_with_workspace_and_progress, routing_corridor,
+        routing_step_cost, routing_transition_cost, solve_analytical_axis, solve_quadratic,
+        timing_tree_cost, unloaded_arc_cost,
     };
 
     fn two_cell_design() -> Design {
@@ -13480,6 +13500,29 @@ mod tests {
     #[test]
     fn route_frontier_entry_stays_compact() {
         assert_eq!(std::mem::size_of::<RouteQueueEntry>(), 16);
+    }
+
+    #[test]
+    fn packed_route_frontier_preserves_tuple_order_and_payload() {
+        let values = [0, 1, 0x7fff_ffff, u32::MAX];
+        let mut entries = Vec::new();
+        for estimate in values {
+            for distance in values {
+                for arrival in values {
+                    for wire in values {
+                        let tuple = (estimate, distance, arrival, wire);
+                        let packed = route_queue_entry(estimate, distance, arrival, wire);
+                        assert_eq!(route_queue_payload(packed), (distance, arrival, wire));
+                        entries.push((tuple, packed));
+                    }
+                }
+            }
+        }
+        for &(left_tuple, left_packed) in &entries {
+            for &(right_tuple, right_packed) in &entries {
+                assert_eq!(left_tuple.cmp(&right_tuple), left_packed.cmp(&right_packed));
+            }
+        }
     }
 
     #[test]
