@@ -20,6 +20,7 @@ struct ClassStats {
     maximum_excess_ps: u64,
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args().skip(1);
     let architecture_path = args.next().ok_or(USAGE)?;
