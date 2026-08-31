@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use texo_model::{
     BelId, BelPinId, CellId, CellPinId, Design, Device, NetId, PinDirection, PipId, ResourceKind,
+    WireId,
 };
 pub use texo_pnr::RoutingProgress;
 use texo_pnr::{
@@ -31,8 +32,9 @@ use texo_target_ecp5::{
     pack_lut_ffs_with_pairs, resolve_lpf_port_cells,
 };
 use texo_timing::{
-    ClockEdge as TimingClockEdge, DelayRange, NetDelay, PICOSECONDS_PER_SECOND, TimingConstraints,
-    TimingError, TimingModel, TimingReport, analyze_timing, analyze_timing_from_net_delays,
+    ClockEdge as TimingClockEdge, DelayRange, NetDelay, PICOSECONDS_PER_SECOND,
+    TimingAnalysisSession, TimingConstraints, TimingError, TimingModel, TimingReport,
+    analyze_timing, analyze_timing_from_net_delays,
 };
 
 use ecp5_pll::{GeneratedClockRelations, constrain_pll_outputs};
@@ -2660,6 +2662,112 @@ fn run_setup_feedback_fallback<State, Error>(
 /// placement feedback. Each net is attempted at most once for one unchanged
 /// physical state, so a nonclosing search terminates after exhausting the
 /// finite set of candidate nets.
+struct Ecp5EcoTimingSession<'a> {
+    timing: TimingAnalysisSession<'a>,
+    architecture: &'a Ecp5Architecture,
+    speed_grade: &'a SpeedGradeRecord,
+    pip_classes: Vec<Option<&'a PipClassTimingRecord>>,
+    selected: Vec<bool>,
+    touched_pips: Vec<PipId>,
+    source_fanout: Vec<u64>,
+    touched_sources: Vec<WireId>,
+    pip_delays: Vec<DelayRange>,
+}
+
+impl<'a> Ecp5EcoTimingSession<'a> {
+    fn new(
+        design: &'a Design,
+        architecture: &'a Ecp5Architecture,
+        speed_grade: &'a SpeedGradeRecord,
+        model: &'a TimingModel,
+        constraints: &'a TimingConstraints,
+    ) -> Result<Self, Ecp5FlowError> {
+        let pip_classes = (0..architecture.device().pips().len())
+            .map(|index| {
+                speed_grade
+                    .pip_classes
+                    .get(architecture.pip_metadata(PipId(index)).timing_class)
+            })
+            .collect();
+        Ok(Self {
+            timing: TimingAnalysisSession::new(design, model, constraints)?,
+            architecture,
+            speed_grade,
+            pip_classes,
+            selected: vec![false; architecture.device().pips().len()],
+            touched_pips: Vec::new(),
+            source_fanout: vec![0; architecture.device().wires().len()],
+            touched_sources: Vec::new(),
+            pip_delays: vec![DelayRange::zero(); architecture.device().pips().len()],
+        })
+    }
+
+    fn analyze(
+        &mut self,
+        design: &Design,
+        implementation: &PnrResult,
+    ) -> Result<TimingReport, Ecp5FlowError> {
+        for pip in self.touched_pips.drain(..) {
+            self.selected[pip.0] = false;
+        }
+        for wire in self.touched_sources.drain(..) {
+            self.source_fanout[wire.0] = 0;
+        }
+        for pip in implementation.routes.iter().flat_map(|route| route.pips()) {
+            if !self.selected[pip.0] {
+                self.selected[pip.0] = true;
+                self.touched_pips.push(pip);
+                let source = self.architecture.device().pips()[pip.0].from();
+                if self.source_fanout[source.0] == 0 {
+                    self.touched_sources.push(source);
+                }
+                self.source_fanout[source.0] += 1;
+            }
+        }
+        for &pip in &self.touched_pips {
+            let class =
+                self.pip_classes[pip.0].ok_or_else(|| Ecp5FlowError::MissingPipTimingClass {
+                    speed_grade: self.speed_grade.name.clone(),
+                    timing_class: self.architecture.pip_metadata(pip).timing_class.to_owned(),
+                })?;
+            self.pip_delays[pip.0] = pip_class_delay(
+                class,
+                self.source_fanout[self.architecture.device().pips()[pip.0].from().0],
+            )?;
+        }
+        let mut routes = vec![None; design.nets().len()];
+        for route in &implementation.routes {
+            routes[route.net.0] = Some(route);
+        }
+        let mut net_delays = Vec::new();
+        for (index, net) in design.nets().iter().enumerate() {
+            let net_id = NetId(index);
+            let route = routes[index].ok_or(TimingError::MissingRoute(net_id))?;
+            for &sink in &net.sinks {
+                let arc = route
+                    .arc(sink)
+                    .ok_or(TimingError::UnreachableSink { net: net_id, sink })?;
+                let mut min_ps = 0_u64;
+                let mut max_ps = 0_u64;
+                for pip in &arc.pips {
+                    min_ps = min_ps
+                        .checked_add(self.pip_delays[pip.0].min_ps)
+                        .ok_or(Ecp5FlowError::TimingDelayOverflow)?;
+                    max_ps = max_ps
+                        .checked_add(self.pip_delays[pip.0].max_ps)
+                        .ok_or(Ecp5FlowError::TimingDelayOverflow)?;
+                }
+                net_delays.push(NetDelay {
+                    net: net_id,
+                    sink,
+                    delay: DelayRange::from_independent_corners(min_ps, max_ps),
+                });
+            }
+        }
+        Ok(self.timing.analyze(net_delays)?)
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn improve_worst_setup_net_route_ecos(
     design: &Design,
@@ -2676,6 +2784,13 @@ fn improve_worst_setup_net_route_ecos(
     progress: &mut impl FnMut(Ecp5FlowStage),
 ) -> Result<(), Ecp5FlowError> {
     let eco_started = Instant::now();
+    let mut timing_session = Ecp5EcoTimingSession::new(
+        design,
+        architecture,
+        speed_grade,
+        timing_model,
+        timing_constraints,
+    )?;
     let mut objective = timing_objective(timing);
     let initial_trials = worklist.trials();
     let mut accepted = 0_usize;
@@ -2727,14 +2842,7 @@ fn improve_worst_setup_net_route_ecos(
             continue;
         };
         let sta_started = Instant::now();
-        let candidate_timing = analyze_ecp5_implementation(
-            design,
-            architecture,
-            speed_grade,
-            &candidate_implementation,
-            timing_model,
-            timing_constraints,
-        )?;
+        let candidate_timing = timing_session.analyze(design, &candidate_implementation)?;
         let sta_elapsed = sta_started.elapsed();
         progress(timing_snapshot(&candidate_timing));
         let candidate_objective = timing_objective(&candidate_timing);

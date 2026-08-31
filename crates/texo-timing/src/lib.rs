@@ -483,7 +483,7 @@ pub fn analyze_timing(
     validate_constraints(design, constraints)?;
     validate_model(design, model)?;
     let net_delays = routed_net_delays(design, device, implementation, pip_delays)?;
-    timing_report_from_net_delays(design, model, constraints, net_delays)
+    timing_report_from_net_delays(design, model, constraints, net_delays, None)
 }
 
 /// Analyzes timing from caller-supplied per-sink net-delay estimates.
@@ -506,7 +506,109 @@ pub fn analyze_timing_from_net_delays(
 ) -> Result<TimingReport, TimingError> {
     validate_constraints(design, constraints)?;
     validate_model(design, model)?;
-    timing_report_from_net_delays(design, model, constraints, net_delays)
+    timing_report_from_net_delays(design, model, constraints, net_delays, None)
+}
+
+/// Reusable static timing workspace for repeated delay updates on one design.
+pub struct TimingAnalysisSession<'a> {
+    design: &'a Design,
+    model: &'a TimingModel,
+    constraints: &'a TimingConstraints,
+    topology: TimingTopology,
+}
+
+impl<'a> TimingAnalysisSession<'a> {
+    /// Validates and builds the immutable timing topology once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid constraints, model data, or cycles.
+    pub fn new(
+        design: &'a Design,
+        model: &'a TimingModel,
+        constraints: &'a TimingConstraints,
+    ) -> Result<Self, TimingError> {
+        validate_constraints(design, constraints)?;
+        validate_model(design, model)?;
+        Ok(Self {
+            design,
+            model,
+            constraints,
+            topology: TimingTopology::new(design, model)?,
+        })
+    }
+
+    /// Analyzes a complete net-delay update on the stored topology.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incomplete delays or arithmetic overflow.
+    pub fn analyze(&self, net_delays: Vec<NetDelay>) -> Result<TimingReport, TimingError> {
+        timing_report_from_net_delays(
+            self.design,
+            self.model,
+            self.constraints,
+            net_delays,
+            Some(&self.topology),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TimingEdgeDelay {
+    Net(NetId, CellPinId),
+    Cell(DelayRange),
+}
+
+struct TimingTopology {
+    edges: Vec<Vec<(CellPinId, TimingEdgeDelay)>>,
+    roots: Vec<bool>,
+    order: Vec<CellPinId>,
+}
+
+impl TimingTopology {
+    fn new(design: &Design, model: &TimingModel) -> Result<Self, TimingError> {
+        let mut edges = vec![Vec::new(); design.pins().len()];
+        let mut indegree = vec![0_usize; design.pins().len()];
+        for index in 0..design.nets().len() {
+            let net = NetId(index);
+            for &sink in &design.nets()[net.0].sinks {
+                edges[design.nets()[net.0].driver.0].push((sink, TimingEdgeDelay::Net(net, sink)));
+                indegree[sink.0] += 1;
+            }
+        }
+        for (&(from, to), &delay) in &model.cell_arcs {
+            edges[from.0].push((to, TimingEdgeDelay::Cell(delay)));
+            indegree[to.0] += 1;
+        }
+        let roots = indegree
+            .iter()
+            .map(|&degree| degree == 0)
+            .collect::<Vec<_>>();
+        let mut ready = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &degree)| (degree == 0).then_some(CellPinId(index)))
+            .collect::<VecDeque<_>>();
+        let mut order = Vec::with_capacity(design.pins().len());
+        while let Some(pin) = ready.pop_front() {
+            order.push(pin);
+            for &(next, _) in &edges[pin.0] {
+                indegree[next.0] -= 1;
+                if indegree[next.0] == 0 {
+                    ready.push_back(next);
+                }
+            }
+        }
+        if order.len() != design.pins().len() {
+            return Err(TimingError::CombinationalCycle);
+        }
+        Ok(Self {
+            edges,
+            roots,
+            order,
+        })
+    }
 }
 
 /// Estimates one net-edge routing delay from placement geometry.
@@ -545,12 +647,27 @@ fn timing_report_from_net_delays(
     model: &TimingModel,
     constraints: &TimingConstraints,
     net_delays: Vec<NetDelay>,
+    topology: Option<&TimingTopology>,
 ) -> Result<TimingReport, TimingError> {
-    let delays_by_sink = net_delays
-        .iter()
-        .map(|delay| ((delay.net, delay.sink), delay.delay))
-        .collect::<BTreeMap<_, _>>();
-    let clock_arrivals = pin_arrivals(design, &delays_by_sink, model, &BTreeMap::new(), true)?;
+    let delays_by_sink = topology.is_none().then(|| {
+        net_delays
+            .iter()
+            .map(|delay| ((delay.net, delay.sink), delay.delay))
+            .collect::<BTreeMap<_, _>>()
+    });
+    let mut delays_by_pin = vec![None; design.pins().len()];
+    for delay in &net_delays {
+        delays_by_pin[delay.sink.0] = Some(delay.delay);
+    }
+    let clock_arrivals = pin_arrivals(
+        design,
+        delays_by_sink.as_ref(),
+        &delays_by_pin,
+        model,
+        &BTreeMap::new(),
+        true,
+        topology,
+    )?;
     let mut register_starts_by_clock =
         BTreeMap::<(NetId, ClockEdge), BTreeMap<CellPinId, DelayRange>>::new();
     for (&output, &(clock, edge, delay)) in &model.clock_to_q {
@@ -568,7 +685,15 @@ fn timing_report_from_net_delays(
         .map(|(&clock, starts)| {
             Ok((
                 clock,
-                pin_arrivals(design, &delays_by_sink, model, starts, false)?,
+                pin_arrivals(
+                    design,
+                    delays_by_sink.as_ref(),
+                    &delays_by_pin,
+                    model,
+                    starts,
+                    false,
+                    topology,
+                )?,
             ))
         })
         .collect::<Result<BTreeMap<_, _>, TimingError>>()?;
@@ -678,6 +803,8 @@ fn timing_report_from_net_delays(
         model,
         &arrivals_by_clock,
         &domain_setup_checks,
+        topology,
+        &delays_by_pin,
     )?;
     Ok(TimingReport {
         net_delays,
@@ -938,14 +1065,20 @@ fn setup_propagation_graph(
     Ok(SetupPropagationGraph { edges, order })
 }
 
+#[allow(clippy::too_many_lines)]
 fn net_setup_metrics(
     design: &Design,
     net_delays: &[NetDelay],
     model: &TimingModel,
     arrivals_by_clock: &BTreeMap<(NetId, ClockEdge), Vec<Option<DelayRange>>>,
     setup_checks: &[SelectedClockCheck<SetupCheck>],
+    topology: Option<&TimingTopology>,
+    delays_by_pin: &[Option<DelayRange>],
 ) -> Result<(Vec<NetSetupSlack>, Vec<NetSetupCriticality>), TimingError> {
-    let propagation = setup_propagation_graph(design, net_delays, model)?;
+    let owned_propagation = topology
+        .is_none()
+        .then(|| setup_propagation_graph(design, net_delays, model))
+        .transpose()?;
     let mut checks_by_domain = BTreeMap::<SetupDomainPair, Vec<SetupCheck>>::new();
     for selected in setup_checks {
         let check = selected.check;
@@ -973,14 +1106,36 @@ fn net_setup_metrics(
             let entry = &mut required[check.data_pin.0];
             *entry = Some(entry.map_or(check.required_ps, |known| known.min(check.required_ps)));
         }
-        for &from in propagation.order.iter().rev() {
-            for &(to, delay_ps) in &propagation.edges[from.0] {
+        let order = match topology {
+            Some(graph) => &graph.order,
+            None => &owned_propagation.as_ref().expect("owned graph").order,
+        };
+        for &from in order.iter().rev() {
+            let mut visit = |to: CellPinId, delay_ps: u64| {
                 let Some(to_required) = required[to.0] else {
-                    continue;
+                    return;
                 };
                 let candidate = to_required - i128::from(delay_ps);
                 let entry = &mut required[from.0];
                 *entry = Some(entry.map_or(candidate, |known| known.min(candidate)));
+            };
+            if let Some(graph) = topology {
+                for &(to, edge) in &graph.edges[from.0] {
+                    let delay = match edge {
+                        TimingEdgeDelay::Cell(delay) => delay.max_ps,
+                        TimingEdgeDelay::Net(_, sink) => {
+                            delays_by_pin[sink.0]
+                                .expect("complete session delays")
+                                .max_ps
+                        }
+                    };
+                    visit(to, delay);
+                }
+            } else {
+                for &(to, delay) in &owned_propagation.as_ref().expect("owned graph").edges[from.0]
+                {
+                    visit(to, delay);
+                }
             }
         }
         let domain_worst_path_delay_ps = checks
@@ -1234,17 +1389,50 @@ fn route_arc_delay(
 
 fn pin_arrivals(
     design: &Design,
-    delays: &BTreeMap<(NetId, CellPinId), DelayRange>,
+    delays: Option<&BTreeMap<(NetId, CellPinId), DelayRange>>,
+    delays_by_pin: &[Option<DelayRange>],
     model: &TimingModel,
     starts: &BTreeMap<CellPinId, DelayRange>,
     implicit_root_starts: bool,
+    topology: Option<&TimingTopology>,
 ) -> Result<Vec<Option<DelayRange>>, TimingError> {
+    if let Some(topology) = topology {
+        let mut arrivals = vec![None; design.pins().len()];
+        for (index, &root) in topology.roots.iter().enumerate() {
+            if root {
+                let pin = CellPinId(index);
+                arrivals[index] = starts
+                    .get(&pin)
+                    .copied()
+                    .or_else(|| implicit_root_starts.then_some(DelayRange::zero()));
+            }
+        }
+        for &pin in &topology.order {
+            for &(next, edge) in &topology.edges[pin.0] {
+                if let Some(arrival) = arrivals[pin.0] {
+                    let delay = match edge {
+                        TimingEdgeDelay::Cell(delay) => delay,
+                        TimingEdgeDelay::Net(net, sink) => delays_by_pin[sink.0]
+                            .ok_or(TimingError::MissingNetDelay { net, sink })?,
+                    };
+                    let candidate = arrival.checked_add(delay)?;
+                    arrivals[next.0] =
+                        Some(arrivals[next.0].map_or(candidate, |known| DelayRange {
+                            min_ps: known.min_ps.min(candidate.min_ps),
+                            max_ps: known.max_ps.max(candidate.max_ps),
+                        }));
+                }
+            }
+        }
+        return Ok(arrivals);
+    }
     let mut edges = vec![Vec::<(CellPinId, DelayRange)>::new(); design.pins().len()];
     let mut indegree = vec![0_usize; design.pins().len()];
     for (net_index, net) in design.nets().iter().enumerate() {
         let net_id = NetId(net_index);
         for &sink in &net.sinks {
             let delay = delays
+                .expect("legacy delay map")
                 .get(&(net_id, sink))
                 .copied()
                 .ok_or(TimingError::MissingNetDelay { net: net_id, sink })?;
@@ -1457,10 +1645,43 @@ mod tests {
     use texo_pnr::place_and_route;
 
     use super::{
-        ClockEdge, DelayRange, NetDelay, TimingConstraints, TimingModel, UncheckedEndpointReason,
-        analyze_timing, analyze_timing_from_net_delays, compare_nonnegative_fractions,
-        timing_report_from_net_delays,
+        ClockEdge, DelayRange, NetDelay, TimingAnalysisSession, TimingConstraints, TimingModel,
+        UncheckedEndpointReason, analyze_timing, analyze_timing_from_net_delays,
+        compare_nonnegative_fractions, timing_report_from_net_delays,
     };
+
+    #[test]
+    fn reusable_session_is_exact_across_delay_updates() {
+        let (design, device, clock_net, model) = registered_path(10);
+        let implementation = place_and_route(&design, &device).unwrap();
+        let pip_delays = device
+            .pips()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| (texo_model::PipId(index), DelayRange::new(100, 100).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        let mut constraints = TimingConstraints::new();
+        constraints.set_clock_period_ps(clock_net, 300);
+        let routed = analyze_timing(
+            &design,
+            &device,
+            &implementation,
+            &pip_delays,
+            &model,
+            &constraints,
+        )
+        .unwrap();
+        let session = TimingAnalysisSession::new(&design, &model, &constraints).unwrap();
+        assert_eq!(session.analyze(routed.net_delays.clone()).unwrap(), routed);
+
+        let mut changed = routed.net_delays.clone();
+        changed[0].delay = DelayRange::new(17, 31).unwrap();
+        assert_eq!(
+            session.analyze(changed.clone()).unwrap(),
+            analyze_timing_from_net_delays(&design, &model, &constraints, changed).unwrap(),
+        );
+        assert_eq!(session.analyze(routed.net_delays.clone()).unwrap(), routed);
+    }
 
     #[test]
     fn reports_positive_and_negative_post_route_setup_slack() {
@@ -1659,6 +1880,7 @@ mod tests {
                 sink: clock,
                 delay: DelayRange::zero(),
             }],
+            None,
         )
         .unwrap();
 
