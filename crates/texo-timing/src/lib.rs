@@ -544,6 +544,33 @@ impl<'a> TimingAnalysisSession<'a> {
     ///
     /// Returns an error for incomplete delays or arithmetic overflow.
     pub fn analyze(&self, net_delays: Vec<NetDelay>) -> Result<TimingReport, TimingError> {
+        let mut seen = vec![false; self.design.pins().len()];
+        for delay in &net_delays {
+            let Some(pin) = self.design.pins().get(delay.sink.0) else {
+                return Err(TimingError::MissingNetDelay {
+                    net: delay.net,
+                    sink: delay.sink,
+                });
+            };
+            if delay.net.0 >= self.design.nets().len()
+                || pin.net() != Some(delay.net)
+                || std::mem::replace(&mut seen[delay.sink.0], true)
+            {
+                return Err(TimingError::MissingNetDelay {
+                    net: delay.net,
+                    sink: delay.sink,
+                });
+            }
+        }
+        for edges in &self.topology.edges {
+            for &(_, edge) in edges {
+                if let TimingEdgeDelay::Net(net, sink) = edge
+                    && !seen[sink.0]
+                {
+                    return Err(TimingError::MissingNetDelay { net, sink });
+                }
+            }
+        }
         timing_report_from_net_delays(
             self.design,
             self.model,
@@ -1681,6 +1708,24 @@ mod tests {
             analyze_timing_from_net_delays(&design, &model, &constraints, changed).unwrap(),
         );
         assert_eq!(session.analyze(routed.net_delays.clone()).unwrap(), routed);
+        let mut incomplete = routed.net_delays.clone();
+        let missing = incomplete.pop().unwrap();
+        assert_eq!(
+            session.analyze(incomplete),
+            Err(super::TimingError::MissingNetDelay {
+                net: missing.net,
+                sink: missing.sink
+            })
+        );
+        let mut invalid = routed.net_delays.clone();
+        invalid[0].sink = texo_model::CellPinId(usize::MAX);
+        assert!(matches!(
+            session.analyze(invalid),
+            Err(super::TimingError::MissingNetDelay {
+                sink: texo_model::CellPinId(usize::MAX),
+                ..
+            })
+        ));
     }
 
     #[test]
