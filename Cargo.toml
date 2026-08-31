@@ -31,6 +31,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 postcard = { version = "1.1.3", features = ["use-std"] }
+rayon = "1.12"
+libm = "0.2"
+rustdct = "0.7.1"
 ureq = { version = "3.1", default-features = false, features = ["rustls"] }
 zstd = "0.13"
 struo-celox = { git = "https://github.com/fabrica-eda/struo.git", rev = "69e7ec13cfe7437b0f12c362741f7790c92940b6" }

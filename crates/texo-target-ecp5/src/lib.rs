@@ -5,11 +5,13 @@
 //! here. Runtime placement and routing then use only Rust and [`texo_model`].
 
 mod lpf;
+mod placement_delay;
 
 pub use lpf::{
     LogicalPort, LpfConstraints, LpfError, ResolvedLpf, parse_lpf, resolve_lpf_port_cells,
     resolve_lpf_ports,
 };
+pub use placement_delay::{Ecp5DelayPredictorError, Ecp5PlacementDelayPredictor};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::error::Error;
@@ -17,7 +19,8 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use texo_model::{
     BelId, BelPinId, BufferSpec, CellId, CellPinId, Design, Device, ModelError, NetId,
     PinDirection, PipId, Point, ResourceKind, UnifiedGraph, WireId,
@@ -363,13 +366,114 @@ struct CompactBelMetadata {
     z: i32,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Eight-byte runtime PIP metadata. Custom serde retains the cache-v5 field
+/// widths and ordering so released architecture databases remain readable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CompactPipMetadata {
+    tile_type_and_fixed: u16,
+    config_tile: u16,
+    timing_class: u16,
+    lutperm_flags: u16,
+}
+
+const FIXED_PIP_METADATA_BIT: u16 = 1 << 15;
+const NO_CONFIG_TILE_METADATA: u16 = u16::MAX;
+
+#[derive(Deserialize, Serialize)]
+struct SerializedCompactPipMetadata {
     tile_type: u32,
     config_tile: Option<u32>,
     timing_class: u32,
     lutperm_flags: u16,
     fixed: bool,
+}
+
+impl CompactPipMetadata {
+    fn new(
+        tile_type: u32,
+        config_tile: Option<u32>,
+        timing_class: u32,
+        lutperm_flags: u16,
+        fixed: bool,
+    ) -> Result<Self, ImportError> {
+        let tile_type =
+            u16::try_from(tile_type).map_err(|_| ImportError::TooManyMetadataStrings)?;
+        if tile_type >= FIXED_PIP_METADATA_BIT {
+            return Err(ImportError::TooManyMetadataStrings);
+        }
+        let config_tile = config_tile
+            .map(|id| {
+                u16::try_from(id)
+                    .ok()
+                    .filter(|&id| id != NO_CONFIG_TILE_METADATA)
+                    .ok_or(ImportError::TooManyMetadataStrings)
+            })
+            .transpose()?
+            .unwrap_or(NO_CONFIG_TILE_METADATA);
+        let timing_class = u16::try_from(timing_class)
+            .ok()
+            .filter(|&id| id != NO_CONFIG_TILE_METADATA)
+            .ok_or(ImportError::TooManyMetadataStrings)?;
+        Ok(Self {
+            tile_type_and_fixed: tile_type | if fixed { FIXED_PIP_METADATA_BIT } else { 0 },
+            config_tile,
+            timing_class,
+            lutperm_flags,
+        })
+    }
+
+    const fn tile_type(self) -> u32 {
+        (self.tile_type_and_fixed & !FIXED_PIP_METADATA_BIT) as u32
+    }
+
+    const fn config_tile(self) -> Option<u32> {
+        if self.config_tile == NO_CONFIG_TILE_METADATA {
+            None
+        } else {
+            Some(self.config_tile as u32)
+        }
+    }
+
+    const fn timing_class(self) -> u32 {
+        self.timing_class as u32
+    }
+
+    const fn fixed(self) -> bool {
+        self.tile_type_and_fixed & FIXED_PIP_METADATA_BIT != 0
+    }
+}
+
+impl Serialize for CompactPipMetadata {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        SerializedCompactPipMetadata {
+            tile_type: self.tile_type(),
+            config_tile: self.config_tile(),
+            timing_class: self.timing_class(),
+            lutperm_flags: self.lutperm_flags,
+            fixed: self.fixed(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CompactPipMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let metadata = SerializedCompactPipMetadata::deserialize(deserializer)?;
+        Self::new(
+            metadata.tile_type,
+            metadata.config_tile,
+            metadata.timing_class,
+            metadata.lutperm_flags,
+            metadata.fixed,
+        )
+        .map_err(|_| D::Error::custom("ECP5 PIP metadata string ID exceeds compact storage"))
+    }
 }
 
 /// Resolved package pin table.
@@ -498,10 +602,10 @@ impl Ecp5Architecture {
     pub fn pip_metadata(&self, pip: PipId) -> PipMetadata<'_> {
         let metadata = &self.pip_metadata[pip.0];
         PipMetadata {
-            fixed: metadata.fixed,
-            tile_type: self.metadata_string(metadata.tile_type),
-            config_tile: metadata.config_tile.map(|id| self.metadata_string(id)),
-            timing_class: self.metadata_string(metadata.timing_class),
+            fixed: metadata.fixed(),
+            tile_type: self.metadata_string(metadata.tile_type()),
+            config_tile: metadata.config_tile().map(|id| self.metadata_string(id)),
+            timing_class: self.metadata_string(metadata.timing_class()),
             lutperm_flags: metadata.lutperm_flags,
         }
     }
@@ -541,7 +645,7 @@ impl Ecp5Architecture {
     pub fn pip_timing_class_ids(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
         self.pip_metadata
             .iter()
-            .map(|metadata| metadata.timing_class)
+            .map(|metadata| metadata.timing_class())
     }
 
     /// Number of entries in the compact metadata string dictionary.
@@ -591,6 +695,25 @@ pub struct LutFfPair {
     pub lut: CellId,
     /// Driven register cell.
     pub ff: CellId,
+}
+
+/// Placement-relevant ECP5 flip-flop control set.
+///
+/// Values are opaque stable identifiers supplied by the mapped-netlist
+/// adapter. `slice_ce` is shared by the two FFs in one slice; `tile_clock`
+/// and `tile_lsr` are shared by all eight FFs in one logic tile. Clock edge,
+/// reset assertion polarity, and synchronous/asynchronous mode must be folded
+/// into the corresponding value by the adapter.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FfControlSet {
+    /// Logical register cell.
+    pub cell: CellId,
+    /// CE net, constant state, and assertion polarity.
+    pub slice_ce: u64,
+    /// Clock net and active edge.
+    pub tile_clock: u64,
+    /// LSR net, assertion polarity, and sync/async mode.
+    pub tile_lsr: u64,
 }
 
 /// Structural information required to pack one logical memory into `DP16KD`.
@@ -649,13 +772,22 @@ pub const DEFAULT_GLOBAL_CLOCK_FANOUT: usize = 5;
 /// Number of global primary clock networks in an ECP5 device.
 pub const ECP5_GLOBAL_CLOCK_COUNT: usize = 16;
 
+/// Output-divider fallback used for emitted `EHXPLLL` configuration.
+///
+/// The nextpnr ECP5 bitstream writer and Texo's native bitgen emit divide-by-eight
+/// for omitted `CLKOP_DIV`, `CLKOS_DIV`, `CLKOS2_DIV`, and `CLKOS3_DIV` parameters.
+/// This differs from nextpnr 0.6's packing-time timing fallback of one (and the
+/// zero reset encoding in Trellis `bits.db`), so STA must follow the configuration
+/// actually emitted into the bitstream.
+pub const ECP5_PLL_OUTPUT_DIVIDER_DEFAULT: u64 = 8;
+
 /// Target packing decisions consumed by grouped placement and configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Ecp5Packing {
     constraints: PlacementConstraints,
     wide_lut_clusters: Option<Vec<Vec<CellId>>>,
     carry_pairs: Vec<[CellId; 2]>,
-    carry_pairs_packed: bool,
+    carry_state: CarryPackingState,
     lut_ff_pairs: Vec<LutFfPair>,
     general_routing_ffs: Vec<CellId>,
     block_rams: Vec<PackedBlockRam>,
@@ -666,6 +798,14 @@ pub struct Ecp5Packing {
     clock_frequencies_hz: BTreeMap<CellId, u64>,
     generated_clock_periods_ps: BTreeMap<NetId, u64>,
     unsupported_lpf_commands: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CarryPackingState {
+    #[default]
+    Unpacked,
+    Pairs,
+    PairsAndFfs,
 }
 
 /// One logical IO cell constrained to a package ball or lead.
@@ -787,11 +927,12 @@ impl Ecp5Packing {
             .add_shared_resource(cell_values, bel_resources);
     }
 
-    /// Constrains FFs sharing one ECP5 logic-tile clock input to a compatible control set.
+    /// Constrains all eight FFs in one ECP5 logic tile to one compatible clock
+    /// control set.
     ///
-    /// Values identify the logical clock net and active edge. Multiple slices
-    /// can share one physical `CLK0` or `CLK1` wire, so compatibility is keyed
-    /// by each FF BEL's actual clock-pin wire rather than by its slice number.
+    /// Values identify the logical clock net and active edge. The split-BEL
+    /// graph exposes a separate local clock wire at each slice,
+    /// but they select one tile-wide clock net and polarity in configuration.
     ///
     /// # Panics
     ///
@@ -813,15 +954,70 @@ impl Ecp5Packing {
             if metadata.bel_type != "TRELLIS_FF" {
                 continue;
             }
-            let clock_pin =
-                find_bel_pin(architecture.device(), bel, "CLK").expect("TRELLIS_FF has a CLK pin");
-            let clock_wire = architecture.device().bel_pins()[clock_pin.0].wire;
-            let next = u64::try_from(resource_ids.len()).expect("ECP5 clock wire count fits u64");
-            let resource = *resource_ids.entry(clock_wire).or_insert(next);
+            let point = architecture.device().bels()[bel.0].point;
+            let next = u64::try_from(resource_ids.len()).expect("ECP5 logic tile count fits u64");
+            let resource = *resource_ids.entry(point).or_insert(next);
             bel_resources.push((bel, resource));
         }
         self.constraints
             .add_shared_resource(cell_values, bel_resources);
+    }
+
+    /// Constrains all eight FFs in one ECP5 logic tile to one reset control
+    /// set.
+    ///
+    /// Values must identify the LSR net together with assertion polarity and
+    /// synchronous/asynchronous mode. A register with no reset therefore has
+    /// a different value from a register using a routed reset: otherwise the
+    /// shared tile LSR would reset both registers.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the architecture contains more shared ECP5 LSR wires
+    /// than fit in a `u64` resource identifier.
+    pub fn constrain_ff_lsr_muxes(
+        &mut self,
+        architecture: &Ecp5Architecture,
+        cell_values: impl IntoIterator<Item = (CellId, u64)>,
+    ) {
+        let cell_values = cell_values.into_iter().collect::<Vec<_>>();
+        if cell_values.is_empty() {
+            return;
+        }
+        let mut resource_ids = BTreeMap::new();
+        let mut bel_resources = Vec::new();
+        for &bel in architecture.device().bels_of_kind(ResourceKind::Register) {
+            let metadata = architecture.bel_metadata(bel);
+            if metadata.bel_type != "TRELLIS_FF" {
+                continue;
+            }
+            let point = architecture.device().bels()[bel.0].point;
+            let next = u64::try_from(resource_ids.len()).expect("ECP5 logic tile count fits u64");
+            let resource = *resource_ids.entry(point).or_insert(next);
+            bel_resources.push((bel, resource));
+        }
+        self.constraints
+            .add_shared_resource(cell_values, bel_resources);
+    }
+
+    /// Installs all placement-relevant ECP5 FF shared-resource constraints.
+    pub fn constrain_ff_control_sets(
+        &mut self,
+        architecture: &Ecp5Architecture,
+        control_sets: &[FfControlSet],
+    ) {
+        self.constrain_ff_slice_ce_muxes(
+            architecture,
+            control_sets.iter().map(|set| (set.cell, set.slice_ce)),
+        );
+        self.constrain_ff_clock_muxes(
+            architecture,
+            control_sets.iter().map(|set| (set.cell, set.tile_clock)),
+        );
+        self.constrain_ff_lsr_muxes(
+            architecture,
+            control_sets.iter().map(|set| (set.cell, set.tile_lsr)),
+        );
     }
 
     /// LUT/FF pairs using the dedicated data path (`SD=1`).
@@ -956,7 +1152,7 @@ impl Ecp5Packing {
             .ok_or_else(|| PackingError::MissingFfDataPin {
                 cell: design.cells()[ff.0].name.clone(),
             })?;
-        if !self.constraints.remove_group(&[lut, ff]) {
+        if !self.constraints.remove_group(&[lut, ff]) && !self.constraints.remove_group_cell(ff) {
             return Err(PackingError::InvalidLutFfPair {
                 lut: design.cells()[lut.0].name.clone(),
                 ff: design.cells()[ff.0].name.clone(),
@@ -989,7 +1185,7 @@ impl Ecp5Packing {
         architecture: &Ecp5Architecture,
         pairs: impl IntoIterator<Item = [CellId; 2]>,
     ) -> Result<(), PackingError> {
-        if self.carry_pairs_packed {
+        if self.carry_state != CarryPackingState::Unpacked {
             return Err(PackingError::CarryPairsAlreadyPacked);
         }
         let mut occupied = BTreeSet::new();
@@ -1031,7 +1227,146 @@ impl Ecp5Packing {
                 .add_group_with_shared_assignments(cells, Arc::clone(assignments));
         }
         self.carry_pairs = packed;
-        self.carry_pairs_packed = true;
+        self.carry_state = CarryPackingState::Pairs;
+        Ok(())
+    }
+
+    /// Packs the maximum deterministic set of carry-result FFs onto the
+    /// dedicated local `F -> DI` paths of an already constructed carry macro.
+    ///
+    /// Carry LUTs remain one rigid atomic group. Selected FFs are appended as
+    /// columns whose BEL is exactly `TRELLIS_FF(z + 1)` for the corresponding
+    /// carry LUT in every legal assignment row. Selection is exact within each
+    /// tile: all selected FFs share one tile clock/LSR control set, each slice
+    /// shares one CE control set, and at most one FF is selected for each LUT
+    /// even when its `F` net has duplicate fanout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when carry pairs have not been packed, this operation
+    /// was already performed, a direct candidate lacks a control set, or the
+    /// architecture/group surface cannot represent the dedicated FF columns.
+    pub fn pack_carry_lut_ffs(
+        &mut self,
+        design: &Design,
+        architecture: &Ecp5Architecture,
+        control_sets: impl IntoIterator<Item = FfControlSet>,
+    ) -> Result<(), PackingError> {
+        self.pack_carry_lut_ffs_impl(design, architecture, control_sets, None)
+    }
+
+    /// Packs an explicitly selected set of carry-result FFs.
+    ///
+    /// This restores packing from an external checkpoint. Requested pairs
+    /// must obey the same tile-wide clock/LSR and slice-wide CE rules as the
+    /// automatic selector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for the same structural failures as
+    /// [`Self::pack_carry_lut_ffs`], or for a requested pair that is not a
+    /// direct carry `F -> DI` edge or violates a shared control set.
+    pub fn pack_carry_lut_ffs_with_pairs(
+        &mut self,
+        design: &Design,
+        architecture: &Ecp5Architecture,
+        control_sets: impl IntoIterator<Item = FfControlSet>,
+        pairs: impl IntoIterator<Item = LutFfPair>,
+    ) -> Result<(), PackingError> {
+        let pairs = pairs.into_iter().collect::<Vec<_>>();
+        self.pack_carry_lut_ffs_impl(design, architecture, control_sets, Some(&pairs))
+    }
+
+    fn pack_carry_lut_ffs_impl(
+        &mut self,
+        design: &Design,
+        architecture: &Ecp5Architecture,
+        control_sets: impl IntoIterator<Item = FfControlSet>,
+        requested_pairs: Option<&[LutFfPair]>,
+    ) -> Result<(), PackingError> {
+        if self.carry_state == CarryPackingState::Unpacked {
+            return Err(PackingError::CarryPairsNotPacked);
+        }
+        if self.carry_state == CarryPackingState::PairsAndFfs {
+            return Err(PackingError::CarryLutFfsAlreadyPacked);
+        }
+        let control_sets = collect_ff_control_sets(design, control_sets)?;
+        let chains = logical_carry_chains(design, &self.carry_pairs)?;
+        let locations = carry_lut_locations(&self.carry_pairs, &chains);
+        let selected = if let Some(requested_pairs) = requested_pairs {
+            validate_requested_carry_lut_ff_pairs(
+                design,
+                &self.general_routing_ffs,
+                &locations,
+                &control_sets,
+                requested_pairs,
+            )?
+        } else {
+            select_carry_lut_ff_pairs(design, &self.general_routing_ffs, &locations, &control_sets)?
+        };
+        let ff_by_slot = physical_ff_by_slot(architecture);
+        let mut constraints = self.constraints.clone();
+        let mut selected_ffs = BTreeSet::new();
+
+        for (chain_index, chain) in chains.iter().enumerate() {
+            let old_cells = chain
+                .iter()
+                .flat_map(|&pair| self.carry_pairs[pair])
+                .collect::<Vec<_>>();
+            let chain_pairs = selected
+                .iter()
+                .filter(|selected| selected.location.chain == chain_index)
+                .collect::<Vec<_>>();
+            if chain_pairs.is_empty() {
+                continue;
+            }
+            let Some(group) = constraints
+                .groups()
+                .iter()
+                .find(|group| group.cells == old_cells)
+                .cloned()
+            else {
+                return Err(PackingError::CarryFfPacking {
+                    cell: design.cells()[old_cells[0].0].name.clone(),
+                    reason: "carry placement group is missing".into(),
+                });
+            };
+            let mut cells = old_cells.clone();
+            cells.extend(chain_pairs.iter().map(|selected| selected.pair.ff));
+            let assignments = carry_group_assignments_with_ffs(
+                architecture,
+                &group.assignments,
+                &chain_pairs,
+                &control_sets,
+                &ff_by_slot,
+            );
+            if assignments.is_empty() {
+                return Err(PackingError::CarryFfPacking {
+                    cell: design.cells()[old_cells[0].0].name.clone(),
+                    reason: "no carry assignment has every matching dedicated FF BEL".into(),
+                });
+            }
+            if !constraints.replace_group(&old_cells, cells, assignments) {
+                return Err(PackingError::CarryFfPacking {
+                    cell: design.cells()[old_cells[0].0].name.clone(),
+                    reason: "carry placement group could not be extended transactionally".into(),
+                });
+            }
+            for selected in chain_pairs {
+                let data_pin = ff_data_pin(design, selected.pair.ff)?;
+                constraints.unbind_pin_name(data_pin);
+                selected_ffs.insert(selected.pair.ff);
+            }
+        }
+
+        self.constraints = constraints;
+        self.lut_ff_pairs
+            .extend(selected.iter().map(|selected| selected.pair));
+        self.lut_ff_pairs
+            .sort_unstable_by_key(|pair| (pair.lut, pair.ff));
+        self.general_routing_ffs
+            .retain(|ff| !selected_ffs.contains(ff));
+        self.carry_state = CarryPackingState::PairsAndFfs;
         Ok(())
     }
 
@@ -1077,21 +1412,23 @@ impl Ecp5Packing {
         let device = architecture.device();
         let graph = UnifiedGraph::new(design, device);
         let candidates = compatible_dcca_bels(architecture);
+        let mut target_wires = Vec::with_capacity(candidates.len());
+        for &bel in &candidates {
+            let Some(pin) = find_bel_pin(device, bel, "CLKI") else {
+                return Err(global_route_error(
+                    &design.nets()[self.global_clocks[0].source_net.0],
+                    format!("compatible DCCA BEL {} has no CLKI pin", bel.0),
+                ));
+            };
+            target_wires.push(device.bel_pins()[pin.0].wire);
+        }
+        let mut distance_search =
+            ForwardRouteTargetDistances::new(device.wires().len(), &target_wires);
         let mut costs = Vec::with_capacity(self.global_clocks.len());
         for clock in &self.global_clocks {
             let net = &design.nets()[clock.source_net.0];
             let source = placed_pin_wire(&graph, placement, net.driver)?;
-            let distances = forward_route_distances(device, source);
-            let row = candidates
-                .iter()
-                .copied()
-                .map(|bel| {
-                    let pin = find_bel_pin(device, bel, "CLKI")?;
-                    let target = device.bel_pins()[pin.0].wire;
-                    (distances[target.0] != usize::MAX).then_some(distances[target.0])
-                })
-                .collect::<Vec<_>>();
-            costs.push(row);
+            costs.push(distance_search.distances(device, source).0.to_vec());
         }
         let reachable = costs
             .iter()
@@ -1958,23 +2295,71 @@ fn forward_route(
     None
 }
 
-fn forward_route_distances(device: &Device, source: WireId) -> Vec<usize> {
-    let mut distances = vec![usize::MAX; device.wires().len()];
-    let mut queue = VecDeque::from([source]);
-    distances[source.0] = 0;
-    while let Some(wire) = queue.pop_front() {
-        let next_distance = distances[wire.0].saturating_add(1);
-        let Ok(neighbors) = device.routing_neighbors(wire) else {
-            continue;
-        };
-        for (next, _) in neighbors {
-            if distances[next.0] == usize::MAX {
-                distances[next.0] = next_distance;
-                queue.push_back(next);
-            }
+#[derive(Debug)]
+struct ForwardRouteTargetDistances {
+    epoch: u32,
+    seen: Vec<u32>,
+    targets_by_wire: HashMap<WireId, Vec<usize>>,
+    results: Vec<Option<usize>>,
+    queue: VecDeque<(WireId, usize)>,
+}
+
+impl ForwardRouteTargetDistances {
+    fn new(wire_count: usize, targets: &[WireId]) -> Self {
+        let mut targets_by_wire = HashMap::<WireId, Vec<usize>>::new();
+        for (index, &target) in targets.iter().enumerate() {
+            targets_by_wire.entry(target).or_default().push(index);
+        }
+        Self {
+            epoch: 0,
+            seen: vec![0; wire_count],
+            targets_by_wire,
+            results: vec![None; targets.len()],
+            queue: VecDeque::new(),
         }
     }
-    distances
+
+    /// Returns target distances in the same order passed to `new`, plus the
+    /// number of popped wires. Search stops as soon as every target is found.
+    fn distances(&mut self, device: &Device, source: WireId) -> (&[Option<usize>], usize) {
+        self.results.fill(None);
+        self.queue.clear();
+        if self.results.is_empty() || source.0 >= self.seen.len() {
+            return (&self.results, 0);
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.seen.fill(0);
+            self.epoch = 1;
+        }
+        self.seen[source.0] = self.epoch;
+        self.queue.push_back((source, 0));
+        let mut unresolved = self.results.len();
+        let mut visited = 0;
+        while let Some((wire, distance)) = self.queue.pop_front() {
+            visited += 1;
+            if let Some(targets) = self.targets_by_wire.get(&wire) {
+                for &target in targets {
+                    self.results[target] = Some(distance);
+                }
+                unresolved -= targets.len();
+                if unresolved == 0 {
+                    break;
+                }
+            }
+            let Ok(neighbors) = device.routing_neighbors(wire) else {
+                continue;
+            };
+            let next_distance = distance.saturating_add(1);
+            for (next, _) in neighbors {
+                if self.seen[next.0] != self.epoch {
+                    self.seen[next.0] = self.epoch;
+                    self.queue.push_back((next, next_distance));
+                }
+            }
+        }
+        (&self.results, visited)
+    }
 }
 
 #[derive(Debug)]
@@ -2332,8 +2717,15 @@ fn carry_chain_assignments(architecture: &Ecp5Architecture, pair_count: usize) -
         .map(|&wire| fixed_carry_successors(architecture, wire, &pairs_by_fci_wire))
         .collect::<Vec<_>>();
 
-    let mut sequences = (0..pairs.len())
-        .map(|index| vec![index])
+    // A carry macro has one continuous origin and one set of member offsets.
+    // Starting only at the first slice of a tile makes every legal assignment
+    // a translation of that same shape, including across tile boundaries.
+    // This matches the ECP5 carry-macro alignment used by nextpnr.
+    let mut sequences = pairs
+        .iter()
+        .enumerate()
+        .filter(|(_, pair)| architecture.bel_metadata(pair[0]).z == 0)
+        .map(|(index, _)| vec![index])
         .collect::<Vec<_>>();
     for _ in 1..pair_count {
         let mut extended = Vec::new();
@@ -2390,6 +2782,7 @@ fn logical_carry_chains(
     design: &Design,
     pairs: &[[CellId; 2]],
 ) -> Result<Vec<Vec<usize>>, PackingError> {
+    validate_logical_carry_pairs(design, pairs)?;
     let pair_by_cell = pairs
         .iter()
         .enumerate()
@@ -2429,6 +2822,15 @@ fn logical_carry_chains(
                     ),
                 });
             };
+            if sink_pin.cell != pairs[next_pair][0] {
+                return Err(PackingError::InvalidCarryConnection {
+                    cell: design.cells()[pair[1].0].name.clone(),
+                    reason: format!(
+                        "FCO must drive the first half of its successor carry pair, not {}",
+                        design.cells()[sink_pin.cell.0].name
+                    ),
+                });
+            }
             if successor_pair.replace(next_pair).is_some() {
                 return Err(PackingError::InvalidCarryConnection {
                     cell: design.cells()[pair[1].0].name.clone(),
@@ -2476,10 +2878,371 @@ fn logical_carry_chains(
     Ok(chains)
 }
 
+fn validate_logical_carry_pairs(
+    design: &Design,
+    pairs: &[[CellId; 2]],
+) -> Result<(), PackingError> {
+    for pair in pairs {
+        let first = pair[0];
+        let second = pair[1];
+        let first_fco = design.cells()[first.0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == "FCO")
+            .ok_or_else(|| PackingError::InvalidCarryConnection {
+                cell: design.cells()[first.0].name.clone(),
+                reason: "first carry half has no FCO pin".into(),
+            })?;
+        let second_fci = design.cells()[second.0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|pin| design.pins()[pin.0].name == "FCI")
+            .ok_or_else(|| PackingError::InvalidCarryConnection {
+                cell: design.cells()[second.0].name.clone(),
+                reason: "second carry half has no FCI pin".into(),
+            })?;
+        let Some(internal_net) = design.pins()[first_fco.0].net() else {
+            return Err(PackingError::InvalidCarryConnection {
+                cell: design.cells()[first.0].name.clone(),
+                reason: format!(
+                    "FCO is not connected exclusively to {}.FCI",
+                    design.cells()[second.0].name
+                ),
+            });
+        };
+        let net = &design.nets()[internal_net.0];
+        if design.pins()[second_fci.0].net() != Some(internal_net)
+            || net.driver != first_fco
+            || net.sinks.as_slice() != [second_fci]
+        {
+            return Err(PackingError::InvalidCarryConnection {
+                cell: design.cells()[first.0].name.clone(),
+                reason: format!(
+                    "FCO must drive only the paired second half {}.FCI",
+                    design.cells()[second.0].name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CarryLutLocation {
+    chain: usize,
+    pair: usize,
+    half: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SelectedCarryLutFf {
+    location: CarryLutLocation,
+    pair: LutFfPair,
+}
+
+fn carry_lut_locations(
+    pairs: &[[CellId; 2]],
+    chains: &[Vec<usize>],
+) -> BTreeMap<CellId, CarryLutLocation> {
+    let mut locations = BTreeMap::new();
+    for (chain_index, chain) in chains.iter().enumerate() {
+        for (pair_index, &pair) in chain.iter().enumerate() {
+            for (half, &cell) in pairs[pair].iter().enumerate() {
+                locations.insert(
+                    cell,
+                    CarryLutLocation {
+                        chain: chain_index,
+                        pair: pair_index,
+                        half,
+                    },
+                );
+            }
+        }
+    }
+    locations
+}
+
+fn collect_ff_control_sets(
+    design: &Design,
+    control_sets: impl IntoIterator<Item = FfControlSet>,
+) -> Result<BTreeMap<CellId, FfControlSet>, PackingError> {
+    let mut collected = BTreeMap::new();
+    for control_set in control_sets {
+        let Some(cell) = design.cells().get(control_set.cell.0) else {
+            return Err(PackingError::CarryFfPacking {
+                cell: format!("cell#{}", control_set.cell.0),
+                reason: "control set names an unknown cell".into(),
+            });
+        };
+        if cell.kind != ResourceKind::Register {
+            return Err(PackingError::CarryFfPacking {
+                cell: cell.name.clone(),
+                reason: "control set member is not a register".into(),
+            });
+        }
+        if collected.insert(control_set.cell, control_set).is_some() {
+            return Err(PackingError::CarryFfPacking {
+                cell: cell.name.clone(),
+                reason: "register has more than one control-set record".into(),
+            });
+        }
+    }
+    Ok(collected)
+}
+
+fn physical_ff_by_slot(architecture: &Ecp5Architecture) -> BTreeMap<(Point, i32), BelId> {
+    architecture
+        .device()
+        .bels_of_kind(ResourceKind::Register)
+        .iter()
+        .copied()
+        .filter_map(|bel| {
+            let metadata = architecture.bel_metadata(bel);
+            (metadata.bel_type == "TRELLIS_FF")
+                .then_some(((architecture.device().bels()[bel.0].point, metadata.z), bel))
+        })
+        .collect()
+}
+
+fn carry_group_assignments_with_ffs(
+    architecture: &Ecp5Architecture,
+    rows: &[Vec<BelId>],
+    selected: &[&SelectedCarryLutFf],
+    control_sets: &BTreeMap<CellId, FfControlSet>,
+    ff_by_slot: &BTreeMap<(Point, i32), BelId>,
+) -> Vec<Vec<BelId>> {
+    rows.iter()
+        .filter_map(|row| {
+            let mut extended = row.clone();
+            let mut tile_controls = BTreeMap::new();
+            let mut slice_controls = BTreeMap::new();
+            let mut used_ff_bels = BTreeSet::new();
+            for selected in selected {
+                let lut_column = selected.location.pair * 2 + selected.location.half;
+                let &lut_bel = row.get(lut_column)?;
+                let metadata = architecture.bel_metadata(lut_bel);
+                let point = architecture.device().bels()[lut_bel.0].point;
+                let ff_z = metadata.z.checked_add(1)?;
+                let &ff_bel = ff_by_slot.get(&(point, ff_z))?;
+                let set = control_sets[&selected.pair.ff];
+                let tile_control = (set.tile_clock, set.tile_lsr);
+                if tile_controls
+                    .insert(point, tile_control)
+                    .is_some_and(|old| old != tile_control)
+                    || slice_controls
+                        .insert((point, metadata.z >> 3), set.slice_ce)
+                        .is_some_and(|old| old != set.slice_ce)
+                    || !used_ff_bels.insert(ff_bel)
+                {
+                    return None;
+                }
+                extended.push(ff_bel);
+            }
+            Some(extended)
+        })
+        .collect()
+}
+
+fn ff_data_pin(design: &Design, ff: CellId) -> Result<CellPinId, PackingError> {
+    design.cells()[ff.0]
+        .pins()
+        .iter()
+        .copied()
+        .find(|pin| design.pins()[pin.0].name == "DI")
+        .ok_or_else(|| PackingError::MissingFfDataPin {
+            cell: design.cells()[ff.0].name.clone(),
+        })
+}
+
+fn select_carry_lut_ff_pairs(
+    design: &Design,
+    general_routing_ffs: &[CellId],
+    locations: &BTreeMap<CellId, CarryLutLocation>,
+    control_sets: &BTreeMap<CellId, FfControlSet>,
+) -> Result<Vec<SelectedCarryLutFf>, PackingError> {
+    let mut candidates = BTreeMap::<CarryLutLocation, Vec<(LutFfPair, FfControlSet)>>::new();
+    for &ff in general_routing_ffs {
+        let data_pin = ff_data_pin(design, ff)?;
+        let Some(lut) = lut_driver(design, data_pin) else {
+            continue;
+        };
+        let Some(&location) = locations.get(&lut) else {
+            continue;
+        };
+        let Some(&control_set) = control_sets.get(&ff) else {
+            return Err(PackingError::CarryFfPacking {
+                cell: design.cells()[ff.0].name.clone(),
+                reason: "direct carry-result FF has no control-set record".into(),
+            });
+        };
+        candidates
+            .entry(location)
+            .or_default()
+            .push((LutFfPair { lut, ff }, control_set));
+    }
+
+    let tiles = candidates
+        .keys()
+        .map(|location| (location.chain, location.pair / 4))
+        .collect::<BTreeSet<_>>();
+    let mut selected = Vec::new();
+    for (chain, tile) in tiles {
+        let tile_classes = candidates
+            .iter()
+            .filter(|(location, _)| location.chain == chain && location.pair / 4 == tile)
+            .flat_map(|(_, candidates)| {
+                candidates
+                    .iter()
+                    .map(|(_, set)| (set.tile_clock, set.tile_lsr))
+            })
+            .collect::<BTreeSet<_>>();
+        let mut best_tile = Vec::new();
+        for tile_class in tile_classes {
+            let mut tile_selection = Vec::new();
+            for slice in 0..4 {
+                let ce_classes = candidates
+                    .iter()
+                    .filter(|(location, _)| {
+                        location.chain == chain
+                            && location.pair / 4 == tile
+                            && location.pair % 4 == slice
+                    })
+                    .flat_map(|(_, candidates)| {
+                        candidates.iter().filter_map(|(_, set)| {
+                            ((set.tile_clock, set.tile_lsr) == tile_class).then_some(set.slice_ce)
+                        })
+                    })
+                    .collect::<BTreeSet<_>>();
+                let mut best_slice = Vec::new();
+                for ce in ce_classes {
+                    let mut slice_selection = Vec::new();
+                    for half in 0..2 {
+                        let location = CarryLutLocation {
+                            chain,
+                            pair: tile * 4 + slice,
+                            half,
+                        };
+                        let candidate = candidates.get(&location).and_then(|candidates| {
+                            candidates
+                                .iter()
+                                .filter(|(_, set)| {
+                                    (set.tile_clock, set.tile_lsr) == tile_class
+                                        && set.slice_ce == ce
+                                })
+                                .min_by_key(|(pair, _)| pair.ff)
+                        });
+                        if let Some(&(pair, _)) = candidate {
+                            slice_selection.push(SelectedCarryLutFf { location, pair });
+                        }
+                    }
+                    if slice_selection.len() > best_slice.len() {
+                        best_slice = slice_selection;
+                    }
+                }
+                tile_selection.extend(best_slice);
+            }
+            if tile_selection.len() > best_tile.len() {
+                best_tile = tile_selection;
+            }
+        }
+        selected.extend(best_tile);
+    }
+    selected.sort_unstable_by_key(|selected| (selected.location, selected.pair.ff));
+    Ok(selected)
+}
+
+fn validate_requested_carry_lut_ff_pairs(
+    design: &Design,
+    general_routing_ffs: &[CellId],
+    locations: &BTreeMap<CellId, CarryLutLocation>,
+    control_sets: &BTreeMap<CellId, FfControlSet>,
+    requested_pairs: &[LutFfPair],
+) -> Result<Vec<SelectedCarryLutFf>, PackingError> {
+    let available_ffs = general_routing_ffs.iter().copied().collect::<BTreeSet<_>>();
+    let mut used_luts = BTreeSet::new();
+    let mut used_ffs = BTreeSet::new();
+    let mut tile_classes = BTreeMap::new();
+    let mut slice_classes = BTreeMap::new();
+    let mut selected = Vec::new();
+    for &pair in requested_pairs {
+        let lut_name = design
+            .cells()
+            .get(pair.lut.0)
+            .map_or_else(|| format!("cell#{}", pair.lut.0), |cell| cell.name.clone());
+        let ff_name = design
+            .cells()
+            .get(pair.ff.0)
+            .map_or_else(|| format!("cell#{}", pair.ff.0), |cell| cell.name.clone());
+        let Some(&location) = locations.get(&pair.lut) else {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: lut_name,
+                ff: ff_name,
+                reason: "requested LUT is not in a packed carry chain".into(),
+            });
+        };
+        if !available_ffs.contains(&pair.ff) {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: lut_name,
+                ff: ff_name,
+                reason: "requested FF is not available on general routing".into(),
+            });
+        }
+        let data_pin = ff_data_pin(design, pair.ff)?;
+        if lut_driver(design, data_pin) != Some(pair.lut) {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: lut_name,
+                ff: ff_name,
+                reason: "carry LUT does not directly drive the FF data input".into(),
+            });
+        }
+        if !used_luts.insert(pair.lut) || !used_ffs.insert(pair.ff) {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: lut_name,
+                ff: ff_name,
+                reason: "carry LUT or FF occurs in more than one requested pair".into(),
+            });
+        }
+        let Some(&set) = control_sets.get(&pair.ff) else {
+            return Err(PackingError::CarryFfPacking {
+                cell: ff_name,
+                reason: "requested carry-result FF has no control-set record".into(),
+            });
+        };
+        let tile = (location.chain, location.pair / 4);
+        let tile_class = (set.tile_clock, set.tile_lsr);
+        if tile_classes
+            .insert(tile, tile_class)
+            .is_some_and(|old| old != tile_class)
+        {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: lut_name,
+                ff: ff_name,
+                reason: "requested carry FF conflicts with the tile CLK/LSR control set".into(),
+            });
+        }
+        let slice = (location.chain, location.pair / 4, location.pair % 4);
+        if slice_classes
+            .insert(slice, set.slice_ce)
+            .is_some_and(|old| old != set.slice_ce)
+        {
+            return Err(PackingError::InvalidLutFfPair {
+                lut: lut_name,
+                ff: ff_name,
+                reason: "requested carry FF conflicts with the slice CE control set".into(),
+            });
+        }
+        selected.push(SelectedCarryLutFf { location, pair });
+    }
+    selected.sort_unstable_by_key(|selected| (selected.location, selected.pair.ff));
+    Ok(selected)
+}
+
 /// Selects nets with at least `minimum_clock_sinks` recognized clock pins.
 ///
-/// A zero threshold is treated as one. Register `CLK` and block-RAM
-/// `CLKA`/`CLKB` pins are recognized. At most 16 nets are returned, choosing
+/// A zero threshold is treated as one. Register `CLK`, block-RAM `CLKA`/`CLKB`,
+/// and PLL `CLKI` pins are recognized. At most 16 nets are returned, choosing
 /// the highest fanout first with stable net-ID tie breaking; the returned set
 /// itself is ordered by net ID.
 #[must_use]
@@ -2515,6 +3278,7 @@ fn is_clock_sink(design: &Design, pin: CellPinId) -> bool {
     let kind = design.cells()[pin.cell.0].kind;
     (kind == ResourceKind::Register && pin.name == "CLK")
         || (kind == ResourceKind::Memory && matches!(pin.name.as_str(), "CLKA" | "CLKB"))
+        || (kind == ResourceKind::Logic && pin.name == "CLKI")
 }
 
 fn compatible_dcca_bels(architecture: &Ecp5Architecture) -> Vec<BelId> {
@@ -2642,7 +3406,7 @@ pub fn pack_lut_ffs_excluding(
         constraints,
         wide_lut_clusters: None,
         carry_pairs: Vec::new(),
-        carry_pairs_packed: false,
+        carry_state: CarryPackingState::Unpacked,
         lut_ff_pairs,
         general_routing_ffs,
         block_rams: Vec::new(),
@@ -2806,7 +3570,7 @@ pub fn pack_lut_ffs_with_pairs(
         constraints,
         wide_lut_clusters: None,
         carry_pairs: Vec::new(),
-        carry_pairs_packed: false,
+        carry_state: CarryPackingState::Unpacked,
         lut_ff_pairs,
         general_routing_ffs,
         block_rams: Vec::new(),
@@ -2923,6 +3687,10 @@ pub enum PackingError {
     },
     /// Carry-pair packing was invoked more than once.
     CarryPairsAlreadyPacked,
+    /// Carry-result FF packing was requested before the carry macros existed.
+    CarryPairsNotPacked,
+    /// Carry-result FF packing was invoked more than once.
+    CarryLutFfsAlreadyPacked,
     /// A carry requirement referenced an unknown cell.
     UnknownCarryCell(CellId),
     /// A carry requirement referenced a cell without the carry pin surface.
@@ -2946,6 +3714,13 @@ pub enum PackingError {
     MissingCarrySlicePair {
         /// First logical slice name.
         cell: String,
+    },
+    /// A carry macro could not be extended with dedicated-path FFs.
+    CarryFfPacking {
+        /// Logical cell associated with the failure.
+        cell: String,
+        /// Structural or control-set reason.
+        reason: String,
     },
     /// A placed carry slice cannot be routed using legal LUT input permutations.
     CarryRouting {
@@ -3116,6 +3891,12 @@ impl fmt::Display for PackingError {
                 "{size}-LUT cluster beginning at `{cell}` has no compatible PFUMX/L6MUX21 BEL sequence"
             ),
             Self::CarryPairsAlreadyPacked => write!(f, "carry pairs were already packed"),
+            Self::CarryPairsNotPacked => {
+                write!(f, "carry-result FFs require carry pairs to be packed first")
+            }
+            Self::CarryLutFfsAlreadyPacked => {
+                write!(f, "carry-result FFs were already packed")
+            }
             Self::UnknownCarryCell(cell) => write!(f, "unknown carry cell ID {}", cell.0),
             Self::CellIsNotCarrySlice { cell } => {
                 write!(f, "cell `{cell}` does not expose an ECP5 carry slice")
@@ -3131,6 +3912,12 @@ impl fmt::Display for PackingError {
             }
             Self::MissingCarrySlicePair { cell } => {
                 write!(f, "carry slice `{cell}` has no compatible K0/K1 BEL pair")
+            }
+            Self::CarryFfPacking { cell, reason } => {
+                write!(
+                    f,
+                    "carry-result FF near `{cell}` cannot be packed: {reason}"
+                )
             }
             Self::CarryRouting { cell, reason } => {
                 write!(
@@ -3238,11 +4025,14 @@ impl Error for PackingError {
             | Self::InvalidWideLutStructure { .. }
             | Self::MissingWideLutCluster { .. }
             | Self::CarryPairsAlreadyPacked
+            | Self::CarryPairsNotPacked
+            | Self::CarryLutFfsAlreadyPacked
             | Self::UnknownCarryCell(_)
             | Self::CellIsNotCarrySlice { .. }
             | Self::DuplicateCarryCell { .. }
             | Self::InvalidCarryConnection { .. }
             | Self::MissingCarrySlicePair { .. }
+            | Self::CarryFfPacking { .. }
             | Self::CarryRouting { .. }
             | Self::UnknownBlockRamCell(_)
             | Self::CellIsNotBlockRam { .. }
@@ -3315,9 +4105,16 @@ pub fn write_architecture_cache(
 /// # Errors
 ///
 /// Returns an error for malformed binary data or an unsupported cache version.
-pub fn read_architecture_cache(reader: impl Read) -> Result<Ecp5Architecture, ImportError> {
-    let mut scratch = [0_u8; 16 * 1024];
-    let (cache, _) = postcard::from_io((reader, &mut scratch))?;
+pub fn read_architecture_cache(mut reader: impl Read) -> Result<Ecp5Architecture, ImportError> {
+    // Postcard's streaming flavor obtains each scalar byte through `Read`.
+    // An ECP5-85F cache contains hundreds of millions of scalar varints, so
+    // decoding one contiguous slice avoids that per-byte I/O dispatch. Drop
+    // the encoded input before validating or normalizing the decoded graph.
+    let cache = {
+        let mut encoded = Vec::new();
+        reader.read_to_end(&mut encoded)?;
+        postcard::from_bytes(&encoded)?
+    };
     let ArchitectureCache {
         version,
         mut architecture,
@@ -3426,13 +4223,13 @@ pub fn expand(file: ArchitectureFile) -> Result<Ecp5Architecture, ImportError> {
                 .map(|tile| metadata_strings.intern(&tile.name))
                 .transpose()?;
             debug_assert_eq!(id.0, pip_metadata.len());
-            pip_metadata.push(CompactPipMetadata {
-                fixed: pip.fixed,
-                tile_type: metadata_strings.intern(&pip.tile_type)?,
+            pip_metadata.push(CompactPipMetadata::new(
+                metadata_strings.intern(&pip.tile_type)?,
                 config_tile,
-                timing_class: metadata_strings.intern(&pip.timing_class)?,
-                lutperm_flags: pip.lutperm_flags,
-            });
+                metadata_strings.intern(&pip.timing_class)?,
+                pip.lutperm_flags,
+                pip.fixed,
+            )?);
         }
     }
 
@@ -3551,13 +4348,13 @@ fn add_global_clock_aliases(
     for (from, to) in aliases {
         let id = device.add_pip(from, to, false, 1)?;
         debug_assert_eq!(id.0, pip_metadata.len());
-        pip_metadata.push(CompactPipMetadata {
-            fixed: true,
+        pip_metadata.push(CompactPipMetadata::new(
             tile_type,
-            config_tile: None,
+            None,
             timing_class,
-            lutperm_flags: 0,
-        });
+            0,
+            true,
+        )?);
     }
     Ok(())
 }
@@ -3839,6 +4636,8 @@ fn qualified_name(x: u32, y: u32, local: &str) -> String {
 pub enum ImportError {
     /// JSON decoding failed.
     Json(serde_json::Error),
+    /// Reading a binary architecture cache failed.
+    Io(std::io::Error),
     /// Expanded binary cache encoding or decoding failed.
     Binary(postcard::Error),
     /// Generic target model construction failed.
@@ -3957,6 +4756,7 @@ impl fmt::Display for ImportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Json(error) => write!(f, "invalid architecture JSON: {error}"),
+            Self::Io(error) => write!(f, "cannot read architecture cache: {error}"),
             Self::Binary(error) => write!(f, "invalid architecture cache: {error}"),
             Self::Model(error) => write!(f, "invalid physical model: {error}"),
             Self::UnsupportedSchema(version) => {
@@ -4047,6 +4847,7 @@ impl Error for ImportError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Json(error) => Some(error),
+            Self::Io(error) => Some(error),
             Self::Binary(error) => Some(error),
             Self::Model(error) => Some(error),
             _ => None,
@@ -4057,6 +4858,12 @@ impl Error for ImportError {
 impl From<serde_json::Error> for ImportError {
     fn from(value: serde_json::Error) -> Self {
         Self::Json(value)
+    }
+}
+
+impl From<std::io::Error> for ImportError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
     }
 }
 
@@ -4074,7 +4881,7 @@ impl From<ModelError> for ImportError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::num::NonZeroU32;
 
     use struo_ir::{
@@ -4086,18 +4893,22 @@ mod tests {
         map_to_ecp5_with_constraints, map_to_ecp5_with_options,
     };
     use texo_model::{
-        BelId, CellId, Design, PinDirection, PipId, Point, ResourceKind, UnifiedGraph, WireId,
+        BelId, CellId, CellPinId, Design, NetId, PinDirection, PipId, Point, ResourceKind,
+        UnifiedGraph, WireId,
     };
     use texo_pnr::{
-        place_and_route_with_constraints, place_with_constraints, swap_placement_cells,
+        RoutingConstraints, place_analytically_with_net_sink_weights,
+        place_and_route_with_constraints, place_with_constraints, placement_from_partial_bindings,
+        refine_placement_with_net_weights, route_with_placement, swap_placement_cells,
     };
     use texo_struo::{PrimitiveMetadata, import_ecp5};
 
     use super::{
         ArchitectureFile, BlockRamRequirement, BlockedGlobalResources, CompactIncomingPips,
-        Ecp5Packing, GlobalClockRequirement, GlobalReverseSearch, ImportError, LogicalPort,
-        LutFfPair, PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, TileRecord,
-        expand, find_bel_pin, find_global_clock_requirements, logical_carry_chains,
+        CompactPipMetadata, Ecp5Packing, FfControlSet, ForwardRouteTargetDistances,
+        GlobalClockRequirement, GlobalReverseSearch, ImportError, LogicalPort, LutFfPair,
+        PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, SerializedCompactPipMetadata,
+        TileRecord, expand, find_bel_pin, find_global_clock_requirements, logical_carry_chains,
         minimum_injective_assignment, pack_lut_ffs, pack_lut_ffs_excluding,
         pack_lut_ffs_with_pairs, parse_lpf, read_architecture, read_architecture_cache,
         resolve_lpf_port_cells, resolve_lpf_ports, valid_wide_lut_cluster,
@@ -4105,6 +4916,241 @@ mod tests {
     };
 
     const FIXTURE: &str = include_str!("../fixtures/minimal-ecp5.json");
+
+    #[derive(Clone, Copy)]
+    struct TestCarryHalf {
+        cell: CellId,
+        fci: CellPinId,
+        f: CellPinId,
+        fco: CellPinId,
+    }
+
+    fn add_test_carry_half(design: &mut Design, name: impl Into<String>) -> TestCarryHalf {
+        let cell = design.add_cell(name, ResourceKind::Lut(4));
+        for name in ["A", "B", "C", "D"] {
+            design.add_pin(cell, name, PinDirection::Input).unwrap();
+        }
+        let fci = design.add_pin(cell, "FCI", PinDirection::Input).unwrap();
+        let f = design.add_pin(cell, "F", PinDirection::Output).unwrap();
+        let fco = design.add_pin(cell, "FCO", PinDirection::Output).unwrap();
+        TestCarryHalf { cell, fci, f, fco }
+    }
+
+    fn test_carry_chain(pair_count: usize) -> (Design, Vec<[CellId; 2]>, Vec<NetId>) {
+        let mut design = Design::new();
+        let halves = (0..pair_count)
+            .map(|pair| {
+                [
+                    add_test_carry_half(&mut design, format!("carry{pair}_0")),
+                    add_test_carry_half(&mut design, format!("carry{pair}_1")),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut nets = Vec::new();
+        for (pair, half) in halves.iter().enumerate() {
+            nets.push(
+                design
+                    .add_net(format!("carry{pair}_internal"), half[0].fco, [half[1].fci])
+                    .unwrap(),
+            );
+            if let Some(successor) = halves.get(pair + 1) {
+                nets.push(
+                    design
+                        .add_net(format!("carry{pair}_next"), half[1].fco, [successor[0].fci])
+                        .unwrap(),
+                );
+            }
+        }
+        let pairs = halves
+            .iter()
+            .map(|half| [half[0].cell, half[1].cell])
+            .collect();
+        (design, pairs, nets)
+    }
+
+    fn ensure_carry_ff_bels(architecture: &mut super::Ecp5Architecture) {
+        let slots = architecture
+            .device()
+            .bels_of_kind(ResourceKind::Lut(4))
+            .iter()
+            .copied()
+            .filter_map(|bel| {
+                let metadata = architecture.bel_metadata(bel);
+                (metadata.bel_type == "TRELLIS_COMB")
+                    .then(|| metadata.z.checked_add(1))
+                    .flatten()
+                    .map(|z| (architecture.device().bels()[bel.0].point, z))
+            })
+            .collect::<BTreeSet<_>>();
+        let mut existing = architecture
+            .device()
+            .bels_of_kind(ResourceKind::Register)
+            .iter()
+            .copied()
+            .map(|bel| {
+                (
+                    architecture.device().bels()[bel.0].point,
+                    architecture.bel_metadata(bel).z,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let ff_type = u32::try_from(
+            architecture
+                .metadata_strings
+                .iter()
+                .position(|value| value == "TRELLIS_FF")
+                .unwrap(),
+        )
+        .unwrap();
+        for (point, z) in slots {
+            if !existing.insert((point, z)) {
+                continue;
+            }
+            let bel = architecture
+                .device
+                .add_bel(
+                    format!("test_ff_x{}_y{}_z{z}", point.x, point.y),
+                    ResourceKind::Register,
+                    point,
+                )
+                .unwrap();
+            for (name, direction) in [
+                ("DI", PinDirection::Input),
+                ("M", PinDirection::Input),
+                ("CLK", PinDirection::Input),
+                ("LSR", PinDirection::Input),
+                ("CE", PinDirection::Input),
+                ("Q", PinDirection::Output),
+            ] {
+                let wire = architecture
+                    .device
+                    .add_wire(
+                        format!("test_ff_x{}_y{}_z{z}_{name}", point.x, point.y),
+                        point,
+                        1,
+                    )
+                    .unwrap();
+                architecture
+                    .device
+                    .add_bel_pin(bel, name, direction, wire)
+                    .unwrap();
+            }
+            architecture.bel_metadata.push(super::CompactBelMetadata {
+                bel_type: ff_type,
+                z,
+            });
+        }
+    }
+
+    fn carry_pair_with_ff_fanouts(
+        first_fanout: usize,
+        second_fanout: usize,
+    ) -> (Design, [CellId; 2], Vec<CellId>) {
+        let mut design = Design::new();
+        let halves = [
+            add_test_carry_half(&mut design, "carry0"),
+            add_test_carry_half(&mut design, "carry1"),
+        ];
+        let pair = [halves[0].cell, halves[1].cell];
+        design
+            .add_net("carry_internal", halves[0].fco, [halves[1].fci])
+            .unwrap();
+        let mut ffs = Vec::new();
+        for (half, fanout) in [first_fanout, second_fanout].into_iter().enumerate() {
+            let mut sinks = Vec::new();
+            for index in 0..fanout {
+                let ff = design.add_cell(format!("ff{half}_{index}"), ResourceKind::Register);
+                sinks.push(design.add_pin(ff, "DI", PinDirection::Input).unwrap());
+                for name in ["CLK", "CE", "LSR"] {
+                    design.add_pin(ff, name, PinDirection::Input).unwrap();
+                }
+                design.add_pin(ff, "Q", PinDirection::Output).unwrap();
+                ffs.push(ff);
+            }
+            if !sinks.is_empty() {
+                design
+                    .add_net(format!("carry_f{half}"), halves[half].f, sinks)
+                    .unwrap();
+            }
+        }
+        (design, pair, ffs)
+    }
+
+    fn add_carry_ff_route_fixture(architecture: &mut super::Ecp5Architecture) {
+        let zero = u32::try_from(
+            architecture
+                .metadata_strings
+                .iter()
+                .position(|value| value == "zero")
+                .unwrap(),
+        )
+        .unwrap();
+        let default = u32::try_from(
+            architecture
+                .metadata_strings
+                .iter()
+                .position(|value| value == "default")
+                .unwrap(),
+        )
+        .unwrap();
+        let plc2 = u32::try_from(
+            architecture
+                .metadata_strings
+                .iter()
+                .position(|value| value == "PLC2")
+                .unwrap(),
+        )
+        .unwrap();
+        let general = architecture
+            .device
+            .add_wire("test_carry_f_general", Point::new(0, 0), 1)
+            .unwrap();
+        let mut by_slot = BTreeMap::new();
+        for &bel in architecture.device().bels_of_kind(ResourceKind::Register) {
+            let metadata = architecture.bel_metadata(bel);
+            if metadata.bel_type == "TRELLIS_FF" {
+                by_slot.insert((architecture.device().bels()[bel.0].point, metadata.z), bel);
+            }
+        }
+        let carry_luts = architecture
+            .device()
+            .bels_of_kind(ResourceKind::Lut(4))
+            .iter()
+            .copied()
+            .filter(|&bel| architecture.bel_metadata(bel).z == 0)
+            .collect::<Vec<_>>();
+        for lut in carry_luts {
+            let point = architecture.device().bels()[lut.0].point;
+            let ff = by_slot[&(point, 1)];
+            let f = find_bel_pin(architecture.device(), lut, "F")
+                .map(|pin| architecture.device().bel_pins()[pin.0].wire)
+                .unwrap();
+            let di = find_bel_pin(architecture.device(), ff, "DI")
+                .map(|pin| architecture.device().bel_pins()[pin.0].wire)
+                .unwrap();
+            let pip = architecture.device.add_pip(f, di, false, 1).unwrap();
+            debug_assert_eq!(pip.0, architecture.pip_metadata.len());
+            architecture
+                .pip_metadata
+                .push(super::CompactPipMetadata::new(plc2, None, zero, 0, true).unwrap());
+
+            let pip = architecture.device.add_pip(f, general, false, 1).unwrap();
+            debug_assert_eq!(pip.0, architecture.pip_metadata.len());
+            architecture
+                .pip_metadata
+                .push(super::CompactPipMetadata::new(plc2, None, default, 0, false).unwrap());
+        }
+        for &ff in by_slot.values() {
+            let m = find_bel_pin(architecture.device(), ff, "M")
+                .map(|pin| architecture.device().bel_pins()[pin.0].wire)
+                .unwrap();
+            let pip = architecture.device.add_pip(general, m, false, 1).unwrap();
+            debug_assert_eq!(pip.0, architecture.pip_metadata.len());
+            architecture
+                .pip_metadata
+                .push(super::CompactPipMetadata::new(plc2, None, default, 0, false).unwrap());
+        }
+    }
 
     #[test]
     fn expands_deduplicated_locations_and_package_pins() {
@@ -4159,6 +5205,71 @@ mod tests {
         let decoded = read_architecture_cache(encoded.as_slice()).unwrap();
 
         assert_eq!(decoded, architecture);
+    }
+
+    #[test]
+    fn architecture_cache_read_preserves_io_errors() {
+        struct FailingReader;
+
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("cache read failed"))
+            }
+        }
+
+        let error = read_architecture_cache(FailingReader).unwrap_err();
+        assert!(matches!(
+            error,
+            ImportError::Io(error) if error.to_string() == "cache read failed"
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires TEXO_ECP5_85F_TXDB pointing to the full target-pack architecture"]
+    fn full_85f_slice_decode_matches_stream_decode() {
+        let path = std::env::var_os("TEXO_ECP5_85F_TXDB")
+            .expect("set TEXO_ECP5_85F_TXDB to architecture.txdb");
+        let mut scratch = [0_u8; 16 * 1024];
+        let (streamed, _) = postcard::from_io::<super::ArchitectureCache, _>((
+            std::io::BufReader::new(std::fs::File::open(&path).unwrap()),
+            &mut scratch,
+        ))
+        .unwrap();
+        assert_eq!(streamed.version, super::ARCHITECTURE_CACHE_VERSION);
+        let mut expected = streamed.architecture;
+        expected.device.compact_routing_graph().unwrap();
+
+        let decoded =
+            read_architecture_cache(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
+                .unwrap();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn compact_pip_metadata_preserves_the_cache_5_wire_format() {
+        let serialized = SerializedCompactPipMetadata {
+            tile_type: 12_345,
+            config_tile: Some(14_000),
+            timing_class: 14_001,
+            lutperm_flags: 0x403b,
+            fixed: true,
+        };
+        let compact = CompactPipMetadata::new(
+            serialized.tile_type,
+            serialized.config_tile,
+            serialized.timing_class,
+            serialized.lutperm_flags,
+            serialized.fixed,
+        )
+        .unwrap();
+
+        assert_eq!(std::mem::size_of::<CompactPipMetadata>(), 8);
+        let historical = postcard::to_stdvec(&serialized).unwrap();
+        assert_eq!(postcard::to_stdvec(&compact).unwrap(), historical);
+        assert_eq!(
+            postcard::from_bytes::<CompactPipMetadata>(&historical).unwrap(),
+            compact
+        );
     }
 
     #[test]
@@ -4682,6 +5793,7 @@ mod tests {
             let [first, second] = assignment.as_slice() else {
                 panic!("carry assignment must contain two BELs")
             };
+            assert_eq!(architecture.bel_metadata(*first).z, 0);
             assert_eq!(
                 architecture.device().bels()[first.0].point,
                 architecture.device().bels()[second.0].point
@@ -4694,21 +5806,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_malformed_or_reversed_split_ccu2c_pair_before_placement() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut disconnected = Design::new();
+        let first = add_test_carry_half(&mut disconnected, "first");
+        let second = add_test_carry_half(&mut disconnected, "second");
+        let mut packing = Ecp5Packing::default();
+
+        assert!(matches!(
+            packing.pack_carry_pairs(&disconnected, &architecture, [[first.cell, second.cell]],),
+            Err(PackingError::InvalidCarryConnection { .. })
+        ));
+        assert!(packing.carry_pairs().is_empty());
+        assert!(packing.constraints().groups().is_empty());
+
+        let (connected, pairs, _) = test_carry_chain(1);
+        assert!(matches!(
+            packing.pack_carry_pairs(&connected, &architecture, [[pairs[0][1], pairs[0][0]]],),
+            Err(PackingError::InvalidCarryConnection { .. })
+        ));
+        assert!(packing.carry_pairs().is_empty());
+        assert!(packing.constraints().groups().is_empty());
+    }
+
+    #[test]
     fn blocks_only_cross_half_lut_permutations_at_placed_carry_bels() {
         let mut architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
-        let mut design = Design::new();
-        let pair = [
-            design.add_cell("carry0", ResourceKind::Lut(4)),
-            design.add_cell("carry1", ResourceKind::Lut(4)),
-        ];
-        for &cell in &pair {
-            for name in ["A", "B", "C", "D", "FCI"] {
-                design.add_pin(cell, name, PinDirection::Input).unwrap();
-            }
-            for name in ["F", "FCO"] {
-                design.add_pin(cell, name, PinDirection::Output).unwrap();
-            }
-        }
+        let (design, pairs, _) = test_carry_chain(1);
+        let pair = pairs[0];
         let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
         packing
             .pack_carry_pairs(&design, &architecture, [pair])
@@ -4804,7 +5929,31 @@ mod tests {
             .find(|group| group.cells == cells)
             .unwrap();
         assert!(!group.assignments.is_empty());
+        let reference_origin = architecture.device().bels()[group.assignments[0][0].0].point;
+        let reference_offsets = group.assignments[0]
+            .iter()
+            .map(|&bel| {
+                let point = architecture.device().bels()[bel.0].point;
+                (
+                    i64::from(point.x) - i64::from(reference_origin.x),
+                    i64::from(point.y) - i64::from(reference_origin.y),
+                )
+            })
+            .collect::<Vec<_>>();
         for assignment in group.assignments.iter() {
+            assert_eq!(architecture.bel_metadata(assignment[0]).z, 0);
+            let origin = architecture.device().bels()[assignment[0].0].point;
+            let offsets = assignment
+                .iter()
+                .map(|&bel| {
+                    let point = architecture.device().bels()[bel.0].point;
+                    (
+                        i64::from(point.x) - i64::from(origin.x),
+                        i64::from(point.y) - i64::from(origin.y),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(offsets, reference_offsets);
             let first_fco = find_bel_pin(architecture.device(), assignment[1], "FCO").unwrap();
             let second_fci = find_bel_pin(architecture.device(), assignment[2], "FCI").unwrap();
             assert_eq!(
@@ -4812,6 +5961,537 @@ mod tests {
                 architecture.device().bel_pins()[second_fci.0].wire
             );
         }
+    }
+
+    #[test]
+    fn routes_a_complete_carry_chain_only_over_fixed_fco_fci_arcs() {
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let (design, pairs, carry_nets) = test_carry_chain(2);
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+        packing
+            .pack_carry_pairs(&design, &architecture, pairs)
+            .unwrap();
+
+        let result =
+            place_and_route_with_constraints(&design, architecture.device(), packing.constraints())
+                .unwrap();
+        let mut saw_carry_arc = false;
+        for net in carry_nets {
+            let route = result.routes.iter().find(|route| route.net == net).unwrap();
+            for arc in &route.arcs {
+                saw_carry_arc = true;
+                // Trellis may canonicalize a dedicated connection as one
+                // shared wire, in which case this path legitimately has no
+                // PIP. Any explicit PIP on the path must be a fixed zero-delay
+                // carry alias rather than general routing.
+                assert!(arc.pips.iter().all(|&pip| {
+                    let metadata = architecture.pip_metadata(pip);
+                    metadata.fixed && metadata.timing_class == "zero"
+                }));
+            }
+        }
+        assert!(saw_carry_arc);
+    }
+
+    #[test]
+    #[ignore = "requires TEXO_ECP5_85F_TXDB pointing to the full target-pack architecture"]
+    fn full_85f_carry_assignment_rows_are_one_translation_shape() {
+        let path = std::env::var_os("TEXO_ECP5_85F_TXDB")
+            .expect("set TEXO_ECP5_85F_TXDB to architecture.txdb");
+        let architecture =
+            read_architecture_cache(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
+                .unwrap();
+        assert_eq!(architecture.device().name(), "LFE5UM5G-85F");
+        let (design, pairs, _) = test_carry_chain(128);
+        let mut packing = Ecp5Packing::default();
+        packing
+            .pack_carry_pairs(&design, &architecture, pairs)
+            .unwrap();
+        let group = packing.constraints().groups().first().unwrap();
+        assert!(group.assignments.len() > 1_000);
+        let reference_origin = architecture.device().bels()[group.assignments[0][0].0].point;
+        let reference_offsets = group.assignments[0]
+            .iter()
+            .map(|&bel| {
+                let point = architecture.device().bels()[bel.0].point;
+                (
+                    i64::from(point.x) - i64::from(reference_origin.x),
+                    i64::from(point.y) - i64::from(reference_origin.y),
+                )
+            })
+            .collect::<Vec<_>>();
+        for assignment in group.assignments.iter() {
+            let origin = architecture.device().bels()[assignment[0].0].point;
+            let offsets = assignment
+                .iter()
+                .map(|&bel| {
+                    let point = architecture.device().bels()[bel.0].point;
+                    (
+                        i64::from(point.x) - i64::from(origin.x),
+                        i64::from(point.y) - i64::from(origin.y),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(offsets, reference_offsets);
+        }
+    }
+
+    #[test]
+    fn packs_maximum_compatible_carry_ffs_and_leaves_duplicate_fanout_routed() {
+        let mut architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        ensure_carry_ff_bels(&mut architecture);
+        let (design, pair, ffs) = carry_pair_with_ff_fanouts(2, 1);
+        let controls = ffs.iter().copied().map(|cell| FfControlSet {
+            cell,
+            slice_ce: 1,
+            tile_clock: 2,
+            tile_lsr: 3,
+        });
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+        packing
+            .pack_carry_pairs(&design, &architecture, [pair])
+            .unwrap();
+
+        packing
+            .pack_carry_lut_ffs(&design, &architecture, controls)
+            .unwrap();
+
+        assert_eq!(
+            packing.lut_ff_pairs(),
+            &[
+                LutFfPair {
+                    lut: pair[0],
+                    ff: ffs[0],
+                },
+                LutFfPair {
+                    lut: pair[1],
+                    ff: ffs[2],
+                },
+            ]
+        );
+        assert_eq!(packing.general_routing_ffs(), &[ffs[1]]);
+        let data_pins = ffs
+            .iter()
+            .map(|&ff| super::ff_data_pin(&design, ff).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            !packing
+                .constraints()
+                .pin_name_bindings()
+                .contains_key(&data_pins[0])
+        );
+        assert_eq!(
+            packing.constraints().pin_name_bindings()[&data_pins[1]],
+            "M"
+        );
+        assert!(
+            !packing
+                .constraints()
+                .pin_name_bindings()
+                .contains_key(&data_pins[2])
+        );
+        let group = packing
+            .constraints()
+            .groups()
+            .iter()
+            .find(|group| group.cells == [pair[0], pair[1], ffs[0], ffs[2]])
+            .unwrap();
+        for row in group.assignments.iter() {
+            assert_eq!(row.len(), 4);
+            for (lut_bel, ff_bel) in [(row[0], row[2]), (row[1], row[3])] {
+                assert_eq!(
+                    architecture.device().bels()[lut_bel.0].point,
+                    architecture.device().bels()[ff_bel.0].point
+                );
+                assert_eq!(
+                    architecture.bel_metadata(lut_bel).z + 1,
+                    architecture.bel_metadata(ff_bel).z
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eplace_legalization_and_detail_preserve_one_complete_carry_ff_row() {
+        let mut architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        ensure_carry_ff_bels(&mut architecture);
+        add_carry_ff_route_fixture(&mut architecture);
+        let (design, pair, ffs) = carry_pair_with_ff_fanouts(1, 0);
+        let controls = [FfControlSet {
+            cell: ffs[0],
+            slice_ce: 1,
+            tile_clock: 2,
+            tile_lsr: 3,
+        }];
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+        packing
+            .pack_carry_pairs(&design, &architecture, [pair])
+            .unwrap();
+        packing
+            .pack_carry_lut_ffs(&design, &architecture, controls)
+            .unwrap();
+        let group = packing
+            .constraints()
+            .groups()
+            .iter()
+            .find(|group| group.cells == [pair[0], pair[1], ffs[0]])
+            .unwrap();
+
+        let assert_complete_row = |placement: &texo_pnr::Placement| {
+            let assignment = group
+                .cells
+                .iter()
+                .map(|&cell| placement.bel(cell).unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                group.assignments.contains(&assignment),
+                "carry+FF placement must be one complete assignment row: {assignment:?}"
+            );
+        };
+        let legalized = place_analytically_with_net_sink_weights(
+            &design,
+            architecture.device(),
+            packing.constraints(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_complete_row(&legalized);
+
+        let weights = design
+            .nets()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| (NetId(index), 64))
+            .collect::<BTreeMap<_, _>>();
+        let detailed = refine_placement_with_net_weights(
+            &design,
+            architecture.device(),
+            packing.constraints(),
+            legalized,
+            &weights,
+        )
+        .unwrap();
+        assert_complete_row(&detailed);
+
+        let result = route_with_placement(
+            &design,
+            architecture.device(),
+            detailed,
+            &RoutingConstraints::new(),
+        )
+        .unwrap();
+        assert_complete_row(&result.placement);
+
+        let direct_pin = super::ff_data_pin(&design, ffs[0]).unwrap();
+        let source_pin = design.cells()[pair[0].0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|&pin| design.pins()[pin.0].name == "F")
+            .unwrap();
+        let direct_net = design.pins()[source_pin.0].net().unwrap();
+        let direct_route = result
+            .routes
+            .iter()
+            .find(|route| route.net == direct_net)
+            .unwrap()
+            .arc(direct_pin)
+            .unwrap();
+        assert_eq!(
+            direct_route.wires.last().copied(),
+            find_bel_pin(
+                architecture.device(),
+                result.placement.bel(ffs[0]).unwrap(),
+                "DI",
+            )
+            .map(|pin| architecture.device().bel_pins()[pin.0].wire)
+        );
+        assert!(!direct_route.pips.is_empty());
+        assert!(direct_route.pips.iter().all(|&pip| {
+            let metadata = architecture.pip_metadata(pip);
+            metadata.fixed && metadata.timing_class == "zero"
+        }));
+    }
+
+    #[test]
+    fn places_and_routes_dedicated_and_general_carry_fanouts_together() {
+        let mut architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        ensure_carry_ff_bels(&mut architecture);
+        add_carry_ff_route_fixture(&mut architecture);
+        let (design, pair, ffs) = carry_pair_with_ff_fanouts(2, 0);
+        let controls = ffs.iter().copied().map(|cell| FfControlSet {
+            cell,
+            slice_ce: 1,
+            tile_clock: 2,
+            tile_lsr: 3,
+        });
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+        packing
+            .pack_carry_pairs(&design, &architecture, [pair])
+            .unwrap();
+        packing
+            .pack_carry_lut_ffs(&design, &architecture, controls)
+            .unwrap();
+
+        assert_eq!(
+            packing.lut_ff_pairs(),
+            &[LutFfPair {
+                lut: pair[0],
+                ff: ffs[0],
+            }]
+        );
+        assert_eq!(packing.general_routing_ffs(), &[ffs[1]]);
+        let result =
+            place_and_route_with_constraints(&design, architecture.device(), packing.constraints())
+                .unwrap();
+        let direct_pin = super::ff_data_pin(&design, ffs[0]).unwrap();
+        let general_pin = super::ff_data_pin(&design, ffs[1]).unwrap();
+        let source_pin = design.cells()[pair[0].0]
+            .pins()
+            .iter()
+            .copied()
+            .find(|&pin| design.pins()[pin.0].name == "F")
+            .unwrap();
+        let net = design.pins()[source_pin.0].net().unwrap();
+        let route = result.routes.iter().find(|route| route.net == net).unwrap();
+        let direct = route.arc(direct_pin).unwrap();
+        let general = route.arc(general_pin).unwrap();
+
+        let lut_bel = result.placement.bel(pair[0]).unwrap();
+        let direct_ff_bel = result.placement.bel(ffs[0]).unwrap();
+        assert_eq!(
+            architecture.device().bels()[lut_bel.0].point,
+            architecture.device().bels()[direct_ff_bel.0].point
+        );
+        assert_eq!(
+            architecture.bel_metadata(lut_bel).z + 1,
+            architecture.bel_metadata(direct_ff_bel).z
+        );
+        assert_eq!(
+            direct.wires.last().copied(),
+            find_bel_pin(architecture.device(), direct_ff_bel, "DI")
+                .map(|pin| architecture.device().bel_pins()[pin.0].wire)
+        );
+        let general_ff_bel = result.placement.bel(ffs[1]).unwrap();
+        assert_eq!(
+            general.wires.last().copied(),
+            find_bel_pin(architecture.device(), general_ff_bel, "M")
+                .map(|pin| architecture.device().bel_pins()[pin.0].wire)
+        );
+        assert!(!direct.pips.is_empty());
+        assert!(direct.pips.iter().all(|&pip| {
+            let metadata = architecture.pip_metadata(pip);
+            metadata.fixed && metadata.timing_class == "zero"
+        }));
+        assert!(general.pips.iter().any(|&pip| {
+            let metadata = architecture.pip_metadata(pip);
+            !metadata.fixed && metadata.timing_class == "default"
+        }));
+    }
+
+    #[test]
+    fn carry_ff_selection_obeys_tile_clock_lsr_and_slice_ce_scopes() {
+        for controls in [
+            [(1, 10, 20), (1, 11, 20)],
+            [(1, 10, 20), (1, 10, 21)],
+            [(1, 10, 20), (2, 10, 20)],
+        ] {
+            let mut architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+            ensure_carry_ff_bels(&mut architecture);
+            let (design, pair, ffs) = carry_pair_with_ff_fanouts(1, 1);
+            let control_sets = ffs.iter().copied().zip(controls).map(
+                |(cell, (slice_ce, tile_clock, tile_lsr))| FfControlSet {
+                    cell,
+                    slice_ce,
+                    tile_clock,
+                    tile_lsr,
+                },
+            );
+            let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+            packing
+                .pack_carry_pairs(&design, &architecture, [pair])
+                .unwrap();
+
+            packing
+                .pack_carry_lut_ffs(&design, &architecture, control_sets)
+                .unwrap();
+
+            assert_eq!(packing.lut_ff_pairs().len(), 1);
+            assert_eq!(packing.lut_ff_pairs()[0].ff, ffs[0]);
+            assert_eq!(packing.general_routing_ffs(), &[ffs[1]]);
+        }
+    }
+
+    #[test]
+    fn rejects_explicit_incompatible_carry_ff_control_sets() {
+        let mut architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        ensure_carry_ff_bels(&mut architecture);
+        let (design, pair, ffs) = carry_pair_with_ff_fanouts(1, 1);
+        let controls = [
+            FfControlSet {
+                cell: ffs[0],
+                slice_ce: 1,
+                tile_clock: 2,
+                tile_lsr: 3,
+            },
+            FfControlSet {
+                cell: ffs[1],
+                slice_ce: 1,
+                tile_clock: 4,
+                tile_lsr: 3,
+            },
+        ];
+        let requested = [
+            LutFfPair {
+                lut: pair[0],
+                ff: ffs[0],
+            },
+            LutFfPair {
+                lut: pair[1],
+                ff: ffs[1],
+            },
+        ];
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+        packing
+            .pack_carry_pairs(&design, &architecture, [pair])
+            .unwrap();
+
+        assert!(matches!(
+            packing.pack_carry_lut_ffs_with_pairs(&design, &architecture, controls, requested,),
+            Err(PackingError::InvalidLutFfPair { .. })
+        ));
+        assert!(packing.lut_ff_pairs().is_empty());
+        assert_eq!(packing.general_routing_ffs(), ffs);
+    }
+
+    #[test]
+    fn ff_shared_resources_use_tile_clock_lsr_and_slice_ce_scopes() {
+        let mut architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        ensure_carry_ff_bels(&mut architecture);
+        let mut by_slot = BTreeMap::new();
+        for &bel in architecture.device().bels_of_kind(ResourceKind::Register) {
+            let metadata = architecture.bel_metadata(bel);
+            if metadata.bel_type == "TRELLIS_FF" {
+                by_slot.insert((architecture.device().bels()[bel.0].point, metadata.z), bel);
+            }
+        }
+        let point = by_slot.keys().find(|(_, z)| *z == 1).unwrap().0;
+        let same_slice = [by_slot[&(point, 1)], by_slot[&(point, 5)]];
+        let other_slice = by_slot[&(point, 9)];
+        let mut design = Design::new();
+        let cells = [
+            design.add_cell("first", ResourceKind::Register),
+            design.add_cell("second", ResourceKind::Register),
+        ];
+
+        let constraints_for = |sets: [FfControlSet; 2]| {
+            let mut packing = Ecp5Packing::default();
+            packing.constrain_ff_control_sets(&architecture, &sets);
+            packing
+        };
+        let bindings = BTreeMap::from([(cells[0], same_slice[0]), (cells[1], other_slice)]);
+        let incompatible_clock = constraints_for([
+            FfControlSet {
+                cell: cells[0],
+                slice_ce: 1,
+                tile_clock: 2,
+                tile_lsr: 3,
+            },
+            FfControlSet {
+                cell: cells[1],
+                slice_ce: 4,
+                tile_clock: 5,
+                tile_lsr: 3,
+            },
+        ]);
+        assert!(
+            placement_from_partial_bindings(
+                &design,
+                architecture.device(),
+                incompatible_clock.constraints(),
+                &bindings,
+            )
+            .is_err()
+        );
+
+        let compatible_other_slice = constraints_for([
+            FfControlSet {
+                cell: cells[0],
+                slice_ce: 1,
+                tile_clock: 2,
+                tile_lsr: 3,
+            },
+            FfControlSet {
+                cell: cells[1],
+                slice_ce: 4,
+                tile_clock: 2,
+                tile_lsr: 3,
+            },
+        ]);
+        assert!(
+            placement_from_partial_bindings(
+                &design,
+                architecture.device(),
+                compatible_other_slice.constraints(),
+                &bindings,
+            )
+            .is_ok()
+        );
+
+        let same_slice_bindings =
+            BTreeMap::from([(cells[0], same_slice[0]), (cells[1], same_slice[1])]);
+        assert!(
+            placement_from_partial_bindings(
+                &design,
+                architecture.device(),
+                compatible_other_slice.constraints(),
+                &same_slice_bindings,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn releasing_a_carry_ff_preserves_the_rigid_carry_group() {
+        let mut architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        ensure_carry_ff_bels(&mut architecture);
+        let (design, pair, ffs) = carry_pair_with_ff_fanouts(1, 1);
+        let controls = ffs.iter().copied().map(|cell| FfControlSet {
+            cell,
+            slice_ce: 1,
+            tile_clock: 2,
+            tile_lsr: 3,
+        });
+        let mut packing = pack_lut_ffs(&design, &architecture).unwrap();
+        packing
+            .pack_carry_pairs(&design, &architecture, [pair])
+            .unwrap();
+        packing
+            .pack_carry_lut_ffs(&design, &architecture, controls)
+            .unwrap();
+
+        packing
+            .release_lut_ff_pair(&design, pair[0], ffs[0])
+            .unwrap();
+
+        assert_eq!(
+            packing.lut_ff_pairs(),
+            &[LutFfPair {
+                lut: pair[1],
+                ff: ffs[1],
+            }]
+        );
+        assert_eq!(packing.general_routing_ffs(), &[ffs[0]]);
+        let group = packing
+            .constraints()
+            .groups()
+            .iter()
+            .find(|group| group.cells.contains(&pair[0]))
+            .unwrap();
+        assert_eq!(group.cells, [pair[0], pair[1], ffs[1]]);
+        assert!(group.assignments.iter().all(|row| row.len() == 3));
+        let released_di = super::ff_data_pin(&design, ffs[0]).unwrap();
+        assert_eq!(packing.constraints().pin_name_bindings()[&released_di], "M");
     }
 
     #[test]
@@ -5247,6 +6927,153 @@ mod tests {
             minimum_injective_assignment(&[vec![Some(1)], vec![Some(2)]]),
             None
         );
+    }
+
+    fn exhaustive_forward_target_distances(
+        device: &texo_model::Device,
+        source: WireId,
+        targets: &[WireId],
+    ) -> Vec<Option<usize>> {
+        let mut distances = vec![usize::MAX; device.wires().len()];
+        let mut queue = VecDeque::from([source]);
+        distances[source.0] = 0;
+        while let Some(wire) = queue.pop_front() {
+            let next_distance = distances[wire.0] + 1;
+            for (next, _) in device.routing_neighbors(wire).unwrap() {
+                if distances[next.0] == usize::MAX {
+                    distances[next.0] = next_distance;
+                    queue.push_back(next);
+                }
+            }
+        }
+        targets
+            .iter()
+            .map(|target| (distances[target.0] != usize::MAX).then_some(distances[target.0]))
+            .collect()
+    }
+
+    #[test]
+    fn bounded_target_distances_preserve_dcca_assignment() {
+        let mut device = texo_model::Device::new("dcca-costs", 1, 1).unwrap();
+        let point = Point::new(0, 0);
+        let source_a = device.add_wire("source-a", point, 1).unwrap();
+        let source_b = device.add_wire("source-b", point, 1).unwrap();
+        let target_a = device.add_wire("target-a", point, 1).unwrap();
+        let target_b = device.add_wire("target-b", point, 1).unwrap();
+        let target_c = device.add_wire("target-c", point, 1).unwrap();
+        let unreachable = device.add_wire("unreachable", point, 1).unwrap();
+        let a_to_b = device.add_wire("a-to-b", point, 1).unwrap();
+        let a_to_c_0 = device.add_wire("a-to-c-0", point, 1).unwrap();
+        let a_to_c_1 = device.add_wire("a-to-c-1", point, 1).unwrap();
+        let b_to_a_0 = device.add_wire("b-to-a-0", point, 1).unwrap();
+        let b_to_a_1 = device.add_wire("b-to-a-1", point, 1).unwrap();
+        let b_to_c = device.add_wire("b-to-c", point, 1).unwrap();
+        device.add_pip(source_a, target_a, false, 1).unwrap();
+        device.add_pip(source_a, a_to_b, false, 1).unwrap();
+        device.add_pip(a_to_b, target_b, false, 1).unwrap();
+        device.add_pip(source_a, a_to_c_0, false, 1).unwrap();
+        device.add_pip(a_to_c_0, a_to_c_1, false, 1).unwrap();
+        device.add_pip(a_to_c_1, target_c, false, 1).unwrap();
+        device.add_pip(source_b, b_to_a_0, false, 1).unwrap();
+        device.add_pip(b_to_a_0, b_to_a_1, false, 1).unwrap();
+        device.add_pip(b_to_a_1, target_a, false, 1).unwrap();
+        device.add_pip(source_b, target_b, false, 1).unwrap();
+        device.add_pip(source_b, b_to_c, false, 1).unwrap();
+        device.add_pip(b_to_c, target_c, false, 1).unwrap();
+        let targets = [target_a, target_b, target_c, unreachable];
+        let mut search = ForwardRouteTargetDistances::new(device.wires().len(), &targets);
+        let optimized = [source_a, source_b]
+            .into_iter()
+            .map(|source| search.distances(&device, source).0.to_vec())
+            .collect::<Vec<_>>();
+        let exhaustive = [source_a, source_b]
+            .into_iter()
+            .map(|source| exhaustive_forward_target_distances(&device, source, &targets))
+            .collect::<Vec<_>>();
+
+        assert_eq!(optimized, exhaustive);
+        assert_eq!(optimized[0], [Some(1), Some(2), Some(3), None]);
+        assert_eq!(optimized[1], [Some(3), Some(1), Some(2), None]);
+        assert_eq!(minimum_injective_assignment(&optimized), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn target_distance_search_stops_after_all_targets_and_reuses_scratch() {
+        let mut device = texo_model::Device::new("bounded-dcca-search", 1, 1).unwrap();
+        let point = Point::new(0, 0);
+        let source = device.add_wire("source", point, 1).unwrap();
+        let target = device.add_wire("target", point, 1).unwrap();
+        let tail = (0..32)
+            .map(|index| device.add_wire(format!("tail-{index}"), point, 1).unwrap())
+            .collect::<Vec<_>>();
+        device.add_pip(source, target, false, 1).unwrap();
+        device.add_pip(source, tail[0], false, 1).unwrap();
+        for pair in tail.windows(2) {
+            device.add_pip(pair[0], pair[1], false, 1).unwrap();
+        }
+        let mut search = ForwardRouteTargetDistances::new(device.wires().len(), &[target, target]);
+
+        let (distances, visited) = search.distances(&device, source);
+        assert_eq!(distances, [Some(1), Some(1)]);
+        assert_eq!(visited, 2);
+
+        let (distances, visited) = search.distances(&device, target);
+        assert_eq!(distances, [Some(0), Some(0)]);
+        assert_eq!(visited, 1);
+    }
+
+    #[test]
+    #[ignore = "release-only microbenchmark; run explicitly with --ignored --nocapture"]
+    fn benchmark_bounded_target_distances_against_exhaustive_search() {
+        const TAIL_LENGTH: u32 = 65_536;
+        let mut device = texo_model::Device::new("dcca-distance-benchmark", 1, 1).unwrap();
+        let point = Point::new(0, 0);
+        let source = device.add_wire("source", point, 1).unwrap();
+        let target = device.add_wire("target", point, 1).unwrap();
+        device.add_pip(source, target, false, 1).unwrap();
+        let mut previous_tail = None;
+        for index in 0..TAIL_LENGTH {
+            let wire = device.add_wire(format!("tail-{index}"), point, 1).unwrap();
+            if let Some(previous) = previous_tail {
+                device.add_pip(previous, wire, false, 1).unwrap();
+            } else {
+                device.add_pip(source, wire, false, 1).unwrap();
+            }
+            previous_tail = Some(wire);
+        }
+
+        let exhaustive_iterations = 20_u32;
+        let exhaustive_started = std::time::Instant::now();
+        for _ in 0..exhaustive_iterations {
+            std::hint::black_box(exhaustive_forward_target_distances(
+                &device,
+                source,
+                &[target],
+            ));
+        }
+        let exhaustive_elapsed =
+            exhaustive_started.elapsed().as_secs_f64() / f64::from(exhaustive_iterations);
+
+        let mut search = ForwardRouteTargetDistances::new(device.wires().len(), &[target]);
+        let bounded_iterations = 10_000_u32;
+        let bounded_started = std::time::Instant::now();
+        for _ in 0..bounded_iterations {
+            std::hint::black_box(search.distances(&device, source));
+        }
+        let bounded_elapsed =
+            bounded_started.elapsed().as_secs_f64() / f64::from(bounded_iterations);
+        let (distances, visited) = search.distances(&device, source);
+
+        eprintln!(
+            "DCCA target distance wires={} exhaustive_ms={:.3} bounded_us={:.3} speedup={:.2}x",
+            device.wires().len(),
+            exhaustive_elapsed * 1.0e3,
+            bounded_elapsed * 1.0e6,
+            exhaustive_elapsed / bounded_elapsed,
+        );
+        assert_eq!(distances, [Some(1)]);
+        assert_eq!(visited, 2);
+        assert!(bounded_elapsed < exhaustive_elapsed);
     }
 
     #[test]

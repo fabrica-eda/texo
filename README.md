@@ -62,9 +62,12 @@ cargo fmt --all -- --check
 `texo pnr` accepts a project directory or `Veryl.toml`. It follows
 `[build].sources`, resolves the standard library and local/Git dependencies
 through `Veryl.lock`, analyzes all compilation units together, and uses
-`[synth].top` unless `--top` overrides it. Run `texo pnr --help` for
-synthesis-goal, placement-weight, unconstrained-IO, global-clock, and
-timing-closure controls. Without `--output`, project checkpoints go to
+`[synth].top` unless `--top` overrides it. Timing-driven ECP5 placement uses
+directional routing-capacity/RUDY area adjustment and connection weight
+`1 + 10 * criticality^exponent`; the exponent defaults to 4 and remains
+configurable with `--placement-weight-exponent`. Run `texo pnr --help` for the
+other synthesis-goal, unconstrained-IO, global-clock, and timing-closure
+controls. Without `--output`, project checkpoints go to
 `target/texo/<top>.json`.
 
 ## PnR search model
@@ -148,8 +151,9 @@ provenance, and SHA-256 checksums. See
 [`docs/architecture-databases.md`](docs/architecture-databases.md) for the
 build, release, download, and verification procedure.
 
-The P&R checkpoint contains provenance, evidence, primitive configuration, absorbed constants,
-packing decisions, IO/clock constraints, placement, Wire/PIP routes, and the
+The P&R checkpoint contains provenance, evidence, primitive configuration,
+absorbed constants, packing decisions, IO/clock constraints, the effective
+initial-placement/weight/routability model, placement, Wire/PIP routes, and the
 post-route timing report.
 
 Render any such checkpoint as a self-contained interactive physical-design

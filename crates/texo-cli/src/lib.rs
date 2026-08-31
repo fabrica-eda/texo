@@ -12,7 +12,7 @@ pub use bitgen::{
     bitgen,
 };
 pub use bitstream::{BitgenError, NativeEcp5Config, generate_ecp5_config};
-pub use checkpoint::ecp5_checkpoint;
+pub use checkpoint::{Ecp5CheckpointRef, ecp5_checkpoint, ecp5_checkpoint_ref};
 pub use target_pack::{
     Ecp5TargetPack, TargetPackError, install_ecp5_target_pack, resolve_ecp5_target,
     target_cache_root,

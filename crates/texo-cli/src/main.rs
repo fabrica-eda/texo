@@ -13,11 +13,12 @@ use clap::{Args, Parser, Subcommand};
 use struo_synth::synthesize;
 use struo_target_ecp5::{
     ECP5_QOR_TARGET_MHZ, Ecp5Netlist, JtaggBinding, MappingOptions, OpenDrainIo, PllBinding,
-    map_to_ecp5_with_options,
+    RegisterEnableFanoutConstraint, map_to_ecp5_with_options,
 };
 use texo_cli::{
-    Ecp5BitgenOptions, Ecp5BitgenPaths, Ecp5BitgenRuntime, VerylProject, bitgen, ecp5_checkpoint,
-    install_ecp5_target_pack, load_veryl_project, resolve_ecp5_target, write_checkpoint_visualizer,
+    Ecp5BitgenOptions, Ecp5BitgenPaths, Ecp5BitgenRuntime, VerylProject, bitgen,
+    ecp5_checkpoint_ref, install_ecp5_target_pack, load_veryl_project, resolve_ecp5_target,
+    write_checkpoint_visualizer,
 };
 use texo_flow::{
     Ecp5FlowOptions, Ecp5FlowResult, Ecp5FlowStage, Evidence, Gate, PostMapSimulationPolicy,
@@ -151,8 +152,8 @@ struct PnrArgs {
     /// Mapping/retiming optimization target in MHz.
     #[arg(long, default_value_t = default_synthesis_goal())]
     synthesis_goal_mhz: NonZeroU32,
-    /// Sharpen timing-driven placement criticality weights.
-    #[arg(long, default_value = "1")]
+    /// Exponent in the ECP5 placement weight 1+10*criticality^exponent.
+    #[arg(long, default_value = "4")]
     placement_weight_exponent: NonZeroU32,
     /// Permit top-level IO bits without an LPF location.
     #[arg(long)]
@@ -160,6 +161,13 @@ struct PnrArgs {
     /// Override automatic global-clock promotion fanout.
     #[arg(long)]
     global_clock_fanout: Option<usize>,
+    /// Limit CE fanout for mapped FF cells matching CELL (`*`/`?`; repeatable).
+    #[arg(
+        long,
+        value_name = "CELL=LIMIT",
+        value_parser = parse_register_enable_fanout
+    )]
+    register_enable_fanout: Vec<RegisterEnableFanoutConstraint>,
     /// Keep the initial legal placement and route without timing closure.
     #[arg(long)]
     no_timing_optimization: bool,
@@ -190,6 +198,22 @@ fn parse_open_drain(value: &str) -> Result<OpenDrainIo, String> {
         return Err("expected PIN:INPUT:DRIVE_LOW".into());
     }
     Ok(OpenDrainIo::new(pin, input, drive_low))
+}
+
+fn parse_register_enable_fanout(value: &str) -> Result<RegisterEnableFanoutConstraint, String> {
+    let (cell, limit) = value
+        .rsplit_once('=')
+        .ok_or_else(|| "expected CELL=LIMIT".to_owned())?;
+    if cell.is_empty() {
+        return Err("mapped FF cell pattern must not be empty".into());
+    }
+    let max_fanout = limit
+        .parse::<usize>()
+        .map_err(|_| "register-enable fanout limit must be a positive integer".to_owned())?;
+    if max_fanout == 0 {
+        return Err("register-enable fanout limit must be greater than zero".into());
+    }
+    Ok(RegisterEnableFanoutConstraint::new(cell, max_fanout))
 }
 
 fn bind_target_primitives(mapped: &mut Ecp5Netlist, args: &PnrArgs) -> Result<(), Box<dyn Error>> {
@@ -333,6 +357,14 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         },
     )?;
     bind_target_primitives(&mut mapped, args)?;
+    let enable_report =
+        mapped.apply_register_enable_fanout_constraints(&args.register_enable_fanout)?;
+    if enable_report.matched_registers != 0 {
+        println!(
+            "register-enable fanout constraints: {} FFs rewired onto {} branches",
+            enable_report.rewired_registers, enable_report.inserted_branches
+        );
+    }
     if !mapped.retiming().equivalence_signed_off {
         return Err("Struo mapping/retiming equivalence sign-off failed".into());
     }
@@ -460,7 +492,7 @@ fn write_checkpoint(
     {
         std::fs::create_dir_all(parent)?;
     }
-    let checkpoint = ecp5_checkpoint(design_name, result, architecture, package, evidence);
+    let checkpoint = ecp5_checkpoint_ref(design_name, result, architecture, package, evidence);
     let mut writer = BufWriter::new(File::create(output)?);
     serde_json::to_writer_pretty(&mut writer, &checkpoint)?;
     writer.write_all(b"\n")?;
@@ -744,6 +776,7 @@ mod tests {
         };
         assert_eq!(args.input, Path::new("project"));
         assert_eq!(args.top, None);
+        assert_eq!(args.placement_weight_exponent.get(), 4);
     }
 
     #[test]

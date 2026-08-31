@@ -16,7 +16,7 @@ use struo_example_axi4_smartconnect::{AXI4_CROSSBAR_SOURCE, axi4_crossbar_self_t
 use struo_ir::Netlist;
 use struo_synth::synthesize;
 use struo_target_ecp5::{Ecp5Cell, Ecp5Netlist, map_to_ecp5};
-use texo_cli::{ecp5_checkpoint, write_checkpoint_visualizer};
+use texo_cli::{ecp5_checkpoint_ref, write_checkpoint_visualizer};
 use texo_flow::{
     Ecp5FlowOptions, Ecp5FlowResult, Ecp5FlowStage, Evidence, Gate, RoutingProgress, implement,
     implement_struo_ecp5_with_progress, verify_post_map_with_celox,
@@ -66,7 +66,7 @@ fn parse_weight_exponent(args: &mut impl Iterator<Item = String>) -> Result<u32,
             format!("axi4-pnr placement weight exponent must be a positive integer\n\n{USAGE}")
                 .into()
         }),
-        None => Ok(1),
+        None => Ok(4),
     }
 }
 
@@ -501,7 +501,7 @@ fn ecp5_demo(
     }
 
     if let Some(path) = checkpoint_path {
-        let checkpoint = ecp5_checkpoint("xor", &result, &architecture, package, &evidence);
+        let checkpoint = ecp5_checkpoint_ref("xor", &result, &architecture, package, &evidence);
         let destination = File::create(path)?;
         serde_json::to_writer_pretty(destination, &checkpoint)?;
         println!("checkpoint: {path}");
@@ -654,7 +654,7 @@ fn axi4_pnr_with_initial_placement(
     }
     report_critical_setup_edges(&result, imported.design(), architecture.device());
     if let Some(path) = checkpoint_path {
-        let checkpoint = ecp5_checkpoint(
+        let checkpoint = ecp5_checkpoint_ref(
             "axi4-crossbar-self-test",
             &result,
             &architecture,
@@ -734,13 +734,6 @@ fn read_nextpnr_placement(path: &str) -> Result<NextpnrPlacement, Box<dyn Error>
             let nextpnr_lut = comb_by_bel.get(local_lut_bel.as_str()).ok_or_else(|| {
                 format!("paired nextpnr FF `{nextpnr_name}` has no LUT at `{local_lut_bel}`")
             })?;
-            if nextpnr_lut.contains("$CCU2_COMB") {
-                // Texo's carry chain group currently has no third column for
-                // the colocated FF. Keep this small subset on general routing;
-                // the external BEL remains exact, so the placement comparison
-                // is still valid while the reported timing is conservative.
-                continue;
-            }
             let texo_lut = nextpnr_cell_to_texo(nextpnr_lut, "TRELLIS_COMB")?;
             if lut_ff_pairs
                 .insert(texo_lut.clone(), texo_name.clone())
@@ -1011,12 +1004,13 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
 
-    use serde_json::Value;
+    use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use struo_example_axi4_smartconnect::axi4_crossbar_self_test;
     use struo_synth::synthesize;
     use struo_target_ecp5::map_to_ecp5;
 
-    use super::{ecp5_cell_name, ecp5_demo, lossless_nextpnr_json};
+    use super::{ecp5_cell_name, ecp5_demo, lossless_nextpnr_json, read_nextpnr_placement};
 
     const ARCHITECTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1043,9 +1037,30 @@ mod tests {
         let checkpoint: Value = serde_json::from_slice(&first_bytes).unwrap();
 
         assert_eq!(first_bytes, second_bytes);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&first_bytes)),
+            "a148a6aabbdeaa925409bd8f768a1e534f5847056b6dd660606b31be8456bb53"
+        );
         assert_eq!(checkpoint["schema_version"], 3);
         assert_eq!(checkpoint["target"]["package"], "CABGA381");
         assert_eq!(checkpoint["target"]["speed_grade"], "6");
+        assert_eq!(checkpoint["target"]["placement_weight_exponent"], 4);
+        assert_eq!(
+            checkpoint["target"]["placement_model"]["initial_algorithm"],
+            "ecp5_timing_routability_electrostatic_v1"
+        );
+        assert_eq!(
+            checkpoint["target"]["placement_model"]["timing_weight_model"],
+            "ecp5_1_plus_10_criticality_power_v1"
+        );
+        assert_eq!(
+            checkpoint["target"]["placement_model"]["routability_model"],
+            "directional_rudy_area_adjustment_v1"
+        );
+        assert_eq!(
+            checkpoint["target"]["placement_model"]["initial_predicted_detail"],
+            false
+        );
         assert_eq!(checkpoint["metrics"]["cells"], 4);
         assert_eq!(checkpoint["metrics"]["routed_nets"], 3);
         assert_eq!(checkpoint["placement"].as_array().unwrap().len(), 4);
@@ -1116,5 +1131,60 @@ mod tests {
             .unwrap();
         assert_eq!(cells.len(), mapped.cells().len());
         assert!(cells.keys().all(|name| !name.contains("$texo_duplicate")));
+    }
+
+    #[test]
+    fn nextpnr_import_preserves_dedicated_carry_lut_ff_pairs() {
+        let path = std::env::temp_dir().join(format!(
+            "texo-nextpnr-carry-pairs-{}.json",
+            std::process::id()
+        ));
+        let document = json!({
+            "modules": {
+                "top": {
+                    "cells": {
+                        "sum$CCU2_COMB0": {
+                            "type": "TRELLIS_COMB",
+                            "attributes": {"NEXTPNR_BEL": "X3/Y4/SLICEA.K0"},
+                            "parameters": {}
+                        },
+                        "sum$CCU2_COMB1": {
+                            "type": "TRELLIS_COMB",
+                            "attributes": {"NEXTPNR_BEL": "X3/Y4/SLICEA.K1"},
+                            "parameters": {}
+                        },
+                        "sum_low": {
+                            "type": "TRELLIS_FF",
+                            "attributes": {"NEXTPNR_BEL": "X3/Y4/SLICEA.FF0"},
+                            "parameters": {"SD": "1"}
+                        },
+                        "sum_high": {
+                            "type": "TRELLIS_FF",
+                            "attributes": {"NEXTPNR_BEL": "X3/Y4/SLICEA.FF1"},
+                            "parameters": {"SD": "1"}
+                        }
+                    }
+                }
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        let placement = read_nextpnr_placement(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            placement.lut_ff_pairs,
+            [
+                ("sum$slice0".into(), "sum_low".into()),
+                ("sum$slice1".into(), "sum_high".into()),
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(placement.bindings["sum$slice0"], "R4C3/SLICEA.K0");
+        assert_eq!(placement.bindings["sum$slice1"], "R4C3/SLICEA.K1");
+        assert_eq!(placement.bindings["sum_low"], "R4C3/SLICEA.FF0");
+        assert_eq!(placement.bindings["sum_high"], "R4C3/SLICEA.FF1");
+
+        fs::remove_file(path).unwrap();
     }
 }
