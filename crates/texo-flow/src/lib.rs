@@ -641,7 +641,7 @@ pub fn implement_struo_ecp5_with_progress(
     }
     report_metric_phase("initial_route_and_timing", &mut phase_started);
     let (mut implementation, mut timing) = (initial_implementation, initial_timing);
-    let mut route_eco_worklist = WorstSetupRouteEcoWorklist::new(WORST_SETUP_ROUTE_ECO_LIMIT);
+    let mut route_eco_worklist = WorstSetupRouteEcoWorklist::default();
     if options.optimize_timing
         && timing.worst_slack_ps.is_some_and(|slack| slack < 0)
         && let Some(costs) = timing_routing_costs.as_mut()
@@ -721,13 +721,12 @@ pub fn implement_struo_ecp5_with_progress(
     if options.optimize_timing
         && placement_feedback_changed_implementation
         && timing.worst_slack_ps.is_some_and(|slack| slack < 0)
-        && route_eco_worklist.has_capacity()
         && let Some(costs) = timing_routing_costs.as_mut()
     {
         // Global placement and routing replaced the incumbent physical state,
         // so a previously tried net is no longer the same route candidate.
-        // Preserve the one flow-wide trial bound while allowing the remaining
-        // budget to inspect the new exact-WNS cone.
+        // Reopen every net because its route candidate now belongs to a new
+        // physical state, then exhaust the refreshed exact-WNS cone.
         route_eco_worklist.reset_attempted_after_global_change();
         let eco_routing = packing.global_routing_constraints_cached(
             &design,
@@ -2027,7 +2026,6 @@ fn scaled_binary_fraction(numerator: u128, denominator: u128, bits: u32) -> u64 
 
 type ViolationScore = (Reverse<u128>, Reverse<u128>, Reverse<u128>, Reverse<usize>);
 
-const WORST_SETUP_ROUTE_ECO_LIMIT: usize = 8;
 const WORST_SETUP_ROUTE_ECO_ESTIMATE_DELAY_PER_TILE_PS: u64 = 52;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2047,37 +2045,23 @@ struct WorstSetupNetRouteEcoAggregate {
     sinks: BTreeSet<CellPinId>,
 }
 
-/// Deterministic bounded scheduler for whole-net route ECO trials.
+/// Deterministic finite scheduler for whole-net route ECO trials.
 ///
-/// The trial limit is a wall-time bound: one work item can run one
-/// transactional route search followed by one exact STA pass. A rejected item
-/// must not be retried: a strict commit changes another net and the global
-/// timing objective, but leaves every rejected net's incumbent route
-/// unchanged. Retrying that unchanged net would consume the bounded search
-/// slot that should inspect a newly exposed member of the refreshed cone.
-#[derive(Debug)]
+/// A rejected item must not be retried: a strict commit changes another net
+/// and the global timing objective, but leaves every rejected net's incumbent
+/// route unchanged. Filtering attempted nets makes exhaustion of the finite
+/// design-net set the natural stop when no candidate closes setup.
+#[derive(Debug, Default)]
 struct WorstSetupRouteEcoWorklist {
-    trial_limit: usize,
     trials: usize,
     attempted: BTreeSet<NetId>,
 }
 
 impl WorstSetupRouteEcoWorklist {
-    fn new(trial_limit: usize) -> Self {
-        Self {
-            trial_limit,
-            trials: 0,
-            attempted: BTreeSet::new(),
-        }
-    }
-
     fn next(
         &mut self,
         candidates: impl IntoIterator<Item = WorstSetupNetRouteEcoCandidate>,
     ) -> Option<WorstSetupNetRouteEcoCandidate> {
-        if self.trials >= self.trial_limit {
-            return None;
-        }
         let candidate = candidates
             .into_iter()
             .find(|candidate| self.attempted.insert(candidate.net))?;
@@ -2089,20 +2073,12 @@ impl WorstSetupRouteEcoWorklist {
         self.trials
     }
 
-    fn trial_limit(&self) -> usize {
-        self.trial_limit
-    }
-
-    fn has_capacity(&self) -> bool {
-        self.trials < self.trial_limit
-    }
-
     fn reset_attempted_after_global_change(&mut self) {
         self.attempted.clear();
     }
 }
 
-/// Selects a bounded set of unique nets from the current worst setup cone.
+/// Selects every unique net from the current worst setup cone.
 ///
 /// `net_setup_slacks` is built from the same forward maximum arrivals and
 /// backward minimum required times as endpoint STA. A net edge whose slack is
@@ -2114,7 +2090,6 @@ fn worst_setup_net_route_eco_candidates(
     timing: &TimingReport,
     routes: &[Arc<NetRoute>],
     pip_delays_ps: &[u32],
-    limit: usize,
 ) -> Vec<WorstSetupNetRouteEcoCandidate> {
     let Some(worst_slack_ps) = timing.worst_slack_ps else {
         return Vec::new();
@@ -2190,7 +2165,6 @@ fn worst_setup_net_route_eco_candidates(
             candidate.net,
         )
     });
-    candidates.truncate(limit);
     candidates
 }
 
@@ -2673,8 +2647,8 @@ fn run_setup_feedback_fallback<State, Error>(
     }
 }
 
-/// Tries a bounded number of route ECOs, refreshing the exact worst setup cone
-/// after every strict commit and stopping immediately at setup closure.
+/// Tries route ECOs, refreshing the exact worst setup cone after every strict
+/// commit and stopping at setup closure or candidate exhaustion.
 ///
 /// A critical LUT releases all of its input nets as one small cohort so that a
 /// noncritical sibling cannot retain the fastest local permutation resource.
@@ -2683,8 +2657,9 @@ fn run_setup_feedback_fallback<State, Error>(
 /// immutable target topology remains fixed, and cohort nets are rebuilt in
 /// deterministic criticality order. This flow commits only after a complete
 /// ECP5 STA pass strictly improves the same staged timing objective used by
-/// placement feedback. The trial bound applies to candidate cohorts and caps
-/// the number of exact STA evaluations.
+/// placement feedback. Each net is attempted at most once for one unchanged
+/// physical state, so a nonclosing search terminates after exhausting the
+/// finite set of candidate nets.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn improve_worst_setup_net_route_ecos(
     design: &Design,
@@ -2712,7 +2687,6 @@ fn improve_worst_setup_net_route_ecos(
             timing,
             &implementation.routes,
             routing_costs.pip_delays_ps(),
-            WORST_SETUP_ROUTE_ECO_LIMIT,
         );
         let Some(candidate) = worklist.next(candidates) else {
             break;
@@ -2737,9 +2711,8 @@ fn improve_worst_setup_net_route_ecos(
         let Some(candidate_implementation) = candidate_implementation else {
             if metrics_enabled() {
                 eprintln!(
-                    "[metrics] worst_setup_net_route_eco candidate={}/{} net={} sink={} cohort_nets={} slack={} route_delay={} shared_prefix_delay={} worst_sinks={} fanout={} routed=false route_ms={:.3} sta_ms=0.000 accepted=false",
+                    "[metrics] worst_setup_net_route_eco candidate={} net={} sink={} cohort_nets={} slack={} route_delay={} shared_prefix_delay={} worst_sinks={} fanout={} routed=false route_ms={:.3} sta_ms=0.000 accepted=false",
                     ordinal,
-                    worklist.trial_limit(),
                     candidate.net.0,
                     candidate.sink.0,
                     cohort.len(),
@@ -2771,9 +2744,8 @@ fn improve_worst_setup_net_route_ecos(
         });
         if metrics_enabled() {
             eprintln!(
-                "[metrics] worst_setup_net_route_eco candidate={}/{} net={} sink={} cohort_nets={} slack={} route_delay={} shared_prefix_delay={} worst_sinks={} fanout={} routed=true route_ms={:.3} sta_ms={:.3} wns={:?} accepted={improves}",
+                "[metrics] worst_setup_net_route_eco candidate={} net={} sink={} cohort_nets={} slack={} route_delay={} shared_prefix_delay={} worst_sinks={} fanout={} routed=true route_ms={:.3} sta_ms={:.3} wns={:?} accepted={improves}",
                 ordinal,
-                worklist.trial_limit(),
                 candidate.net.0,
                 candidate.sink.0,
                 cohort.len(),
@@ -4824,7 +4796,7 @@ mod tests {
 
     #[test]
     fn worst_setup_route_eco_worklist_uses_refreshed_cone_order_after_commit() {
-        let mut worklist = WorstSetupRouteEcoWorklist::new(4);
+        let mut worklist = WorstSetupRouteEcoWorklist::default();
 
         assert_eq!(
             worklist
@@ -4851,7 +4823,7 @@ mod tests {
     #[test]
     fn worst_setup_route_eco_worklist_never_retries_an_unchanged_net() {
         let candidate = route_eco_candidate(1, 500);
-        let mut worklist = WorstSetupRouteEcoWorklist::new(4);
+        let mut worklist = WorstSetupRouteEcoWorklist::default();
 
         assert_eq!(worklist.next([candidate]), Some(candidate));
         assert_eq!(worklist.next([candidate]), None);
@@ -4859,26 +4831,32 @@ mod tests {
     }
 
     #[test]
-    fn worst_setup_route_eco_worklist_preserves_total_trial_bound_across_commits() {
-        let mut worklist = WorstSetupRouteEcoWorklist::new(2);
+    fn worst_setup_route_eco_worklist_stops_at_unique_candidate_exhaustion() {
+        let mut worklist = WorstSetupRouteEcoWorklist::default();
 
         assert!(worklist.next([route_eco_candidate(1, 500)]).is_some());
         assert!(worklist.next([route_eco_candidate(2, 400)]).is_some());
-        assert!(worklist.next([route_eco_candidate(3, 300)]).is_none());
+        assert!(
+            worklist
+                .next([route_eco_candidate(1, 600), route_eco_candidate(2, 300)])
+                .is_none()
+        );
         assert_eq!(worklist.trials(), 2);
     }
 
     #[test]
-    fn route_eco_retry_after_global_change_preserves_flow_wide_trial_bound() {
+    fn route_eco_retry_after_global_change_reopens_changed_candidates() {
         let candidate = route_eco_candidate(1, 500);
-        let mut worklist = WorstSetupRouteEcoWorklist::new(2);
+        let mut worklist = WorstSetupRouteEcoWorklist::default();
 
         assert_eq!(worklist.next([candidate]), Some(candidate));
         worklist.reset_attempted_after_global_change();
         assert_eq!(worklist.next([candidate]), Some(candidate));
-        assert!(!worklist.has_capacity());
-        assert_eq!(worklist.next([route_eco_candidate(2, 400)]), None);
-        assert_eq!(worklist.trials(), 2);
+        assert_eq!(
+            worklist.next([route_eco_candidate(2, 400)]),
+            Some(route_eco_candidate(2, 400))
+        );
+        assert_eq!(worklist.trials(), 3);
     }
 
     #[test]
@@ -4889,7 +4867,7 @@ mod tests {
             route_eco_candidate(3, 500),
             route_eco_candidate(4, 400),
         ];
-        let mut worklist = WorstSetupRouteEcoWorklist::new(4);
+        let mut worklist = WorstSetupRouteEcoWorklist::default();
 
         // Reject A, reject B, then accept C under exact STA.
         assert_eq!(worklist.next(candidates).unwrap().net, NetId(1));
@@ -4897,14 +4875,14 @@ mod tests {
         assert_eq!(worklist.next(candidates).unwrap().net, NetId(3));
 
         // Recomputing the exact-WNS cone can rank A first again, but A's
-        // incumbent route is unchanged.  The final bounded trial must inspect
-        // newly exposed D instead of retrying A.
+        // incumbent route is unchanged. The worklist must inspect newly
+        // exposed D instead of retrying A.
         let refreshed = [route_eco_candidate(1, 800), route_eco_candidate(4, 750)];
         assert_eq!(worklist.next(refreshed).unwrap().net, NetId(4));
     }
 
     #[test]
-    fn worst_setup_net_route_eco_selects_four_unique_largest_worst_cone_nets() {
+    fn worst_setup_net_route_eco_selects_every_unique_worst_cone_net() {
         let mut net_delays = Vec::new();
         let mut net_setup_slacks = Vec::new();
         let mut routes = Vec::new();
@@ -4980,8 +4958,8 @@ mod tests {
         };
 
         let pip_delays = [100, 600, 300, 500, 200, 400];
-        let candidates = worst_setup_net_route_eco_candidates(&timing, &routes, &pip_delays, 4);
-        assert_eq!(candidates.len(), 4);
+        let candidates = worst_setup_net_route_eco_candidates(&timing, &routes, &pip_delays);
+        assert_eq!(candidates.len(), 6);
         assert_eq!(
             candidates
                 .iter()
@@ -4997,6 +4975,8 @@ mod tests {
                 (NetId(3), 500, 0, 1),
                 (NetId(5), 400, 0, 1),
                 (NetId(2), 300, 0, 1),
+                (NetId(4), 200, 0, 1),
+                (NetId(0), 100, 0, 1),
             ]
         );
     }
