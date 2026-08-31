@@ -107,6 +107,7 @@ impl Eq for PlacementConstraints {}
 pub struct RoutingConstraints {
     routes: BTreeMap<NetId, Arc<NetRoute>>,
     blocked_pips: BTreeSet<PipId>,
+    blocked_pip_words: Option<Arc<Vec<u64>>>,
 }
 
 /// Characterized costs used by timing-driven negotiated routing.
@@ -260,6 +261,7 @@ impl RoutingConstraints {
         Self {
             routes: BTreeMap::new(),
             blocked_pips: BTreeSet::new(),
+            blocked_pip_words: None,
         }
     }
 
@@ -277,7 +279,22 @@ impl RoutingConstraints {
 
     /// Prevents the router from using target-defined illegal PIPs.
     pub fn block_pips(&mut self, pips: impl IntoIterator<Item = PipId>) {
-        self.blocked_pips.extend(pips);
+        let mut pips = pips.into_iter();
+        let Some(first) = pips.next() else {
+            return;
+        };
+        let words = Arc::make_mut(
+            self.blocked_pip_words
+                .get_or_insert_with(|| Arc::new(Vec::new())),
+        );
+        for pip in std::iter::once(first).chain(pips) {
+            self.blocked_pips.insert(pip);
+            let word = pip.0 / u64::BITS as usize;
+            if words.len() <= word {
+                words.resize(word + 1, 0);
+            }
+            words[word] |= 1_u64 << (pip.0 % u64::BITS as usize);
+        }
     }
 
     /// PIPs unavailable in this placement-specific routing problem.
@@ -285,6 +302,17 @@ impl RoutingConstraints {
     pub const fn blocked_pips(&self) -> &BTreeSet<PipId> {
         &self.blocked_pips
     }
+
+    fn blocked_pip_words(&self) -> &[u64] {
+        self.blocked_pip_words.as_deref().map_or(&[], Vec::as_slice)
+    }
+}
+
+fn pip_is_blocked(words: &[u64], pip: PipId) -> bool {
+    let word = pip.0 / u64::BITS as usize;
+    words
+        .get(word)
+        .is_some_and(|bits| bits & (1_u64 << (pip.0 % u64::BITS as usize)) != 0)
 }
 
 impl PlacementConstraints {
@@ -7257,7 +7285,7 @@ fn route(
                 net_id,
                 wire_congestion,
                 pip_congestion,
-                constraints.blocked_pips(),
+                constraints.blocked_pip_words(),
                 None,
                 None,
                 iteration == 0,
@@ -7719,7 +7747,7 @@ fn polish_legal_timing_routes(
             connection.net,
             wire_congestion,
             pip_congestion,
-            constraints.blocked_pips(),
+            constraints.blocked_pip_words(),
             Some(HardRoutingOccupancy {
                 wires: wire_occupancy,
                 pips: pip_occupancy,
@@ -8004,7 +8032,7 @@ pub fn legal_route_eco_candidate_with_workspace(
         connection.net,
         &workspace.wire_congestion,
         &workspace.pip_congestion,
-        routing_constraints.blocked_pips(),
+        routing_constraints.blocked_pip_words(),
         Some(HardRoutingOccupancy {
             wires: &workspace.wire_occupancy,
             pips: &workspace.pip_occupancy,
@@ -8240,7 +8268,7 @@ fn legal_nets_route_eco_candidate(
                 net_id,
                 &workspace.wire_congestion,
                 &workspace.pip_congestion,
-                routing_constraints.blocked_pips(),
+                routing_constraints.blocked_pip_words(),
                 Some(HardRoutingOccupancy {
                     wires: &workspace.wire_occupancy,
                     pips: &workspace.pip_occupancy,
@@ -9037,7 +9065,7 @@ fn route_net(
     net_id: NetId,
     wire_congestion: &[u32],
     pip_congestion: &[u32],
-    blocked_pips: &BTreeSet<PipId>,
+    blocked_pip_words: &[u64],
     hard_occupancy: Option<HardRoutingOccupancy<'_>>,
     mut hard_blockers: Option<&mut HardRoutingBlockers>,
     allow_alternate_source: bool,
@@ -9169,7 +9197,7 @@ fn route_net(
                 sink_wire,
                 wire_congestion,
                 pip_congestion,
-                blocked_pips,
+                blocked_pip_words,
                 hard_occupancy,
                 hard_blockers.as_deref_mut(),
                 costs,
@@ -9255,7 +9283,7 @@ fn route_net(
                     sink_wire,
                     wire_congestion,
                     pip_congestion,
-                    blocked_pips,
+                    blocked_pip_words,
                     hard_occupancy,
                     hard_blockers.as_deref_mut(),
                     Some(costs),
@@ -9559,7 +9587,7 @@ impl RouteSearch {
         goal: WireId,
         wire_congestion: &[u32],
         pip_congestion: &[u32],
-        blocked_pips: &BTreeSet<PipId>,
+        blocked_pip_words: &[u64],
         hard_occupancy: Option<HardRoutingOccupancy<'_>>,
         mut hard_blockers: Option<&mut HardRoutingBlockers>,
         costs: Option<&RoutingCosts>,
@@ -9576,7 +9604,7 @@ impl RouteSearch {
                 goal,
                 wire_congestion,
                 pip_congestion,
-                blocked_pips,
+                blocked_pip_words,
                 hard_occupancy,
                 hard_blockers.as_deref_mut(),
                 costs?,
@@ -9615,7 +9643,7 @@ impl RouteSearch {
                 goal,
                 wire_congestion,
                 pip_congestion,
-                blocked_pips,
+                blocked_pip_words,
                 hard_occupancy,
                 hard_blockers.as_deref_mut(),
                 costs,
@@ -9636,7 +9664,7 @@ impl RouteSearch {
             goal,
             wire_congestion,
             pip_congestion,
-            blocked_pips,
+            blocked_pip_words,
             hard_occupancy,
             hard_blockers,
             costs,
@@ -9658,7 +9686,7 @@ impl RouteSearch {
         goal: WireId,
         wire_congestion: &[u32],
         pip_congestion: &[u32],
-        blocked_pips: &BTreeSet<PipId>,
+        blocked_pip_words: &[u64],
         hard_occupancy: Option<HardRoutingOccupancy<'_>>,
         mut hard_blockers: Option<&mut HardRoutingBlockers>,
         costs: Option<&RoutingCosts>,
@@ -9754,7 +9782,7 @@ impl RouteSearch {
             }
 
             for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
-                if blocked_pips.contains(&pip) {
+                if pip_is_blocked(blocked_pip_words, pip) {
                     continue;
                 }
                 if self.start_mark[neighbor.0] == epoch {
@@ -9871,7 +9899,7 @@ fn shortest_hold_path(
     goal: WireId,
     wire_congestion: &[u32],
     pip_congestion: &[u32],
-    blocked_pips: &BTreeSet<PipId>,
+    blocked_pip_words: &[u64],
     hard_occupancy: Option<HardRoutingOccupancy<'_>>,
     mut hard_blockers: Option<&mut HardRoutingBlockers>,
     costs: &RoutingCosts,
@@ -9934,7 +9962,7 @@ fn shortest_hold_path(
         }
 
         for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
-            if blocked_pips.contains(&pip) {
+            if pip_is_blocked(blocked_pip_words, pip) {
                 continue;
             }
             if starts.contains(&neighbor) {
@@ -10301,7 +10329,7 @@ mod tests {
         legal_net_route_eco_candidate_with_workspace,
         legal_nets_route_eco_candidate_with_workspace, legal_route_eco_candidate_with_workspace,
         local_connection_projected_cost_from_starts, maximum_window_occupancy, nearest_rank,
-        ordered_sinks, place_analytically_with_net_sink_weights, place_and_route,
+        ordered_sinks, pip_is_blocked, place_analytically_with_net_sink_weights, place_and_route,
         place_with_constraints, placement_from_complete_bindings, placement_from_partial_bindings,
         placement_neighbors, polish_legal_timing_routes, prioritize_cycle_connections,
         projected_release_scope_penalty, projected_resource_penalty,
@@ -13497,7 +13525,7 @@ mod tests {
                 goal,
                 &[0; 3],
                 &[0; 2],
-                &BTreeSet::new(),
+                &[],
                 None,
                 None,
                 Some(&costs),
@@ -13576,7 +13604,7 @@ mod tests {
                 goal,
                 &vec![0; device.wires().len()],
                 &vec![0; device.pips().len()],
-                &BTreeSet::new(),
+                &[],
                 None,
                 None,
                 Some(&costs),
@@ -13639,7 +13667,7 @@ mod tests {
                 goal,
                 &[0; 4],
                 &[0; 3],
-                &BTreeSet::new(),
+                &[],
                 None,
                 None,
                 Some(&costs),
@@ -13708,7 +13736,7 @@ mod tests {
                 goal,
                 &[0; 4],
                 &[0; 4],
-                &BTreeSet::new(),
+                &[],
                 None,
                 None,
                 Some(&costs),
@@ -13738,6 +13766,33 @@ mod tests {
         let detour_last = device.add_pip(detour, goal, false, 1).unwrap();
         let graph = UnifiedGraph::new(&design, &device);
         let mut search = RouteSearch::new(device.wires().len());
+        let mut empty_constraints = RoutingConstraints::new();
+        empty_constraints.block_pips(std::iter::empty());
+        assert_eq!(empty_constraints, RoutingConstraints::new());
+        assert!(empty_constraints.blocked_pip_words.is_none());
+
+        let mut constraints = RoutingConstraints::new();
+        constraints.block_pips([blocked]);
+        let mut cloned_constraints = constraints.clone();
+        cloned_constraints.block_pips([detour_first]);
+        assert_eq!(
+            cloned_constraints.blocked_pips(),
+            &BTreeSet::from([blocked, detour_first])
+        );
+        assert!(pip_is_blocked(
+            cloned_constraints.blocked_pip_words(),
+            blocked
+        ));
+        assert!(pip_is_blocked(
+            cloned_constraints.blocked_pip_words(),
+            detour_first
+        ));
+        assert_eq!(constraints.blocked_pips(), &BTreeSet::from([blocked]));
+        assert!(pip_is_blocked(constraints.blocked_pip_words(), blocked));
+        assert!(!pip_is_blocked(
+            constraints.blocked_pip_words(),
+            detour_first
+        ));
         let wire_points = device
             .wires()
             .iter()
@@ -13767,7 +13822,7 @@ mod tests {
                 goal,
                 &[0; 4],
                 &[0; 4],
-                &BTreeSet::from([blocked]),
+                constraints.blocked_pip_words(),
                 None,
                 None,
                 None,
@@ -13826,7 +13881,7 @@ mod tests {
                 goal,
                 &[0; 4],
                 &[0; 4],
-                &BTreeSet::new(),
+                &[],
                 None,
                 None,
                 Some(&costs),
