@@ -6,7 +6,7 @@ use std::fmt::{self, Write as _};
 
 use serde_json::Value;
 use texo_model::Point;
-use texo_target_ecp5::Ecp5Architecture;
+use texo_target_ecp5::{ECP5_PLL_OUTPUT_DIVIDER_DEFAULT, Ecp5Architecture};
 
 const REQUIRED_IMPLEMENTATION_EVIDENCE: [&str; 4] = [
     "synthesis_equivalence",
@@ -351,6 +351,7 @@ pub fn generate_ecp5_config(
                 &mut config,
                 placement,
                 configuration,
+                &absorbed_inputs,
                 &routed_wires,
                 dedicated_ffs.contains(&cell_id),
             )?,
@@ -525,7 +526,7 @@ fn write_pll(
     }
     for output in ["CLKOP", "CLKOS", "CLKOS2", "CLKOS3"] {
         let divider = format!("{output}_DIV");
-        let value = pll_integer(parameters, &divider, 8)?;
+        let value = pll_integer(parameters, &divider, ECP5_PLL_OUTPUT_DIVIDER_DEFAULT)?;
         let encoded = value
             .checked_sub(1)
             .ok_or_else(|| BitgenError::new(format!("PLL {divider} must be greater than zero")))?;
@@ -844,20 +845,94 @@ fn permute_lut(
     Ok((permuted, used))
 }
 
+fn absorbed_ff_input(
+    absorbed_inputs: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<Option<bool>, BitgenError> {
+    absorbed_inputs
+        .get(name)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| BitgenError::new(format!("absorbed FF {name} is not a boolean")))
+        })
+        .transpose()
+}
+
+fn ff_ce_mux(
+    configuration: &Value,
+    absorbed_inputs: &serde_json::Map<String, Value>,
+) -> Result<&'static str, BitgenError> {
+    let enable = configuration
+        .get("enable")
+        .and_then(|value| (!value.is_null()).then_some(value))
+        .and_then(Value::as_str);
+    let enable_active_high = match enable {
+        None | Some("high") => true,
+        Some("low") => false,
+        Some(other) => {
+            return Err(BitgenError::new(format!(
+                "unsupported flip-flop enable level {other}"
+            )));
+        }
+    };
+    Ok(
+        if let Some(signal) = absorbed_ff_input(absorbed_inputs, "CE")? {
+            if signal == enable_active_high {
+                "1"
+            } else {
+                "0"
+            }
+        } else if enable.is_none() {
+            "1"
+        } else if enable_active_high {
+            "CE"
+        } else {
+            "INV"
+        },
+    )
+}
+
+fn effective_ff_reset<'a>(
+    configuration: &'a Value,
+    absorbed_inputs: &serde_json::Map<String, Value>,
+) -> Result<Option<&'a Value>, BitgenError> {
+    let configured_reset = configuration.get("reset").filter(|value| !value.is_null());
+    let absorbed_lsr = absorbed_ff_input(absorbed_inputs, "LSR")?;
+    let reset = if let (Some(reset), Some(signal)) = (configured_reset, absorbed_lsr) {
+        let active = string(reset, "active")?;
+        let asserted = match active {
+            "high" => signal,
+            "low" => !signal,
+            other => {
+                return Err(BitgenError::new(format!(
+                    "unsupported flip-flop reset level {other}"
+                )));
+            }
+        };
+        if asserted {
+            return Err(BitgenError::new(
+                "an asserted constant FF LSR cannot be absorbed",
+            ));
+        }
+        None
+    } else {
+        configured_reset
+    };
+    Ok(reset)
+}
+
 fn write_ff(
     config: &mut ChipConfig,
     placement: &Value,
     configuration: &Value,
+    absorbed_inputs: &serde_json::Map<String, Value>,
     routed_wires: &BTreeSet<String>,
     dedicated: bool,
 ) -> Result<(), BitgenError> {
     let tile = logic_tile(placement)?.to_owned();
     let (slice, lc) = slice_and_lc(placement)?;
-    let reset = configuration.get("reset").filter(|value| !value.is_null());
-    let enable = configuration
-        .get("enable")
-        .and_then(|value| (!value.is_null()).then_some(value))
-        .and_then(Value::as_str);
+    let reset = effective_ff_reset(configuration, absorbed_inputs)?;
     let target = config.tile_mut(&tile);
     target.add_enum(format!("{slice}.GSR"), "DISABLED");
     target.add_enum(
@@ -878,16 +953,7 @@ fn write_ff(
     target.add_enum(format!("{slice}.REG{lc}.LSRMODE"), "LSR");
     target.add_enum(
         format!("{slice}.CEMUX"),
-        match enable {
-            None => "1",
-            Some("high") => "CE",
-            Some("low") => "INV",
-            Some(other) => {
-                return Err(BitgenError::new(format!(
-                    "unsupported flip-flop enable level {other}"
-                )));
-            }
-        },
+        ff_ce_mux(configuration, absorbed_inputs)?,
     );
     let point = (usize_value(placement, "x")?, usize_value(placement, "y")?);
     if let Some(reset) = reset {
@@ -1575,7 +1641,7 @@ mod tests {
 
     use super::{
         ChipConfig, TileConfig, generate_ecp5_config, io_base_direction, reverse_bits,
-        trellis_wire_name, validate_checkpoint, write_bram, write_jtagg, write_pll,
+        trellis_wire_name, validate_checkpoint, write_bram, write_ff, write_jtagg, write_pll,
     };
 
     const ARCHITECTURE: &str = include_str!(concat!(
@@ -1611,6 +1677,194 @@ mod tests {
         config.tile_mut("R0C0:PLC2").add_enum("SLICEA.CEMUX", "1");
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("conflicting enum settings for SLICEA.CEMUX"));
+    }
+
+    #[test]
+    fn dedicated_lut_ff_data_path_sets_sd() {
+        let placement = json!({
+            "bel": "R0C0/SLICEA.FF0",
+            "bel_z": 1,
+            "x": 0,
+            "y": 0,
+            "configuration_tiles": [{"tile_type": "PLC2", "name": "R0C0:PLC2"}],
+        });
+        let configuration = json!({
+            "kind": "flip_flop",
+            "edge": "rising",
+            "enable": null,
+            "reset": null,
+        });
+        let mut config = ChipConfig::default();
+
+        write_ff(
+            &mut config,
+            &placement,
+            &configuration,
+            &serde_json::Map::new(),
+            &std::collections::BTreeSet::new(),
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            config.tiles["R0C0:PLC2"]
+                .enums
+                .contains(&("SLICEA.REG0.SD".into(), "1".into()))
+        );
+    }
+
+    #[test]
+    fn absorbed_ff_ce_selects_a_constant_mux_after_polarity() {
+        let placement = json!({
+            "bel": "R0C0/SLICEA.FF0",
+            "bel_z": 1,
+            "x": 0,
+            "y": 0,
+            "configuration_tiles": [{"tile_type": "PLC2", "name": "R0C0:PLC2"}],
+        });
+
+        for (enable, signal, expected) in [
+            ("high", true, "1"),
+            ("high", false, "0"),
+            ("low", false, "1"),
+            ("low", true, "0"),
+        ] {
+            let configuration = json!({
+                "kind": "flip_flop",
+                "edge": "rising",
+                "enable": enable,
+                "reset": null,
+            });
+            let absorbed = json!({"CE": signal});
+            let mut config = ChipConfig::default();
+
+            write_ff(
+                &mut config,
+                &placement,
+                &configuration,
+                absorbed.as_object().unwrap(),
+                &std::collections::BTreeSet::new(),
+                false,
+            )
+            .unwrap();
+
+            assert!(
+                config.tiles["R0C0:PLC2"]
+                    .enums
+                    .contains(&("SLICEA.CEMUX".into(), expected.into()))
+            );
+        }
+    }
+
+    #[test]
+    fn absorbed_inactive_ff_lsr_does_not_program_a_shared_reset_mux() {
+        let placement = json!({
+            "bel": "R0C0/SLICEA.FF0",
+            "bel_z": 1,
+            "x": 0,
+            "y": 0,
+            "configuration_tiles": [{"tile_type": "PLC2", "name": "R0C0:PLC2"}],
+        });
+        let configuration = json!({
+            "kind": "flip_flop",
+            "edge": "rising",
+            "enable": null,
+            "reset": {
+                "active": "low",
+                "asynchronous": true,
+                "value": true,
+            },
+        });
+        let absorbed = json!({"CE": true, "LSR": true});
+        let routed_wires = std::collections::BTreeSet::from(["R0C0/LSR0".into()]);
+        let mut config = ChipConfig::default();
+
+        write_ff(
+            &mut config,
+            &placement,
+            &configuration,
+            absorbed.as_object().unwrap(),
+            &routed_wires,
+            false,
+        )
+        .unwrap();
+
+        let enums = &config.tiles["R0C0:PLC2"].enums;
+        assert!(enums.contains(&("SLICEA.REG0.REGSET".into(), "RESET".into())));
+        assert!(!enums.iter().any(|(name, _)| name.starts_with("LSR0.")));
+    }
+
+    #[test]
+    fn rejects_an_asserted_absorbed_ff_lsr() {
+        let placement = json!({
+            "bel": "R0C0/SLICEA.FF0",
+            "bel_z": 1,
+            "x": 0,
+            "y": 0,
+            "configuration_tiles": [{"tile_type": "PLC2", "name": "R0C0:PLC2"}],
+        });
+        let configuration = json!({
+            "kind": "flip_flop",
+            "edge": "rising",
+            "enable": null,
+            "reset": {
+                "active": "high",
+                "asynchronous": false,
+                "value": false,
+            },
+        });
+        let absorbed = json!({"CE": true, "LSR": true});
+
+        let error = write_ff(
+            &mut ChipConfig::default(),
+            &placement,
+            &configuration,
+            absorbed.as_object().unwrap(),
+            &std::collections::BTreeSet::new(),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("asserted constant FF LSR"));
+    }
+
+    #[test]
+    fn routed_ff_controls_keep_their_signal_muxes() {
+        let placement = json!({
+            "bel": "R0C0/SLICEA.FF0",
+            "bel_z": 1,
+            "x": 0,
+            "y": 0,
+            "configuration_tiles": [{"tile_type": "PLC2", "name": "R0C0:PLC2"}],
+        });
+        let configuration = json!({
+            "kind": "flip_flop",
+            "edge": "rising",
+            "enable": "low",
+            "reset": {
+                "active": "low",
+                "asynchronous": true,
+                "value": true,
+            },
+        });
+        let routed_wires = std::collections::BTreeSet::from(["R0C0/LSR1".into()]);
+        let mut config = ChipConfig::default();
+
+        write_ff(
+            &mut config,
+            &placement,
+            &configuration,
+            &serde_json::Map::new(),
+            &routed_wires,
+            false,
+        )
+        .unwrap();
+
+        let enums = &config.tiles["R0C0:PLC2"].enums;
+        assert!(enums.contains(&("SLICEA.CEMUX".into(), "INV".into())));
+        assert!(enums.contains(&("LSR1.SRMODE".into(), "ASYNC".into())));
+        assert!(enums.contains(&("LSR1.LSRMUX".into(), "INV".into())));
+        assert!(enums.contains(&("SLICEA.REG0.REGSET".into(), "SET".into())));
     }
 
     #[test]
@@ -1722,6 +1976,10 @@ mod tests {
         assert!(pll.words.contains(&(
             "CLKOP_DIV".into(),
             vec![false, false, false, true, true, false, false]
+        )));
+        assert!(pll.words.contains(&(
+            "CLKOS2_DIV".into(),
+            vec![true, true, true, false, false, false, false]
         )));
         assert!(
             pll.words

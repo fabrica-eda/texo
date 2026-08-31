@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+libm.workspace = true
+rayon.workspace = true
+rustdct.workspace = true
 texo-model.workspace = true
 
 [lints]

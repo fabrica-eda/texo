@@ -1,14 +1,24 @@
 //! Stable JSON checkpoint serialization for implemented ECP5 designs.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
-use texo_flow::{Ecp5FlowResult, Evidence, Gate};
+use texo_flow::{
+    ECP5_PLACEMENT_ROUTABILITY_MODEL, ECP5_PLACEMENT_TIMING_WEIGHT_MODEL, Ecp5FlowResult,
+    Ecp5InitialPlacementAlgorithm, Evidence, Gate,
+};
 use texo_model::{BelId, Design, PinDirection, PipId, ResourceKind, WireId};
 use texo_struo::{ActiveLevel, ClockEdge, PortDirection, PrimitiveMetadata};
 use texo_target_ecp5::Ecp5Architecture;
 
 /// Builds the stable, schema-versioned JSON representation of one ECP5 run.
+///
+/// # Panics
+///
+/// Panics only if an in-memory checkpoint record cannot be represented by
+/// `serde_json::Value`.
 #[must_use]
 pub fn ecp5_checkpoint(
     design_name: &str,
@@ -17,38 +27,40 @@ pub fn ecp5_checkpoint(
     package: &str,
     evidence: &Evidence,
 ) -> Value {
-    let device = architecture.device();
-    json!({
-        "schema_version": 3,
-        "design": design_name,
-        "target": {
-            "family": "ECP5",
-            "device": device.name(),
-            "package": package,
-            "speed_grade": result.speed_grade,
-            "placement_weight_exponent": result.placement_weight_exponent,
-            "project_trellis_revision": architecture.provenance().project_trellis_revision,
-            "database_revision": architecture.provenance().database_revision,
-        },
-        "evidence": checkpoint_evidence(evidence),
-        "metrics": {
-            "cells": result.design.cells().len(),
-            "nets": result.design.nets().len(),
-            "routed_nets": result.implementation.routes.len(),
-            "total_pips": result.implementation.total_pips,
-        },
-        "primitive_metadata": result.primitive_metadata.iter().map(|(cell, metadata)| {
-            primitive_metadata_json(*cell, metadata, &result.design)
-        }).collect::<Vec<_>>(),
-        "absorbed_inputs": checkpoint_absorbed_inputs(result),
-        "packing": checkpoint_packing(result),
-        "placement": checkpoint_placement(result, architecture),
-        "routes": checkpoint_routes(result, architecture),
-        "timing": checkpoint_timing(result),
-    })
+    serde_json::to_value(ecp5_checkpoint_ref(
+        design_name,
+        result,
+        architecture,
+        package,
+        evidence,
+    ))
+    .expect("ECP5 checkpoint records are JSON-representable")
 }
 
-fn checkpoint_placement(result: &Ecp5FlowResult, architecture: &Ecp5Architecture) -> Vec<Value> {
+/// Borrowed schema-v3 checkpoint document that serializes without first
+/// materializing the complete JSON value tree.
+///
+/// The emitted JSON is semantically identical to [`ecp5_checkpoint`]. This
+/// form avoids cloning every architecture and design name and keeps only the
+/// small block-RAM CIB-tie index alive while the document is written.
+pub struct Ecp5CheckpointRef<'a> {
+    design_name: &'a str,
+    result: &'a Ecp5FlowResult,
+    architecture: &'a Ecp5Architecture,
+    package: &'a str,
+    evidence: &'a Evidence,
+    cib_ties: BTreeMap<WireId, Value>,
+}
+
+/// Builds a borrowed, streaming schema-v3 checkpoint document.
+#[must_use]
+pub fn ecp5_checkpoint_ref<'a>(
+    design_name: &'a str,
+    result: &'a Ecp5FlowResult,
+    architecture: &'a Ecp5Architecture,
+    package: &'a str,
+    evidence: &'a Evidence,
+) -> Ecp5CheckpointRef<'a> {
     let memory_bels = result
         .implementation
         .placement
@@ -58,54 +70,666 @@ fn checkpoint_placement(result: &Ecp5FlowResult, architecture: &Ecp5Architecture
         .filter_map(|(cell, bel)| {
             (result.design.cells()[cell].kind == ResourceKind::Memory).then_some(*bel)
         });
-    let cib_ties = cib_ties_for_bels(architecture, memory_bels);
-    result
-        .implementation
-        .placement
-        .bindings()
-        .iter()
-        .enumerate()
-        .map(|(cell_id, bel_id)| {
-            let cell = &result.design.cells()[cell_id];
-            let bel = &architecture.device().bels()[bel_id.0];
-            let metadata = architecture.bel_metadata(*bel_id);
-            let bel_pins = bel
-                .pins()
+    Ecp5CheckpointRef {
+        design_name,
+        result,
+        architecture,
+        package,
+        evidence,
+        cib_ties: cib_ties_for_bels(architecture, memory_bels),
+    }
+}
+
+fn checkpoint_placement_model(
+    algorithm: Ecp5InitialPlacementAlgorithm,
+    weight_exponent: u32,
+) -> Value {
+    let timing_driven = algorithm.is_timing_driven_routability();
+    json!({
+        "initial_algorithm": algorithm.checkpoint_name(),
+        "timing_weight_model": timing_driven.then_some(ECP5_PLACEMENT_TIMING_WEIGHT_MODEL),
+        "criticality_exponent": timing_driven.then_some(weight_exponent),
+        "routability_model": timing_driven.then_some(ECP5_PLACEMENT_ROUTABILITY_MODEL),
+        "initial_predicted_detail": false,
+    })
+}
+
+impl Serialize for Ecp5CheckpointRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let device = self.architecture.device();
+        let mut checkpoint = serializer.serialize_map(Some(11))?;
+        checkpoint.serialize_entry("absorbed_inputs", &checkpoint_absorbed_inputs(self.result))?;
+        checkpoint.serialize_entry("design", self.design_name)?;
+        checkpoint.serialize_entry("evidence", &checkpoint_evidence(self.evidence))?;
+        checkpoint.serialize_entry(
+            "metrics",
+            &json!({
+                "cells": self.result.design.cells().len(),
+                "nets": self.result.design.nets().len(),
+                "routed_nets": self.result.implementation.routes.len(),
+                "total_pips": self.result.implementation.total_pips,
+            }),
+        )?;
+        checkpoint.serialize_entry("packing", &checkpoint_packing(self.result))?;
+        checkpoint.serialize_entry(
+            "placement",
+            &PlacementRecords {
+                result: self.result,
+                architecture: self.architecture,
+                cib_ties: &self.cib_ties,
+            },
+        )?;
+        checkpoint.serialize_entry(
+            "primitive_metadata",
+            &self
+                .result
+                .primitive_metadata
                 .iter()
-                .map(|pin_id| {
-                    let pin = &architecture.device().bel_pins()[pin_id.0];
-                    json!({
-                        "name": pin.name,
-                        "direction": match pin.direction {
-                            texo_model::PinDirection::Input => "input",
-                            texo_model::PinDirection::Output => "output",
-                            texo_model::PinDirection::Inout => "inout",
-                        },
-                        "wire_id": pin.wire.0,
-                        "wire": architecture.device().wires()[pin.wire.0].name,
-                        "cib_tie": cib_ties.get(&pin.wire),
-                    })
+                .map(|(cell, metadata)| {
+                    primitive_metadata_json(*cell, metadata, &self.result.design)
                 })
-                .collect::<Vec<_>>();
-            let configuration_tiles = architecture
-                .configuration_tiles(bel.point)
-                .map(|(name, tile_type)| json!({ "name": name, "tile_type": tile_type }))
-                .collect::<Vec<_>>();
-            json!({
-                "cell_id": cell_id,
-                "cell": cell.name,
-                "kind": checkpoint_resource_kind(cell.kind),
-                "bel_id": bel_id.0,
-                "bel": bel.name,
-                "bel_type": metadata.bel_type,
-                "bel_z": metadata.z,
-                "bel_pins": bel_pins,
-                "configuration_tiles": configuration_tiles,
-                "x": bel.point.x,
-                "y": bel.point.y,
+                .collect::<Vec<_>>(),
+        )?;
+        checkpoint.serialize_entry(
+            "routes",
+            &RouteRecords {
+                result: self.result,
+                architecture: self.architecture,
+            },
+        )?;
+        checkpoint.serialize_entry("schema_version", &3)?;
+        checkpoint.serialize_entry(
+            "target",
+            &json!({
+                "family": "ECP5",
+                "device": device.name(),
+                "package": self.package,
+                "speed_grade": self.result.speed_grade,
+                "placement_weight_exponent": self.result.placement_weight_exponent,
+                "placement_model": checkpoint_placement_model(
+                    self.result.initial_placement_algorithm,
+                    self.result.placement_weight_exponent,
+                ),
+                "project_trellis_revision": self.architecture.provenance().project_trellis_revision,
+                "database_revision": self.architecture.provenance().database_revision,
+            }),
+        )?;
+        checkpoint.serialize_entry("timing", &TimingRecord(self.result))?;
+        checkpoint.end()
+    }
+}
+
+struct PlacementRecords<'a> {
+    result: &'a Ecp5FlowResult,
+    architecture: &'a Ecp5Architecture,
+    cib_ties: &'a BTreeMap<WireId, Value>,
+}
+
+impl Serialize for PlacementRecords<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let bindings = self.result.implementation.placement.bindings();
+        let mut records = serializer.serialize_seq(Some(bindings.len()))?;
+        for cell_id in 0..bindings.len() {
+            records.serialize_element(&PlacementRecord {
+                result: self.result,
+                architecture: self.architecture,
+                cib_ties: self.cib_ties,
+                cell_id,
+            })?;
+        }
+        records.end()
+    }
+}
+
+struct PlacementRecord<'a> {
+    result: &'a Ecp5FlowResult,
+    architecture: &'a Ecp5Architecture,
+    cib_ties: &'a BTreeMap<WireId, Value>,
+    cell_id: usize,
+}
+
+impl Serialize for PlacementRecord<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let cell = &self.result.design.cells()[self.cell_id];
+        let bel_id = self.result.implementation.placement.bindings()[self.cell_id];
+        let bel = &self.architecture.device().bels()[bel_id.0];
+        let metadata = self.architecture.bel_metadata(bel_id);
+        let mut record = serializer.serialize_map(Some(11))?;
+        record.serialize_entry("bel", &bel.name)?;
+        record.serialize_entry("bel_id", &bel_id.0)?;
+        record.serialize_entry(
+            "bel_pins",
+            &BelPinRecords {
+                architecture: self.architecture,
+                cib_ties: self.cib_ties,
+                bel: bel_id,
+            },
+        )?;
+        record.serialize_entry("bel_type", metadata.bel_type)?;
+        record.serialize_entry("bel_z", &metadata.z)?;
+        record.serialize_entry("cell", &cell.name)?;
+        record.serialize_entry("cell_id", &self.cell_id)?;
+        record.serialize_entry(
+            "configuration_tiles",
+            &ConfigurationTileRecords {
+                architecture: self.architecture,
+                bel: bel_id,
+            },
+        )?;
+        record.serialize_entry("kind", checkpoint_resource_kind(cell.kind))?;
+        record.serialize_entry("x", &bel.point.x)?;
+        record.serialize_entry("y", &bel.point.y)?;
+        record.end()
+    }
+}
+
+struct BelPinRecords<'a> {
+    architecture: &'a Ecp5Architecture,
+    cib_ties: &'a BTreeMap<WireId, Value>,
+    bel: BelId,
+}
+
+impl Serialize for BelPinRecords<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let device = self.architecture.device();
+        let bel = &device.bels()[self.bel.0];
+        let mut records = serializer.serialize_seq(Some(bel.pins().len()))?;
+        for pin_id in bel.pins() {
+            let pin = &device.bel_pins()[pin_id.0];
+            records.serialize_element(&BelPinRecord {
+                name: &pin.name,
+                direction: match pin.direction {
+                    PinDirection::Input => "input",
+                    PinDirection::Output => "output",
+                    PinDirection::Inout => "inout",
+                },
+                wire_id: pin.wire.0,
+                wire: &device.wires()[pin.wire.0].name,
+                cib_tie: self.cib_ties.get(&pin.wire),
+            })?;
+        }
+        records.end()
+    }
+}
+
+#[derive(Serialize)]
+struct BelPinRecord<'a> {
+    cib_tie: Option<&'a Value>,
+    direction: &'static str,
+    name: &'a str,
+    wire: &'a str,
+    wire_id: usize,
+}
+
+struct ConfigurationTileRecords<'a> {
+    architecture: &'a Ecp5Architecture,
+    bel: BelId,
+}
+
+impl Serialize for ConfigurationTileRecords<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let point = self.architecture.device().bels()[self.bel.0].point;
+        let tiles = self
+            .architecture
+            .configuration_tiles(point)
+            .collect::<Vec<_>>();
+        let mut records = serializer.serialize_seq(Some(tiles.len()))?;
+        for (name, tile_type) in tiles {
+            records.serialize_element(&ConfigurationTileRecord { name, tile_type })?;
+        }
+        records.end()
+    }
+}
+
+#[derive(Serialize)]
+struct ConfigurationTileRecord<'a> {
+    name: &'a str,
+    tile_type: &'a str,
+}
+
+struct RouteRecords<'a> {
+    result: &'a Ecp5FlowResult,
+    architecture: &'a Ecp5Architecture,
+}
+
+impl Serialize for RouteRecords<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let routes = &self.result.implementation.routes;
+        let mut records = serializer.serialize_seq(Some(routes.len()))?;
+        for route_index in 0..routes.len() {
+            records.serialize_element(&RouteRecord {
+                result: self.result,
+                architecture: self.architecture,
+                route_index,
+            })?;
+        }
+        records.end()
+    }
+}
+
+struct RouteRecord<'a> {
+    result: &'a Ecp5FlowResult,
+    architecture: &'a Ecp5Architecture,
+    route_index: usize,
+}
+
+impl Serialize for RouteRecord<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let device = self.architecture.device();
+        let route = &self.result.implementation.routes[self.route_index];
+        let net = &self.result.design.nets()[route.net.0];
+        let driver_pin = &self.result.design.pins()[net.driver.0];
+        let driver_bel = self.result.implementation.placement.bindings()[driver_pin.cell.0];
+        let driver_bel_pin = self
+            .result
+            .implementation
+            .placement
+            .pin_binding(net.driver)
+            .or_else(|| {
+                device.bels()[driver_bel.0]
+                    .pins()
+                    .iter()
+                    .copied()
+                    .find(|bel_pin| {
+                        let physical = &device.bel_pins()[bel_pin.0];
+                        physical.name == driver_pin.name
+                            && physical.direction == driver_pin.direction
+                    })
             })
-        })
-        .collect()
+            .expect("a routed net driver has a physical BEL pin");
+        let driver_wire = device.bel_pins()[driver_bel_pin.0].wire;
+        let mut record = serializer.serialize_map(Some(6))?;
+        record.serialize_entry("driver_wire", &device.wires()[driver_wire.0].name)?;
+        record.serialize_entry("driver_wire_id", &driver_wire.0)?;
+        record.serialize_entry("net", &net.name)?;
+        record.serialize_entry("net_id", &route.net.0)?;
+        record.serialize_entry(
+            "pips",
+            &RoutePipRecords {
+                result: self.result,
+                architecture: self.architecture,
+                route_index: self.route_index,
+            },
+        )?;
+        record.serialize_entry(
+            "wires",
+            &RouteWireRecords {
+                result: self.result,
+                architecture: self.architecture,
+                route_index: self.route_index,
+            },
+        )?;
+        record.end()
+    }
+}
+
+struct RouteWireRecords<'a> {
+    result: &'a Ecp5FlowResult,
+    architecture: &'a Ecp5Architecture,
+    route_index: usize,
+}
+
+impl Serialize for RouteWireRecords<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let route = &self.result.implementation.routes[self.route_index];
+        let device = self.architecture.device();
+        let mut records = serializer.serialize_seq(Some(route.wires().count()))?;
+        for wire in route.wires() {
+            records.serialize_element(&RouteWireRecord {
+                id: wire.0,
+                name: &device.wires()[wire.0].name,
+            })?;
+        }
+        records.end()
+    }
+}
+
+#[derive(Serialize)]
+struct RouteWireRecord<'a> {
+    #[serde(rename = "wire")]
+    name: &'a str,
+    #[serde(rename = "wire_id")]
+    id: usize,
+}
+
+struct RoutePipRecords<'a> {
+    result: &'a Ecp5FlowResult,
+    architecture: &'a Ecp5Architecture,
+    route_index: usize,
+}
+
+impl Serialize for RoutePipRecords<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let route = &self.result.implementation.routes[self.route_index];
+        let mut records = serializer.serialize_seq(Some(route.pips().count()))?;
+        for pip in route.pips() {
+            records.serialize_element(&RoutePipRecord {
+                architecture: self.architecture,
+                pip,
+            })?;
+        }
+        records.end()
+    }
+}
+
+struct RoutePipRecord<'a> {
+    architecture: &'a Ecp5Architecture,
+    pip: PipId,
+}
+
+impl Serialize for RoutePipRecord<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let device = self.architecture.device();
+        let pip = &device.pips()[self.pip.0];
+        let metadata = self.architecture.pip_metadata(self.pip);
+        let mut record = serializer.serialize_map(Some(10))?;
+        record.serialize_entry("bidirectional", &pip.bidirectional())?;
+        record.serialize_entry("config_tile", &metadata.config_tile)?;
+        record.serialize_entry("fixed", &metadata.fixed)?;
+        record.serialize_entry("from", &device.wires()[pip.from().0].name)?;
+        record.serialize_entry("from_wire_id", &pip.from().0)?;
+        record.serialize_entry("lutperm_flags", &metadata.lutperm_flags)?;
+        record.serialize_entry("pip_id", &self.pip.0)?;
+        record.serialize_entry("tile_type", metadata.tile_type)?;
+        record.serialize_entry("to", &device.wires()[pip.to().0].name)?;
+        record.serialize_entry("to_wire_id", &pip.to().0)?;
+        record.end()
+    }
+}
+
+struct TimingRecord<'a>(&'a Ecp5FlowResult);
+
+impl Serialize for TimingRecord<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let result = self.0;
+        let mut timing = serializer.serialize_map(Some(12))?;
+        timing.serialize_entry(
+            "all_modeled_endpoints_checked",
+            &result.timing.all_modeled_endpoints_checked(),
+        )?;
+        timing.serialize_entry("delay_model", "nextpnr_ecp5_project_trellis_min_max_ps")?;
+        timing.serialize_entry("hold_checks", &HoldCheckRecords(result))?;
+        timing.serialize_entry("met_timing", &result.timing.met_timing())?;
+        timing.serialize_entry(
+            "modeled_endpoint_count",
+            &result.timing.modeled_endpoint_count(),
+        )?;
+        timing.serialize_entry("net_delays", &NetDelayRecords(result))?;
+        timing.serialize_entry(
+            "net_setup_criticalities",
+            &NetSetupCriticalityRecords(result),
+        )?;
+        timing.serialize_entry("net_setup_slacks", &NetSetupSlackRecords(result))?;
+        timing.serialize_entry("setup_checks", &SetupCheckRecords(result))?;
+        timing.serialize_entry("unchecked_endpoints", &UncheckedEndpointRecords(result))?;
+        timing.serialize_entry("worst_hold_slack_ps", &result.timing.worst_hold_slack_ps)?;
+        timing.serialize_entry("worst_slack_ps", &result.timing.worst_slack_ps)?;
+        timing.end()
+    }
+}
+
+struct NetDelayRecords<'a>(&'a Ecp5FlowResult);
+
+impl Serialize for NetDelayRecords<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let result = self.0;
+        let mut records = serializer.serialize_seq(Some(result.timing.net_delays.len()))?;
+        for delay in &result.timing.net_delays {
+            let net = &result.design.nets()[delay.net.0];
+            let driver = &result.design.pins()[net.driver.0];
+            let sink = &result.design.pins()[delay.sink.0];
+            records.serialize_element(&NetDelayRecord {
+                net_id: delay.net.0,
+                net: &net.name,
+                driver_pin_id: net.driver.0,
+                driver_pin: &driver.name,
+                driver_cell_id: driver.cell.0,
+                driver_cell: &result.design.cells()[driver.cell.0].name,
+                sink_pin_id: delay.sink.0,
+                sink_pin: &sink.name,
+                sink_cell_id: sink.cell.0,
+                sink_cell: &result.design.cells()[sink.cell.0].name,
+                min_delay_ps: delay.delay.min_ps,
+                max_delay_ps: delay.delay.max_ps,
+            })?;
+        }
+        records.end()
+    }
+}
+
+#[derive(Serialize)]
+struct NetDelayRecord<'a> {
+    driver_cell: &'a str,
+    driver_cell_id: usize,
+    driver_pin: &'a str,
+    driver_pin_id: usize,
+    max_delay_ps: u64,
+    min_delay_ps: u64,
+    net: &'a str,
+    net_id: usize,
+    sink_cell: &'a str,
+    sink_cell_id: usize,
+    sink_pin: &'a str,
+    sink_pin_id: usize,
+}
+
+struct NetSetupSlackRecords<'a>(&'a Ecp5FlowResult);
+
+impl Serialize for NetSetupSlackRecords<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let result = self.0;
+        let mut records = serializer.serialize_seq(Some(result.timing.net_setup_slacks.len()))?;
+        for edge in &result.timing.net_setup_slacks {
+            records.serialize_element(&NetSetupSlackRecord {
+                net_id: edge.net.0,
+                net: &result.design.nets()[edge.net.0].name,
+                sink_pin_id: edge.sink.0,
+                slack_ps: edge.slack_ps,
+            })?;
+        }
+        records.end()
+    }
+}
+
+#[derive(Serialize)]
+struct NetSetupSlackRecord<'a> {
+    net: &'a str,
+    net_id: usize,
+    sink_pin_id: usize,
+    slack_ps: i128,
+}
+
+struct NetSetupCriticalityRecords<'a>(&'a Ecp5FlowResult);
+
+impl Serialize for NetSetupCriticalityRecords<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let result = self.0;
+        let mut records =
+            serializer.serialize_seq(Some(result.timing.net_setup_criticalities.len()))?;
+        for edge in &result.timing.net_setup_criticalities {
+            records.serialize_element(&NetSetupCriticalityRecord {
+                net_id: edge.net.0,
+                net: &result.design.nets()[edge.net.0].name,
+                sink_pin_id: edge.sink.0,
+                path_delay_ps: edge.path_delay_ps,
+                domain_worst_path_delay_ps: edge.domain_worst_path_delay_ps,
+            })?;
+        }
+        records.end()
+    }
+}
+
+#[derive(Serialize)]
+struct NetSetupCriticalityRecord<'a> {
+    domain_worst_path_delay_ps: u128,
+    net: &'a str,
+    net_id: usize,
+    path_delay_ps: u128,
+    sink_pin_id: usize,
+}
+
+struct SetupCheckRecords<'a>(&'a Ecp5FlowResult);
+
+impl Serialize for SetupCheckRecords<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let result = self.0;
+        let mut records = serializer.serialize_seq(Some(result.timing.setup_checks.len()))?;
+        for check in &result.timing.setup_checks {
+            records.serialize_element(&SetupCheckRecord {
+                cell_id: check.cell.0,
+                cell: &result.design.cells()[check.cell.0].name,
+                data_pin_id: check.data_pin.0,
+                clock_net_id: check.clock_net.0,
+                launch_edge: check.launch_edge.as_str(),
+                capture_edge: check.capture_edge.as_str(),
+                arrival_ps: check.arrival_ps,
+                clock_arrival_ps: check.clock_arrival_ps,
+                setup_ps: check.setup_ps,
+                uncertainty_ps: check.uncertainty_ps,
+                required_ps: check.required_ps,
+                slack_ps: check.slack_ps,
+            })?;
+        }
+        records.end()
+    }
+}
+
+#[derive(Serialize)]
+struct SetupCheckRecord<'a> {
+    arrival_ps: u64,
+    capture_edge: &'static str,
+    cell: &'a str,
+    cell_id: usize,
+    clock_arrival_ps: u64,
+    clock_net_id: usize,
+    data_pin_id: usize,
+    launch_edge: &'static str,
+    required_ps: i128,
+    setup_ps: u64,
+    slack_ps: i128,
+    uncertainty_ps: u64,
+}
+
+struct HoldCheckRecords<'a>(&'a Ecp5FlowResult);
+
+impl Serialize for HoldCheckRecords<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let result = self.0;
+        let mut records = serializer.serialize_seq(Some(result.timing.hold_checks.len()))?;
+        for check in &result.timing.hold_checks {
+            records.serialize_element(&HoldCheckRecord {
+                cell_id: check.cell.0,
+                cell: &result.design.cells()[check.cell.0].name,
+                data_pin_id: check.data_pin.0,
+                clock_net_id: check.clock_net.0,
+                launch_edge: check.launch_edge.as_str(),
+                capture_edge: check.capture_edge.as_str(),
+                arrival_ps: check.arrival_ps,
+                clock_arrival_ps: check.clock_arrival_ps,
+                hold_ps: check.hold_ps,
+                required_ps: check.required_ps,
+                slack_ps: check.slack_ps,
+            })?;
+        }
+        records.end()
+    }
+}
+
+#[derive(Serialize)]
+struct HoldCheckRecord<'a> {
+    arrival_ps: u64,
+    capture_edge: &'static str,
+    cell: &'a str,
+    cell_id: usize,
+    clock_arrival_ps: u64,
+    clock_net_id: usize,
+    data_pin_id: usize,
+    hold_ps: u64,
+    launch_edge: &'static str,
+    required_ps: i128,
+    slack_ps: i128,
+}
+
+struct UncheckedEndpointRecords<'a>(&'a Ecp5FlowResult);
+
+impl Serialize for UncheckedEndpointRecords<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let result = self.0;
+        let mut records =
+            serializer.serialize_seq(Some(result.timing.unchecked_endpoints.len()))?;
+        for endpoint in &result.timing.unchecked_endpoints {
+            records.serialize_element(&UncheckedEndpointRecord {
+                cell_id: endpoint.cell.0,
+                cell: &result.design.cells()[endpoint.cell.0].name,
+                data_pin_id: endpoint.data_pin.0,
+                clock_pin_id: endpoint.clock_pin.0,
+                clock_net_id: endpoint.clock_net.map(|net| net.0),
+                reason: endpoint.reason.as_str(),
+            })?;
+        }
+        records.end()
+    }
+}
+
+#[derive(Serialize)]
+struct UncheckedEndpointRecord<'a> {
+    cell: &'a str,
+    cell_id: usize,
+    clock_net_id: Option<usize>,
+    clock_pin_id: usize,
+    data_pin_id: usize,
+    reason: &'static str,
 }
 
 fn cib_ties_for_bels(
@@ -113,20 +737,27 @@ fn cib_ties_for_bels(
     bels: impl IntoIterator<Item = BelId>,
 ) -> BTreeMap<WireId, Value> {
     let device = architecture.device();
-    let targets = bels
+    let mut targets = vec![false; device.wires().len()];
+    let mut target_count = 0_usize;
+    for wire in bels
         .into_iter()
         .flat_map(|bel| device.bels()[bel.0].pins().iter().copied())
         .filter_map(|pin| {
             let pin = &device.bel_pins()[pin.0];
             (pin.direction == PinDirection::Input).then_some(pin.wire)
         })
-        .collect::<BTreeSet<_>>();
-    if targets.is_empty() {
+    {
+        if !targets[wire.0] {
+            targets[wire.0] = true;
+            target_count += 1;
+        }
+    }
+    if target_count == 0 {
         return BTreeMap::new();
     }
     let mut ties = BTreeMap::new();
     for (index, pip) in device.pips().iter().enumerate() {
-        if !targets.contains(&pip.to()) || !architecture.pip_metadata(PipId(index)).fixed {
+        if !targets[pip.to().0] || !architecture.pip_metadata(PipId(index)).fixed {
             continue;
         }
         let source = &device.wires()[pip.from().0];
@@ -181,68 +812,6 @@ const fn checkpoint_resource_kind(kind: ResourceKind) -> &'static str {
         ResourceKind::Io => "port",
         ResourceKind::Constant => "constant",
     }
-}
-
-fn checkpoint_routes(result: &Ecp5FlowResult, architecture: &Ecp5Architecture) -> Vec<Value> {
-    let device = architecture.device();
-    result
-        .implementation
-        .routes
-        .iter()
-        .map(|route| {
-            let net = &result.design.nets()[route.net.0];
-            let driver_pin = &result.design.pins()[net.driver.0];
-            let driver_bel = result.implementation.placement.bindings()[driver_pin.cell.0];
-            let driver_bel_pin = result
-                .implementation
-                .placement
-                .pin_binding(net.driver)
-                .or_else(|| {
-                    device.bels()[driver_bel.0]
-                        .pins()
-                        .iter()
-                        .copied()
-                        .find(|bel_pin| {
-                            let physical = &device.bel_pins()[bel_pin.0];
-                            physical.name == driver_pin.name
-                                && physical.direction == driver_pin.direction
-                        })
-                })
-                .expect("a routed net driver has a physical BEL pin");
-            let driver_wire = device.bel_pins()[driver_bel_pin.0].wire;
-            let wires = route
-                .wires()
-                .map(|wire| json!({ "wire_id": wire.0, "wire": device.wires()[wire.0].name }))
-                .collect::<Vec<_>>();
-            let pips = route
-                .pips()
-                .map(|pip_id| {
-                    let pip = &device.pips()[pip_id.0];
-                    let metadata = architecture.pip_metadata(pip_id);
-                    json!({
-                        "pip_id": pip_id.0,
-                        "from_wire_id": pip.from().0,
-                        "from": device.wires()[pip.from().0].name,
-                        "to_wire_id": pip.to().0,
-                        "to": device.wires()[pip.to().0].name,
-                        "bidirectional": pip.bidirectional(),
-                        "fixed": metadata.fixed,
-                        "config_tile": metadata.config_tile,
-                        "tile_type": metadata.tile_type,
-                        "lutperm_flags": metadata.lutperm_flags,
-                    })
-                })
-                .collect::<Vec<_>>();
-            json!({
-                "net_id": route.net.0,
-                "net": net.name,
-                "driver_wire_id": driver_wire.0,
-                "driver_wire": device.wires()[driver_wire.0].name,
-                "wires": wires,
-                "pips": pips,
-            })
-        })
-        .collect()
 }
 
 fn checkpoint_absorbed_inputs(result: &Ecp5FlowResult) -> Vec<Value> {
@@ -352,119 +921,6 @@ fn checkpoint_packing(result: &Ecp5FlowResult) -> Value {
         "generated_clock_periods_ps": generated_clock_periods_ps,
         "unsupported_lpf_commands": result.packing.unsupported_lpf_commands(),
     })
-}
-
-fn checkpoint_timing(result: &Ecp5FlowResult) -> Value {
-    let net_delays = result
-        .timing
-        .net_delays
-        .iter()
-        .map(|delay| {
-            let net = &result.design.nets()[delay.net.0];
-            let driver = &result.design.pins()[net.driver.0];
-            let sink = &result.design.pins()[delay.sink.0];
-            json!({
-                "net_id": delay.net.0,
-                "net": net.name,
-                "driver_pin_id": net.driver.0,
-                "driver_pin": driver.name,
-                "driver_cell_id": driver.cell.0,
-                "driver_cell": result.design.cells()[driver.cell.0].name,
-                "sink_pin_id": delay.sink.0,
-                "sink_pin": sink.name,
-                "sink_cell_id": sink.cell.0,
-                "sink_cell": result.design.cells()[sink.cell.0].name,
-                "min_delay_ps": delay.delay.min_ps,
-                "max_delay_ps": delay.delay.max_ps,
-            })
-        })
-        .collect::<Vec<_>>();
-    let setup_checks = result
-        .timing
-        .setup_checks
-        .iter()
-        .map(|check| {
-            json!({
-                "cell_id": check.cell.0,
-                "cell": result.design.cells()[check.cell.0].name,
-                "data_pin_id": check.data_pin.0,
-                "clock_net_id": check.clock_net.0,
-                "launch_edge": check.launch_edge.as_str(),
-                "capture_edge": check.capture_edge.as_str(),
-                "arrival_ps": check.arrival_ps,
-                "clock_arrival_ps": check.clock_arrival_ps,
-                "setup_ps": check.setup_ps,
-                "uncertainty_ps": check.uncertainty_ps,
-                "required_ps": check.required_ps,
-                "slack_ps": check.slack_ps,
-            })
-        })
-        .collect::<Vec<_>>();
-    let net_setup_slacks = result
-        .timing
-        .net_setup_slacks
-        .iter()
-        .map(|edge| {
-            json!({
-                "net_id": edge.net.0,
-                "net": result.design.nets()[edge.net.0].name,
-                "sink_pin_id": edge.sink.0,
-                "slack_ps": edge.slack_ps,
-            })
-        })
-        .collect::<Vec<_>>();
-    let hold_checks = result
-        .timing
-        .hold_checks
-        .iter()
-        .map(|check| {
-            json!({
-                "cell_id": check.cell.0,
-                "cell": result.design.cells()[check.cell.0].name,
-                "data_pin_id": check.data_pin.0,
-                "clock_net_id": check.clock_net.0,
-                "launch_edge": check.launch_edge.as_str(),
-                "capture_edge": check.capture_edge.as_str(),
-                "arrival_ps": check.arrival_ps,
-                "clock_arrival_ps": check.clock_arrival_ps,
-                "hold_ps": check.hold_ps,
-                "required_ps": check.required_ps,
-                "slack_ps": check.slack_ps,
-            })
-        })
-        .collect::<Vec<_>>();
-    let unchecked_endpoints = checkpoint_unchecked_endpoints(result);
-    json!({
-        "delay_model": "nextpnr_ecp5_project_trellis_min_max_ps",
-        "net_delays": net_delays,
-        "net_setup_slacks": net_setup_slacks,
-        "setup_checks": setup_checks,
-        "hold_checks": hold_checks,
-        "unchecked_endpoints": unchecked_endpoints,
-        "modeled_endpoint_count": result.timing.modeled_endpoint_count(),
-        "all_modeled_endpoints_checked": result.timing.all_modeled_endpoints_checked(),
-        "worst_slack_ps": result.timing.worst_slack_ps,
-        "worst_hold_slack_ps": result.timing.worst_hold_slack_ps,
-        "met_timing": result.timing.met_timing(),
-    })
-}
-
-fn checkpoint_unchecked_endpoints(result: &Ecp5FlowResult) -> Vec<Value> {
-    result
-        .timing
-        .unchecked_endpoints
-        .iter()
-        .map(|endpoint| {
-            json!({
-                "cell_id": endpoint.cell.0,
-                "cell": result.design.cells()[endpoint.cell.0].name,
-                "data_pin_id": endpoint.data_pin.0,
-                "clock_pin_id": endpoint.clock_pin.0,
-                "clock_net_id": endpoint.clock_net.map(|net| net.0),
-                "reason": endpoint.reason.as_str(),
-            })
-        })
-        .collect()
 }
 
 fn checkpoint_evidence(evidence: &Evidence) -> Vec<&'static str> {
@@ -597,18 +1053,50 @@ const fn active_level_name(level: ActiveLevel) -> &'static str {
 mod tests {
     use std::collections::BTreeMap;
 
+    use serde_json::json;
+    use texo_flow::{
+        ECP5_PLACEMENT_ROUTABILITY_MODEL, ECP5_PLACEMENT_TIMING_WEIGHT_MODEL,
+        Ecp5InitialPlacementAlgorithm,
+    };
     use texo_model::{CellId, Design, PinDirection, ResourceKind};
     use texo_struo::{PllOutput, PortDirection, PrimitiveMetadata};
     use texo_target_ecp5::{
         ArchitectureFile, PipRecord, RelativeRef, TileRecord, WireRecord, expand,
     };
 
-    use super::{cib_ties_for_bels, primitive_metadata_json};
+    use super::{checkpoint_placement_model, cib_ties_for_bels, primitive_metadata_json};
 
     const ARCHITECTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../texo-target-ecp5/fixtures/minimal-ecp5.json"
     ));
+
+    #[test]
+    fn checkpoints_the_effective_timing_driven_placement_model() {
+        assert_eq!(
+            checkpoint_placement_model(
+                Ecp5InitialPlacementAlgorithm::TimingDrivenRoutabilityElectrostatic,
+                4,
+            ),
+            json!({
+                "initial_algorithm": "ecp5_timing_routability_electrostatic_v1",
+                "timing_weight_model": ECP5_PLACEMENT_TIMING_WEIGHT_MODEL,
+                "criticality_exponent": 4,
+                "routability_model": ECP5_PLACEMENT_ROUTABILITY_MODEL,
+                "initial_predicted_detail": false,
+            }),
+        );
+        assert_eq!(
+            checkpoint_placement_model(Ecp5InitialPlacementAlgorithm::Imported, 4),
+            json!({
+                "initial_algorithm": "imported_v1",
+                "timing_weight_model": null,
+                "criticality_exponent": null,
+                "routability_model": null,
+                "initial_predicted_detail": false,
+            }),
+        );
+    }
 
     #[test]
     fn checkpoints_bidirectional_port_direction() {

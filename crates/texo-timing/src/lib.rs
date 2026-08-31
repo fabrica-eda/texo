@@ -2,9 +2,9 @@
 //!
 //! Both early/minimum and late/maximum propagation are modeled so setup and
 //! hold checks can share one characterized target timing model. Register
-//! launches are propagated independently per clock net; unconstrained primary
-//! inputs and cross-clock paths are not treated as zero-time synchronous
-//! launches.
+//! launches are propagated independently per clock net. Related generated
+//! clocks are checked from their exact integer frequency ratio and phase;
+//! primary inputs and unrelated clocks are not fabricated as synchronous.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
@@ -14,6 +14,13 @@ use texo_model::{
     CellId, CellPinId, Design, Device, ModelError, NetId, PipId, UnifiedGraph, WireId,
 };
 use texo_pnr::{NetRoute, Placement, PnrResult};
+
+mod clock_relation;
+
+use clock_relation::{
+    ClockWaveform, GeneratedClockConstraint, related_edge_offsets, resolve_clock_waveforms,
+    validate_clock_relations,
+};
 
 /// One trillion picoseconds per second.
 pub const PICOSECONDS_PER_SECOND: u64 = 1_000_000_000_000;
@@ -39,10 +46,11 @@ impl ClockEdge {
     }
 }
 
-/// Clock periods applied to logical clock nets.
+/// Clock periods and relationships applied to logical clock nets.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TimingConstraints {
     clock_periods_ps: BTreeMap<NetId, u64>,
+    generated_clocks: BTreeMap<NetId, GeneratedClockConstraint>,
     setup_uncertainties_ps: BTreeMap<NetId, u64>,
 }
 
@@ -52,6 +60,7 @@ impl TimingConstraints {
     pub const fn new() -> Self {
         Self {
             clock_periods_ps: BTreeMap::new(),
+            generated_clocks: BTreeMap::new(),
             setup_uncertainties_ps: BTreeMap::new(),
         }
     }
@@ -65,6 +74,33 @@ impl TimingConstraints {
     #[must_use]
     pub const fn clock_periods_ps(&self) -> &BTreeMap<NetId, u64> {
         &self.clock_periods_ps
+    }
+
+    /// Sets or replaces one generated-clock relationship.
+    ///
+    /// `multiply_by / divide_by` is the generated-to-source frequency ratio;
+    /// `phase_ps` is its rising-edge offset from the source clock.
+    /// The generated clock and clocks used as sequential endpoints still need
+    /// period constraints from [`Self::set_clock_period_ps`]. A source clock
+    /// used only as the common relationship root does not need a period.
+    /// Invalid zero ratios and relationship cycles are reported by analysis.
+    pub fn set_generated_clock(
+        &mut self,
+        net: NetId,
+        source: NetId,
+        multiply_by: u32,
+        divide_by: u32,
+        phase_ps: i64,
+    ) {
+        self.generated_clocks.insert(
+            net,
+            GeneratedClockConstraint {
+                source,
+                multiply_by,
+                divide_by,
+                phase_ps,
+            },
+        );
     }
 
     /// Sets or replaces the setup uncertainty for one clock in picoseconds.
@@ -273,6 +309,24 @@ pub struct NetSetupSlack {
     pub slack_ps: i128,
 }
 
+/// Maximum setup criticality of one logical net edge across clock-domain pairs.
+///
+/// The ratio `path_delay_ps / domain_worst_path_delay_ps` is in `[0, 1]`.
+/// Both values are retained instead of rounding to a floating-point number so
+/// timing-driven consumers can choose their own precision and exponent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetSetupCriticality {
+    /// Logical net.
+    pub net: NetId,
+    /// Logical sink pin for this fanout edge.
+    pub sink: CellPinId,
+    /// Constraint-normalized path delay through this edge's most critical
+    /// launch/capture domain pair.
+    pub path_delay_ps: u128,
+    /// Worst constraint-normalized path delay in that same domain pair.
+    pub domain_worst_path_delay_ps: u128,
+}
+
 /// One register data setup check.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SetupCheck {
@@ -280,7 +334,7 @@ pub struct SetupCheck {
     pub cell: CellId,
     /// Register data input pin.
     pub data_pin: CellPinId,
-    /// Constrained clock net.
+    /// Capture clock net.
     pub clock_net: NetId,
     /// Active edge that launches the worst setup path.
     pub launch_edge: ClockEdge,
@@ -307,7 +361,7 @@ pub struct HoldCheck {
     pub cell: CellId,
     /// Register data input pin.
     pub data_pin: CellPinId,
-    /// Constrained clock net.
+    /// Capture clock net.
     pub clock_net: NetId,
     /// Active edge that launches the worst hold path.
     pub launch_edge: ClockEdge,
@@ -332,7 +386,7 @@ pub enum UncheckedEndpointReason {
     UnconnectedClock,
     /// The endpoint's clock net has no period constraint.
     UnconstrainedClock,
-    /// No launch in the capture clock domain reaches the endpoint.
+    /// No launch from the capture clock or a related clock reaches the endpoint.
     NoSynchronousLaunch,
 }
 
@@ -370,6 +424,8 @@ pub struct TimingReport {
     pub net_delays: Vec<NetDelay>,
     /// Per-sink setup slack after backward required-time propagation.
     pub net_setup_slacks: Vec<NetSetupSlack>,
+    /// Per-sink maximum setup criticality across launch/capture domain pairs.
+    pub net_setup_criticalities: Vec<NetSetupCriticality>,
     /// Constrained register setup checks.
     pub setup_checks: Vec<SetupCheck>,
     /// Constrained register hold checks.
@@ -399,8 +455,7 @@ impl TimingReport {
     /// Whether every modeled sequential endpoint was checked.
     ///
     /// This is deliberately separate from [`Self::met_timing`]: primary-input
-    /// and cross-clock paths require constraints that the current constraint
-    /// model cannot yet express, so existing flows may intentionally omit them.
+    /// and unrelated cross-clock paths may intentionally remain omitted.
     #[must_use]
     pub fn all_modeled_endpoints_checked(&self) -> bool {
         self.unchecked_endpoints.is_empty()
@@ -518,8 +573,17 @@ fn timing_report_from_net_delays(
         })
         .collect::<Result<BTreeMap<_, _>, TimingError>>()?;
 
-    let mut setup_checks = Vec::new();
-    let mut hold_checks = Vec::new();
+    let clock_nets = arrivals_by_clock.keys().map(|&(net, _)| net).chain(
+        model
+            .setup_holds
+            .values()
+            .filter_map(|&(clock, _, _, _)| design.pins()[clock.0].net()),
+    );
+    let clock_waveforms = resolve_clock_waveforms(constraints, clock_nets)?;
+
+    let mut selected_setup_checks = Vec::new();
+    let mut domain_setup_checks = Vec::new();
+    let mut selected_hold_checks = Vec::new();
     let mut unchecked_endpoints = Vec::new();
     for (&data_pin, &(clock_pin, capture_edge, setup, hold)) in &model.setup_holds {
         let Some(clock_net) = design.pins()[clock_pin.0].net() else {
@@ -542,10 +606,17 @@ fn timing_report_from_net_delays(
             ));
             continue;
         };
-        let launch_arrivals = synchronous_launch_arrivals(&arrivals_by_clock, clock_net, data_pin);
+        let launch_arrivals = synchronous_launch_arrivals(
+            &arrivals_by_clock,
+            &clock_waveforms,
+            clock_net,
+            period_ps,
+            capture_edge,
+            data_pin,
+        )?;
         if launch_arrivals.is_empty() {
-            // Primary-input and cross-clock paths need explicit timing
-            // constraints. Do not invent a synchronous launch at time zero.
+            // Primary-input and unrelated cross-clock paths need explicit
+            // timing constraints. Do not invent a synchronous launch at zero.
             unchecked_endpoints.push(unchecked_endpoint(
                 design,
                 data_pin,
@@ -556,40 +627,62 @@ fn timing_report_from_net_delays(
             continue;
         }
         let clock_arrival = clock_arrivals[clock_pin.0].unwrap_or(DelayRange::zero());
-        let common_clock_arrival =
-            clock_arrivals[design.nets()[clock_net.0].driver.0].unwrap_or(DelayRange::zero());
-        let checks = launch_arrivals.into_iter().map(|(launch_edge, arrival)| {
-            endpoint_checks(EndpointCheckContext {
-                design,
-                data_pin,
-                clock_net,
-                period_ps,
-                uncertainty_ps: constraints.setup_uncertainty_ps(clock_net),
-                arrival,
-                clock_arrival,
-                common_clock_arrival,
-                setup,
-                hold,
-                launch_edge,
-                capture_edge,
+        let checks = launch_arrivals
+            .into_iter()
+            .map(|launch| {
+                let common_clock_arrival = if launch.clock_net == clock_net {
+                    clock_arrivals[design.nets()[clock_net.0].driver.0]
+                        .unwrap_or(DelayRange::zero())
+                } else {
+                    // Distinct generated clock trees are related in time, but
+                    // their physically common path is not represented by either
+                    // logical output net. Omitting CPPR here is conservative.
+                    DelayRange::zero()
+                };
+                endpoint_checks(EndpointCheckContext {
+                    design,
+                    data_pin,
+                    clock_net,
+                    launch_clock_net: launch.clock_net,
+                    uncertainty_ps: constraints.setup_uncertainty_ps(clock_net),
+                    arrival: launch.arrival,
+                    clock_arrival,
+                    common_clock_arrival,
+                    setup,
+                    hold,
+                    launch_edge: launch.edge,
+                    capture_edge,
+                    setup_edge_separation_ps: launch.setup_edge_separation_ps,
+                    hold_launch_offset_ps: launch.hold_launch_offset_ps,
+                })
             })
-        });
+            .collect::<Vec<_>>();
+        domain_setup_checks.extend(checks.iter().map(|(setup, _)| *setup));
         let (setup_check, hold_check) = select_worst_edge_checks(checks);
-        setup_checks.push(setup_check);
-        hold_checks.push(hold_check);
+        selected_setup_checks.push(setup_check);
+        selected_hold_checks.push(hold_check);
     }
+    let setup_checks = selected_setup_checks
+        .iter()
+        .map(|selected| selected.check)
+        .collect::<Vec<_>>();
+    let hold_checks = selected_hold_checks
+        .iter()
+        .map(|selected| selected.check)
+        .collect::<Vec<_>>();
     let worst_slack_ps = setup_checks.iter().map(|check| check.slack_ps).min();
     let worst_hold_slack_ps = hold_checks.iter().map(|check| check.slack_ps).min();
-    let net_setup_slacks = net_setup_slacks(
+    let (net_setup_slacks, net_setup_criticalities) = net_setup_metrics(
         design,
         &net_delays,
         model,
         &arrivals_by_clock,
-        &setup_checks,
+        &domain_setup_checks,
     )?;
     Ok(TimingReport {
         net_delays,
         net_setup_slacks,
+        net_setup_criticalities,
         setup_checks,
         hold_checks,
         unchecked_endpoints,
@@ -600,33 +693,76 @@ fn timing_report_from_net_delays(
 
 fn synchronous_launch_arrivals(
     arrivals_by_clock: &BTreeMap<(NetId, ClockEdge), Vec<Option<DelayRange>>>,
-    clock_net: NetId,
+    clock_waveforms: &BTreeMap<NetId, ClockWaveform>,
+    capture_clock_net: NetId,
+    capture_period_ps: u64,
+    capture_edge: ClockEdge,
     data_pin: CellPinId,
-) -> Vec<(ClockEdge, DelayRange)> {
-    [ClockEdge::Rising, ClockEdge::Falling]
-        .into_iter()
-        .filter_map(|launch_edge| {
-            arrivals_by_clock
-                .get(&(clock_net, launch_edge))
-                .and_then(|arrivals| arrivals[data_pin.0])
-                .map(|arrival| (launch_edge, arrival))
-        })
-        .collect()
+) -> Result<Vec<SynchronousLaunch>, TimingError> {
+    let capture_waveform = clock_waveforms
+        .get(&capture_clock_net)
+        .copied()
+        .expect("capture clock waveform was resolved");
+    let mut launches = Vec::new();
+    for (&(launch_clock_net, launch_edge), arrivals) in arrivals_by_clock {
+        let Some(arrival) = arrivals[data_pin.0] else {
+            continue;
+        };
+        let launch_waveform = clock_waveforms
+            .get(&launch_clock_net)
+            .copied()
+            .expect("launch clock waveform was resolved");
+        if launch_waveform.root != capture_waveform.root {
+            continue;
+        }
+        let offsets = related_edge_offsets(
+            launch_waveform,
+            capture_waveform,
+            capture_period_ps,
+            launch_edge,
+            capture_edge,
+        )?;
+        launches.push(SynchronousLaunch {
+            clock_net: launch_clock_net,
+            edge: launch_edge,
+            arrival,
+            setup_edge_separation_ps: offsets.setup_ps,
+            hold_launch_offset_ps: offsets.hold_ps,
+        });
+    }
+    Ok(launches)
+}
+
+#[derive(Clone, Copy)]
+struct SynchronousLaunch {
+    clock_net: NetId,
+    edge: ClockEdge,
+    arrival: DelayRange,
+    setup_edge_separation_ps: u64,
+    hold_launch_offset_ps: u64,
 }
 
 fn select_worst_edge_checks(
-    checks: impl IntoIterator<Item = (SetupCheck, HoldCheck)>,
-) -> (SetupCheck, HoldCheck) {
+    checks: impl IntoIterator<
+        Item = (
+            SelectedClockCheck<SetupCheck>,
+            SelectedClockCheck<HoldCheck>,
+        ),
+    >,
+) -> (
+    SelectedClockCheck<SetupCheck>,
+    SelectedClockCheck<HoldCheck>,
+) {
     checks
         .into_iter()
         .reduce(|(setup_best, hold_best), (setup, hold)| {
             (
-                if setup.slack_ps < setup_best.slack_ps {
+                if setup.check.slack_ps < setup_best.check.slack_ps {
                     setup
                 } else {
                     setup_best
                 },
-                if hold.slack_ps < hold_best.slack_ps {
+                if hold.check.slack_ps < hold_best.check.slack_ps {
                     hold
                 } else {
                     hold_best
@@ -637,11 +773,18 @@ fn select_worst_edge_checks(
 }
 
 #[derive(Clone, Copy)]
+struct SelectedClockCheck<T> {
+    check: T,
+    launch_clock_net: NetId,
+    setup_edge_separation_ps: u64,
+}
+
+#[derive(Clone, Copy)]
 struct EndpointCheckContext<'a> {
     design: &'a Design,
     data_pin: CellPinId,
     clock_net: NetId,
-    period_ps: u64,
+    launch_clock_net: NetId,
     uncertainty_ps: u64,
     arrival: DelayRange,
     clock_arrival: DelayRange,
@@ -650,14 +793,21 @@ struct EndpointCheckContext<'a> {
     hold: DelayRange,
     launch_edge: ClockEdge,
     capture_edge: ClockEdge,
+    setup_edge_separation_ps: u64,
+    hold_launch_offset_ps: u64,
 }
 
-fn endpoint_checks(context: EndpointCheckContext<'_>) -> (SetupCheck, HoldCheck) {
+fn endpoint_checks(
+    context: EndpointCheckContext<'_>,
+) -> (
+    SelectedClockCheck<SetupCheck>,
+    SelectedClockCheck<HoldCheck>,
+) {
     let EndpointCheckContext {
         design,
         data_pin,
         clock_net,
-        period_ps,
+        launch_clock_net,
         uncertainty_ps,
         arrival,
         clock_arrival,
@@ -666,6 +816,8 @@ fn endpoint_checks(context: EndpointCheckContext<'_>) -> (SetupCheck, HoldCheck)
         hold,
         launch_edge,
         capture_edge,
+        setup_edge_separation_ps,
+        hold_launch_offset_ps,
     } = context;
     // Every launch in this analysis group and the capture endpoint share the
     // path up to the constrained clock net's driver. Its corner range is
@@ -674,16 +826,6 @@ fn endpoint_checks(context: EndpointCheckContext<'_>) -> (SetupCheck, HoldCheck)
     // so the correction must remain signed.
     let common_clock_pessimism_ps =
         i128::from(common_clock_arrival.max_ps) - i128::from(common_clock_arrival.min_ps);
-    let setup_edge_separation_ps = if launch_edge == capture_edge {
-        period_ps
-    } else {
-        period_ps / 2
-    };
-    let hold_launch_offset_ps = if launch_edge == capture_edge {
-        0
-    } else {
-        period_ps / 2
-    };
     let setup_required_ps = i128::from(setup_edge_separation_ps)
         + i128::from(clock_arrival.min_ps)
         + common_clock_pessimism_ps
@@ -692,31 +834,39 @@ fn endpoint_checks(context: EndpointCheckContext<'_>) -> (SetupCheck, HoldCheck)
     let hold_required_ps =
         i128::from(clock_arrival.max_ps) + i128::from(hold.max_ps) - common_clock_pessimism_ps;
     (
-        SetupCheck {
-            cell: design.pins()[data_pin.0].cell,
-            data_pin,
-            clock_net,
-            launch_edge,
-            capture_edge,
-            arrival_ps: arrival.max_ps,
-            clock_arrival_ps: clock_arrival.min_ps,
-            setup_ps: setup.max_ps,
-            uncertainty_ps,
-            required_ps: setup_required_ps,
-            slack_ps: setup_required_ps - i128::from(arrival.max_ps),
+        SelectedClockCheck {
+            launch_clock_net,
+            setup_edge_separation_ps,
+            check: SetupCheck {
+                cell: design.pins()[data_pin.0].cell,
+                data_pin,
+                clock_net,
+                launch_edge,
+                capture_edge,
+                arrival_ps: arrival.max_ps,
+                clock_arrival_ps: clock_arrival.min_ps,
+                setup_ps: setup.max_ps,
+                uncertainty_ps,
+                required_ps: setup_required_ps,
+                slack_ps: setup_required_ps - i128::from(arrival.max_ps),
+            },
         },
-        HoldCheck {
-            cell: design.pins()[data_pin.0].cell,
-            data_pin,
-            clock_net,
-            launch_edge,
-            capture_edge,
-            arrival_ps: arrival.min_ps.saturating_add(hold_launch_offset_ps),
-            clock_arrival_ps: clock_arrival.max_ps,
-            hold_ps: hold.max_ps,
-            required_ps: hold_required_ps,
-            slack_ps: i128::from(arrival.min_ps) + i128::from(hold_launch_offset_ps)
-                - hold_required_ps,
+        SelectedClockCheck {
+            launch_clock_net,
+            setup_edge_separation_ps,
+            check: HoldCheck {
+                cell: design.pins()[data_pin.0].cell,
+                data_pin,
+                clock_net,
+                launch_edge,
+                capture_edge,
+                arrival_ps: arrival.min_ps.saturating_add(hold_launch_offset_ps),
+                clock_arrival_ps: clock_arrival.max_ps,
+                hold_ps: hold.max_ps,
+                required_ps: hold_required_ps,
+                slack_ps: i128::from(arrival.min_ps) + i128::from(hold_launch_offset_ps)
+                    - hold_required_ps,
+            },
         },
     )
 }
@@ -737,13 +887,25 @@ fn unchecked_endpoint(
     }
 }
 
-fn net_setup_slacks(
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SetupDomainPair {
+    launch_clock_net: NetId,
+    launch_edge: ClockEdge,
+    capture_clock_net: NetId,
+    capture_edge: ClockEdge,
+    edge_separation_ps: u64,
+}
+
+struct SetupPropagationGraph {
+    edges: Vec<Vec<(CellPinId, u64)>>,
+    order: Vec<CellPinId>,
+}
+
+fn setup_propagation_graph(
     design: &Design,
     net_delays: &[NetDelay],
     model: &TimingModel,
-    arrivals_by_clock: &BTreeMap<(NetId, ClockEdge), Vec<Option<DelayRange>>>,
-    setup_checks: &[SetupCheck],
-) -> Result<Vec<NetSetupSlack>, TimingError> {
+) -> Result<SetupPropagationGraph, TimingError> {
     let mut edges = vec![Vec::<(CellPinId, u64)>::new(); design.pins().len()];
     let mut indegree = vec![0_usize; design.pins().len()];
     for delay in net_delays {
@@ -755,13 +917,11 @@ fn net_setup_slacks(
         edges[from.0].push((to, delay.max_ps));
         indegree[to.0] += 1;
     }
-
-    let mut ready = VecDeque::new();
-    for (index, &degree) in indegree.iter().enumerate() {
-        if degree == 0 {
-            ready.push_back(CellPinId(index));
-        }
-    }
+    let mut ready = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &degree)| (degree == 0).then_some(CellPinId(index)))
+        .collect::<VecDeque<_>>();
     let mut order = Vec::with_capacity(design.pins().len());
     while let Some(pin) = ready.pop_front() {
         order.push(pin);
@@ -775,19 +935,46 @@ fn net_setup_slacks(
     if order.len() != design.pins().len() {
         return Err(TimingError::CombinationalCycle);
     }
+    Ok(SetupPropagationGraph { edges, order })
+}
+
+fn net_setup_metrics(
+    design: &Design,
+    net_delays: &[NetDelay],
+    model: &TimingModel,
+    arrivals_by_clock: &BTreeMap<(NetId, ClockEdge), Vec<Option<DelayRange>>>,
+    setup_checks: &[SelectedClockCheck<SetupCheck>],
+) -> Result<(Vec<NetSetupSlack>, Vec<NetSetupCriticality>), TimingError> {
+    let propagation = setup_propagation_graph(design, net_delays, model)?;
+    let mut checks_by_domain = BTreeMap::<SetupDomainPair, Vec<SetupCheck>>::new();
+    for selected in setup_checks {
+        let check = selected.check;
+        checks_by_domain
+            .entry(SetupDomainPair {
+                launch_clock_net: selected.launch_clock_net,
+                launch_edge: check.launch_edge,
+                capture_clock_net: check.clock_net,
+                capture_edge: check.capture_edge,
+                edge_separation_ps: selected.setup_edge_separation_ps,
+            })
+            .or_default()
+            .push(check);
+    }
 
     let mut slacks = BTreeMap::<(NetId, CellPinId), i128>::new();
-    for (&(clock_net, launch_edge), arrivals) in arrivals_by_clock {
+    let mut criticalities = BTreeMap::<(NetId, CellPinId), (u128, u128)>::new();
+    for (domain, checks) in checks_by_domain {
+        let Some(arrivals) = arrivals_by_clock.get(&(domain.launch_clock_net, domain.launch_edge))
+        else {
+            continue;
+        };
         let mut required = vec![None::<i128>; design.pins().len()];
-        for check in setup_checks
-            .iter()
-            .filter(|check| check.clock_net == clock_net && check.launch_edge == launch_edge)
-        {
+        for check in &checks {
             let entry = &mut required[check.data_pin.0];
             *entry = Some(entry.map_or(check.required_ps, |known| known.min(check.required_ps)));
         }
-        for &from in order.iter().rev() {
-            for &(to, delay_ps) in &edges[from.0] {
+        for &from in propagation.order.iter().rev() {
+            for &(to, delay_ps) in &propagation.edges[from.0] {
                 let Some(to_required) = required[to.0] else {
                     continue;
                 };
@@ -796,6 +983,11 @@ fn net_setup_slacks(
                 *entry = Some(entry.map_or(candidate, |known| known.min(candidate)));
             }
         }
+        let domain_worst_path_delay_ps = checks
+            .iter()
+            .map(|check| constrained_path_delay_ps(domain.edge_separation_ps, check.slack_ps))
+            .max()
+            .unwrap_or(0);
         for delay in net_delays {
             let driver = design.nets()[delay.net.0].driver;
             let (Some(required_ps), Some(arrival)) = (required[delay.sink.0], arrivals[driver.0])
@@ -808,17 +1000,103 @@ fn net_setup_slacks(
                 .entry((delay.net, delay.sink))
                 .and_modify(|known| *known = (*known).min(slack_ps))
                 .or_insert(slack_ps);
+            if domain_worst_path_delay_ps == 0 {
+                continue;
+            }
+            let path_delay_ps = constrained_path_delay_ps(domain.edge_separation_ps, slack_ps)
+                .min(domain_worst_path_delay_ps);
+            criticalities
+                .entry((delay.net, delay.sink))
+                .and_modify(|known| {
+                    if compare_nonnegative_fractions(
+                        path_delay_ps,
+                        domain_worst_path_delay_ps,
+                        known.0,
+                        known.1,
+                    )
+                    .is_gt()
+                    {
+                        *known = (path_delay_ps, domain_worst_path_delay_ps);
+                    }
+                })
+                .or_insert((path_delay_ps, domain_worst_path_delay_ps));
         }
     }
 
-    Ok(slacks
+    let slacks = slacks
         .into_iter()
         .map(|((net, sink), slack_ps)| NetSetupSlack {
             net,
             sink,
             slack_ps,
         })
-        .collect())
+        .collect();
+    let criticalities = criticalities
+        .into_iter()
+        .map(
+            |((net, sink), (path_delay_ps, domain_worst_path_delay_ps))| NetSetupCriticality {
+                net,
+                sink,
+                path_delay_ps,
+                domain_worst_path_delay_ps,
+            },
+        )
+        .collect();
+    Ok((slacks, criticalities))
+}
+
+fn constrained_path_delay_ps(edge_separation_ps: u64, slack_ps: i128) -> u128 {
+    let separation = u128::from(edge_separation_ps);
+    if slack_ps >= 0 {
+        separation.saturating_sub(slack_ps.unsigned_abs())
+    } else {
+        separation.saturating_add(slack_ps.unsigned_abs())
+    }
+}
+
+fn compare_nonnegative_fractions(
+    mut left_numerator: u128,
+    mut left_denominator: u128,
+    mut right_numerator: u128,
+    mut right_denominator: u128,
+) -> std::cmp::Ordering {
+    debug_assert!(left_denominator > 0 && right_denominator > 0);
+    let mut reverse = false;
+    loop {
+        let left_quotient = left_numerator / left_denominator;
+        let right_quotient = right_numerator / right_denominator;
+        if left_quotient != right_quotient {
+            let ordering = left_quotient.cmp(&right_quotient);
+            return if reverse {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+        }
+        let left_remainder = left_numerator % left_denominator;
+        let right_remainder = right_numerator % right_denominator;
+        match (left_remainder == 0, right_remainder == 0) {
+            (true, true) => return std::cmp::Ordering::Equal,
+            (true, false) => {
+                return if reverse {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                };
+            }
+            (false, true) => {
+                return if reverse {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+            }
+            (false, false) => {}
+        }
+        (left_numerator, left_denominator) = (left_denominator, left_remainder);
+        (right_numerator, right_denominator) = (right_denominator, right_remainder);
+        reverse = !reverse;
+    }
 }
 
 fn validate_model(design: &Design, model: &TimingModel) -> Result<(), TimingError> {
@@ -865,7 +1143,7 @@ fn validate_constraints(
             return Err(TimingError::ZeroClockPeriod(net));
         }
     }
-    Ok(())
+    validate_clock_relations(constraints, design.nets().len())
 }
 
 fn routed_net_delays(
@@ -1067,6 +1345,19 @@ pub enum TimingError {
     UnknownClockNet(NetId),
     /// A constrained clock period is zero.
     ZeroClockPeriod(NetId),
+    /// A generated clock has a zero frequency ratio component.
+    InvalidGeneratedClockRatio(NetId),
+    /// Generated-clock source relationships contain a cycle.
+    GeneratedClockCycle(NetId),
+    /// Generated-clock ratio or phase arithmetic overflowed.
+    ClockRelationOverflow,
+    /// Related constrained clocks disagree with their declared frequency ratio.
+    InconsistentRelatedClockPeriods {
+        /// First conflicting logical clock net.
+        first: NetId,
+        /// Second conflicting logical clock net.
+        second: NetId,
+    },
     /// A routed net/sink pair had no calculated delay.
     MissingNetDelay {
         /// Logical net.
@@ -1116,6 +1407,24 @@ impl fmt::Display for TimingError {
                 write!(f, "clock constraint references unknown net {}", net.0)
             }
             Self::ZeroClockPeriod(net) => write!(f, "clock net {} has a zero period", net.0),
+            Self::InvalidGeneratedClockRatio(net) => write!(
+                f,
+                "generated clock net {} has a zero ratio component",
+                net.0
+            ),
+            Self::GeneratedClockCycle(net) => write!(
+                f,
+                "generated-clock relationships contain a cycle at net {}",
+                net.0
+            ),
+            Self::ClockRelationOverflow => {
+                write!(f, "generated-clock relationship arithmetic overflowed")
+            }
+            Self::InconsistentRelatedClockPeriods { first, second } => write!(
+                f,
+                "related clock nets {} and {} have inconsistent periods",
+                first.0, second.0
+            ),
             Self::MissingNetDelay { net, sink } => {
                 write!(f, "net {} sink pin {} has no routed delay", net.0, sink.0)
             }
@@ -1149,7 +1458,8 @@ mod tests {
 
     use super::{
         ClockEdge, DelayRange, NetDelay, TimingConstraints, TimingModel, UncheckedEndpointReason,
-        analyze_timing, analyze_timing_from_net_delays, timing_report_from_net_delays,
+        analyze_timing, analyze_timing_from_net_delays, compare_nonnegative_fractions,
+        timing_report_from_net_delays,
     };
 
     #[test]
@@ -1185,6 +1495,12 @@ mod tests {
         );
         assert!(!failed.all_modeled_endpoints_checked());
         assert_eq!(failed.worst_slack_ps, Some(-240));
+        assert_eq!(failed.net_setup_criticalities.len(), 2);
+        assert!(
+            failed.net_setup_criticalities.iter().all(|edge| {
+                edge.path_delay_ps == 290 && edge.domain_worst_path_delay_ps == 290
+            })
+        );
         assert!(!failed.met_timing());
 
         constraints.set_clock_period_ps(clock_net, 300);
@@ -1205,6 +1521,10 @@ mod tests {
                 .net_setup_slacks
                 .iter()
                 .all(|edge| edge.slack_ps == 10)
+        );
+        assert_eq!(
+            passed.net_setup_criticalities,
+            failed.net_setup_criticalities
         );
         assert!(passed.met_timing());
 
@@ -1227,6 +1547,19 @@ mod tests {
                 .all(|edge| edge.slack_ps == -10)
         );
         assert!(!guarded.met_timing());
+    }
+
+    #[test]
+    fn fraction_comparison_never_cross_multiplies() {
+        use std::cmp::Ordering;
+
+        assert_eq!(compare_nonnegative_fractions(1, 2, 2, 4), Ordering::Equal);
+        assert_eq!(compare_nonnegative_fractions(1, 3, 1, 2), Ordering::Less);
+        assert_eq!(compare_nonnegative_fractions(3, 4, 2, 3), Ordering::Greater);
+        assert_eq!(
+            compare_nonnegative_fractions(u128::MAX - 1, u128::MAX, 1, 2),
+            Ordering::Greater
+        );
     }
 
     #[test]

@@ -61,8 +61,9 @@ serialization. Its schema-versioned JSON checkpoint is deterministic
 and records architecture/database provenance, verification evidence, mapped
 primitive configuration, absorbed inputs, target packing, final Cell-to-BEL
 bindings, selected speed grade, every routed Wire/PIP ID and name, exact
-configuration-tile ownership, and min/max timing checks. It is the complete
-input to the native configuration stage. `texo bitgen` translates those
+configuration-tile ownership, the effective initial-placement algorithm,
+criticality exponent, timing-weight and routability model, and min/max timing
+checks. It is the complete input to the native configuration stage. `texo bitgen` translates those
 records directly into configuration features in Rust and invokes the
 target-pack-local `ecppack` only as the final binary codec. The release path
 has no nextpnr, Python, pytrellis, or system Project Trellis dependency.
@@ -260,6 +261,8 @@ paths remain future work.
   never follow a moving Git branch in a release flow.
 - Store the target device/package/speed grade and constraints in every artifact
   manifest.
+- Record the effective placement algorithm, timing-weight exponent/model, and
+  routability model; defaults are part of the reproducible search trajectory.
 - Seed randomized algorithms explicitly and record the seed.
 - Keep a human-readable route artifact and compare it against nextpnr during
   bring-up.
