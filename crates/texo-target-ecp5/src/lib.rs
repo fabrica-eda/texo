@@ -748,6 +748,17 @@ pub struct PackedBlockRam {
     pub physical_width: u8,
 }
 
+/// Seven logical cells that implement one `TRELLIS_DPR16X4` macro.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DistributedRamRequirement {
+    /// Four LUT-RAM data bits in physical K0..K3 order.
+    pub data: [CellId; 4],
+    /// Two LUT slots reserved by the write-distribution machinery.
+    pub blockers: [CellId; 2],
+    /// Dedicated `TRELLIS_RAMW` write-address/data distributor.
+    pub write_port: CellId,
+}
+
 /// One logical net selected for promotion onto an ECP5 global clock network.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GlobalClockRequirement {
@@ -792,6 +803,7 @@ pub struct Ecp5Packing {
     general_routing_ffs: Vec<CellId>,
     block_rams: Vec<PackedBlockRam>,
     block_rams_packed: bool,
+    distributed_rams: Option<Vec<DistributedRamRequirement>>,
     global_clocks: Vec<PackedGlobalClock>,
     global_clocks_packed: bool,
     io_attributes: BTreeMap<CellId, BTreeMap<String, String>>,
@@ -828,6 +840,79 @@ impl Ecp5Packing {
     #[must_use]
     pub fn wide_lut_clusters(&self) -> &[Vec<CellId>] {
         self.wide_lut_clusters.as_deref().unwrap_or_default()
+    }
+
+    /// Packed `TRELLIS_DPR16X4` macros.
+    #[must_use]
+    pub fn distributed_rams(&self) -> &[DistributedRamRequirement] {
+        self.distributed_rams.as_deref().unwrap_or_default()
+    }
+
+    /// Constrains every distributed RAM to four LUT-RAM slots, two occupied
+    /// RAMW slots, and the dedicated `TRELLIS_RAMW` BEL in one PLC.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unknown, repeated, mistyped, or physically
+    /// incompatible cells, or when invoked more than once.
+    pub fn pack_distributed_rams(
+        &mut self,
+        design: &Design,
+        architecture: &Ecp5Architecture,
+        requirements: impl IntoIterator<Item = DistributedRamRequirement>,
+    ) -> Result<(), PackingError> {
+        if self.distributed_rams.is_some() {
+            return Err(PackingError::DistributedRamsAlreadyPacked);
+        }
+        let requirements = requirements.into_iter().collect::<Vec<_>>();
+        let mut occupied = BTreeSet::new();
+        let assignments = Arc::<[Vec<BelId>]>::from(distributed_ram_assignments(architecture));
+        for requirement in &requirements {
+            let cells = requirement
+                .data
+                .into_iter()
+                .chain(requirement.blockers)
+                .chain([requirement.write_port])
+                .collect::<Vec<_>>();
+            for (index, &cell) in cells.iter().enumerate() {
+                let Some(logical) = design.cells().get(cell.0) else {
+                    return Err(PackingError::UnknownDistributedRamCell(cell));
+                };
+                let expected = if index < 6 {
+                    ResourceKind::Lut(4)
+                } else {
+                    ResourceKind::Logic
+                };
+                if logical.kind != expected {
+                    return Err(PackingError::CellIsNotDistributedRam {
+                        cell: logical.name.clone(),
+                    });
+                }
+                if !occupied.insert(cell) {
+                    return Err(PackingError::DuplicateDistributedRamCell {
+                        cell: logical.name.clone(),
+                    });
+                }
+            }
+            let graph = UnifiedGraph::new(design, architecture.device());
+            let compatible = assignments.iter().filter(|assignment| {
+                cells.iter().zip(*assignment).all(|(&cell, &bel)| {
+                    graph
+                        .placement_candidates(cell)
+                        .is_ok_and(|candidates| candidates.contains(&bel))
+                })
+            });
+            let compatible = Arc::<[Vec<BelId>]>::from(compatible.cloned().collect::<Vec<_>>());
+            if compatible.is_empty() {
+                return Err(PackingError::MissingDistributedRamBel {
+                    cell: design.cells()[requirement.data[0].0].name.clone(),
+                });
+            }
+            self.constraints
+                .add_group_with_shared_assignments(cells, compatible);
+        }
+        self.distributed_rams = Some(requirements);
+        Ok(())
     }
 
     /// Constrains two-, four-, and eight-LUT clusters to the
@@ -2017,6 +2102,14 @@ impl Ecp5Packing {
             &cache.incoming,
             &mut constraints,
         )?;
+        block_distributed_ram_lut_permutations(
+            self,
+            design,
+            architecture,
+            placement,
+            &cache.incoming,
+            &mut constraints,
+        )?;
         Ok(constraints)
     }
 }
@@ -2051,6 +2144,43 @@ fn block_illegal_carry_lut_permutations(
                 let source_input = flags & 0x3;
                 let destination_input = (flags >> 2) & 0x3;
                 (is_lut_permutation && source_input / 2 != destination_input / 2).then_some(pip)
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn block_distributed_ram_lut_permutations(
+    packing: &Ecp5Packing,
+    design: &Design,
+    architecture: &Ecp5Architecture,
+    placement: &Placement,
+    incoming: &CompactIncomingPips,
+    constraints: &mut RoutingConstraints,
+) -> Result<(), PackingError> {
+    let device = architecture.device();
+    for &cell in packing
+        .distributed_rams()
+        .iter()
+        .flat_map(|ram| ram.data.iter())
+    {
+        let bel = placement
+            .bel(cell)
+            .ok_or_else(|| PackingError::DistributedRamRouting {
+                cell: design.cells()[cell.0].name.clone(),
+                reason: "cell is missing from placement".into(),
+            })?;
+        for pin_name in ["A", "B", "C", "D"] {
+            let pin = find_bel_pin(device, bel, pin_name).ok_or_else(|| {
+                PackingError::DistributedRamRouting {
+                    cell: design.cells()[cell.0].name.clone(),
+                    reason: format!("placed BEL has no `{pin_name}` input"),
+                }
+            })?;
+            let wire = device.bel_pins()[pin.0].wire;
+            constraints.block_pips(incoming.for_wire(wire).iter().filter_map(|&raw_pip| {
+                let pip = PipId(raw_pip as usize);
+                (architecture.pip_metadata(pip).lutperm_flags & 0x4000 != 0).then_some(pip)
             }));
         }
     }
@@ -2574,6 +2704,45 @@ fn physical_carry_pairs(architecture: &Ecp5Architecture) -> Vec<[BelId; 2]> {
                 assignments.push([first, second]);
             }
         }
+    }
+    assignments
+}
+
+fn distributed_ram_assignments(architecture: &Ecp5Architecture) -> Vec<Vec<BelId>> {
+    let mut comb_by_slot = BTreeMap::new();
+    let mut ramw_by_slot = BTreeMap::new();
+    for (index, bel) in architecture.device().bels().iter().enumerate() {
+        let bel_id = BelId(index);
+        let metadata = architecture.bel_metadata(bel_id);
+        match metadata.bel_type {
+            "TRELLIS_COMB" => {
+                comb_by_slot.insert((bel.point, metadata.z), bel_id);
+            }
+            "TRELLIS_RAMW" => {
+                ramw_by_slot.insert((bel.point, metadata.z), bel_id);
+            }
+            _ => {}
+        }
+    }
+    let mut assignments = Vec::new();
+    for (&(point, z), &first) in &comb_by_slot {
+        if z.rem_euclid(32) != 0 {
+            continue;
+        }
+        let mut assignment = vec![first];
+        let Some(rest) = [4, 8, 12, 16, 20]
+            .into_iter()
+            .map(|offset| comb_by_slot.get(&(point, z + offset)).copied())
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        assignment.extend(rest);
+        let Some(&write_port) = ramw_by_slot.get(&(point, z + 18)) else {
+            continue;
+        };
+        assignment.push(write_port);
+        assignments.push(assignment);
     }
     assignments
 }
@@ -3242,7 +3411,7 @@ fn validate_requested_carry_lut_ff_pairs(
 /// Selects nets with at least `minimum_clock_sinks` recognized clock pins.
 ///
 /// A zero threshold is treated as one. Register `CLK`, block-RAM `CLKA`/`CLKB`,
-/// and PLL `CLKI` pins are recognized. At most 16 nets are returned, choosing
+/// distributed-RAM `WCK`, and PLL `CLKI` pins are recognized. At most 16 nets are returned, choosing
 /// the highest fanout first with stable net-ID tie breaking; the returned set
 /// itself is ordered by net ID.
 #[must_use]
@@ -3278,6 +3447,7 @@ fn is_clock_sink(design: &Design, pin: CellPinId) -> bool {
     let kind = design.cells()[pin.cell.0].kind;
     (kind == ResourceKind::Register && pin.name == "CLK")
         || (kind == ResourceKind::Memory && matches!(pin.name.as_str(), "CLKA" | "CLKB"))
+        || (kind == ResourceKind::Lut(4) && pin.name == "WCK")
         || (kind == ResourceKind::Logic && pin.name == "CLKI")
 }
 
@@ -3411,6 +3581,7 @@ pub fn pack_lut_ffs_excluding(
         general_routing_ffs,
         block_rams: Vec::new(),
         block_rams_packed: false,
+        distributed_rams: None,
         global_clocks: Vec::new(),
         global_clocks_packed: false,
         io_attributes: BTreeMap::new(),
@@ -3575,6 +3746,7 @@ pub fn pack_lut_ffs_with_pairs(
         general_routing_ffs,
         block_rams: Vec::new(),
         block_rams_packed: false,
+        distributed_rams: None,
         global_clocks: Vec::new(),
         global_clocks_packed: false,
         io_attributes: BTreeMap::new(),
@@ -3725,6 +3897,32 @@ pub enum PackingError {
     /// A placed carry slice cannot be routed using legal LUT input permutations.
     CarryRouting {
         /// Logical carry slice name.
+        cell: String,
+        /// Physical topology or placement reason.
+        reason: String,
+    },
+    /// Distributed-RAM packing was invoked more than once.
+    DistributedRamsAlreadyPacked,
+    /// A distributed-RAM requirement referenced an unknown cell.
+    UnknownDistributedRamCell(CellId),
+    /// A distributed-RAM requirement referenced a cell with the wrong kind.
+    CellIsNotDistributedRam {
+        /// Logical cell name.
+        cell: String,
+    },
+    /// One cell occurred in more than one distributed-RAM macro.
+    DuplicateDistributedRamCell {
+        /// Logical cell name.
+        cell: String,
+    },
+    /// No physical PLC exposes the complete distributed-RAM macro surface.
+    MissingDistributedRamBel {
+        /// First logical data-cell name.
+        cell: String,
+    },
+    /// A placed distributed-RAM data cell cannot retain its fixed address-pin mapping.
+    DistributedRamRouting {
+        /// Logical data-cell name.
         cell: String,
         /// Physical topology or placement reason.
         reason: String,
@@ -3925,6 +4123,33 @@ impl fmt::Display for PackingError {
                     "carry slice `{cell}` has an invalid routing context: {reason}"
                 )
             }
+            Self::DistributedRamsAlreadyPacked => {
+                write!(f, "distributed RAMs were already packed")
+            }
+            Self::UnknownDistributedRamCell(cell) => {
+                write!(f, "unknown distributed-RAM cell ID {}", cell.0)
+            }
+            Self::CellIsNotDistributedRam { cell } => {
+                write!(f, "cell `{cell}` is not part of a distributed RAM")
+            }
+            Self::DuplicateDistributedRamCell { cell } => {
+                write!(
+                    f,
+                    "distributed-RAM cell `{cell}` occurs in more than one macro"
+                )
+            }
+            Self::MissingDistributedRamBel { cell } => {
+                write!(
+                    f,
+                    "distributed RAM `{cell}` has no compatible PLC/RAMW macro"
+                )
+            }
+            Self::DistributedRamRouting { cell, reason } => {
+                write!(
+                    f,
+                    "distributed RAM `{cell}` has an invalid routing context: {reason}"
+                )
+            }
             Self::UnknownBlockRamCell(cell) => {
                 write!(f, "unknown block RAM cell ID {}", cell.0)
             }
@@ -4034,6 +4259,12 @@ impl Error for PackingError {
             | Self::MissingCarrySlicePair { .. }
             | Self::CarryFfPacking { .. }
             | Self::CarryRouting { .. }
+            | Self::DistributedRamsAlreadyPacked
+            | Self::UnknownDistributedRamCell(_)
+            | Self::CellIsNotDistributedRam { .. }
+            | Self::DuplicateDistributedRamCell { .. }
+            | Self::MissingDistributedRamBel { .. }
+            | Self::DistributedRamRouting { .. }
             | Self::UnknownBlockRamCell(_)
             | Self::CellIsNotBlockRam { .. }
             | Self::DuplicateBlockRamRequirement { .. }
@@ -4905,14 +5136,14 @@ mod tests {
 
     use super::{
         ArchitectureFile, BlockRamRequirement, BlockedGlobalResources, CompactIncomingPips,
-        CompactPipMetadata, Ecp5Packing, FfControlSet, ForwardRouteTargetDistances,
-        GlobalClockRequirement, GlobalReverseSearch, ImportError, LogicalPort, LutFfPair,
-        PackagePinBinding, PackedBlockRam, PackingError, PipMetadata, SerializedCompactPipMetadata,
-        TileRecord, expand, find_bel_pin, find_global_clock_requirements, logical_carry_chains,
-        minimum_injective_assignment, pack_lut_ffs, pack_lut_ffs_excluding,
-        pack_lut_ffs_with_pairs, parse_lpf, read_architecture, read_architecture_cache,
-        resolve_lpf_port_cells, resolve_lpf_ports, valid_wide_lut_cluster,
-        write_architecture_cache,
+        CompactPipMetadata, DistributedRamRequirement, Ecp5Packing, FfControlSet,
+        ForwardRouteTargetDistances, GlobalClockRequirement, GlobalReverseSearch, ImportError,
+        LogicalPort, LutFfPair, PackagePinBinding, PackedBlockRam, PackingError, PipMetadata,
+        SerializedCompactPipMetadata, TileRecord, expand, find_bel_pin,
+        find_global_clock_requirements, logical_carry_chains, minimum_injective_assignment,
+        pack_lut_ffs, pack_lut_ffs_excluding, pack_lut_ffs_with_pairs, parse_lpf,
+        read_architecture, read_architecture_cache, resolve_lpf_port_cells, resolve_lpf_ports,
+        valid_wide_lut_cluster, write_architecture_cache,
     };
 
     const FIXTURE: &str = include_str!("../fixtures/minimal-ecp5.json");
@@ -5042,6 +5273,89 @@ mod tests {
         }
     }
 
+    fn ensure_distributed_ram_bels(architecture: &mut super::Ecp5Architecture) {
+        let root = architecture
+            .device()
+            .bels_of_kind(ResourceKind::Lut(4))
+            .iter()
+            .copied()
+            .find(|&bel| architecture.bel_metadata(bel).z == 0)
+            .unwrap();
+        let point = architecture.device().bels()[root.0].point;
+        let comb_type = architecture.bel_metadata[root.0].bel_type;
+        for z in [0, 4, 8, 12] {
+            let bel = architecture
+                .device()
+                .bels_of_kind(ResourceKind::Lut(4))
+                .iter()
+                .copied()
+                .find(|&bel| {
+                    architecture.device().bels()[bel.0].point == point
+                        && architecture.bel_metadata(bel).z == z
+                })
+                .unwrap();
+            for name in ["WCK", "WRE", "WAD0", "WAD1", "WAD2", "WAD3", "WD"] {
+                let wire = architecture
+                    .device
+                    .add_wire(format!("dpram_z{z}_{name}"), point, 1)
+                    .unwrap();
+                architecture
+                    .device
+                    .add_bel_pin(bel, name, PinDirection::Input, wire)
+                    .unwrap();
+            }
+        }
+        for z in [16, 20] {
+            let bel = architecture
+                .device
+                .add_bel(format!("dpram_block_z{z}"), ResourceKind::Lut(4), point)
+                .unwrap();
+            architecture.bel_metadata.push(super::CompactBelMetadata {
+                bel_type: comb_type,
+                z,
+            });
+            assert_eq!(bel.0 + 1, architecture.bel_metadata.len());
+        }
+        let ramw_type = u32::try_from(architecture.metadata_strings.len()).unwrap();
+        architecture.metadata_strings.push("TRELLIS_RAMW".into());
+        let ramw = architecture
+            .device
+            .add_bel("SLICEC.RAMW", ResourceKind::Logic, point)
+            .unwrap();
+        for (name, direction) in [
+            ("D0", PinDirection::Input),
+            ("B0", PinDirection::Input),
+            ("C0", PinDirection::Input),
+            ("A0", PinDirection::Input),
+            ("C1", PinDirection::Input),
+            ("A1", PinDirection::Input),
+            ("D1", PinDirection::Input),
+            ("B1", PinDirection::Input),
+            ("WADO0", PinDirection::Output),
+            ("WADO1", PinDirection::Output),
+            ("WADO2", PinDirection::Output),
+            ("WADO3", PinDirection::Output),
+            ("WDO0", PinDirection::Output),
+            ("WDO1", PinDirection::Output),
+            ("WDO2", PinDirection::Output),
+            ("WDO3", PinDirection::Output),
+        ] {
+            let wire = architecture
+                .device
+                .add_wire(format!("ramw_{name}"), point, 1)
+                .unwrap();
+            architecture
+                .device
+                .add_bel_pin(ramw, name, direction, wire)
+                .unwrap();
+        }
+        architecture.bel_metadata.push(super::CompactBelMetadata {
+            bel_type: ramw_type,
+            z: 18,
+        });
+        assert_eq!(ramw.0 + 1, architecture.bel_metadata.len());
+    }
+
     fn carry_pair_with_ff_fanouts(
         first_fanout: usize,
         second_fanout: usize,
@@ -5074,6 +5388,58 @@ mod tests {
             }
         }
         (design, pair, ffs)
+    }
+
+    #[test]
+    fn packs_distributed_ram_into_fixed_plc_and_ramw_slots() {
+        let mut architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        ensure_distributed_ram_bels(&mut architecture);
+        let mut design = Design::new();
+        let data = std::array::from_fn(|index| {
+            let cell = design.add_cell(format!("data{index}"), ResourceKind::Lut(4));
+            for name in [
+                "A", "B", "C", "D", "WCK", "WRE", "WAD0", "WAD1", "WAD2", "WAD3", "WD",
+            ] {
+                design.add_pin(cell, name, PinDirection::Input).unwrap();
+            }
+            design.add_pin(cell, "F", PinDirection::Output).unwrap();
+            cell
+        });
+        let blockers = std::array::from_fn(|index| {
+            design.add_cell(format!("blocker{index}"), ResourceKind::Lut(4))
+        });
+        let write_port = design.add_cell("write_port", ResourceKind::Logic);
+        for name in ["D0", "B0", "C0", "A0", "C1", "A1", "D1", "B1"] {
+            design
+                .add_pin(write_port, name, PinDirection::Input)
+                .unwrap();
+        }
+        for name in [
+            "WADO0", "WADO1", "WADO2", "WADO3", "WDO0", "WDO1", "WDO2", "WDO3",
+        ] {
+            design
+                .add_pin(write_port, name, PinDirection::Output)
+                .unwrap();
+        }
+        let requirement = DistributedRamRequirement {
+            data,
+            blockers,
+            write_port,
+        };
+        let mut packing = Ecp5Packing::default();
+        packing
+            .pack_distributed_rams(&design, &architecture, [requirement])
+            .unwrap();
+        let placement =
+            place_with_constraints(&design, architecture.device(), packing.constraints()).unwrap();
+        let zs = data
+            .into_iter()
+            .chain(blockers)
+            .chain([write_port])
+            .map(|cell| architecture.bel_metadata(placement.bel(cell).unwrap()).z)
+            .collect::<Vec<_>>();
+        assert_eq!(zs, [0, 4, 8, 12, 16, 20, 18]);
+        assert_eq!(packing.distributed_rams(), &[requirement]);
     }
 
     fn add_carry_ff_route_fixture(architecture: &mut super::Ecp5Architecture) {

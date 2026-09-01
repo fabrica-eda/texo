@@ -23,12 +23,12 @@ use texo_pnr::{
     route_with_timing_costs_workspace_and_progress, route_with_workspace_and_progress,
     routing_capacity_map,
 };
-use texo_struo::{ActiveLevel, ImportedEcp5Design, PrimitiveMetadata};
+use texo_struo::{ActiveLevel, DistributedRamRole, ImportedEcp5Design, PrimitiveMetadata};
 use texo_target_ecp5::{
-    BlockRamRequirement, DEFAULT_GLOBAL_CLOCK_FANOUT, DelayRangeRecord, Ecp5Architecture,
-    Ecp5DelayPredictorError, Ecp5GlobalRoutingCache, Ecp5Packing, Ecp5PlacementDelayPredictor,
-    FfControlSet, LpfConstraints, LpfError, LutFfPair, PackingError, PipClassTimingRecord,
-    SpeedGradeRecord, find_global_clock_requirements, pack_lut_ffs_excluding,
+    BlockRamRequirement, DEFAULT_GLOBAL_CLOCK_FANOUT, DelayRangeRecord, DistributedRamRequirement,
+    Ecp5Architecture, Ecp5DelayPredictorError, Ecp5GlobalRoutingCache, Ecp5Packing,
+    Ecp5PlacementDelayPredictor, FfControlSet, LpfConstraints, LpfError, LutFfPair, PackingError,
+    PipClassTimingRecord, SpeedGradeRecord, find_global_clock_requirements, pack_lut_ffs_excluding,
     pack_lut_ffs_with_pairs, resolve_lpf_port_cells,
 };
 use texo_timing::{
@@ -409,6 +409,17 @@ pub fn implement_struo_ecp5_with_progress(
         .flatten()
         .copied()
         .collect::<BTreeSet<_>>();
+    let distributed_ram_cells = imported
+        .distributed_ram_clusters()
+        .iter()
+        .flat_map(|cluster| {
+            cluster
+                .data
+                .into_iter()
+                .chain(cluster.blockers)
+                .chain([cluster.write_port])
+        })
+        .collect::<BTreeSet<_>>();
     let explicit_pairs = options
         .lut_ff_pairs
         .map(|pairs| named_lut_ff_pairs(&design, pairs))
@@ -421,6 +432,18 @@ pub fn implement_struo_ecp5_with_progress(
             lut: design.cells()[pair.lut.0].name.clone(),
             ff: design.cells()[pair.ff.0].name.clone(),
             reason: "wide-LUT members cannot use the ordinary LUT/FF path".into(),
+        }
+        .into());
+    }
+    if let Some(pair) = explicit_pairs.as_deref().and_then(|pairs| {
+        pairs
+            .iter()
+            .find(|pair| distributed_ram_cells.contains(&pair.lut))
+    }) {
+        return Err(PackingError::InvalidLutFfPair {
+            lut: design.cells()[pair.lut.0].name.clone(),
+            ff: design.cells()[pair.ff.0].name.clone(),
+            reason: "distributed-RAM members cannot use the ordinary LUT/FF path".into(),
         }
         .into());
     }
@@ -451,7 +474,11 @@ pub fn implement_struo_ecp5_with_progress(
         None => pack_lut_ffs_excluding(
             &design,
             architecture,
-            constant_luts.iter().chain(&wide_luts).copied(),
+            constant_luts
+                .iter()
+                .chain(&wide_luts)
+                .chain(&distributed_ram_cells)
+                .copied(),
         )?,
     };
     packing.pack_wide_luts(
@@ -463,6 +490,18 @@ pub fn implement_struo_ecp5_with_progress(
         &design,
         architecture,
         imported.carry_pairs().iter().copied(),
+    )?;
+    packing.pack_distributed_rams(
+        &design,
+        architecture,
+        imported
+            .distributed_ram_clusters()
+            .iter()
+            .map(|cluster| DistributedRamRequirement {
+                data: cluster.data,
+                blockers: cluster.blockers,
+                write_port: cluster.write_port,
+            }),
     )?;
     packing.pack_block_rams(&design, architecture, block_ram_requirements(imported))?;
 
@@ -3211,6 +3250,11 @@ fn primitive_clock_edge(
                 *edge
             }
         }
+        PrimitiveMetadata::DistributedRam {
+            role: DistributedRamRole::Data(_),
+            edge,
+            ..
+        } if clock_pin == "WCK" => *edge,
         _ => return None,
     };
     Some(match edge {
