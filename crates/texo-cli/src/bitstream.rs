@@ -376,6 +376,13 @@ pub fn generate_ecp5_config(
                     &absorbed_inputs,
                 )?;
             }
+            "distributed_ram_data" => {
+                write_distributed_ram_data(&mut config, placement, configuration)?;
+            }
+            "distributed_ram_write_port" => {
+                write_distributed_ram_write_port(&mut config, placement)?;
+            }
+            "distributed_ram_blocker" => {}
             "jtagg" => write_jtagg(&mut config, architecture, configuration)?,
             "pll" => write_pll(&mut config, architecture, placement, configuration)?,
             kind => return Err(BitgenError::new(format!("unsupported primitive {kind}"))),
@@ -759,6 +766,64 @@ fn write_comb(
             target.add_enum(format!("{slice}.{pin}{lc}MUX"), "1");
         }
     }
+    Ok(())
+}
+
+fn write_distributed_ram_data(
+    config: &mut ChipConfig,
+    placement: &Value,
+    configuration: &Value,
+) -> Result<(), BitgenError> {
+    let tile = logic_tile(placement)?.to_owned();
+    let (slice, lc) = slice_and_lc(placement)?;
+    let bit = usize_value(configuration, "bit")?;
+    if bit >= 4 {
+        return Err(BitgenError::new("distributed-RAM data bit exceeds 3"));
+    }
+    if usize_value(placement, "bel_z")? != bit * 4 {
+        return Err(BitgenError::new(format!(
+            "distributed-RAM bit {bit} is not placed in its fixed LUT slot"
+        )));
+    }
+    let target = config.tile_mut(&tile);
+    target.add_enum(format!("{slice}.MODE"), "DPRAM");
+    target.add_word(format!("{slice}.K{lc}.INIT"), vec![false; 16]);
+    target.add_enum(format!("{slice}.CCU2.INJECT1_{lc}"), "_NONE_");
+    if bit == 0 {
+        target.add_enum(
+            "SLICEA.WREMUX",
+            if string(configuration, "write_enable")? == "high" {
+                "WRE"
+            } else {
+                "INV"
+            },
+        );
+        target.add_enum(
+            "CLK1.CLKMUX",
+            if string(configuration, "edge")? == "rising" {
+                "CLK"
+            } else {
+                "INV"
+            },
+        );
+    }
+    Ok(())
+}
+
+fn write_distributed_ram_write_port(
+    config: &mut ChipConfig,
+    placement: &Value,
+) -> Result<(), BitgenError> {
+    if usize_value(placement, "bel_z")? != 18 {
+        return Err(BitgenError::new(
+            "distributed-RAM write port is not placed at SLICEC.RAMW",
+        ));
+    }
+    let tile = logic_tile(placement)?.to_owned();
+    let target = config.tile_mut(&tile);
+    target.add_enum("SLICEC.MODE", "RAMW");
+    target.add_word("SLICEC.K0.INIT", vec![false; 16]);
+    target.add_word("SLICEC.K1.INIT", vec![false; 16]);
     Ok(())
 }
 
@@ -1641,7 +1706,8 @@ mod tests {
 
     use super::{
         ChipConfig, TileConfig, generate_ecp5_config, io_base_direction, reverse_bits,
-        trellis_wire_name, validate_checkpoint, write_bram, write_ff, write_jtagg, write_pll,
+        trellis_wire_name, validate_checkpoint, write_bram, write_distributed_ram_data,
+        write_distributed_ram_write_port, write_ff, write_jtagg, write_pll,
     };
 
     const ARCHITECTURE: &str = include_str!(concat!(
@@ -1664,6 +1730,45 @@ mod tests {
     #[test]
     fn bit_helpers_match_trellis_ordering() {
         assert_eq!(reverse_bits(0b000_000_011, 9), 0b110_000_000);
+    }
+
+    #[test]
+    fn writes_distributed_ram_modes_and_polarity() {
+        let placement = |bel: &str, bel_z: usize| {
+            json!({
+                "bel": bel,
+                "bel_z": bel_z,
+                "configuration_tiles": [{"tile_type": "PLC2", "name": "R0C0:PLC2"}],
+            })
+        };
+        let mut config = ChipConfig::default();
+        write_distributed_ram_data(
+            &mut config,
+            &placement("R0C0/SLICEA.K0", 0),
+            &json!({"bit": 0, "edge": "falling", "write_enable": "low"}),
+        )
+        .unwrap();
+        for bit in 1..4 {
+            write_distributed_ram_data(
+                &mut config,
+                &placement("R0C0/DPRAM", bit * 4),
+                &json!({"bit": bit, "edge": "falling", "write_enable": "low"}),
+            )
+            .unwrap();
+        }
+        write_distributed_ram_write_port(&mut config, &placement("R0C0/SLICEC.RAMW", 18)).unwrap();
+
+        let tile = &config.tiles["R0C0:PLC2"];
+        for slice in ["SLICEA", "SLICEB"] {
+            assert!(
+                tile.enums
+                    .contains(&(format!("{slice}.MODE"), "DPRAM".into()))
+            );
+        }
+        assert!(tile.enums.contains(&("SLICEC.MODE".into(), "RAMW".into())));
+        assert!(tile.enums.contains(&("SLICEA.WREMUX".into(), "INV".into())));
+        assert!(tile.enums.contains(&("CLK1.CLKMUX".into(), "INV".into())));
+        assert!(config.validate().is_ok());
     }
 
     #[test]

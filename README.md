@@ -28,7 +28,7 @@ architecture data is introduced; it is not yet a production FPGA router.
 | `texo-timing` | Min/max post-route timing graph with setup and hold analysis |
 | `texo-flow` | Verified Struo-to-ECP5 orchestration and release gates |
 | `texo-struo` | Direct Struo ECP5 import and crates.io Celox verification boundary |
-| `texo-target-ecp5` | Project Trellis import, LUT/FF, DP16KD and DCCA packing, package-to-PIO binding |
+| `texo-target-ecp5` | Project Trellis import, LUT/FF, distributed RAM, DP16KD and DCCA packing, package-to-PIO binding |
 | `texo-cli` | Command-line entry point |
 
 The PnR crates do not depend on Veryl, Struo, Celox, or a particular FPGA.
@@ -42,6 +42,16 @@ algorithms.
 on crates.io. Celox is pinned to `=0.3.1` from crates.io and is never replaced
 with a Git dependency. The adapter accepts current Struo `CCU2C` output by
 splitting each primitive into two atomically packed ECP5 carry slices.
+
+Struo's selectable distributed-memory mapping is supported end to end. Mark a
+Veryl array with `#[sv("struo_memory = \"distributed\"")]` and use one
+synchronous whole-word write plus one asynchronous read. Struo tiles depths up
+to 128 words into 16-word banks and arbitrary positive widths into four-bit
+chunks. Texo expands each `TRELLIS_DPR16X4` into the four LUT-RAM data cells,
+two reserved LUT slots, and one `TRELLIS_RAMW` write distributor required by
+the ECP5 fabric, then places and routes the seven-cell macro atomically. Native
+bit generation emits the corresponding `DPRAM`/`RAMW`, clock-edge, and
+write-enable configuration.
 
 ## Try it
 

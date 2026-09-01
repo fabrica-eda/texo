@@ -54,6 +54,9 @@ same mapped design still passes Celox simulation.
   clock-to-Q/setup/hold, and DCCA arcs from Project Trellis timing data.
 - [x] Validate DP16KD width/depth modes, constrain each BRAM to compatible
   BELs, and assign stable WID configuration values with explicit errors.
+- [x] Import Struo distributed memories, atomically pack each
+  `TRELLIS_DPR16X4` LUT-RAM/RAMW macro, preserve fixed address routing, and
+  emit native distributed-RAM configuration.
 - [x] Rank clock nets by FF/BRAM clock-pin fanout, insert DCCA cells for at most
   16 global networks, and constrain them to compatible BELs transactionally.
 - [x] Fold LUT constants into INIT, absorb FF/BRAM constants into input-mux

@@ -10,7 +10,7 @@ use texo_flow::{
     Ecp5InitialPlacementAlgorithm, Evidence, Gate,
 };
 use texo_model::{BelId, Design, PinDirection, PipId, ResourceKind, WireId};
-use texo_struo::{ActiveLevel, ClockEdge, PortDirection, PrimitiveMetadata};
+use texo_struo::{ActiveLevel, ClockEdge, DistributedRamRole, PortDirection, PrimitiveMetadata};
 use texo_target_ecp5::Ecp5Architecture;
 
 /// Builds the stable, schema-versioned JSON representation of one ECP5 run.
@@ -861,6 +861,7 @@ fn checkpoint_packing(result: &Ecp5FlowResult) -> Value {
             })
         })
         .collect::<Vec<_>>();
+    let distributed_rams = checkpoint_distributed_rams(result);
     let global_clocks = result
         .packing
         .global_clocks()
@@ -915,12 +916,28 @@ fn checkpoint_packing(result: &Ecp5FlowResult) -> Value {
         "carry_pairs": carry_pairs,
         "general_routing_ffs": result.packing.general_routing_ffs().iter().map(|cell| cell.0).collect::<Vec<_>>(),
         "block_rams": block_rams,
+        "distributed_rams": distributed_rams,
         "global_clocks": global_clocks,
         "io_attributes": io_attributes,
         "clock_frequencies_hz": clock_frequencies_hz,
         "generated_clock_periods_ps": generated_clock_periods_ps,
         "unsupported_lpf_commands": result.packing.unsupported_lpf_commands(),
     })
+}
+
+fn checkpoint_distributed_rams(result: &Ecp5FlowResult) -> Vec<Value> {
+    result
+        .packing
+        .distributed_rams()
+        .iter()
+        .map(|ram| {
+            json!({
+                "data": ram.data.map(|cell| cell.0),
+                "blockers": ram.blockers.map(|cell| cell.0),
+                "write_port": ram.write_port.0,
+            })
+        })
+        .collect()
 }
 
 fn checkpoint_evidence(evidence: &Evidence) -> Vec<&'static str> {
@@ -990,6 +1007,11 @@ fn primitive_metadata_json(
                 "read_enable": port.read_enable.map(active_level_name),
             })),
         }),
+        PrimitiveMetadata::DistributedRam {
+            role,
+            edge,
+            write_enable,
+        } => distributed_ram_metadata_json(*role, *edge, *write_enable),
         PrimitiveMetadata::Jtagg {
             extension_register_1,
             extension_register_2,
@@ -1035,6 +1057,26 @@ fn primitive_metadata_json(
     })
 }
 
+fn distributed_ram_metadata_json(
+    role: DistributedRamRole,
+    edge: ClockEdge,
+    write_enable: ActiveLevel,
+) -> Value {
+    json!({
+        "kind": match role {
+            DistributedRamRole::Data(_) => "distributed_ram_data",
+            DistributedRamRole::WritePort => "distributed_ram_write_port",
+            DistributedRamRole::WriteBlocker => "distributed_ram_blocker",
+        },
+        "bit": match role {
+            DistributedRamRole::Data(bit) => Some(bit),
+            DistributedRamRole::WritePort | DistributedRamRole::WriteBlocker => None,
+        },
+        "edge": clock_edge_name(edge),
+        "write_enable": active_level_name(write_enable),
+    })
+}
+
 const fn clock_edge_name(edge: ClockEdge) -> &'static str {
     match edge {
         ClockEdge::Rising => "rising",
@@ -1059,7 +1101,9 @@ mod tests {
         Ecp5InitialPlacementAlgorithm,
     };
     use texo_model::{CellId, Design, PinDirection, ResourceKind};
-    use texo_struo::{PllOutput, PortDirection, PrimitiveMetadata};
+    use texo_struo::{
+        ActiveLevel, ClockEdge, DistributedRamRole, PllOutput, PortDirection, PrimitiveMetadata,
+    };
     use texo_target_ecp5::{
         ArchitectureFile, PipRecord, RelativeRef, TileRecord, WireRecord, expand,
     };
@@ -1070,6 +1114,29 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../texo-target-ecp5/fixtures/minimal-ecp5.json"
     ));
+
+    #[test]
+    fn checkpoints_distributed_ram_cell_roles() {
+        let mut design = Design::new();
+        let data = design.add_cell("ram$data0", ResourceKind::Lut(4));
+        assert_eq!(
+            primitive_metadata_json(
+                data,
+                &PrimitiveMetadata::DistributedRam {
+                    role: DistributedRamRole::Data(0),
+                    edge: ClockEdge::Falling,
+                    write_enable: ActiveLevel::Low,
+                },
+                &design,
+            )["configuration"],
+            json!({
+                "kind": "distributed_ram_data",
+                "bit": 0,
+                "edge": "falling",
+                "write_enable": "low",
+            })
+        );
+    }
 
     #[test]
     fn checkpoints_the_effective_timing_driven_placement_model() {

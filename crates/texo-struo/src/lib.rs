@@ -10,7 +10,8 @@ use std::fmt;
 
 use struo_ir::{ActiveLevel as StruoActiveLevel, ClockEdge as StruoClockEdge};
 use struo_target_ecp5::{
-    Bit, Control, Ecp5Cell, Ecp5Netlist, MappedPortDirection, PllOutput as StruoPllOutput, Reset,
+    Bit, Control, Ecp5Cell, Ecp5MemoryImplementation, Ecp5Netlist, MappedPortDirection,
+    PllOutput as StruoPllOutput, Reset,
 };
 use texo_model::{CellId, CellPinId, Design, ModelError, PinDirection, ResourceKind};
 
@@ -136,6 +137,17 @@ pub struct BlockRamPortMetadata {
     pub read_enable: Option<ActiveLevel>,
 }
 
+/// Physical role of one cell in a packed `TRELLIS_DPR16X4` macro.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DistributedRamRole {
+    /// One of the four asynchronous-read LUT-RAM bits.
+    Data(u8),
+    /// The `TRELLIS_RAMW` write-address/data distributor.
+    WritePort,
+    /// One of the two LUT slots reserved by the RAM write machinery.
+    WriteBlocker,
+}
+
 /// Direction of a top-level package port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PortDirection {
@@ -189,6 +201,15 @@ pub enum PrimitiveMetadata {
         read_enable: Option<ActiveLevel>,
         /// Independently clocked second port, when this is true dual port.
         second_port: Option<BlockRamPortMetadata>,
+    },
+    /// One physical cell inside a `TRELLIS_DPR16X4` distributed-RAM macro.
+    DistributedRam {
+        /// Cell role within the seven-cell physical macro.
+        role: DistributedRamRole,
+        /// Active write-clock edge.
+        edge: ClockEdge,
+        /// Write-enable assertion level.
+        write_enable: ActiveLevel,
     },
     /// Dedicated ECP5 JTAG TAP access block.
     Jtagg {
@@ -245,6 +266,18 @@ pub struct ImportedEcp5Design {
     ports: Vec<ImportedPort>,
     carry_pairs: Vec<[CellId; 2]>,
     wide_lut_clusters: Vec<Vec<CellId>>,
+    distributed_ram_clusters: Vec<DistributedRamCluster>,
+}
+
+/// Seven cells that implement one ECP5 `TRELLIS_DPR16X4` primitive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DistributedRamCluster {
+    /// Four LUT-RAM data cells in physical K0..K3 order.
+    pub data: [CellId; 4],
+    /// Two otherwise-unused LUT slots occupied by RAMW.
+    pub blockers: [CellId; 2],
+    /// Dedicated write-address/data distribution BEL.
+    pub write_port: CellId,
 }
 
 impl ImportedEcp5Design {
@@ -293,6 +326,12 @@ impl ImportedEcp5Design {
     #[must_use]
     pub fn wide_lut_clusters(&self) -> &[Vec<CellId>] {
         &self.wide_lut_clusters
+    }
+
+    /// Distributed-RAM macros that must occupy one PLC atomically.
+    #[must_use]
+    pub fn distributed_ram_clusters(&self) -> &[DistributedRamCluster] {
+        &self.distributed_ram_clusters
     }
 
     /// Moves out the generic logical design.
@@ -363,6 +402,7 @@ struct Importer {
     carry_pairs: Vec<[CellId; 2]>,
     pending_wide_muxes: BTreeMap<u32, Vec<CellId>>,
     wide_lut_clusters: Vec<Vec<CellId>>,
+    distributed_ram_clusters: Vec<DistributedRamCluster>,
     next_synthetic_signal: u32,
     drivers: BTreeMap<MappedSignal, CellPinId>,
     sinks: BTreeMap<MappedSignal, Vec<CellPinId>>,
@@ -427,7 +467,14 @@ impl Importer {
             }
             Ecp5Cell::Ccu2c { .. } => self.add_ccu2c(primitive),
             Ecp5Cell::FlipFlop { .. } => self.add_flip_flop(primitive),
-            Ecp5Cell::BlockRam { .. } => self.add_block_ram(primitive),
+            Ecp5Cell::BlockRam {
+                implementation: Ecp5MemoryImplementation::Block,
+                ..
+            } => self.add_block_ram(primitive),
+            Ecp5Cell::BlockRam {
+                implementation: Ecp5MemoryImplementation::Distributed,
+                ..
+            } => self.add_distributed_ram(primitive),
             Ecp5Cell::TrellisIo { .. } => self.add_trellis_io(primitive),
             Ecp5Cell::Jtagg { .. } => self.add_jtagg(primitive),
             Ecp5Cell::Pll { .. } => self.add_pll(primitive),
@@ -904,6 +951,7 @@ impl Importer {
     fn add_block_ram(&mut self, primitive: &Ecp5Cell) -> Result<(), AdapterError> {
         let Ecp5Cell::BlockRam {
             name,
+            implementation: Ecp5MemoryImplementation::Block,
             depth,
             word_width,
             physical_width,
@@ -962,6 +1010,101 @@ impl Importer {
                 self.add_output(cell, format!("DOB{index}"), wire)?;
             }
         }
+        Ok(())
+    }
+
+    fn add_distributed_ram(&mut self, primitive: &Ecp5Cell) -> Result<(), AdapterError> {
+        let Ecp5Cell::BlockRam {
+            name,
+            implementation: Ecp5MemoryImplementation::Distributed,
+            write_address,
+            write_data,
+            write_enable,
+            read_address,
+            read_data,
+            clock,
+            edge,
+            ..
+        } = primitive
+        else {
+            unreachable!("dispatch guarantees distributed RAM")
+        };
+        debug_assert_eq!(write_data.len(), 4);
+        debug_assert_eq!(read_data.len(), 4);
+
+        let metadata = |role| PrimitiveMetadata::DistributedRam {
+            role,
+            edge: (*edge).into(),
+            write_enable: write_enable.active.into(),
+        };
+        let write_port = self.add_cell(
+            format!("{name}$RAMW_SLICE"),
+            ResourceKind::Logic,
+            metadata(DistributedRamRole::WritePort),
+        );
+        for (pin, bit) in [
+            ("D0", write_address[0]),
+            ("B0", write_address[1]),
+            ("C0", write_address[2]),
+            ("A0", write_address[3]),
+            ("C1", write_data[0]),
+            ("A1", write_data[1]),
+            ("D1", write_data[2]),
+            ("B1", write_data[3]),
+        ] {
+            self.add_input(write_port, pin, bit)?;
+        }
+
+        let address_signals: [MappedSignal; 4] =
+            std::array::from_fn(|_| self.fresh_synthetic_signal());
+        let data_signals: [MappedSignal; 4] =
+            std::array::from_fn(|_| self.fresh_synthetic_signal());
+        for (index, signal) in address_signals.into_iter().enumerate() {
+            self.add_signal_output(write_port, format!("WADO{index}"), signal)?;
+        }
+        for (index, signal) in data_signals.into_iter().enumerate() {
+            self.add_signal_output(write_port, format!("WDO{index}"), signal)?;
+        }
+
+        let mut data = [CellId(0); 4];
+        for index in 0..4 {
+            let cell = self.add_cell(
+                format!("{name}$DPRAM_COMB{index}"),
+                ResourceKind::Lut(4),
+                metadata(DistributedRamRole::Data(
+                    u8::try_from(index).expect("distributed RAM has four data bits"),
+                )),
+            );
+            data[index] = cell;
+            for (pin, bit) in [
+                ("D", read_address[0]),
+                ("B", read_address[1]),
+                ("C", read_address[2]),
+                ("A", read_address[3]),
+                ("WRE", write_enable.signal),
+                ("WCK", *clock),
+            ] {
+                self.add_input(cell, pin, bit)?;
+            }
+            for (address, signal) in address_signals.into_iter().enumerate() {
+                self.add_signal_input(cell, format!("WAD{address}"), signal)?;
+            }
+            self.add_signal_input(cell, "WD", data_signals[index])?;
+            self.add_output(cell, "F", read_data[index])?;
+        }
+
+        let blockers = std::array::from_fn(|index| {
+            self.add_cell(
+                format!("{name}$RAMW_BLOCK{index}"),
+                ResourceKind::Lut(4),
+                metadata(DistributedRamRole::WriteBlocker),
+            )
+        });
+        self.distributed_ram_clusters.push(DistributedRamCluster {
+            data,
+            blockers,
+            write_port,
+        });
         Ok(())
     }
 
@@ -1332,6 +1475,7 @@ impl Importer {
             ports: self.ports,
             carry_pairs: self.carry_pairs,
             wide_lut_clusters: self.wide_lut_clusters,
+            distributed_ram_clusters: self.distributed_ram_clusters,
         })
     }
 }
@@ -1490,7 +1634,7 @@ mod tests {
 
     use struo_ir::{
         ActiveLevel as StruoActiveLevel, ArithmeticOp, ClockEdge as StruoClockEdge, ComparisonOp,
-        EnableControl, MemoryCell, MemoryPort, Netlist, RegisterCell, ResetControl,
+        EnableControl, MemoryCell, MemoryPort, MemoryStyle, Netlist, RegisterCell, ResetControl,
     };
     use struo_target_ecp5::{
         Bit, Ecp5Cell, IoTimingConstraints, JtaggBinding, MappingOptions, OpenDrainIo, PllBinding,
@@ -1500,8 +1644,9 @@ mod tests {
     use texo_model::{CellId, ResourceKind};
 
     use super::{
-        ActiveLevel, BlockRamPortMetadata, ClockEdge, Importer, PortDirection, PrimitiveMetadata,
-        ResetMetadata, celox_frontend_artifact, fold_lut_input, import_ecp5, pack_carry_inputs,
+        ActiveLevel, BlockRamPortMetadata, ClockEdge, DistributedRamRole, Importer, PortDirection,
+        PrimitiveMetadata, ResetMetadata, celox_frontend_artifact, fold_lut_input, import_ecp5,
+        pack_carry_inputs,
     };
 
     fn mapped_xor() -> struo_target_ecp5::Ecp5Netlist {
@@ -1511,6 +1656,85 @@ mod tests {
         let value = source.add_xor(lhs, rhs);
         source.add_output("value", value);
         map_to_ecp5(&source).unwrap()
+    }
+
+    #[test]
+    fn expands_distributed_ram_into_one_atomic_physical_macro() {
+        let mut source = Netlist::new("distributed_memory");
+        let clock = source.add_input("clock");
+        let write_enable = source.add_input("write_enable");
+        let read_address = (0..4)
+            .map(|index| source.add_input(format!("read_address_{index}")))
+            .collect::<Vec<_>>();
+        let write_address = (0..4)
+            .map(|index| source.add_input(format!("write_address_{index}")))
+            .collect::<Vec<_>>();
+        let write_data = (0..4)
+            .map(|index| source.add_input(format!("write_data_{index}")))
+            .collect::<Vec<_>>();
+        let read_data = (0..4)
+            .map(|index| source.add_memory_output(format!("read_data_{index}")))
+            .collect::<Vec<_>>();
+        source.add_memory(
+            MemoryCell::new(
+                "words",
+                16,
+                read_address,
+                read_data.clone(),
+                None,
+                write_address,
+                write_data,
+                EnableControl {
+                    signal: write_enable,
+                    active: StruoActiveLevel::Low,
+                },
+                clock,
+                StruoClockEdge::Falling,
+            )
+            .with_style(MemoryStyle::Distributed)
+            .with_read_latency(0),
+        );
+        for (index, output) in read_data.into_iter().enumerate() {
+            source.add_output(format!("read_data_{index}"), output);
+        }
+
+        let imported = import_ecp5(&map_to_ecp5(&source).unwrap()).unwrap();
+        let [cluster] = imported.distributed_ram_clusters() else {
+            panic!("expected one distributed-RAM cluster")
+        };
+        assert_eq!(
+            cluster
+                .data
+                .into_iter()
+                .chain(cluster.blockers)
+                .chain([cluster.write_port])
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            7
+        );
+        assert_eq!(
+            imported.metadata()[&cluster.data[0]],
+            PrimitiveMetadata::DistributedRam {
+                role: DistributedRamRole::Data(0),
+                edge: ClockEdge::Falling,
+                write_enable: ActiveLevel::Low,
+            }
+        );
+        assert!(matches!(
+            imported.metadata()[&cluster.write_port],
+            PrimitiveMetadata::DistributedRam {
+                role: DistributedRamRole::WritePort,
+                ..
+            }
+        ));
+        assert_eq!(
+            imported.design().cells()[cluster.write_port.0].pins().len(),
+            16
+        );
+        assert!(cluster.data.into_iter().all(|cell| {
+            imported.design().cells()[cell.0].pins().len() == 12
+                && imported.design().cells()[cell.0].kind == ResourceKind::Lut(4)
+        }));
     }
 
     #[test]

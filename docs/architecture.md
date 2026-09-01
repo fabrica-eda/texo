@@ -19,7 +19,7 @@ The inspected upstream versions are:
 
 | Project | Dependency policy | Relevant contract |
 |---|---|---|
-| `fabrica-eda/struo` | `89e3fa16deeb10d3eddd95708f4056de3b893d9a` | `Ecp5Netlist`, `Ecp5Cell`, `PFUMX`/`L6MUX21`, `CCU2C`, `PllBinding`, mapped ports, nextpnr-compatible JSON, verification policy |
+| `fabrica-eda/struo` | `7917f1149dfab9d1227d53c2721df6454238b7d4` | `Ecp5Netlist`, `Ecp5Cell`, distributed/block memory selection, `PFUMX`/`L6MUX21`, `CCU2C`, `PllBinding`, mapped ports, nextpnr-compatible JSON, verification policy |
 | `celox` | crates.io exact version `=0.3.1` | `FrontendArtifact` and native post-map simulation |
 | `YosysHQ/prjtrellis` | exporter inspected at `3afe7b52b30f4b4417ee98f03016767a502006e3` | deduplicated chip database, relative resource references, package IO database |
 | `prjtrellis-db` | snapshot records the exact revision; fixture uses `015e0330630d7c238c0e4f2cdd9c8157eb78c54a` | ECP5 routing, package, cell timing, and interconnect timing data |
@@ -32,7 +32,7 @@ upgrade.
 
 `texo-struo` implements that boundary. It consumes Struo's in-memory
 `Ecp5Netlist`, creates explicit logical pins for LUT4, CCU2C carry slices,
-TRELLIS_FF, DP16KD, EHXPLLL, constant networks, and every top-level port bit, then
+TRELLIS_FF, `TRELLIS_DPR16X4`, DP16KD, EHXPLLL, constant networks, and every top-level port bit, then
 connects them through Texo nets without serializing JSON. Each compound CCU2C
 is split into two cells joined by an adapter-local carry net while INIT and
 INJECT configuration remains in metadata. The same mapped object can be turned
@@ -43,6 +43,16 @@ the same form used by nextpnr-ecp5: `F1`/`M`/`OFX` represent a LUT5 and
 cascades. Packing keeps these as two-, four-, or eight-LUT atomic placement
 groups on consecutive ECP5 logic slots, and STA uses the Project Trellis
 `SLOGICB` wide-mux characterization.
+
+Each Struo `TRELLIS_DPR16X4` becomes the same physical macro used by
+nextpnr-ecp5: four `TRELLIS_COMB` cells in `DPRAM` mode, two occupied LUT slots,
+and one `TRELLIS_RAMW` cell. An atomic seven-cell placement group restricts the
+macro to one compatible PLC, while dedicated WAD/WD nets remain explicit fixed
+routes. Read-address pins retain their required D/B/C/A permutation and the
+router blocks alternative LUT-input permutation PIPs for those cells. STA sees
+the asynchronous address-to-data LUT arcs; global-clock selection recognizes
+the four WCK sinks. Checkpoints retain each macro role and native bitgen emits
+`SLICEA/B.MODE=DPRAM`, `SLICEC.MODE=RAMW`, WRE polarity, and WCK edge.
 
 `texo-flow::verify_post_map_with_celox` records simulation evidence only after
 a caller-provided Celox testbench succeeds. `implement_struo_ecp5` requires
