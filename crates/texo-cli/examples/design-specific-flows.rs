@@ -1039,7 +1039,7 @@ mod tests {
         assert_eq!(first_bytes, second_bytes);
         assert_eq!(
             format!("{:x}", Sha256::digest(&first_bytes)),
-            "a148a6aabbdeaa925409bd8f768a1e534f5847056b6dd660606b31be8456bb53"
+            "8c5d806a6ef2740af35aaeeaab01c25b707a317ad3d57fc0943b2c0125cc0072"
         );
         assert_eq!(checkpoint["schema_version"], 3);
         assert_eq!(checkpoint["target"]["package"], "CABGA381");
@@ -1091,6 +1091,11 @@ mod tests {
             0
         );
         assert_eq!(checkpoint["timing"]["met_timing"], false);
+        assert_eq!(checkpoint["timing"]["meets_timing_closure"], false);
+        assert_eq!(
+            checkpoint["timing"]["coverage_exceptions"],
+            serde_json::json!([])
+        );
         assert_eq!(checkpoint["timing"]["modeled_endpoint_count"], 0);
         assert_eq!(checkpoint["timing"]["all_modeled_endpoints_checked"], true);
         assert!(

@@ -262,8 +262,14 @@ and recorded in the checkpoint. For nextpnr-compatible ECP5 QoR, no additional
 clock skew, PLL jitter, or setup uncertainty is deducted from the nominal
 period. A report with no constrained sequential
 endpoint, negative setup slack, or negative hold slack does not satisfy the
-timing-closure gate. BRAM timing, generated clocks, multicycle paths, and false
-paths remain future work.
+timing-closure gate. Modeled endpoints omitted from analysis must also pass
+the [explicit timing coverage policy](timing-coverage.md): missing capture
+clocks/periods block release, and `no_synchronous_launch` requires an exact
+reviewed exception. Checkpoints retain the exceptions and bitgen revalidates
+them before resolving its runtime or writing artifacts. This is coverage of
+the existing timing model, not proof that every primitive or external boundary
+has been characterized. General multicycle and false-path constraints remain
+future work.
 
 ## Reproducibility
 

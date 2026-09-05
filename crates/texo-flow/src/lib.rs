@@ -1,6 +1,9 @@
 //! Flow orchestration and explicit verification evidence.
 
 mod ecp5_pll;
+mod timing_coverage;
+
+pub use timing_coverage::{TimingCoverageError, TimingEndpointException, validate_timing_coverage};
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -57,7 +60,7 @@ pub enum Gate {
     PostMapSimulation,
     /// `PnR` completed and independent physical checks passed.
     PhysicalImplementation,
-    /// Static timing constraints were met.
+    /// Modeled setup/hold constraints passed and unchecked endpoints were reviewed.
     TimingClosure,
 }
 
@@ -85,6 +88,22 @@ impl Evidence {
     #[must_use]
     pub fn contains(&self, gate: Gate) -> bool {
         self.passed.contains(&gate)
+    }
+
+    fn record_timing(
+        &mut self,
+        design: &Design,
+        timing: &TimingReport,
+        exceptions: &[TimingEndpointException],
+    ) {
+        // A caller can reuse evidence from a previous implementation. Never
+        // carry its timing gate into a run with failing or incomplete timing.
+        self.passed.remove(&Gate::TimingClosure);
+        if timing.met_timing()
+            && timing_coverage::validate_report_coverage(design, timing, exceptions).is_ok()
+        {
+            self.record(Gate::TimingClosure);
+        }
     }
 
     /// Checks all bitstream release gates.
@@ -183,6 +202,9 @@ pub struct Ecp5FlowOptions<'a> {
     pub lpf: Option<&'a LpfConstraints>,
     /// Whether LPF resolution may leave top-level IO bits unconstrained.
     pub allow_unconstrained_io: bool,
+    /// Exact reviewed `no_synchronous_launch` exceptions, saved in the checkpoint.
+    /// Unconstrained or unconnected capture clocks cannot be excepted.
+    pub timing_exceptions: &'a [TimingEndpointException],
     /// Minimum recognized clock-pin fanout for automatic DCCA promotion.
     pub global_clock_fanout: usize,
     /// Exponent in the ECP5 analytical-placement connection weight
@@ -215,6 +237,7 @@ impl Default for Ecp5FlowOptions<'_> {
             package: None,
             lpf: None,
             allow_unconstrained_io: false,
+            timing_exceptions: &[],
             global_clock_fanout: DEFAULT_GLOBAL_CLOCK_FANOUT,
             placement_weight_exponent: 4,
             initial_placement: None,
@@ -273,10 +296,35 @@ pub struct Ecp5FlowResult {
     pub implementation: PnrResult,
     /// Post-route PIP-delay timing analysis.
     pub timing: TimingReport,
+    /// Exact caller-supplied exceptions retained for independent bitgen validation.
+    pub timing_exceptions: Vec<TimingEndpointException>,
     /// Placement-weight exponent the flow was configured with.
     pub placement_weight_exponent: u32,
     /// Initial placement algorithm used to build this implementation.
     pub initial_placement_algorithm: Ecp5InitialPlacementAlgorithm,
+}
+
+impl Ecp5FlowResult {
+    /// Validates that every omitted modeled endpoint has an exact reviewed exception.
+    ///
+    /// # Errors
+    ///
+    /// Reports missing clock constraints, unreviewed endpoints, or invalid exceptions.
+    pub fn validate_timing_coverage(&self) -> Result<(), TimingCoverageError> {
+        timing_coverage::validate_report_coverage(
+            &self.design,
+            &self.timing,
+            &self.timing_exceptions,
+        )
+    }
+
+    /// Whether modeled timing checks pass and all omitted endpoints are reviewed.
+    ///
+    /// This does not characterize primitives absent from the timing model.
+    #[must_use]
+    pub fn meets_timing_closure(&self) -> bool {
+        self.timing.met_timing() && self.validate_timing_coverage().is_ok()
+    }
 }
 
 /// Completed milestones emitted by the native ECP5 implementation flow.
@@ -820,9 +868,7 @@ pub fn implement_struo_ecp5_with_progress(
     report_metric_phase("timing_closure", &mut phase_started);
     progress(Ecp5FlowStage::Timed);
     staged_evidence.record(Gate::PhysicalImplementation);
-    if timing.met_timing() {
-        staged_evidence.record(Gate::TimingClosure);
-    }
+    staged_evidence.record_timing(&design, &timing, options.timing_exceptions);
     *evidence = staged_evidence;
     if metrics_enabled() {
         eprintln!("[metrics] flow_total={:?}", flow_started.elapsed());
@@ -836,6 +882,7 @@ pub fn implement_struo_ecp5_with_progress(
         packing,
         implementation,
         timing,
+        timing_exceptions: options.timing_exceptions.to_vec(),
         placement_weight_exponent,
         initial_placement_algorithm,
     })
@@ -3710,6 +3757,88 @@ mod tests {
     };
 
     const ECP5_FIXTURE: &str = include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json");
+
+    #[test]
+    fn timing_gate_rejects_an_unconstrained_domain_even_when_checked_paths_pass() {
+        let mut design = Design::new();
+        let mut model = TimingModel::new();
+        let mut delays = Vec::new();
+        let mut clocks = Vec::new();
+        for name in ["cpu", "jtag"] {
+            let source = design.add_cell(format!("{name}_clock"), ResourceKind::Io);
+            let output = design.add_pin(source, "O", PinDirection::Output).unwrap();
+            let ff = design.add_cell(name, ResourceKind::Register);
+            let clock = design.add_pin(ff, "CLK", PinDirection::Input).unwrap();
+            let data = design.add_pin(ff, "DI", PinDirection::Input).unwrap();
+            let q = design.add_pin(ff, "Q", PinDirection::Output).unwrap();
+            let clock_net = design
+                .add_net(format!("{name}_clock"), output, [clock])
+                .unwrap();
+            let data_net = design.add_net(format!("{name}_data"), q, [data]).unwrap();
+            clocks.push(clock_net);
+            delays.extend([
+                NetDelay {
+                    net: clock_net,
+                    sink: clock,
+                    delay: DelayRange::zero(),
+                },
+                NetDelay {
+                    net: data_net,
+                    sink: data,
+                    delay: DelayRange::new(30, 30).unwrap(),
+                },
+            ]);
+            model
+                .add_clock_to_q(
+                    clock,
+                    q,
+                    TimingClockEdge::Rising,
+                    DelayRange::new(40, 40).unwrap(),
+                )
+                .unwrap();
+            model
+                .add_setup_hold(
+                    clock,
+                    data,
+                    TimingClockEdge::Rising,
+                    DelayRange::new(10, 10).unwrap(),
+                    DelayRange::new(10, 10).unwrap(),
+                )
+                .unwrap();
+        }
+        let mut constraints = TimingConstraints::new();
+        constraints.set_clock_period_ps(clocks[0], 1_000);
+        let mut evidence = Evidence::new();
+        for gate in super::REQUIRED_GATES {
+            evidence.record(gate);
+        }
+        let report =
+            analyze_timing_from_net_delays(&design, &model, &constraints, delays.clone()).unwrap();
+        assert!(report.met_timing());
+        assert_eq!(report.setup_checks.len(), 1);
+        assert_eq!(report.unchecked_endpoints.len(), 1);
+        assert_eq!(
+            report.unchecked_endpoints[0].reason.as_str(),
+            "unconstrained_clock"
+        );
+        evidence.record_timing(&design, &report, &[]);
+        assert!(!evidence.contains(Gate::TimingClosure));
+        assert!(evidence.authorize_bitstream().is_err());
+
+        constraints.set_clock_period_ps(clocks[1], 1_000);
+        let report =
+            analyze_timing_from_net_delays(&design, &model, &constraints, delays.clone()).unwrap();
+        assert_eq!(report.setup_checks.len(), 2);
+        assert!(report.all_modeled_endpoints_checked());
+        evidence.record_timing(&design, &report, &[]);
+        assert!(evidence.authorize_bitstream().is_ok());
+
+        constraints.set_clock_period_ps(clocks[1], 50);
+        let report = analyze_timing_from_net_delays(&design, &model, &constraints, delays).unwrap();
+        assert!(!report.met_timing());
+        evidence.record_timing(&design, &report, &[]);
+        assert!(!evidence.contains(Gate::TimingClosure));
+    }
 
     #[test]
     #[allow(deprecated)]

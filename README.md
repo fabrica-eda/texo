@@ -80,6 +80,14 @@ other synthesis-goal, unconstrained-IO, global-clock, and timing-closure
 controls. Without `--output`, project checkpoints go to
 `target/texo/<top>.json`.
 
+`timing.met_timing` describes only the checked paths. Bit generation also
+requires coverage of modeled endpoints: an unconnected or unconstrained
+capture clock blocks `timing_closure`, even when all reported slacks pass.
+Primary-input and unrelated CDC endpoints require exact, justified exceptions
+via `pnr --timing-exceptions review.json`; no exceptions are assumed by default.
+See [timing coverage and the JTAG reproducer](docs/timing-coverage.md) for the
+JSON format, checkpoint compatibility, and remaining model limitations.
+
 ## PnR search model
 
 Texo is intended to support two entry points into the same deterministic,
