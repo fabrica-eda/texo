@@ -131,10 +131,18 @@ scratch rebase remains an available search branch. Reopening the chip restores
 search freedom, but cannot promise the identical basin or result of a separate
 scratch run.
 
-The current CLI writes complete physical checkpoints, but does not yet expose
-checkpoint-guided PnR as a general project command. Until that interface and
-its compatibility checks are implemented, checkpoints are output artifacts
-for inspection, bit generation, and future incremental reuse.
+The CLI accepts initial placement hints with `--initial-placement cells.json`,
+a JSON object mapping exact mapped cell names to BEL names. Optional
+`--lut-ff-pairs pairs.json` maps LUT names to FF names for dedicated pairing.
+These expose the corresponding `Ecp5FlowOptions` inputs. The flow completes
+partial placements and validates packing, resource sharing and placement
+legality before routing. Incompatible atomic groups are rejected.
+
+These options import placement only: routing and timing are computed again,
+and cell names can change after synthesis. They do not import checkpoint
+equivalence or timing evidence, preserve previous routes, or guarantee the
+previous timing result. Full checkpoint-guided incremental PnR and its design
+compatibility checks remain future work.
 
 Board-level open-drain buses keep a two-state verification interface in the
 Veryl design and are fused into one physical bidirectional ECP5 pad at the
