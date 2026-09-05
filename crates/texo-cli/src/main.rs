@@ -164,6 +164,9 @@ struct PnrArgs {
     /// JSON array of exact mapped cell/output-pin clock periods in picoseconds.
     #[arg(long, value_name = "JSON")]
     clock_constraints: Option<PathBuf>,
+    /// Reserve this setup margin on all clocks without changing their periods.
+    #[arg(long, default_value_t = 0)]
+    setup_uncertainty_ps: u64,
     /// Override automatic global-clock promotion fanout.
     #[arg(long)]
     global_clock_fanout: Option<usize>,
@@ -430,6 +433,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         allow_unconstrained_io: args.allow_unconstrained_io,
         timing_exceptions: &timing_exceptions,
         clock_constraints: &clock_constraints,
+        setup_uncertainty_ps: args.setup_uncertainty_ps,
         placement_weight_exponent: args.placement_weight_exponent.get(),
         optimize_timing: !args.no_timing_optimization,
         ..Ecp5FlowOptions::default()
@@ -793,6 +797,8 @@ mod tests {
             "2",
             "--clock-constraints",
             "clocks.json",
+            "--setup-uncertainty-ps",
+            "250",
         ])
         .unwrap();
         let Command::Pnr(args) = cli.command else {
@@ -807,6 +813,7 @@ mod tests {
             Some(Path::new("clocks.json"))
         );
         assert!(!args.no_timing_optimization);
+        assert_eq!(args.setup_uncertainty_ps, 250);
     }
 
     #[test]

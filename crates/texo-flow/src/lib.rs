@@ -209,6 +209,9 @@ pub struct Ecp5FlowOptions<'a> {
     pub timing_exceptions: &'a [TimingEndpointException],
     /// Primary periods on exact mapped source pins, including internal clocks.
     pub clock_constraints: &'a [ClockConstraint],
+    /// Setup margin reserved on every constrained capture clock, in picoseconds.
+    /// This leaves nominal periods, generated-clock relations and hold intact.
+    pub setup_uncertainty_ps: u64,
     /// Minimum recognized clock-pin fanout for automatic DCCA promotion.
     pub global_clock_fanout: usize,
     /// Exponent in the ECP5 analytical-placement connection weight
@@ -243,6 +246,7 @@ impl Default for Ecp5FlowOptions<'_> {
             allow_unconstrained_io: false,
             timing_exceptions: &[],
             clock_constraints: &[],
+            setup_uncertainty_ps: 0,
             global_clock_fanout: DEFAULT_GLOBAL_CLOCK_FANOUT,
             placement_weight_exponent: 4,
             initial_placement: None,
@@ -305,6 +309,8 @@ pub struct Ecp5FlowResult {
     pub timing_exceptions: Vec<TimingEndpointException>,
     /// Explicit source periods used before deriving PLL and global clocks.
     pub clock_constraints: Vec<ClockConstraint>,
+    /// Uniform setup margin applied throughout placement, routing and repair.
+    pub setup_uncertainty_ps: u64,
     /// Placement-weight exponent the flow was configured with.
     pub placement_weight_exponent: u32,
     /// Initial placement algorithm used to build this implementation.
@@ -600,7 +606,8 @@ pub fn implement_struo_ecp5_with_progress(
         &constant_luts,
         imported.metadata(),
     )?;
-    let timing_constraints = ecp5_timing_constraints(&design, &packing, &pll_relations)?;
+    let mut timing_constraints = ecp5_timing_constraints(&design, &packing, &pll_relations)?;
+    apply_setup_uncertainty(&mut timing_constraints, options.setup_uncertainty_ps);
     let mut staged_evidence = evidence.clone();
     staged_evidence.record(Gate::MappedNetlistComplete);
     let use_timing_route = options.optimize_timing || options.initial_timing_reroute;
@@ -856,7 +863,7 @@ pub fn implement_struo_ecp5_with_progress(
             speed_grade,
             &constant_luts,
             imported.metadata(),
-            &pll_relations,
+            &timing_constraints,
             &mut packing,
             &mut implementation,
             &mut timing,
@@ -892,6 +899,7 @@ pub fn implement_struo_ecp5_with_progress(
         timing,
         timing_exceptions: options.timing_exceptions.to_vec(),
         clock_constraints: options.clock_constraints.to_vec(),
+        setup_uncertainty_ps: options.setup_uncertainty_ps,
         placement_weight_exponent,
         initial_placement_algorithm,
     })
@@ -1317,7 +1325,7 @@ fn repair_hold_after_setup(
     speed_grade: &SpeedGradeRecord,
     constant_cells: &BTreeSet<CellId>,
     metadata: &BTreeMap<CellId, PrimitiveMetadata>,
-    pll_relations: &GeneratedClockRelations,
+    timing_constraints: &TimingConstraints,
     packing: &mut Ecp5Packing,
     implementation: &mut PnrResult,
     timing: &mut TimingReport,
@@ -1332,7 +1340,7 @@ fn repair_hold_after_setup(
         speed_grade,
         constant_cells,
         metadata,
-        pll_relations,
+        timing_constraints,
         packing,
         implementation,
         timing,
@@ -1383,7 +1391,8 @@ fn repair_hold_after_setup(
                 constant_cells,
                 metadata,
             )?;
-            let trial_constraints = ecp5_timing_constraints(design, &trial_packing, pll_relations)?;
+            // LUT/FF pair release changes data arcs only. Reuse the original
+            // clock constraints, including the caller's setup uncertainty.
             let requested_minimums = BTreeMap::from([(key, minimum_ps)]);
             let Some((mut trial_implementation, mut trial_timing)) = route_hold_trial(
                 design,
@@ -1393,7 +1402,7 @@ fn repair_hold_after_setup(
                 implementation,
                 timing,
                 &trial_model,
-                &trial_constraints,
+                timing_constraints,
                 requested_minimums.clone(),
                 routing_costs,
                 global_routing_cache,
@@ -1425,7 +1434,7 @@ fn repair_hold_after_setup(
                     &trial_implementation,
                     &trial_timing,
                     &trial_model,
-                    &trial_constraints,
+                    timing_constraints,
                     requested_minimums.clone(),
                     routing_costs,
                     global_routing_cache,
@@ -1486,7 +1495,7 @@ fn repair_hold_after_setup(
         speed_grade,
         constant_cells,
         metadata,
-        pll_relations,
+        timing_constraints,
         packing,
         implementation,
         timing,
@@ -1505,7 +1514,7 @@ fn repair_general_hold_routes(
     speed_grade: &SpeedGradeRecord,
     constant_cells: &BTreeSet<CellId>,
     metadata: &BTreeMap<CellId, PrimitiveMetadata>,
-    pll_relations: &GeneratedClockRelations,
+    timing_constraints: &TimingConstraints,
     packing: &Ecp5Packing,
     implementation: &mut PnrResult,
     timing: &mut TimingReport,
@@ -1515,7 +1524,6 @@ fn repair_general_hold_routes(
     progress: &mut impl FnMut(Ecp5FlowStage),
 ) -> Result<(), Ecp5FlowError> {
     let model = ecp5_timing_model(design, packing, speed_grade, constant_cells, metadata)?;
-    let constraints = ecp5_timing_constraints(design, packing, pll_relations)?;
     let mut accumulated_minimums = BTreeMap::<(NetId, CellPinId), u64>::new();
     loop {
         let new_minimums = hold_sink_min_delays(timing);
@@ -1531,7 +1539,7 @@ fn repair_general_hold_routes(
             implementation,
             timing,
             &model,
-            &constraints,
+            timing_constraints,
             accumulated_minimums.clone(),
             routing_costs,
             global_routing_cache,
@@ -3047,7 +3055,8 @@ fn ecp5_timing_constraints(
     // Match nextpnr's ECP5 QoR model: constraints provide only the nominal
     // period. Project Trellis cell/PIP min/max values are applied by STA, but
     // clock-tree skew, PLL jitter, and additional setup uncertainty are not
-    // deducted from that period.
+    // deducted from that period by default. The caller can apply explicit
+    // setup uncertainty after all generated and promoted clocks are resolved.
     let mut constraints = TimingConstraints::new();
     for (&cell_id, &frequency_hz) in packing.clock_frequencies_hz() {
         let cell = &design.cells()[cell_id.0];
@@ -3098,6 +3107,17 @@ fn ecp5_timing_constraints(
         }
     }
     Ok(constraints)
+}
+
+fn apply_setup_uncertainty(constraints: &mut TimingConstraints, uncertainty_ps: u64) {
+    let clocks = constraints
+        .clock_periods_ps()
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    for clock in clocks {
+        constraints.set_setup_uncertainty_ps(clock, uncertainty_ps);
+    }
 }
 
 fn ecp5_pip_delays(

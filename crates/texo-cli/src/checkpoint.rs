@@ -475,7 +475,7 @@ impl Serialize for TimingRecord<'_> {
         S: Serializer,
     {
         let result = self.0;
-        let mut timing = serializer.serialize_map(Some(16))?;
+        let mut timing = serializer.serialize_map(Some(17))?;
         timing.serialize_entry(
             "all_modeled_endpoints_checked",
             &result.timing.all_modeled_endpoints_checked(),
@@ -486,6 +486,7 @@ impl Serialize for TimingRecord<'_> {
         timing.serialize_entry("meets_timing_closure", &result.meets_timing_closure())?;
         timing.serialize_entry("coverage_exceptions", &result.timing_exceptions)?;
         timing.serialize_entry("clock_constraints", &result.clock_constraints)?;
+        timing.serialize_entry("setup_uncertainty_ps", &result.setup_uncertainty_ps)?;
         timing.serialize_entry("unmodeled_boundaries", &jtagg_timing_boundaries(result))?;
         timing.serialize_entry(
             "modeled_endpoint_count",
