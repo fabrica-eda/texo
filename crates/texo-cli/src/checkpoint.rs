@@ -475,7 +475,7 @@ impl Serialize for TimingRecord<'_> {
         S: Serializer,
     {
         let result = self.0;
-        let mut timing = serializer.serialize_map(Some(12))?;
+        let mut timing = serializer.serialize_map(Some(14))?;
         timing.serialize_entry(
             "all_modeled_endpoints_checked",
             &result.timing.all_modeled_endpoints_checked(),
@@ -483,6 +483,8 @@ impl Serialize for TimingRecord<'_> {
         timing.serialize_entry("delay_model", "nextpnr_ecp5_project_trellis_min_max_ps")?;
         timing.serialize_entry("hold_checks", &HoldCheckRecords(result))?;
         timing.serialize_entry("met_timing", &result.timing.met_timing())?;
+        timing.serialize_entry("meets_timing_closure", &result.meets_timing_closure())?;
+        timing.serialize_entry("coverage_exceptions", &result.timing_exceptions)?;
         timing.serialize_entry(
             "modeled_endpoint_count",
             &result.timing.modeled_endpoint_count(),
@@ -713,6 +715,7 @@ impl Serialize for UncheckedEndpointRecords<'_> {
                 cell_id: endpoint.cell.0,
                 cell: &result.design.cells()[endpoint.cell.0].name,
                 data_pin_id: endpoint.data_pin.0,
+                data_pin: &result.design.pins()[endpoint.data_pin.0].name,
                 clock_pin_id: endpoint.clock_pin.0,
                 clock_net_id: endpoint.clock_net.map(|net| net.0),
                 reason: endpoint.reason.as_str(),
@@ -729,6 +732,7 @@ struct UncheckedEndpointRecord<'a> {
     clock_net_id: Option<usize>,
     clock_pin_id: usize,
     data_pin_id: usize,
+    data_pin: &'a str,
     reason: &'static str,
 }
 

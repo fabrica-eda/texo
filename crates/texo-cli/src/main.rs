@@ -158,6 +158,9 @@ struct PnrArgs {
     /// Permit top-level IO bits without an LPF location.
     #[arg(long)]
     allow_unconstrained_io: bool,
+    /// JSON array of exact reviewed `no_synchronous_launch` endpoint exceptions.
+    #[arg(long, value_name = "JSON")]
+    timing_exceptions: Option<PathBuf>,
     /// Override automatic global-clock promotion fanout.
     #[arg(long)]
     global_clock_fanout: Option<usize>,
@@ -343,6 +346,14 @@ fn target(args: &TargetArgs) -> Result<(), Box<dyn Error>> {
 #[allow(clippy::too_many_lines)]
 fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
     let flow_started = Instant::now();
+    let timing_exceptions: Vec<texo_flow::TimingEndpointException> = args
+        .timing_exceptions
+        .as_ref()
+        .map(|path| -> Result<_, Box<dyn Error>> {
+            Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?)
+        })
+        .transpose()?
+        .unwrap_or_default();
     let (loaded, output) = prepare_veryl_input(args)?;
 
     let synthesized = synthesize(&loaded.design)?;
@@ -406,6 +417,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         package: Some(&args.package),
         lpf: lpf.as_ref(),
         allow_unconstrained_io: args.allow_unconstrained_io,
+        timing_exceptions: &timing_exceptions,
         placement_weight_exponent: args.placement_weight_exponent.get(),
         optimize_timing: !args.no_timing_optimization,
         ..Ecp5FlowOptions::default()
@@ -439,7 +451,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         flow_started.elapsed(),
     );
     println!(
-        "timing: WNS {}, WHS {}, {}; endpoints {}/{} checked",
+        "timing: WNS {}, WHS {}, checked paths {}; endpoints {}/{} checked",
         format_slack(result.timing.worst_slack_ps),
         format_slack(result.timing.worst_hold_slack_ps),
         if result.timing.met_timing() {
@@ -450,6 +462,18 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         result.timing.setup_checks.len(),
         result.timing.modeled_endpoint_count(),
     );
+    println!(
+        "timing closure: {}; {} explicit endpoint exceptions",
+        if result.meets_timing_closure() {
+            "met"
+        } else {
+            "not met"
+        },
+        result.timing_exceptions.len(),
+    );
+    if let Err(error) = result.validate_timing_coverage() {
+        eprintln!("timing coverage: {error}");
+    }
     println!("checkpoint: {}", output.display());
     println!(
         "verification: mapping equivalence passed; post-map functional simulation not supplied"

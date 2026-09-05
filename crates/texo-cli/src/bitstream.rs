@@ -5,6 +5,7 @@ use std::error::Error;
 use std::fmt::{self, Write as _};
 
 use serde_json::Value;
+use texo_flow::{TimingEndpointException, validate_timing_coverage};
 use texo_model::Point;
 use texo_target_ecp5::{ECP5_PLL_OUTPUT_DIVIDER_DEFAULT, Ecp5Architecture};
 
@@ -397,7 +398,7 @@ pub fn generate_ecp5_config(
     })
 }
 
-fn validate_checkpoint(checkpoint: &Value) -> Result<(), BitgenError> {
+pub(crate) fn validate_checkpoint(checkpoint: &Value) -> Result<(), BitgenError> {
     if u64_value(checkpoint, "schema_version")? != 3 {
         return Err(BitgenError::new(
             "native bitgen requires checkpoint schema version 3",
@@ -423,12 +424,46 @@ fn validate_checkpoint(checkpoint: &Value) -> Result<(), BitgenError> {
             "bitstream generation requires a timing-closed checkpoint",
         ));
     }
+    validate_checkpoint_timing_coverage(member(checkpoint, "timing")?)?;
     if string(member(checkpoint, "target")?, "family")? != "ECP5" {
         return Err(BitgenError::new(
             "native bitgen only accepts ECP5 checkpoints",
         ));
     }
     Ok(())
+}
+
+fn validate_checkpoint_timing_coverage(timing: &Value) -> Result<(), BitgenError> {
+    // Do not trust timing_closure/met_timing from an older writer, or a cached
+    // meets_timing_closure flag. Recheck the actual endpoint/exception records.
+    let unchecked = array(timing, "unchecked_endpoints")?;
+    if bool_value(timing, "all_modeled_endpoints_checked")? != unchecked.is_empty() {
+        return Err(BitgenError::new(
+            "timing coverage flag disagrees with unchecked_endpoints",
+        ));
+    }
+    let exceptions: Vec<TimingEndpointException> = timing
+        .get("coverage_exceptions")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .map_err(|error| BitgenError::new(format!("invalid timing exceptions: {error}")))?
+        .unwrap_or_default();
+    let endpoints = unchecked
+        .iter()
+        .map(|endpoint| {
+            let cell = string(endpoint, "cell")?;
+            let reason = string(endpoint, "reason")?;
+            if reason != "no_synchronous_launch" {
+                return Err(BitgenError::new(format!(
+                    "unchecked timing endpoint {cell}: {reason}; \
+                     capture clocks must be connected and constrained",
+                )));
+            }
+            Ok((cell, string(endpoint, "data_pin")?, reason))
+        })
+        .collect::<Result<Vec<_>, BitgenError>>()?;
+    validate_timing_coverage(endpoints, &exceptions)
+        .map_err(|error| BitgenError::new(format!("timing coverage: {error}")))
 }
 
 type IncomingFlags = HashMap<u64, Vec<u64>>;
@@ -2112,7 +2147,11 @@ mod tests {
                 "physical_implementation",
                 "timing_closure",
             ],
-            "timing": {"met_timing": true},
+            "timing": {
+                "met_timing": true,
+                "all_modeled_endpoints_checked": true,
+                "unchecked_endpoints": [],
+            },
             "target": {
                 "family": "ECP5",
                 "device": "LFE5UM5G-85F-test",
@@ -2171,7 +2210,11 @@ mod tests {
                 "synthesis_equivalence", "mapped_netlist_complete",
                 "physical_implementation", "timing_closure"
             ],
-            "timing": {"met_timing": true},
+            "timing": {
+                "met_timing": true,
+                "all_modeled_endpoints_checked": true,
+                "unchecked_endpoints": [],
+            },
             "target": {"family": "ECP5"}
         });
         assert!(validate_checkpoint(&checkpoint).is_ok());
@@ -2182,6 +2225,90 @@ mod tests {
                 .to_string()
                 .contains("schema version 3")
         );
+    }
+
+    fn reviewed_cdc_checkpoint() -> serde_json::Value {
+        json!({
+            "schema_version": 3,
+            "evidence": [
+                "synthesis_equivalence", "mapped_netlist_complete",
+                "physical_implementation", "timing_closure"
+            ],
+            "timing": {
+                "met_timing": true,
+                "meets_timing_closure": true,
+                "all_modeled_endpoints_checked": false,
+                "unchecked_endpoints": [{
+                    "cell": "request_meta", "data_pin": "DI",
+                    "reason": "no_synchronous_launch"
+                }],
+                "coverage_exceptions": [{
+                    "cell": "request_meta", "data_pin": "DI",
+                    "reason": "no_synchronous_launch",
+                    "justification": "First stage of a reviewed toggle synchronizer"
+                }]
+            },
+            "target": {"family": "ECP5"}
+        })
+    }
+
+    #[test]
+    fn bitgen_rechecks_coverage_even_with_a_cached_timing_closure_gate() {
+        let checkpoint = reviewed_cdc_checkpoint();
+        assert!(validate_checkpoint(&checkpoint).is_ok());
+        for reason in ["unconstrained_clock", "unconnected_clock", "unknown_reason"] {
+            let mut changed = checkpoint.clone();
+            changed["timing"]["unchecked_endpoints"][0]["reason"] = json!(reason);
+            let error = validate_checkpoint(&changed).unwrap_err().to_string();
+            assert!(error.contains(reason), "{error}");
+        }
+        let mut changed = checkpoint.clone();
+        changed["timing"]["unchecked_endpoints"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "cell": "new_meta", "data_pin": "DI", "reason": "no_synchronous_launch"
+            }));
+        assert!(
+            validate_checkpoint(&changed)
+                .unwrap_err()
+                .to_string()
+                .contains("new_meta.DI")
+        );
+
+        let mut changed = checkpoint.clone();
+        changed["timing"]
+            .as_object_mut()
+            .unwrap()
+            .remove("coverage_exceptions");
+        assert!(validate_checkpoint(&changed).is_err());
+        let mut changed = checkpoint;
+        changed["timing"]["unchecked_endpoints"] = json!([]);
+        changed["timing"]["all_modeled_endpoints_checked"] = json!(true);
+        assert!(
+            validate_checkpoint(&changed)
+                .unwrap_err()
+                .to_string()
+                .contains("unused")
+        );
+    }
+
+    #[test]
+    fn bitgen_rejects_missing_malformed_or_contradictory_coverage() {
+        for key in ["unchecked_endpoints", "all_modeled_endpoints_checked"] {
+            let mut checkpoint = reviewed_cdc_checkpoint();
+            checkpoint["timing"].as_object_mut().unwrap().remove(key);
+            assert!(validate_checkpoint(&checkpoint).is_err());
+        }
+        let mut checkpoint = reviewed_cdc_checkpoint();
+        checkpoint["timing"]["all_modeled_endpoints_checked"] = json!(true);
+        assert!(validate_checkpoint(&checkpoint).is_err());
+        let mut checkpoint = reviewed_cdc_checkpoint();
+        checkpoint["timing"]["coverage_exceptions"] = json!(null);
+        assert!(validate_checkpoint(&checkpoint).is_err());
+        let mut checkpoint = reviewed_cdc_checkpoint();
+        checkpoint["timing"]["met_timing"] = json!(false);
+        assert!(validate_checkpoint(&checkpoint).is_err());
     }
 
     #[test]

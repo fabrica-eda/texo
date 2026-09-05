@@ -440,6 +440,9 @@ pub struct TimingReport {
 
 impl TimingReport {
     /// Whether at least one setup endpoint was checked and every check passed.
+    ///
+    /// This is a numerical result for checked paths, not a coverage/sign-off
+    /// predicate. Unchecked endpoints must be reviewed separately before release.
     #[must_use]
     pub fn met_timing(&self) -> bool {
         self.worst_slack_ps.is_some_and(|slack| slack >= 0)

@@ -113,6 +113,9 @@ pub fn bitgen(options: &Ecp5BitgenOptions) -> Result<Ecp5BitgenOutput, Ecp5Bitge
 fn bitgen_inner(options: &Ecp5BitgenOptions) -> Result<Ecp5BitgenOutput, Box<dyn Error>> {
     let checkpoint: Value =
         serde_json::from_reader(BufReader::new(File::open(&options.checkpoint)?))?;
+    // Reject missing evidence/coverage before loading or fetching the runtime
+    // and before writing a configuration or invoking the bitstream codec.
+    crate::bitstream::validate_checkpoint(&checkpoint)?;
     let device = checkpoint
         .get("target")
         .and_then(|target| target.get("device"))
