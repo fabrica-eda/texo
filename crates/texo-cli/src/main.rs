@@ -161,6 +161,9 @@ struct PnrArgs {
     /// JSON array of exact reviewed `no_synchronous_launch` endpoint exceptions.
     #[arg(long, value_name = "JSON")]
     timing_exceptions: Option<PathBuf>,
+    /// JSON array of exact mapped cell/output-pin clock periods in picoseconds.
+    #[arg(long, value_name = "JSON")]
+    clock_constraints: Option<PathBuf>,
     /// Override automatic global-clock promotion fanout.
     #[arg(long)]
     global_clock_fanout: Option<usize>,
@@ -346,6 +349,14 @@ fn target(args: &TargetArgs) -> Result<(), Box<dyn Error>> {
 #[allow(clippy::too_many_lines)]
 fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
     let flow_started = Instant::now();
+    let clock_constraints: Vec<texo_flow::ClockConstraint> = args
+        .clock_constraints
+        .as_ref()
+        .map(|path| -> Result<_, Box<dyn Error>> {
+            Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?)
+        })
+        .transpose()?
+        .unwrap_or_default();
     let timing_exceptions: Vec<texo_flow::TimingEndpointException> = args
         .timing_exceptions
         .as_ref()
@@ -418,6 +429,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         lpf: lpf.as_ref(),
         allow_unconstrained_io: args.allow_unconstrained_io,
         timing_exceptions: &timing_exceptions,
+        clock_constraints: &clock_constraints,
         placement_weight_exponent: args.placement_weight_exponent.get(),
         optimize_timing: !args.no_timing_optimization,
         ..Ecp5FlowOptions::default()
@@ -473,6 +485,16 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
     );
     if let Err(error) = result.validate_timing_coverage() {
         eprintln!("timing coverage: {error}");
+    }
+    let jtagg_count = result
+        .primitive_metadata
+        .values()
+        .filter(|metadata| matches!(metadata, texo_struo::PrimitiveMetadata::Jtagg { .. }))
+        .count();
+    if jtagg_count != 0 {
+        println!(
+            "timing scope: {jtagg_count} JTAGG primitive(s) have uncharacterized launch/capture boundaries; see checkpoint timing.unmodeled_boundaries"
+        );
     }
     println!("checkpoint: {}", output.display());
     println!(
@@ -769,6 +791,8 @@ mod tests {
             "build/design.json",
             "--placement-weight-exponent",
             "2",
+            "--clock-constraints",
+            "clocks.json",
         ])
         .unwrap();
         let Command::Pnr(args) = cli.command else {
@@ -778,6 +802,10 @@ mod tests {
         assert_eq!(args.top.as_deref(), Some("Top"));
         assert_eq!(args.speed, "8_5G");
         assert_eq!(args.placement_weight_exponent.get(), 2);
+        assert_eq!(
+            args.clock_constraints.as_deref(),
+            Some(Path::new("clocks.json"))
+        );
         assert!(!args.no_timing_optimization);
     }
 
