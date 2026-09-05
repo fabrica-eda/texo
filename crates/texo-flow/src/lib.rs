@@ -1,8 +1,10 @@
 //! Flow orchestration and explicit verification evidence.
 
+mod clock_constraints;
 mod ecp5_pll;
 mod timing_coverage;
 
+pub use clock_constraints::ClockConstraint;
 pub use timing_coverage::{TimingCoverageError, TimingEndpointException, validate_timing_coverage};
 
 use std::cmp::Reverse;
@@ -205,6 +207,8 @@ pub struct Ecp5FlowOptions<'a> {
     /// Exact reviewed `no_synchronous_launch` exceptions, saved in the checkpoint.
     /// Unconstrained or unconnected capture clocks cannot be excepted.
     pub timing_exceptions: &'a [TimingEndpointException],
+    /// Primary periods on exact mapped source pins, including internal clocks.
+    pub clock_constraints: &'a [ClockConstraint],
     /// Minimum recognized clock-pin fanout for automatic DCCA promotion.
     pub global_clock_fanout: usize,
     /// Exponent in the ECP5 analytical-placement connection weight
@@ -238,6 +242,7 @@ impl Default for Ecp5FlowOptions<'_> {
             lpf: None,
             allow_unconstrained_io: false,
             timing_exceptions: &[],
+            clock_constraints: &[],
             global_clock_fanout: DEFAULT_GLOBAL_CLOCK_FANOUT,
             placement_weight_exponent: 4,
             initial_placement: None,
@@ -298,6 +303,8 @@ pub struct Ecp5FlowResult {
     pub timing: TimingReport,
     /// Exact caller-supplied exceptions retained for independent bitgen validation.
     pub timing_exceptions: Vec<TimingEndpointException>,
+    /// Explicit source periods used before deriving PLL and global clocks.
+    pub clock_constraints: Vec<ClockConstraint>,
     /// Placement-weight exponent the flow was configured with.
     pub placement_weight_exponent: u32,
     /// Initial placement algorithm used to build this implementation.
@@ -580,6 +587,7 @@ pub fn implement_struo_ecp5_with_progress(
         packing.pack_carry_lut_ffs(&design, architecture, ff_control_sets.iter().copied())?;
     }
     packing.constrain_ff_control_sets(architecture, &ff_control_sets);
+    clock_constraints::apply_clock_constraints(&design, &mut packing, options.clock_constraints)?;
     let pll_relations = constrain_pll_outputs(&design, imported.metadata(), &mut packing)?;
     progress(Ecp5FlowStage::Packed);
     report_metric_phase("packing", &mut phase_started);
@@ -883,6 +891,7 @@ pub fn implement_struo_ecp5_with_progress(
         implementation,
         timing,
         timing_exceptions: options.timing_exceptions.to_vec(),
+        clock_constraints: options.clock_constraints.to_vec(),
         placement_weight_exponent,
         initial_placement_algorithm,
     })
@@ -3418,6 +3427,15 @@ pub enum Ecp5FlowError {
         /// Requested frequency.
         frequency_hz: u64,
     },
+    /// An explicit internal/source clock constraint cannot be applied.
+    InvalidClockConstraint {
+        /// Requested source cell name.
+        cell: String,
+        /// Requested source pin name.
+        pin: String,
+        /// Exact reason the constraint was rejected.
+        reason: String,
+    },
     /// More than one source assigned different periods to one logical net.
     ConflictingClockPeriods {
         /// Logical clock net.
@@ -3553,6 +3571,9 @@ impl fmt::Display for Ecp5FlowError {
                 f,
                 "clock IO cell `{cell}` frequency {frequency_hz} Hz is outside picosecond resolution"
             ),
+            Self::InvalidClockConstraint { cell, pin, reason } => {
+                write!(f, "invalid clock constraint `{cell}.{pin}`: {reason}")
+            }
             Self::ConflictingClockPeriods { net } => {
                 write!(f, "clock net {} has conflicting periods", net.0)
             }
@@ -3638,6 +3659,7 @@ impl Error for Ecp5FlowError {
             | Self::TimingDelayOverflow
             | Self::ClockIoNet { .. }
             | Self::ClockFrequencyOutOfRange { .. }
+            | Self::InvalidClockConstraint { .. }
             | Self::ConflictingClockPeriods { .. }
             | Self::ConflictingClockRelations { .. }
             | Self::MissingPllOutputFrequency { .. }
@@ -3929,6 +3951,40 @@ mod tests {
             (memory.multiply_by, memory.divide_by, memory.phase_ps),
             (1, 2, 0)
         );
+    }
+
+    #[test]
+    fn explicit_periods_cannot_override_lpf_or_pll_derived_clocks() {
+        let fixture = DualPllFixture::new();
+        let metadata = dual_output_pll_metadata(fixture.pll);
+        let mut reference = packing_with_input_clock(&fixture.design, fixture.input, 12_000_000);
+        let expected = constrain_pll_outputs(&fixture.design, &metadata, &mut reference).unwrap();
+        for (cell, pin, period_ps, passes) in [
+            ("pll", "CLKOS", 8_013, true),
+            ("pll", "CLKOS", 8_100, false),
+            ("clock_input", "O", 40_000, false),
+        ] {
+            let mut packing = packing_with_input_clock(&fixture.design, fixture.input, 12_000_000);
+            super::clock_constraints::apply_clock_constraints(
+                &fixture.design,
+                &mut packing,
+                &[super::ClockConstraint {
+                    cell: cell.into(),
+                    pin: pin.into(),
+                    period_ps,
+                }],
+            )
+            .unwrap();
+            let result = constrain_pll_outputs(&fixture.design, &metadata, &mut packing);
+            if passes {
+                assert_eq!(result.unwrap(), expected);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(Ecp5FlowError::ConflictingClockPeriods { .. })
+                ));
+            }
+        }
     }
 
     #[test]

@@ -475,7 +475,7 @@ impl Serialize for TimingRecord<'_> {
         S: Serializer,
     {
         let result = self.0;
-        let mut timing = serializer.serialize_map(Some(14))?;
+        let mut timing = serializer.serialize_map(Some(16))?;
         timing.serialize_entry(
             "all_modeled_endpoints_checked",
             &result.timing.all_modeled_endpoints_checked(),
@@ -485,6 +485,8 @@ impl Serialize for TimingRecord<'_> {
         timing.serialize_entry("met_timing", &result.timing.met_timing())?;
         timing.serialize_entry("meets_timing_closure", &result.meets_timing_closure())?;
         timing.serialize_entry("coverage_exceptions", &result.timing_exceptions)?;
+        timing.serialize_entry("clock_constraints", &result.clock_constraints)?;
+        timing.serialize_entry("unmodeled_boundaries", &jtagg_timing_boundaries(result))?;
         timing.serialize_entry(
             "modeled_endpoint_count",
             &result.timing.modeled_endpoint_count(),
@@ -504,6 +506,27 @@ impl Serialize for TimingRecord<'_> {
 }
 
 struct NetDelayRecords<'a>(&'a Ecp5FlowResult);
+
+fn jtagg_timing_boundaries(result: &Ecp5FlowResult) -> Vec<Value> {
+    result
+        .primitive_metadata
+        .iter()
+        .filter(|(_, metadata)| matches!(metadata, PrimitiveMetadata::Jtagg { .. }))
+        .map(|(cell, _)| {
+            let logical = &result.design.cells()[cell.0];
+            json!({
+                "cell_id": cell.0,
+                "cell": logical.name,
+                "primitive": "JTAGG",
+                "reason": "launch_capture_not_characterized",
+                "connected_pins": logical.pins().iter().filter_map(|pin| {
+                    let p = &result.design.pins()[pin.0];
+                    p.net().map(|_| p.name.as_str())
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
 
 impl Serialize for NetDelayRecords<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>

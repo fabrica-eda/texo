@@ -88,6 +88,11 @@ via `pnr --timing-exceptions review.json`; no exceptions are assumed by default.
 See [timing coverage and the JTAG reproducer](docs/timing-coverage.md) for the
 JSON format, checkpoint compatibility, and remaining model limitations.
 
+For internal sources such as `JTAGG.JTCK`, use
+`--clock-constraints clocks.json` to specify an exact mapped cell/output pin
+and minimum period. Periods propagate through DCCA buffers and coexist with
+PLL-derived clock relationships. See [internal clocks](docs/internal-clocks.md).
+
 ## PnR search model
 
 Texo is intended to support two entry points into the same deterministic,

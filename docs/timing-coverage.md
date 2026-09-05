@@ -140,6 +140,7 @@ failure were not measured. This failure does not establish that the
 nextpnr/Project Trellis delay numbers or Texo's STA arithmetic were wrong:
 the failing boundary was outside the reported checks.
 
-No JTAGG delay constants, PLL uncertainty values, clock constraints, or PnR
-search behavior are changed here. A characterized JTAGG model and a general
-internal-clock constraint interface remain separate follow-up work.
+The coverage policy does not supply JTAGG delay constants or PLL uncertainty
+values. [Internal source clock constraints](internal-clocks.md) can now bring
+JTCK register-to-register paths into the normal flow. A characterized JTAGG
+model and reset/CDC analysis remain separate follow-up work.
