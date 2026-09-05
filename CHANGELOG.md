@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7](https://github.com/fabrica-eda/texo/compare/v0.1.6...v0.1.7) (2026-09-05)
+
+
+### Features
+
+* **ecp5:** support Struo distributed RAM ([#57](https://github.com/fabrica-eda/texo/issues/57)) ([bc7498e](https://github.com/fabrica-eda/texo/commit/bc7498eb0eabfcd02851724c6aa9b224c491027f))
+* **timing:** constrain internal clock sources and report JTAGG scope ([#62](https://github.com/fabrica-eda/texo/issues/62)) ([fd261c7](https://github.com/fabrica-eda/texo/commit/fd261c773ed14f4eec38a6c5dfe16480b4d25bfe))
+
+
+### Bug Fixes
+
+* **timing:** require reviewed endpoint coverage before bitgen ([#61](https://github.com/fabrica-eda/texo/issues/61)) ([f1db5e4](https://github.com/fabrica-eda/texo/commit/f1db5e4cbc8a728621a5fe79b5e7482b845c7024))
+
 ## [0.1.6](https://github.com/fabrica-eda/texo/compare/v0.1.5...v0.1.6) (2026-08-31)
 
 
