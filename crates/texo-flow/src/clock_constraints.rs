@@ -178,6 +178,10 @@ mod tests {
         }
 
         fn analyze(&self) -> TimingReport {
+            self.analyze_with_margin(0)
+        }
+
+        fn analyze_with_margin(&self, uncertainty_ps: u64) -> TimingReport {
             let model = ecp5_timing_model(
                 &self.design,
                 &self.packing,
@@ -186,12 +190,13 @@ mod tests {
                 &self.metadata,
             )
             .unwrap();
-            let constraints = ecp5_timing_constraints(
+            let mut constraints = ecp5_timing_constraints(
                 &self.design,
                 &self.packing,
                 &GeneratedClockRelations::new(),
             )
             .unwrap();
+            crate::apply_setup_uncertainty(&mut constraints, uncertainty_ps);
             let delays = self
                 .design
                 .nets()
@@ -206,6 +211,31 @@ mod tests {
                 })
                 .collect();
             analyze_timing_from_net_delays(&self.design, &model, &constraints, delays).unwrap()
+        }
+    }
+
+    #[test]
+    fn setup_margin_preserves_periods_edges_and_hold_in_promoted_domain() {
+        let mut fixture = Fixture::new();
+        apply_clock_constraints(
+            &fixture.design,
+            &mut fixture.packing,
+            &[ClockConstraint {
+                cell: "tap".into(),
+                pin: "JTCK".into(),
+                period_ps: 166_666,
+            }],
+        )
+        .unwrap();
+        let nominal = fixture.analyze();
+        let guarded = fixture.analyze_with_margin(250);
+        assert_eq!(nominal.hold_checks, guarded.hold_checks);
+        assert_eq!(nominal.unchecked_endpoints, guarded.unchecked_endpoints);
+        for (before, after) in nominal.setup_checks.iter().zip(&guarded.setup_checks) {
+            assert_eq!(before.slack_ps - 250, after.slack_ps);
+            assert_eq!(after.uncertainty_ps, 250);
+            assert_eq!(before.launch_edge, after.launch_edge);
+            assert_eq!(before.capture_edge, after.capture_edge);
         }
     }
 
