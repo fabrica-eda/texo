@@ -36,22 +36,22 @@ libm = "0.2"
 rustdct = "0.7.1"
 ureq = { version = "3.1", default-features = false, features = ["rustls"] }
 zstd = "0.13"
-struo-celox = { git = "https://github.com/fabrica-eda/struo.git", rev = "eff404dff0c4806064e2a4e0f59564b1079c001d" }
-struo-example-axi4-smartconnect = { git = "https://github.com/fabrica-eda/struo.git", rev = "eff404dff0c4806064e2a4e0f59564b1079c001d" }
-struo-frontend-veryl = { git = "https://github.com/fabrica-eda/struo.git", rev = "eff404dff0c4806064e2a4e0f59564b1079c001d" }
-struo-ir = { git = "https://github.com/fabrica-eda/struo.git", rev = "eff404dff0c4806064e2a4e0f59564b1079c001d" }
-struo-rtl = { git = "https://github.com/fabrica-eda/struo.git", rev = "eff404dff0c4806064e2a4e0f59564b1079c001d" }
-struo-synth = { git = "https://github.com/fabrica-eda/struo.git", rev = "eff404dff0c4806064e2a4e0f59564b1079c001d" }
-struo-target-ecp5 = { git = "https://github.com/fabrica-eda/struo.git", rev = "eff404dff0c4806064e2a4e0f59564b1079c001d" }
+struo-celox = { git = "https://github.com/fabrica-eda/struo.git", rev = "836236ddb3f4fa4ba7f456a134785d58525212a5" }
+struo-example-axi4-smartconnect = { git = "https://github.com/fabrica-eda/struo.git", rev = "836236ddb3f4fa4ba7f456a134785d58525212a5" }
+struo-frontend-veryl = { git = "https://github.com/fabrica-eda/struo.git", rev = "836236ddb3f4fa4ba7f456a134785d58525212a5" }
+struo-ir = { git = "https://github.com/fabrica-eda/struo.git", rev = "836236ddb3f4fa4ba7f456a134785d58525212a5" }
+struo-rtl = { git = "https://github.com/fabrica-eda/struo.git", rev = "836236ddb3f4fa4ba7f456a134785d58525212a5" }
+struo-synth = { git = "https://github.com/fabrica-eda/struo.git", rev = "836236ddb3f4fa4ba7f456a134785d58525212a5" }
+struo-target-ecp5 = { git = "https://github.com/fabrica-eda/struo.git", rev = "836236ddb3f4fa4ba7f456a134785d58525212a5" }
 texo-flow = { path = "crates/texo-flow" }
 texo-model = { path = "crates/texo-model" }
 texo-pnr = { path = "crates/texo-pnr" }
 texo-struo = { path = "crates/texo-struo" }
 texo-target-ecp5 = { path = "crates/texo-target-ecp5" }
 texo-timing = { path = "crates/texo-timing" }
-veryl-analyzer = "=0.20.3"
-veryl-metadata = "=0.20.3"
-veryl-parser = "=0.20.3"
+veryl-analyzer = "=0.21.0"
+veryl-metadata = "=0.21.0"
+veryl-parser = "=0.21.0"
 
 [workspace.lints.rust]
 missing_docs = "warn"
