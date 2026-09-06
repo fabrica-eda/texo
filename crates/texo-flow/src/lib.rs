@@ -853,6 +853,33 @@ pub fn implement_struo_ecp5_with_progress(
             &mut progress,
         )?;
     }
+    if options.optimize_timing
+        && timing.worst_slack_ps.is_some_and(|slack| slack < 0)
+        && let (Some(costs), Some(delay_predictor)) = (
+            timing_routing_costs.as_mut(),
+            placement_delay_predictor.as_ref(),
+        )
+    {
+        let placement_refiner = PlacementRefiner::new_with_workspace(
+            &design,
+            architecture.device(),
+            packing.constraints(),
+            &mut placement_refinement_workspace,
+        )?;
+        TimingFeedbackContext {
+            design: &design,
+            architecture,
+            packing: &packing,
+            placement_refiner: &placement_refiner,
+            global_routing_cache: &mut global_routing_cache,
+            speed_grade,
+            timing_model: &timing_model,
+            timing_constraints: &timing_constraints,
+            delay_predictor,
+            routing_workspace: &mut routing_workspace,
+        }
+        .improve_local_setup(&mut implementation, &mut timing, costs, &mut progress)?;
+    }
     if let Some(costs) = timing_routing_costs.as_mut()
         && timing.worst_slack_ps.is_some_and(|slack| slack >= 0)
         && timing.worst_hold_slack_ps.is_some_and(|slack| slack < 0)
@@ -1171,6 +1198,174 @@ fn report_timing_feedback_prescreen(
 }
 
 impl TimingFeedbackContext<'_, '_, '_> {
+    #[allow(clippy::too_many_lines)]
+    fn improve_local_setup(
+        &mut self,
+        implementation: &mut PnrResult,
+        timing: &mut TimingReport,
+        routing_costs: &mut RoutingCosts,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<(), Ecp5FlowError> {
+        let mut seen = BTreeSet::from([placement_identity(self.design, &implementation.placement)]);
+        let mut round = 0_usize;
+        'refresh: while let Some(worst) = timing.worst_slack_ps.filter(|&slack| slack < 0) {
+            round += 1;
+            let delays = timing
+                .net_delays
+                .iter()
+                .map(|delay| ((delay.net, delay.sink), delay.delay.max_ps))
+                .collect::<BTreeMap<_, _>>();
+            let edges = timing
+                .net_setup_slacks
+                .iter()
+                .filter(|edge| edge.slack_ps == worst)
+                .copied()
+                .collect::<Vec<_>>();
+            let mut cells = BTreeMap::<CellId, u64>::new();
+            for edge in &edges {
+                let driver = self.design.nets()[edge.net.0].driver;
+                let delay = delays.get(&(edge.net, edge.sink)).copied().unwrap_or(0);
+                for cell in [
+                    self.design.pins()[driver.0].cell,
+                    self.design.pins()[edge.sink.0].cell,
+                ] {
+                    cells
+                        .entry(cell)
+                        .and_modify(|known| *known = (*known).max(delay))
+                        .or_insert(delay);
+                }
+            }
+            let mut cells = cells.into_iter().collect::<Vec<_>>();
+            cells.sort_unstable_by_key(|&(cell, delay)| (Reverse(delay), cell));
+            for (cell, _) in cells {
+                let selected = edges
+                    .iter()
+                    .filter_map(|edge| {
+                        let driver = self.design.nets()[edge.net.0].driver;
+                        (self.design.pins()[driver.0].cell == cell
+                            || self.design.pins()[edge.sink.0].cell == cell)
+                            .then_some((driver, edge.sink, edge.net))
+                    })
+                    .collect::<Vec<_>>();
+                let connections = selected
+                    .iter()
+                    .map(|&(driver, sink, _)| (driver, sink))
+                    .collect::<Vec<_>>();
+                let deficit = u64::try_from(worst.unsigned_abs()).unwrap_or(u64::MAX);
+                let targets = selected
+                    .iter()
+                    .map(|&(_, sink, net)| {
+                        delays
+                            .get(&(net, sink))
+                            .copied()
+                            .unwrap_or(0)
+                            .saturating_sub(deficit)
+                    })
+                    .collect::<Vec<_>>();
+                // A broad move contracts long physical detours; a two-tile
+                // move then uses exact local route-delay excess. Both are
+                // proposals only, and full routed STA decides acceptance.
+                for radius in [256, 2] {
+                    let candidates = self.placement_refiner.refine_cell_connection_delays(
+                        implementation.placement.clone(),
+                        cell,
+                        &connections,
+                        &targets,
+                        routing_costs.pip_delays_ps(),
+                        None,
+                        radius,
+                        2,
+                    )?;
+                    for placement in candidates {
+                        if !seen.insert(placement_identity(self.design, &placement)) {
+                            continue;
+                        }
+                        let routing = self.packing.global_routing_constraints_cached(
+                            self.design,
+                            self.architecture,
+                            &placement,
+                            self.global_routing_cache,
+                        )?;
+                        let frozen = freeze_unchanged_routes(
+                            self.design,
+                            implementation,
+                            &placement,
+                            &routing,
+                            &BTreeSet::new(),
+                        );
+                        routing_costs.set_net_criticalities(timing_net_weights(
+                            timing,
+                            self.timing_constraints,
+                        ));
+                        routing_costs.set_sink_criticalities(timing_arc_weights(
+                            timing,
+                            self.timing_constraints,
+                        ));
+                        routing_costs.set_sink_min_delays_ps(BTreeMap::new());
+                        let candidate = match route_with_timing_costs_workspace_and_progress(
+                            self.design,
+                            self.architecture.device(),
+                            placement,
+                            &frozen,
+                            routing_costs,
+                            self.routing_workspace,
+                            |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
+                        ) {
+                            Ok(candidate) => candidate,
+                            Err(
+                                PnrError::CongestionNotResolved { .. }
+                                | PnrError::Unroutable { .. },
+                            ) => {
+                                if metrics_enabled() {
+                                    eprintln!(
+                                        "[metrics] setup_placement_eco round={round} cell={} radius={radius} rejected=routing",
+                                        cell.0
+                                    );
+                                }
+                                continue;
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
+                        let candidate_timing = analyze_ecp5_implementation(
+                            self.design,
+                            self.architecture,
+                            self.speed_grade,
+                            &candidate,
+                            self.timing_model,
+                            self.timing_constraints,
+                        )?;
+                        progress(timing_snapshot(&candidate_timing));
+                        let improves = strictly_improves_timing_objective(
+                            timing_objective(&candidate_timing),
+                            timing_objective(timing),
+                        );
+                        progress(Ecp5FlowStage::TimingTrialDecision {
+                            improves_objective: improves,
+                        });
+                        if metrics_enabled() {
+                            eprintln!(
+                                "[metrics] setup_placement_eco round={round} cell={} radius={radius} frozen_routes={} wns={:?} accepted={improves}",
+                                cell.0,
+                                frozen.routes().len(),
+                                candidate_timing.worst_slack_ps
+                            );
+                        }
+                        if commit_strict_route_eco_candidate(
+                            implementation,
+                            timing,
+                            candidate,
+                            candidate_timing,
+                        ) {
+                            continue 'refresh;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        Ok(())
+    }
+
     fn prescreen_placement(
         &self,
         round: usize,
@@ -5495,6 +5690,123 @@ mod tests {
             placement_identity(&design, &rebound),
         );
         assert!(!frozen.routes().contains_key(&net));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn setup_placement_preserves_unaffected_routes_and_releases_shared_moved_branches() {
+        for shared_prefix in [false, true] {
+            let mut design = Design::new();
+            let source = design.add_cell("source", ResourceKind::Logic);
+            let output = design.add_pin(source, "out", PinDirection::Output).unwrap();
+            let other_output = design
+                .add_pin(source, "other", PinDirection::Output)
+                .unwrap();
+            let sinks = (0..3)
+                .map(|index| {
+                    let cell = design.add_cell(format!("sink{index}"), ResourceKind::Register);
+                    let pin = design.add_pin(cell, "DI", PinDirection::Input).unwrap();
+                    (cell, pin)
+                })
+                .collect::<Vec<_>>();
+            let fanout = design
+                .add_net("fanout", output, [sinks[0].1, sinks[1].1])
+                .unwrap();
+            let unaffected = design
+                .add_net("unaffected", other_output, [sinks[2].1])
+                .unwrap();
+            let mut device = Device::new("move", 5, 1).unwrap();
+            let driver = device.add_wire("driver", Point::new(0, 0), 1).unwrap();
+            let other_driver = device
+                .add_wire("other_driver", Point::new(0, 0), 1)
+                .unwrap();
+            let branch = device.add_wire("branch", Point::new(0, 0), 1).unwrap();
+            let source_bel = device
+                .add_bel("source", ResourceKind::Logic, Point::new(0, 0))
+                .unwrap();
+            device
+                .add_bel_pin(source_bel, "out", PinDirection::Output, driver)
+                .unwrap();
+            device
+                .add_bel_pin(source_bel, "other", PinDirection::Output, other_driver)
+                .unwrap();
+            let sites = (1..5)
+                .map(|x| {
+                    let point = Point::new(x, 0);
+                    let wire = device.add_wire(format!("wire{x}"), point, 1).unwrap();
+                    let bel = device
+                        .add_bel(format!("bel{x}"), ResourceKind::Register, point)
+                        .unwrap();
+                    device
+                        .add_bel_pin(bel, "DI", PinDirection::Input, wire)
+                        .unwrap();
+                    (bel, wire)
+                })
+                .collect::<Vec<_>>();
+            let prefix = device.add_pip(driver, branch, false, 1).unwrap();
+            let from = if shared_prefix { branch } else { driver };
+            let first = device.add_pip(from, sites[0].1, false, 1).unwrap();
+            let second = device.add_pip(from, sites[1].1, false, 1).unwrap();
+            let third = device.add_pip(other_driver, sites[2].1, false, 1).unwrap();
+            let mut bindings = BTreeMap::from([(source, source_bel)]);
+            for (index, &(cell, _)) in sinks.iter().enumerate() {
+                bindings.insert(cell, sites[index].0);
+            }
+            let constraints = PlacementConstraints::new();
+            let original =
+                placement_from_partial_bindings(&design, &device, &constraints, &bindings).unwrap();
+            bindings.insert(sinks[0].0, sites[3].0);
+            let moved =
+                placement_from_partial_bindings(&design, &device, &constraints, &bindings).unwrap();
+            let arcs = [first, second]
+                .into_iter()
+                .enumerate()
+                .map(|(index, pip)| RouteArc {
+                    sink: Some(sinks[index].1),
+                    wires: if shared_prefix {
+                        vec![driver, branch, sites[index].1]
+                    } else {
+                        vec![driver, sites[index].1]
+                    },
+                    pips: if shared_prefix {
+                        vec![prefix, pip]
+                    } else {
+                        vec![pip]
+                    },
+                })
+                .collect::<Vec<_>>();
+            let independent = NetRoute::new(
+                unaffected,
+                vec![RouteArc {
+                    sink: Some(sinks[2].1),
+                    wires: vec![other_driver, sites[2].1],
+                    pips: vec![third],
+                }],
+            );
+            let implementation = PnrResult {
+                placement: original,
+                routes: vec![
+                    Arc::new(NetRoute::new(fanout, arcs.clone())),
+                    Arc::new(independent.clone()),
+                ],
+                total_pips: if shared_prefix { 4 } else { 3 },
+            };
+            let before = implementation.clone();
+            let frozen = freeze_unchanged_routes(
+                &design,
+                &implementation,
+                &moved,
+                &RoutingConstraints::new(),
+                &BTreeSet::new(),
+            );
+            assert_eq!(frozen.routes()[&unaffected].as_ref(), &independent);
+            if shared_prefix {
+                assert!(!frozen.routes().contains_key(&fanout));
+            } else {
+                assert_eq!(frozen.routes()[&fanout].arcs, vec![arcs[1].clone()]);
+            }
+            assert_eq!(implementation, before);
+        }
     }
 
     #[test]
