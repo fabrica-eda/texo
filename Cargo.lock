@@ -380,11 +380,11 @@ dependencies = [
  "thiserror 2.0.20",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
- "veryl-analyzer",
+ "veryl-analyzer 0.20.3",
  "veryl-component-sys",
- "veryl-metadata",
- "veryl-parser",
- "veryl-path",
+ "veryl-metadata 0.20.3",
+ "veryl-parser 0.20.3",
+ "veryl-path 0.20.3",
  "wasmtime",
 ]
 
@@ -517,9 +517,9 @@ dependencies = [
  "num-traits",
  "thiserror 2.0.20",
  "tracing",
- "veryl-analyzer",
- "veryl-metadata",
- "veryl-parser",
+ "veryl-analyzer 0.20.3",
+ "veryl-metadata 0.20.3",
+ "veryl-parser 0.20.3",
 ]
 
 [[package]]
@@ -533,9 +533,9 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
- "veryl-analyzer",
- "veryl-metadata",
- "veryl-parser",
+ "veryl-analyzer 0.20.3",
+ "veryl-metadata 0.20.3",
+ "veryl-parser 0.20.3",
 ]
 
 [[package]]
@@ -3162,7 +3162,7 @@ dependencies = [
 [[package]]
 name = "struo"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=eff404dff0c4806064e2a4e0f59564b1079c001d#eff404dff0c4806064e2a4e0f59564b1079c001d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=836236ddb3f4fa4ba7f456a134785d58525212a5#836236ddb3f4fa4ba7f456a134785d58525212a5"
 dependencies = [
  "struo-celox",
  "struo-formal",
@@ -3177,7 +3177,7 @@ dependencies = [
 [[package]]
 name = "struo-celox"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=eff404dff0c4806064e2a4e0f59564b1079c001d#eff404dff0c4806064e2a4e0f59564b1079c001d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=836236ddb3f4fa4ba7f456a134785d58525212a5#836236ddb3f4fa4ba7f456a134785d58525212a5"
 dependencies = [
  "celox",
  "struo-ir",
@@ -3187,7 +3187,7 @@ dependencies = [
 [[package]]
 name = "struo-example-axi4-smartconnect"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=eff404dff0c4806064e2a4e0f59564b1079c001d#eff404dff0c4806064e2a4e0f59564b1079c001d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=836236ddb3f4fa4ba7f456a134785d58525212a5#836236ddb3f4fa4ba7f456a134785d58525212a5"
 dependencies = [
  "struo",
 ]
@@ -3195,7 +3195,7 @@ dependencies = [
 [[package]]
 name = "struo-formal"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=eff404dff0c4806064e2a4e0f59564b1079c001d#eff404dff0c4806064e2a4e0f59564b1079c001d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=836236ddb3f4fa4ba7f456a134785d58525212a5#836236ddb3f4fa4ba7f456a134785d58525212a5"
 dependencies = [
  "struo-ir",
 ]
@@ -3203,33 +3203,33 @@ dependencies = [
 [[package]]
 name = "struo-frontend-veryl"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=eff404dff0c4806064e2a4e0f59564b1079c001d#eff404dff0c4806064e2a4e0f59564b1079c001d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=836236ddb3f4fa4ba7f456a134785d58525212a5#836236ddb3f4fa4ba7f456a134785d58525212a5"
 dependencies = [
  "struo-rtl",
- "veryl-analyzer",
- "veryl-metadata",
- "veryl-parser",
+ "veryl-analyzer 0.21.0",
+ "veryl-metadata 0.21.0",
+ "veryl-parser 0.21.0",
 ]
 
 [[package]]
 name = "struo-ir"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=eff404dff0c4806064e2a4e0f59564b1079c001d#eff404dff0c4806064e2a4e0f59564b1079c001d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=836236ddb3f4fa4ba7f456a134785d58525212a5#836236ddb3f4fa4ba7f456a134785d58525212a5"
 
 [[package]]
 name = "struo-rtl"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=eff404dff0c4806064e2a4e0f59564b1079c001d#eff404dff0c4806064e2a4e0f59564b1079c001d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=836236ddb3f4fa4ba7f456a134785d58525212a5#836236ddb3f4fa4ba7f456a134785d58525212a5"
 
 [[package]]
 name = "struo-sim"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=eff404dff0c4806064e2a4e0f59564b1079c001d#eff404dff0c4806064e2a4e0f59564b1079c001d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=836236ddb3f4fa4ba7f456a134785d58525212a5#836236ddb3f4fa4ba7f456a134785d58525212a5"
 
 [[package]]
 name = "struo-synth"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=eff404dff0c4806064e2a4e0f59564b1079c001d#eff404dff0c4806064e2a4e0f59564b1079c001d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=836236ddb3f4fa4ba7f456a134785d58525212a5#836236ddb3f4fa4ba7f456a134785d58525212a5"
 dependencies = [
  "struo-ir",
  "struo-rtl",
@@ -3238,7 +3238,7 @@ dependencies = [
 [[package]]
 name = "struo-target-ecp5"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=eff404dff0c4806064e2a4e0f59564b1079c001d#eff404dff0c4806064e2a4e0f59564b1079c001d"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=836236ddb3f4fa4ba7f456a134785d58525212a5#836236ddb3f4fa4ba7f456a134785d58525212a5"
 dependencies = [
  "serde",
  "serde_json",
@@ -3390,9 +3390,9 @@ dependencies = [
  "texo-struo",
  "texo-target-ecp5",
  "ureq",
- "veryl-analyzer",
- "veryl-metadata",
- "veryl-parser",
+ "veryl-analyzer 0.21.0",
+ "veryl-metadata 0.21.0",
+ "veryl-parser 0.21.0",
  "zstd",
 ]
 
@@ -3823,8 +3823,40 @@ dependencies = [
  "toml 1.1.4+spec-1.1.0",
  "vcd",
  "veryl-component-sys",
- "veryl-metadata",
- "veryl-parser",
+ "veryl-metadata 0.20.3",
+ "veryl-parser 0.20.3",
+]
+
+[[package]]
+name = "veryl-analyzer"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27642985fd83ff90aeea356cbc70f63d2ac83988e1e1bae9e7b0bd63fe61fcf8"
+dependencies = [
+ "bimap",
+ "daggy",
+ "fxhash",
+ "indent",
+ "itertools 0.15.0",
+ "log",
+ "miette",
+ "num-bigint",
+ "num-traits",
+ "paste",
+ "postcard",
+ "serde",
+ "serde_json",
+ "similar",
+ "smallvec",
+ "strnum_bitwidth",
+ "strum",
+ "strum_macros",
+ "thiserror 2.0.20",
+ "toml 1.1.4+spec-1.1.0",
+ "vcd",
+ "veryl-component-sys",
+ "veryl-metadata 0.21.0",
+ "veryl-parser 0.21.0",
 ]
 
 [[package]]
@@ -3854,9 +3886,37 @@ dependencies = [
  "url",
  "uuid",
  "veryl-component-sys",
- "veryl-parser",
- "veryl-path",
- "veryl-std",
+ "veryl-parser 0.20.3",
+ "veryl-path 0.20.3",
+ "veryl-std 0.20.3",
+ "walkdir",
+ "which",
+]
+
+[[package]]
+name = "veryl-metadata"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1feef2d04be41a3b8f35b5fc1a1573e161054561d42f76d80dd89284048a9a83"
+dependencies = [
+ "log",
+ "miette",
+ "once_cell",
+ "pathdiff",
+ "regex",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_regex",
+ "spdx",
+ "thiserror 2.0.20",
+ "toml 1.1.4+spec-1.1.0",
+ "url",
+ "uuid",
+ "veryl-component-sys",
+ "veryl-parser 0.21.0",
+ "veryl-path 0.21.0",
+ "veryl-std 0.21.0",
  "walkdir",
  "which",
 ]
@@ -3866,6 +3926,25 @@ name = "veryl-parser"
 version = "0.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8e3e84d2e553967d73f60573d1992bc7e784da7ef248d50434cafb3655fbf06"
+dependencies = [
+ "anyhow",
+ "bimap",
+ "miette",
+ "once_cell",
+ "parol",
+ "parol_runtime",
+ "paste",
+ "regex",
+ "scnr2",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "veryl-parser"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d8b2b967783ca8fbb19915e9dd7fb9d69bc6b51dcda8a7c578d31d724c8f7fa"
 dependencies = [
  "anyhow",
  "bimap",
@@ -3896,6 +3975,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "veryl-path"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f03fd8c2c572a28be2ea6ba2a97ded7308fddc9d7c8d71732392228d7d95962"
+dependencies = [
+ "directories",
+ "fs4",
+ "log",
+ "miette",
+ "tempfile",
+ "thiserror 2.0.20",
+ "walkdir",
+]
+
+[[package]]
 name = "veryl-std"
 version = "0.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3905,7 +3999,20 @@ dependencies = [
  "miette",
  "rust-embed",
  "thiserror 2.0.20",
- "veryl-path",
+ "veryl-path 0.20.3",
+]
+
+[[package]]
+name = "veryl-std"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3a03c4f7d6bf43edd7dbd5d7a4c68d52f36a0624e6242a99b03caaa72d9ccc4"
+dependencies = [
+ "merkle_hash",
+ "miette",
+ "rust-embed",
+ "thiserror 2.0.20",
+ "veryl-path 0.21.0",
 ]
 
 [[package]]
