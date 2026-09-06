@@ -1,5 +1,7 @@
 //! Texo command-line entry point.
 
+mod resume;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
@@ -171,6 +173,9 @@ struct PnrArgs {
     /// JSON object mapping exact cell names to BEL names for initial placement.
     #[arg(long, value_name = "JSON")]
     initial_placement: Option<PathBuf>,
+    /// Resume checked routes and placement; fresh synthesis, routing checks and STA still run.
+    #[arg(long, value_name = "JSON", conflicts_with_all = ["initial_placement", "lut_ff_pairs"])]
+    resume_checkpoint: Option<PathBuf>,
     /// JSON object mapping LUT names to FF names for imported dedicated pairs.
     #[arg(long, value_name = "JSON")]
     lut_ff_pairs: Option<PathBuf>,
@@ -362,12 +367,21 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
     let load_bindings = |path: &PathBuf| -> Result<BTreeMap<String, String>, Box<dyn Error>> {
         Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?)
     };
-    let initial_placement = args
+    let resumed = args
+        .resume_checkpoint
+        .as_deref()
+        .map(resume::Checkpoint::read)
+        .transpose()?;
+    let mut initial_placement = args
         .initial_placement
         .as_ref()
         .map(load_bindings)
         .transpose()?;
-    let lut_ff_pairs = args.lut_ff_pairs.as_ref().map(load_bindings).transpose()?;
+    let mut lut_ff_pairs = args.lut_ff_pairs.as_ref().map(load_bindings).transpose()?;
+    if let Some(saved) = &resumed {
+        initial_placement = Some(saved.placement()?);
+        lut_ff_pairs = Some(saved.pairs()?);
+    }
     let clock_constraints: Vec<texo_flow::ClockConstraint> = args
         .clock_constraints
         .as_ref()
@@ -385,6 +399,9 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         .transpose()?
         .unwrap_or_default();
     let (loaded, output) = prepare_veryl_input(args)?;
+    if let Some(input) = &args.resume_checkpoint {
+        ensure_distinct_paths(input, &output, "resume checkpoint", "output checkpoint")?;
+    }
 
     let synthesized = synthesize(&loaded.design)?;
     for report in &synthesized.reports {
@@ -432,6 +449,9 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         .or_else(|| pack.as_ref().map(|pack| pack.architecture.as_path()))
         .expect("an explicit architecture or target pack was resolved");
     let architecture = load_architecture(architecture_path)?;
+    if let Some(saved) = &resumed {
+        saved.validate_target(&architecture, &args.package)?;
+    }
     println!(
         "architecture loaded in {:.2?}",
         architecture_started.elapsed()
@@ -451,6 +471,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         clock_constraints: &clock_constraints,
         setup_uncertainty_ps: args.setup_uncertainty_ps,
         initial_placement: initial_placement.as_ref(),
+        initial_routes: resumed.as_ref().map(|saved| saved.routes.as_slice()),
         lut_ff_pairs: lut_ff_pairs.as_ref(),
         placement_weight_exponent: args.placement_weight_exponent.get(),
         optimize_timing: !args.no_timing_optimization,
@@ -863,6 +884,34 @@ mod tests {
         assert_eq!(args.input, Path::new("project"));
         assert_eq!(args.top, None);
         assert_eq!(args.placement_weight_exponent.get(), 4);
+    }
+
+    #[test]
+    fn resume_conflicts_with_independent_placement_or_packing() {
+        let base = [
+            "texo",
+            "pnr",
+            "project",
+            "--package",
+            "TEST",
+            "--speed",
+            "8",
+            "--resume-checkpoint",
+            "saved.json",
+        ];
+        let cli = Cli::try_parse_from(base).unwrap();
+        let Command::Pnr(args) = cli.command else {
+            panic!("expected pnr");
+        };
+        assert_eq!(
+            args.resume_checkpoint.as_deref(),
+            Some(Path::new("saved.json"))
+        );
+        for flag in ["--initial-placement", "--lut-ff-pairs"] {
+            let mut args = base.to_vec();
+            args.extend([flag, "other.json"]);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]
