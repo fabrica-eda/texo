@@ -2,9 +2,11 @@
 
 mod clock_constraints;
 mod ecp5_pll;
+mod initial_routing;
 mod timing_coverage;
 
 pub use clock_constraints::ClockConstraint;
+pub use initial_routing::Ecp5InitialRoute;
 pub use timing_coverage::{TimingCoverageError, TimingEndpointException, validate_timing_coverage};
 
 use std::cmp::Reverse;
@@ -222,6 +224,8 @@ pub struct Ecp5FlowOptions<'a> {
     /// Optional cell-name to BEL-name bindings used instead of native initial
     /// placement. Missing synthetic cells are completed from packing groups.
     pub initial_placement: Option<&'a BTreeMap<String, String>>,
+    /// Validated physical trees to preserve in the initial route. Requires imported placement.
+    pub initial_routes: Option<&'a [Ecp5InitialRoute]>,
     /// Optional explicit dedicated-path LUT-to-FF pairs, named as
     /// `LUT -> FF`. This must accompany placements imported after packing.
     pub lut_ff_pairs: Option<&'a BTreeMap<String, String>>,
@@ -250,6 +254,7 @@ impl Default for Ecp5FlowOptions<'_> {
             global_clock_fanout: DEFAULT_GLOBAL_CLOCK_FANOUT,
             placement_weight_exponent: 4,
             initial_placement: None,
+            initial_routes: None,
             lut_ff_pairs: None,
             initial_timing_reroute: false,
             optimize_timing: true,
@@ -700,12 +705,21 @@ pub fn implement_struo_ecp5_with_progress(
             Ok::<_, Ecp5FlowError>(costs)
         })
         .transpose()?;
-    let routing = packing.global_routing_constraints_cached(
+    let mut routing = packing.global_routing_constraints_cached(
         &design,
         architecture,
         &placement,
         &mut global_routing_cache,
     )?;
+    if let Some(routes) = options.initial_routes {
+        initial_routing::import_routes(
+            &design,
+            architecture.device(),
+            &placement,
+            routes,
+            &mut routing,
+        )?;
+    }
     progress(Ecp5FlowStage::GlobalClocksRouted);
     report_metric_phase("initial_global_routing", &mut phase_started);
     let mut routing_workspace = RoutingWorkspace::new(architecture.device());
@@ -773,6 +787,7 @@ pub fn implement_struo_ecp5_with_progress(
     }
     let mut placement_feedback_changed_implementation = false;
     if options.optimize_timing
+        && options.initial_routes.is_none()
         && let (Some(costs), Some(delay_predictor), Some(initial_predicted_timing)) = (
             timing_routing_costs.as_mut(),
             placement_delay_predictor.as_ref(),
@@ -866,19 +881,55 @@ pub fn implement_struo_ecp5_with_progress(
             packing.constraints(),
             &mut placement_refinement_workspace,
         )?;
-        TimingFeedbackContext {
-            design: &design,
-            architecture,
-            packing: &packing,
-            placement_refiner: &placement_refiner,
-            global_routing_cache: &mut global_routing_cache,
-            speed_grade,
-            timing_model: &timing_model,
-            timing_constraints: &timing_constraints,
-            delay_predictor,
-            routing_workspace: &mut routing_workspace,
+        // A placement repair changes which routes compete for resources.
+        // Reopen route ECOs after a strict local-placement improvement, then
+        // iterate until closure or a fixed point instead of requiring another
+        // synthesis/checkpoint round trip.
+        while timing.worst_slack_ps.is_some_and(|slack| slack < 0) {
+            let before = timing_objective(&timing);
+            TimingFeedbackContext {
+                design: &design,
+                architecture,
+                packing: &packing,
+                placement_refiner: &placement_refiner,
+                global_routing_cache: &mut global_routing_cache,
+                speed_grade,
+                timing_model: &timing_model,
+                timing_constraints: &timing_constraints,
+                delay_predictor,
+                routing_workspace: &mut routing_workspace,
+            }
+            .improve_local_setup(
+                &mut implementation,
+                &mut timing,
+                costs,
+                &mut progress,
+            )?;
+            if !strictly_improves_timing_objective(timing_objective(&timing), before) {
+                break;
+            }
+            route_eco_worklist.reset_attempted_after_global_change();
+            let eco_routing = packing.global_routing_constraints_cached(
+                &design,
+                architecture,
+                &implementation.placement,
+                &mut global_routing_cache,
+            )?;
+            improve_worst_setup_net_route_ecos(
+                &design,
+                architecture,
+                speed_grade,
+                &timing_model,
+                &timing_constraints,
+                &eco_routing,
+                costs,
+                &mut routing_workspace,
+                &mut implementation,
+                &mut timing,
+                &mut route_eco_worklist,
+                &mut progress,
+            )?;
         }
-        .improve_local_setup(&mut implementation, &mut timing, costs, &mut progress)?;
     }
     if let Some(costs) = timing_routing_costs.as_mut()
         && timing.worst_slack_ps.is_some_and(|slack| slack >= 0)
