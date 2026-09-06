@@ -1,5 +1,6 @@
 //! Texo command-line entry point.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fs::File;
@@ -41,7 +42,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Synthesize, place, route, and time a Veryl project.
-    Pnr(PnrArgs),
+    Pnr(Box<PnrArgs>),
     /// Cache an expanded JSON architecture for fast subsequent loads.
     CacheArchitecture {
         /// Project Trellis architecture JSON.
@@ -164,6 +165,15 @@ struct PnrArgs {
     /// JSON array of exact mapped cell/output-pin clock periods in picoseconds.
     #[arg(long, value_name = "JSON")]
     clock_constraints: Option<PathBuf>,
+    /// Reserve this setup margin on all clocks without changing their periods.
+    #[arg(long, default_value_t = 0)]
+    setup_uncertainty_ps: u64,
+    /// JSON object mapping exact cell names to BEL names for initial placement.
+    #[arg(long, value_name = "JSON")]
+    initial_placement: Option<PathBuf>,
+    /// JSON object mapping LUT names to FF names for imported dedicated pairs.
+    #[arg(long, value_name = "JSON")]
+    lut_ff_pairs: Option<PathBuf>,
     /// Override automatic global-clock promotion fanout.
     #[arg(long)]
     global_clock_fanout: Option<usize>,
@@ -349,6 +359,15 @@ fn target(args: &TargetArgs) -> Result<(), Box<dyn Error>> {
 #[allow(clippy::too_many_lines)]
 fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
     let flow_started = Instant::now();
+    let load_bindings = |path: &PathBuf| -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+        Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?)
+    };
+    let initial_placement = args
+        .initial_placement
+        .as_ref()
+        .map(load_bindings)
+        .transpose()?;
+    let lut_ff_pairs = args.lut_ff_pairs.as_ref().map(load_bindings).transpose()?;
     let clock_constraints: Vec<texo_flow::ClockConstraint> = args
         .clock_constraints
         .as_ref()
@@ -430,6 +449,9 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         allow_unconstrained_io: args.allow_unconstrained_io,
         timing_exceptions: &timing_exceptions,
         clock_constraints: &clock_constraints,
+        setup_uncertainty_ps: args.setup_uncertainty_ps,
+        initial_placement: initial_placement.as_ref(),
+        lut_ff_pairs: lut_ff_pairs.as_ref(),
         placement_weight_exponent: args.placement_weight_exponent.get(),
         optimize_timing: !args.no_timing_optimization,
         ..Ecp5FlowOptions::default()
@@ -793,6 +815,12 @@ mod tests {
             "2",
             "--clock-constraints",
             "clocks.json",
+            "--setup-uncertainty-ps",
+            "250",
+            "--initial-placement",
+            "placement.json",
+            "--lut-ff-pairs",
+            "pairs.json",
         ])
         .unwrap();
         let Command::Pnr(args) = cli.command else {
@@ -807,6 +835,12 @@ mod tests {
             Some(Path::new("clocks.json"))
         );
         assert!(!args.no_timing_optimization);
+        assert_eq!(args.setup_uncertainty_ps, 250);
+        assert_eq!(
+            args.initial_placement.as_deref(),
+            Some(Path::new("placement.json"))
+        );
+        assert_eq!(args.lut_ff_pairs.as_deref(), Some(Path::new("pairs.json")));
     }
 
     #[test]

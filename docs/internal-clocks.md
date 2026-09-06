@@ -61,3 +61,15 @@ hard-macro interface safe.
 Regression tests use the real ECP5 timing model and engine to check JTCK
 propagation, falling/opposite-edge budgets, retained external boundaries,
 DCCA aliases, rejected stale inputs, and LPF/PLL conflict handling.
+
+## Reserving setup margin
+
+`pnr --setup-uncertainty-ps 250` reserves 250 ps on every constrained capture
+clock, including PLL outputs and DCCA-promoted clocks. The API field is
+`Ecp5FlowOptions::setup_uncertainty_ps`; the default is zero. Nominal periods,
+PLL phase/ratios and hold checks remain unchanged. All placement, routing and
+hold-repair trials use the same guarded setup budget. The checkpoint records
+`timing.setup_uncertainty_ps` as well as each setup check's `uncertainty_ps`.
+A guarded setup slack of +1 ps with a 250 ps reserve is +251 ps against the
+nominal period. This is a user-selected engineering reserve; it does not
+characterize PLL jitter, clock-tree skew or an unmodeled primitive boundary.
