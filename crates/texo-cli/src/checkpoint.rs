@@ -1,6 +1,6 @@
 //! Stable JSON checkpoint serialization for implemented ECP5 designs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
@@ -42,7 +42,7 @@ pub fn ecp5_checkpoint(
 ///
 /// The emitted JSON is semantically identical to [`ecp5_checkpoint`]. This
 /// form avoids cloning every architecture and design name and keeps only the
-/// small block-RAM CIB-tie index alive while the document is written.
+/// small block-RAM/DSP CIB-tie index alive while the document is written.
 pub struct Ecp5CheckpointRef<'a> {
     design_name: &'a str,
     result: &'a Ecp5FlowResult,
@@ -61,14 +61,18 @@ pub fn ecp5_checkpoint_ref<'a>(
     package: &'a str,
     evidence: &'a Evidence,
 ) -> Ecp5CheckpointRef<'a> {
-    let memory_bels = result
+    let hard_block_bels = result
         .implementation
         .placement
         .bindings()
         .iter()
         .enumerate()
         .filter_map(|(cell, bel)| {
-            (result.design.cells()[cell].kind == ResourceKind::Memory).then_some(*bel)
+            matches!(
+                result.design.cells()[cell].kind,
+                ResourceKind::Memory | ResourceKind::Dsp
+            )
+            .then_some(*bel)
         });
     Ecp5CheckpointRef {
         design_name,
@@ -76,7 +80,7 @@ pub fn ecp5_checkpoint_ref<'a>(
         architecture,
         package,
         evidence,
-        cib_ties: cib_ties_for_bels(architecture, memory_bels),
+        cib_ties: cib_ties_for_bels(architecture, hard_block_bels),
     }
 }
 
@@ -783,34 +787,59 @@ fn cib_ties_for_bels(
     if target_count == 0 {
         return BTreeMap::new();
     }
+    // Some MULT18X18D sites reach the CIB through JDSPC/JMUIC aliases.
+    // Index only fixed predecessors: a programmable alternative is not a tie.
+    let mut fixed_predecessors = device
+        .pips()
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| architecture.pip_metadata(PipId(*index)).fixed)
+        .map(|(_, pip)| (pip.to(), pip.from()))
+        .collect::<Vec<_>>();
+    fixed_predecessors.sort_unstable();
     let mut ties = BTreeMap::new();
-    for (index, pip) in device.pips().iter().enumerate() {
-        if !targets[pip.to().0] || !architecture.pip_metadata(PipId(index)).fixed {
-            continue;
+    for (index, target) in targets
+        .into_iter()
+        .enumerate()
+        .filter(|(_, target)| *target)
+    {
+        debug_assert!(target);
+        let target = WireId(index);
+        let mut pending = vec![target];
+        let mut visited = BTreeSet::new();
+        let mut found = BTreeSet::new();
+        while let Some(wire) = pending.pop() {
+            if !visited.insert(wire) {
+                continue;
+            }
+            let source = &device.wires()[wire.0];
+            if let Some((_, mux)) = source.name.rsplit_once('/')
+                && is_cib_tie_mux(mux)
+            {
+                let mut configuration_tiles = architecture
+                    .configuration_tiles(source.point)
+                    .filter(|(_, tile_type)| {
+                        tile_type.starts_with("CIB") || tile_type.starts_with("VCIB")
+                    });
+                if let Some((tile, _)) = configuration_tiles.next()
+                    && configuration_tiles.next().is_none()
+                {
+                    found.insert((tile, mux));
+                }
+                continue;
+            }
+            let start = fixed_predecessors.partition_point(|&(to, _)| to < wire);
+            pending.extend(
+                fixed_predecessors[start..]
+                    .iter()
+                    .take_while(|&&(to, _)| to == wire)
+                    .map(|&(_, from)| from),
+            );
         }
-        let source = &device.wires()[pip.from().0];
-        let Some(mux) = source.name.rsplit_once('/').map(|(_, basename)| basename) else {
-            continue;
-        };
-        if !is_cib_tie_mux(mux) {
-            continue;
+        if found.len() == 1 {
+            let (tile, mux) = found.into_iter().next().unwrap();
+            ties.insert(target, json!({ "tile": tile, "mux": mux }));
         }
-        let mut configuration_tiles = architecture
-            .configuration_tiles(source.point)
-            .filter(|(_, tile_type)| tile_type.starts_with("CIB") || tile_type.starts_with("VCIB"));
-        let Some((tile, _)) = configuration_tiles.next() else {
-            continue;
-        };
-        if configuration_tiles.next().is_some() {
-            continue;
-        }
-        ties.insert(
-            pip.to(),
-            json!({
-                "tile": tile,
-                "mux": mux,
-            }),
-        );
     }
     ties
 }
@@ -836,6 +865,7 @@ const fn checkpoint_resource_kind(kind: ResourceKind) -> &'static str {
         ResourceKind::Lut(_) => "lut",
         ResourceKind::Register => "flip_flop",
         ResourceKind::Memory => "block_ram",
+        ResourceKind::Dsp => "multiplier",
         ResourceKind::Clock => "global_clock",
         ResourceKind::Io => "port",
         ResourceKind::Constant => "constant",
@@ -982,12 +1012,19 @@ fn checkpoint_evidence(evidence: &Evidence) -> Vec<&'static str> {
     .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 fn primitive_metadata_json(
     cell: texo_model::CellId,
     metadata: &PrimitiveMetadata,
     design: &Design,
 ) -> Value {
     let configuration = match metadata {
+        PrimitiveMetadata::Multiplier => json!({
+            "kind": "multiplier",
+            "registers": "none",
+            "signed": false,
+            "cascade": false,
+        }),
         PrimitiveMetadata::Lut4 { init } => json!({ "kind": "lut4", "init": init }),
         PrimitiveMetadata::CarrySlice {
             init,
@@ -1262,27 +1299,53 @@ mod tests {
 
     #[test]
     fn checkpoints_the_fixed_cib_tie_before_a_dp16kd_pin() {
+        check_cib_tie_path(1, true, false);
+    }
+
+    #[test]
+    fn checkpoints_cib_ties_through_multiple_fixed_aliases_and_cycles() {
+        check_cib_tie_path(3, true, false);
+    }
+
+    #[test]
+    fn does_not_treat_a_programmable_cib_path_as_a_fixed_tie() {
+        check_cib_tie_path(3, false, false);
+    }
+
+    #[test]
+    fn rejects_ambiguous_fixed_cib_ties() {
+        check_cib_tie_path(3, true, true);
+    }
+
+    fn check_cib_tie_path(hops: usize, fixed: bool, ambiguous: bool) {
         let mut file: ArchitectureFile = serde_json::from_str(ARCHITECTURE).unwrap();
-        let source = file.location_types[0].wires.len();
-        file.location_types[0].wires.push(WireRecord {
-            name: "JCLK0".into(),
-        });
-        file.location_types[0].pips.push(PipRecord {
-            from: RelativeRef {
-                dx: 0,
-                dy: 0,
-                index: source,
-            },
-            to: RelativeRef {
-                dx: 0,
-                dy: 0,
-                index: 15,
-            },
-            fixed: true,
-            tile_type: "CIB_EBR".into(),
-            timing_class: "zero".into(),
-            lutperm_flags: 0,
-        });
+        let location_type = &mut file.location_types[0];
+        let mut sink = 15;
+        for hop in 0..hops {
+            let source = location_type.wires.len();
+            location_type.wires.push(WireRecord {
+                name: if hop + 1 == hops {
+                    "JCLK0".into()
+                } else {
+                    format!("DSP_ALIAS{hop}")
+                },
+            });
+            location_type
+                .pips
+                .push(cib_pip(source, sink, hop + 1 != hops || fixed));
+            if hop == 1 {
+                // Fixed aliases may form a cycle; it must not prevent discovery.
+                location_type.pips.push(cib_pip(sink, source, true));
+            }
+            sink = source;
+        }
+        if ambiguous {
+            let source = location_type.wires.len();
+            location_type.wires.push(WireRecord {
+                name: "JCLK1".into(),
+            });
+            location_type.pips.push(cib_pip(source, 15, true));
+        }
         file.locations[0].tiles.push(TileRecord {
             name: "CIB_R0C0:CIB_EBR".into(),
             tile_type: "CIB_EBR".into(),
@@ -1309,10 +1372,31 @@ mod tests {
             .find(|pin| pin.name == "CLKA" && pin.direction == PinDirection::Input)
             .unwrap()
             .wire;
-
         let ties = cib_ties_for_bels(&architecture, [bel]);
+        if fixed && !ambiguous {
+            assert_eq!(ties[&clock]["tile"], "CIB_R0C0:CIB_EBR");
+            assert_eq!(ties[&clock]["mux"], "JCLK0");
+        } else {
+            assert!(!ties.contains_key(&clock));
+        }
+    }
 
-        assert_eq!(ties[&clock]["tile"], "CIB_R0C0:CIB_EBR");
-        assert_eq!(ties[&clock]["mux"], "JCLK0");
+    fn cib_pip(source: usize, sink: usize, fixed: bool) -> PipRecord {
+        PipRecord {
+            from: RelativeRef {
+                dx: 0,
+                dy: 0,
+                index: source,
+            },
+            to: RelativeRef {
+                dx: 0,
+                dy: 0,
+                index: sink,
+            },
+            fixed,
+            tile_type: "CIB_EBR".into(),
+            timing_class: "zero".into(),
+            lutperm_flags: 0,
+        }
     }
 }

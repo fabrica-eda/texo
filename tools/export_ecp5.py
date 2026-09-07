@@ -196,6 +196,32 @@ def timing_corners(samples, scale=1.0):
     }
 
 
+def export_multiplier_timing(cell_database):
+    """Expand bus arcs only for the supported combinational DSP mode."""
+    multiplier_arcs = []
+    multiplier_sources = set()
+    for entry in cell_database["MULT18X18D:REGS=NONE"]:
+        if entry["type"] != "IOPath" or entry["to_pin"] != "P":
+            raise ValueError("unsupported unregistered MULT18X18D timing record")
+        source = entry["from_pin"]
+        if source not in {"A", "B", "SIGNEDA", "SIGNEDB"}:
+            raise ValueError(f"unsupported MULT18X18D source {source}")
+        if source in multiplier_sources:
+            raise ValueError(f"duplicate MULT18X18D source {source}")
+        multiplier_sources.add(source)
+        sources = [f"{source}{i}" for i in range(18)] if source in {"A", "B"} else [source]
+        for pin in sources:
+            for bit in range(36):
+                multiplier_arcs.append({"from_pin": pin, "to_pin": f"P{bit}", "delay": delay_range(entry)})
+    if multiplier_sources != {"A", "B", "SIGNEDA", "SIGNEDB"}:
+        raise ValueError("incomplete unregistered MULT18X18D timing record")
+    return {
+        "cell_type": "MULT18X18D:REGS=NONE",
+        "arcs": multiplier_arcs,
+        "setup_holds": [],
+    }
+
+
 def export_cell_timings(cell_database):
     slogic = cell_database["SLOGICB"]
     carry = cell_database["SCCU2C"]
@@ -333,6 +359,7 @@ def export_cell_timings(cell_database):
         key=lambda check: (check["clock_pin"], check["signal_pin"])
     )
     return [
+        export_multiplier_timing(cell_database),
         {
             "cell_type": "DCCA",
             "arcs": [

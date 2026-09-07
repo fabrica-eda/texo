@@ -17,8 +17,8 @@ jobs:
 
       - name: Install pinned toolchain
         run: |
-          rustup toolchain install 1.97.1 --profile minimal
-          rustup override set 1.97.1
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
           db_version=$(/usr/bin/python3 -c 'import json; print(json.load(open("architectures/ecp5/manifest.json"))["source"]["packages"]["fpga-trellis-database"])')
           pytrellis_version=$(/usr/bin/python3 -c 'import json; print(json.load(open("architectures/ecp5/manifest.json"))["source"]["packages"]["python3-pytrellis"])')
           trellis_version=$(/usr/bin/python3 -c 'import json; print(json.load(open("architectures/ecp5/manifest.json"))["source"]["packages"]["fpga-trellis"])')

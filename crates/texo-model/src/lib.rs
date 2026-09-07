@@ -81,6 +81,9 @@ pub enum ResourceKind {
     Io,
     /// Dedicated constant network source.
     Constant,
+    // Append new variants to retain the numeric tags in existing caches.
+    /// Hard DSP multiplier.
+    Dsp,
 }
 
 /// Signal direction at a logical or physical pin.

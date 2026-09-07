@@ -325,7 +325,8 @@ fn ecp5_cell_name(cell: &Ecp5Cell) -> &str {
         | Ecp5Cell::BlockRam { name, .. }
         | Ecp5Cell::TrellisIo { name, .. }
         | Ecp5Cell::Jtagg { name, .. }
-        | Ecp5Cell::Pll { name, .. } => name,
+        | Ecp5Cell::Pll { name, .. }
+        | Ecp5Cell::Multiplier { name, .. } => name,
     }
 }
 

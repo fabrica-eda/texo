@@ -1,0 +1,12 @@
+/// Routing fixture: all multiplier inputs and product bits participate.
+module DspPipeline (clk: input clock, led: output logic<8>) {
+    var a_q: logic<18>;
+    var b_q: logic<18>;
+    var p_q: logic<36>;
+    always_ff (clk) {
+        a_q = a_q + 18'd1;
+        b_q = b_q + 18'd3;
+        p_q = a_q * b_q;
+    }
+    assign led = p_q[7:0] ^ p_q[15:8] ^ p_q[23:16] ^ p_q[31:24] ^ {4'd0, p_q[35:32]};
+}

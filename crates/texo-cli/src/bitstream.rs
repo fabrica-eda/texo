@@ -289,6 +289,7 @@ fn validate_unique_settings<'a, T: Eq + ?Sized + 'a>(
 /// its target does not match the architecture/base configuration, or a
 /// routed/configured resource cannot be represented by the native ECP5
 /// configuration writer. RTL and post-map simulation evidence is optional.
+#[allow(clippy::too_many_lines)]
 pub fn generate_ecp5_config(
     checkpoint: &Value,
     architecture: &Ecp5Architecture,
@@ -384,6 +385,13 @@ pub fn generate_ecp5_config(
                 write_distributed_ram_write_port(&mut config, placement)?;
             }
             "distributed_ram_blocker" => {}
+            "multiplier" => write_multiplier(
+                &mut config,
+                architecture,
+                placement,
+                configuration,
+                &absorbed_inputs,
+            )?,
             "jtagg" => write_jtagg(&mut config, architecture, configuration)?,
             "pll" => write_pll(&mut config, architecture, placement, configuration)?,
             kind => return Err(BitgenError::new(format!("unsupported primitive {kind}"))),
@@ -1486,6 +1494,125 @@ fn write_bram(
     Ok(())
 }
 
+fn write_multiplier(
+    config: &mut ChipConfig,
+    architecture: &Ecp5Architecture,
+    placement: &Value,
+    configuration: &Value,
+    absorbed_inputs: &serde_json::Map<String, Value>,
+) -> Result<(), BitgenError> {
+    if string(configuration, "registers")? != "none"
+        || bool_value(configuration, "signed")?
+        || bool_value(configuration, "cascade")?
+        || !absorbed_inputs.is_empty()
+    {
+        return Err(BitgenError::new(
+            "MULT18X18D requires unsigned combinational mode, no cascade and routed inputs",
+        ));
+    }
+    let tiles = multiplier_tiles(architecture, placement)?;
+    // Match the hardware primitive's unused C port tie-offs. A/B, sign and
+    // source controls remain explicit routed pins, including constant bits.
+    for pin in array(placement, "bel_pins")? {
+        let name = string(pin, "name")?;
+        if name
+            .strip_prefix('C')
+            .and_then(|bit| bit.parse::<u8>().ok())
+            .is_some_and(|bit| bit < 18)
+        {
+            add_cib_tie(config, member(pin, "cib_tie")?, false)?;
+        }
+    }
+    let z = usize_value(placement, "bel_z")?;
+    let dsp = format!("MULT18_{z}");
+    let mut group = TileConfig::default();
+    // Internal registers and cascade are intentionally unsupported. These
+    // settings must match the REGS=NONE timing record and the mapped model.
+    for (name, value) in [
+        ("REG_INPUTA_CLK", "NONE"),
+        ("REG_INPUTA_CE", "CE0"),
+        ("REG_INPUTA_RST", "RST0"),
+        ("REG_INPUTB_CLK", "NONE"),
+        ("REG_INPUTB_CE", "CE0"),
+        ("REG_INPUTB_RST", "RST0"),
+        ("REG_INPUTC_CLK", "NONE"),
+        ("REG_PIPELINE_CLK", "NONE"),
+        ("REG_PIPELINE_CE", "CE0"),
+        ("REG_PIPELINE_RST", "RST0"),
+        ("REG_OUTPUT_CLK", "NONE"),
+        ("GSR", "ENABLED"),
+        ("SOURCEB_MODE", "B_SHIFT"),
+        ("RESETMODE", "SYNC"),
+        ("MODE", "MULT18X18D"),
+        ("CIBOUT_BYP", "ON"),
+    ] {
+        group.add_enum(format!("{dsp}.{name}"), value);
+    }
+    if z == 0 || z == 4 {
+        group.add_enum(format!("{dsp}.REG_OUTPUT_RST"), "RST0");
+    }
+    group.add_enum(
+        if z < 4 {
+            "DSP_LEFT.CIBOUT"
+        } else {
+            "DSP_RIGHT.CIBOUT"
+        },
+        "ON",
+    );
+    for index in 0..4 {
+        group.add_enum(format!("{dsp}.CLK{index}_DIV"), "ENABLED");
+        for port in ["CLK", "CE", "RST"] {
+            let signal = format!("{port}{index}");
+            group.add_enum(format!("{dsp}.{signal}MUX"), signal);
+        }
+    }
+    config.tile_groups.push((tiles, group));
+    Ok(())
+}
+
+fn multiplier_tiles(
+    architecture: &Ecp5Architecture,
+    placement: &Value,
+) -> Result<Vec<String>, BitgenError> {
+    let x = usize_value(placement, "x")?;
+    let y = usize_value(placement, "y")?;
+    let z = usize_value(placement, "bel_z")?;
+    if ![0, 1, 4, 5].contains(&z) || !string(placement, "bel")?.ends_with(&format!("/MULT18_{z}")) {
+        return Err(BitgenError::new(format!(
+            "invalid MULT18X18D BEL: {}",
+            string(placement, "bel")?
+        )));
+    }
+    let start_x = x
+        .checked_sub(z % 4)
+        .ok_or_else(|| BitgenError::new("MULT18X18D tile group underflows device boundary"))?;
+    let start_type = if z < 4 { 0 } else { 4 };
+    let mut tiles = Vec::with_capacity(10);
+    for offset in 0..5 {
+        let kind = start_type + offset;
+        let primary = format!("MIB_DSP{kind}");
+        let secondary = format!("MIB2_DSP{kind}");
+        let accepted: &[&str] = if kind == 8 {
+            &[
+                "MIB_DSP8",
+                "DSP_SPINE_UL0",
+                "DSP_SPINE_UR0",
+                "DSP_SPINE_UR1",
+            ]
+        } else {
+            &[primary.as_str()]
+        };
+        tiles.push(chip_tile(architecture, start_x + offset, y, accepted)?);
+        tiles.push(chip_tile(
+            architecture,
+            start_x + offset,
+            y,
+            &[secondary.as_str()],
+        )?);
+    }
+    Ok(tiles)
+}
+
 fn bram_tiles(
     architecture: &Ecp5Architecture,
     placement: &Value,
@@ -1742,7 +1869,7 @@ mod tests {
     use super::{
         ChipConfig, TileConfig, generate_ecp5_config, io_base_direction, reverse_bits,
         trellis_wire_name, validate_checkpoint, write_bram, write_distributed_ram_data,
-        write_distributed_ram_write_port, write_ff, write_jtagg, write_pll,
+        write_distributed_ram_write_port, write_ff, write_jtagg, write_multiplier, write_pll,
     };
 
     const ARCHITECTURE: &str = include_str!(concat!(
@@ -1760,6 +1887,93 @@ mod tests {
             parsed.serialize(),
             ".device TEST\n\n\n.tile R0C0:CIB\nenum: CIB.JA0MUX 0\nunknown: F2B0\n\n"
         );
+    }
+
+    #[test]
+    fn multiplier_configures_all_four_sites_and_rejects_unmodeled_modes() {
+        let mut file: ArchitectureFile = serde_json::from_str(ARCHITECTURE).unwrap();
+        file.width = 9;
+        for x in 2..9 {
+            let mut location = file.locations[1].clone();
+            location.x = x;
+            file.locations.push(location);
+        }
+        for (x, location) in file.locations.iter_mut().enumerate() {
+            for tile_type in [
+                if x == 8 {
+                    "DSP_SPINE_UL0".into()
+                } else {
+                    format!("MIB_DSP{x}")
+                },
+                format!("MIB2_DSP{x}"),
+            ] {
+                location.tiles.push(TileRecord {
+                    name: format!("R0C{x}:{tile_type}"),
+                    tile_type,
+                });
+            }
+        }
+        let architecture = expand(file).unwrap();
+        let mode = json!({"registers": "none", "signed": false, "cascade": false});
+        let empty = serde_json::Map::new();
+        for z in [0, 1, 4, 5] {
+            let placement = json!({"x": z, "y": 0, "bel_z": z, "bel": format!("R0C{z}/MULT18_{z}"), "bel_pins": []});
+            let mut config = ChipConfig::default();
+            write_multiplier(&mut config, &architecture, &placement, &mode, &empty).unwrap();
+            assert_eq!(config.tile_groups.len(), 1);
+            let (tiles, group) = &config.tile_groups[0];
+            assert_eq!(tiles.len(), 10);
+            let first = if z < 4 { 0 } else { 4 };
+            assert_eq!(tiles[0], format!("R0C{first}:MIB_DSP{first}"));
+            let dsp = format!("MULT18_{z}");
+            for name in [
+                "REG_INPUTA_CLK",
+                "REG_INPUTB_CLK",
+                "REG_INPUTC_CLK",
+                "REG_PIPELINE_CLK",
+                "REG_OUTPUT_CLK",
+            ] {
+                assert!(
+                    group
+                        .enums
+                        .contains(&(format!("{dsp}.{name}"), "NONE".into()))
+                );
+            }
+            assert!(
+                group
+                    .enums
+                    .contains(&(format!("{dsp}.CIBOUT_BYP"), "ON".into()))
+            );
+            assert!(
+                group
+                    .enums
+                    .contains(&(format!("{dsp}.MODE"), "MULT18X18D".into()))
+            );
+            assert_eq!(
+                group
+                    .enums
+                    .contains(&(format!("{dsp}.REG_OUTPUT_RST"), "RST0".into())),
+                z == 0 || z == 4
+            );
+            for (field, value) in [
+                ("registers", json!("all")),
+                ("signed", json!(true)),
+                ("cascade", json!(true)),
+            ] {
+                let mut unsupported = mode.clone();
+                unsupported[field] = value;
+                assert!(
+                    write_multiplier(
+                        &mut ChipConfig::default(),
+                        &architecture,
+                        &placement,
+                        &unsupported,
+                        &empty
+                    )
+                    .is_err()
+                );
+            }
+        }
     }
 
     #[test]

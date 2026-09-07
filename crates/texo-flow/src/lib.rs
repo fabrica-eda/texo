@@ -3458,6 +3458,7 @@ fn ecp5_timing_model(
                 ResourceKind::Lut(4) => "TRELLIS_COMB",
                 ResourceKind::Register => "TRELLIS_FF",
                 ResourceKind::Memory => "DP16KD",
+                ResourceKind::Dsp => "MULT18X18D:REGS=NONE",
                 ResourceKind::Clock => "DCCA",
                 _ => continue,
             }
@@ -3470,6 +3471,9 @@ fn ecp5_timing_model(
                     speed_grade: speed_grade.name.clone(),
                     cell_type: cell_type.into(),
                 })?;
+        if cell.kind == ResourceKind::Dsp {
+            validate_multiplier_timing(record, &speed_grade.name)?;
+        }
         for arc in &record.arcs {
             let Some(from) = find_cell_pin(design, cell_id, &arc.from_pin) else {
                 continue;
@@ -3505,6 +3509,29 @@ fn ecp5_timing_model(
         )?;
     }
     Ok(model)
+}
+
+fn validate_multiplier_timing(
+    record: &texo_target_ecp5::CellTimingRecord,
+    speed_grade: &str,
+) -> Result<(), Ecp5FlowError> {
+    let expected = ["A", "B"]
+        .into_iter()
+        .flat_map(|port| (0..18).map(move |bit| format!("{port}{bit}")))
+        .chain(["SIGNEDA".into(), "SIGNEDB".into()])
+        .flat_map(|from| (0..36).map(move |bit| (from.clone(), format!("P{bit}"))))
+        .collect::<BTreeSet<_>>();
+    let actual = record
+        .arcs
+        .iter()
+        .map(|arc| (arc.from_pin.clone(), arc.to_pin.clone()))
+        .collect::<BTreeSet<_>>();
+    if actual != expected || record.arcs.len() != expected.len() || !record.setup_holds.is_empty() {
+        return Err(Ecp5FlowError::IncompleteMultiplierTiming {
+            speed_grade: speed_grade.into(),
+        });
+    }
+    Ok(())
 }
 
 fn add_setup_hold_timing(
@@ -3679,6 +3706,11 @@ pub enum Ecp5FlowError {
         /// Missing cell type.
         cell_type: String,
     },
+    /// The combinational multiplier record lacks a complete scalar pin surface.
+    IncompleteMultiplierTiming {
+        /// Speed-grade name.
+        speed_grade: String,
+    },
     /// Speed-grade delay arithmetic overflowed.
     TimingDelayOverflow,
     /// A frequency-constrained IO cell does not drive exactly one net.
@@ -3828,6 +3860,10 @@ impl fmt::Display for Ecp5FlowError {
                 f,
                 "ECP5 speed grade `{speed_grade}` has no cell timing for `{cell_type}`"
             ),
+            Self::IncompleteMultiplierTiming { speed_grade } => write!(
+                f,
+                "ECP5 speed grade `{speed_grade}` has incomplete MULT18X18D:REGS=NONE timing"
+            ),
             Self::TimingDelayOverflow => write!(f, "ECP5 timing delay arithmetic overflowed"),
             Self::ClockIoNet { cell } => write!(
                 f,
@@ -3922,6 +3958,7 @@ impl Error for Ecp5FlowError {
             | Self::UnknownSpeedGrade(_)
             | Self::MissingPipTimingClass { .. }
             | Self::MissingCellTiming { .. }
+            | Self::IncompleteMultiplierTiming { .. }
             | Self::TimingDelayOverflow
             | Self::ClockIoNet { .. }
             | Self::ClockFrequencyOutOfRange { .. }
@@ -6265,6 +6302,84 @@ mod tests {
         assert_eq!(timing_model.clock_to_q(ff_q).unwrap().2.max_ps, 525);
         assert_eq!(timing_model.setup_hold(ff_data).unwrap().3.min_ps, 233);
         assert!(timing_model.setup_hold(ff_lsr).is_none());
+    }
+
+    #[test]
+    fn multiplier_timing_includes_high_product_bits_and_rejects_partial_tables() {
+        use texo_target_ecp5::{
+            CellArcTimingRecord, CellTimingRecord, DelayRangeRecord, Ecp5Packing,
+        };
+        let mut design = Design::new();
+        let dsp = design.add_cell("dsp", ResourceKind::Dsp);
+        let sources = ["A", "B"]
+            .into_iter()
+            .flat_map(|port| (0..18).map(move |bit| format!("{port}{bit}")))
+            .chain(["SIGNEDA".into(), "SIGNEDB".into()])
+            .collect::<Vec<_>>();
+        for pin in &sources {
+            design.add_pin(dsp, pin, PinDirection::Input).unwrap();
+        }
+        for bit in 0..36 {
+            design
+                .add_pin(dsp, format!("P{bit}"), PinDirection::Output)
+                .unwrap();
+        }
+        let arcs = sources
+            .iter()
+            .flat_map(|from| {
+                (0..36).map(move |bit| CellArcTimingRecord {
+                    from_pin: from.clone(),
+                    to_pin: format!("P{bit}"),
+                    delay: DelayRangeRecord {
+                        min_ps: 1930,
+                        max_ps: 2538,
+                    },
+                })
+            })
+            .collect();
+        let mut record = CellTimingRecord {
+            cell_type: "MULT18X18D:REGS=NONE".into(),
+            arcs,
+            setup_holds: Vec::new(),
+        };
+        let architecture = read_architecture(ECP5_FIXTURE.as_bytes()).unwrap();
+        let mut grade = architecture.speed_grades()["6"].clone();
+        let metadata = BTreeMap::from([(dsp, PrimitiveMetadata::Multiplier)]);
+        let model = |grade: &_| {
+            ecp5_timing_model(
+                &design,
+                &Ecp5Packing::default(),
+                grade,
+                &BTreeSet::new(),
+                &metadata,
+            )
+        };
+        assert!(matches!(
+            model(&grade),
+            Err(Ecp5FlowError::MissingCellTiming { .. })
+        ));
+        grade.cells.push(record.clone());
+        let timing = model(&grade).unwrap();
+        for from in ["A0", "A17", "B0", "B17", "SIGNEDA", "SIGNEDB"] {
+            for to in ["P0", "P17", "P35"] {
+                assert_eq!(
+                    timing
+                        .cell_arc(
+                            find_cell_pin(&design, dsp, from).unwrap(),
+                            find_cell_pin(&design, dsp, to).unwrap()
+                        )
+                        .unwrap()
+                        .max_ps,
+                    2538
+                );
+            }
+        }
+        record.arcs.pop();
+        *grade.cells.last_mut().unwrap() = record;
+        assert!(matches!(
+            model(&grade),
+            Err(Ecp5FlowError::IncompleteMultiplierTiming { .. })
+        ));
     }
 
     #[test]

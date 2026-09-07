@@ -272,3 +272,6 @@ second PnR context. The bundled `ecppack` is only the final binary codec.
 
 See [docs/architecture.md](docs/architecture.md) for the integration boundary
 and [docs/roadmap.md](docs/roadmap.md) for the implementation sequence.
+
+ECP5 combinational DSP multiplication, architecture-cache requirements, and
+a minimal routing fixture are documented in [DSP support](docs/dsp.md).
