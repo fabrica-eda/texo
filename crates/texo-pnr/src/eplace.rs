@@ -731,6 +731,7 @@ fn routability_adjusted_member_area(
     match kind {
         ResourceKind::Lut(_) | ResourceKind::Register => Ok(inflated),
         ResourceKind::Memory
+        | ResourceKind::Dsp
         | ResourceKind::Logic
         | ResourceKind::Clock
         | ResourceKind::Io
@@ -1266,7 +1267,7 @@ fn multiplier_growth_from_logarithm(logarithm: f64) -> Result<f64, EplaceError> 
 
 fn density_overflow_target(kind: ResourceKind) -> f64 {
     match kind {
-        ResourceKind::Memory => 0.20,
+        ResourceKind::Memory | ResourceKind::Dsp => 0.20,
         ResourceKind::Lut(_) | ResourceKind::Register => 0.10,
         ResourceKind::Logic | ResourceKind::Clock | ResourceKind::Io | ResourceKind::Constant => {
             0.0

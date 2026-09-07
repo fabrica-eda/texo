@@ -185,6 +185,8 @@ pub enum PrimitiveMetadata {
         /// Optional local reset configuration.
         reset: Option<ResetMetadata>,
     },
+    /// Unsigned combinational `MULT18X18D`, without registers or cascades.
+    Multiplier,
     /// `DP16KD` configuration.
     BlockRam {
         /// Logical number of words.
@@ -466,6 +468,7 @@ impl Importer {
                 unreachable!("wide muxes are packed after their LUT4 drivers")
             }
             Ecp5Cell::Ccu2c { .. } => self.add_ccu2c(primitive),
+            Ecp5Cell::Multiplier { .. } => self.add_multiplier(primitive),
             Ecp5Cell::FlipFlop { .. } => self.add_flip_flop(primitive),
             Ecp5Cell::BlockRam {
                 implementation: Ecp5MemoryImplementation::Block,
@@ -479,6 +482,42 @@ impl Importer {
             Ecp5Cell::Jtagg { .. } => self.add_jtagg(primitive),
             Ecp5Cell::Pll { .. } => self.add_pll(primitive),
         }
+    }
+
+    fn add_multiplier(&mut self, primitive: &Ecp5Cell) -> Result<(), AdapterError> {
+        let Ecp5Cell::Multiplier {
+            name,
+            lhs,
+            rhs,
+            product,
+        } = primitive
+        else {
+            unreachable!("dispatch guarantees a multiplier")
+        };
+        let cell = self.add_cell(
+            name.clone(),
+            ResourceKind::Dsp,
+            PrimitiveMetadata::Multiplier,
+        );
+        for (port, bits) in [("A", lhs.as_slice()), ("B", rhs.as_slice())] {
+            for (index, bit) in bits.iter().copied().enumerate() {
+                let pin =
+                    self.design
+                        .add_pin(cell, format!("{port}{index}"), PinDirection::Input)?;
+                self.add_sink(bit, pin);
+            }
+        }
+        for (index, wire) in product.iter().copied().enumerate() {
+            let pin = self
+                .design
+                .add_pin(cell, format!("P{index}"), PinDirection::Output)?;
+            self.claim_driver(Bit::Wire(wire).into(), pin)?;
+        }
+        for name in ["SIGNEDA", "SIGNEDB", "SOURCEA", "SOURCEB"] {
+            let pin = self.design.add_pin(cell, name, PinDirection::Input)?;
+            self.add_sink(Bit::Zero, pin);
+        }
+        Ok(())
     }
 
     fn add_pfu_mux(&mut self, primitive: &Ecp5Cell) -> Result<(), AdapterError> {
@@ -2218,6 +2257,49 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn imports_unsigned_multiplier_and_routes_its_mode_controls() {
+        let mut source = Netlist::new("multiply");
+        let width = NonZeroU32::new(18).unwrap();
+        let mut lhs = source.add_input_port("lhs", width);
+        let mut rhs = source.add_input_port("rhs", width);
+        let zero = source.add_constant(false);
+        lhs.resize(36, zero);
+        rhs.resize(36, zero);
+        let product = source
+            .add_arithmetic(ArithmeticOp::Multiply, &lhs, &rhs)
+            .unwrap();
+        source.add_output_port("product", &product).unwrap();
+        let imported = import_ecp5(&map_to_ecp5(&source).unwrap()).unwrap();
+        let multipliers = imported
+            .metadata()
+            .iter()
+            .filter_map(|(&id, metadata)| {
+                matches!(metadata, PrimitiveMetadata::Multiplier).then_some(id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(multipliers.len(), 1);
+        let cell_id = multipliers[0];
+        let cell = &imported.design().cells()[cell_id.0];
+        assert_eq!(cell.kind, ResourceKind::Dsp);
+        assert_eq!(cell.pins().len(), 76);
+        assert!(!imported.absorbed_inputs().contains_key(&cell_id));
+        for name in ["SIGNEDA", "SIGNEDB", "SOURCEA", "SOURCEB"] {
+            let pin = cell
+                .pins()
+                .iter()
+                .map(|id| &imported.design().pins()[id.0])
+                .find(|pin| pin.name == name)
+                .unwrap();
+            let net = &imported.design().nets()[pin.net().unwrap().0];
+            let driver = imported.design().pins()[net.driver.0].cell;
+            assert!(matches!(
+                imported.metadata()[&driver],
+                PrimitiveMetadata::Constant { value: false }
+            ));
+        }
     }
 
     #[test]

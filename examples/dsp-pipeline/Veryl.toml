@@ -1,0 +1,10 @@
+[project]
+name = "dsp_pipeline"
+version = "0.1.0"
+
+[build]
+sources = ["src"]
+exclude_std = true
+
+[synth]
+top = "DspPipeline"

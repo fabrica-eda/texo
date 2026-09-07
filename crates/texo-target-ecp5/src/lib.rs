@@ -31,7 +31,7 @@ use texo_pnr::{NetRoute, Placement, PlacementConstraints, RoutingConstraints};
 pub const SCHEMA_VERSION: u32 = 7;
 
 /// Version of the expanded binary architecture cache.
-pub const ARCHITECTURE_CACHE_VERSION: u32 = 5;
+pub const ARCHITECTURE_CACHE_VERSION: u32 = 6;
 
 /// Provenance required for every generated architecture snapshot.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4350,7 +4350,10 @@ pub fn read_architecture_cache(mut reader: impl Read) -> Result<Ecp5Architecture
         version,
         mut architecture,
     } = cache;
-    if version != ARCHITECTURE_CACHE_VERSION {
+    // Cache 5 remains usable for designs without DSPs. Cache 6 additionally
+    // classifies MULT18X18D BELs and carries their complete timing tables.
+    // ResourceKind's pre-existing numeric tags are preserved.
+    if version != ARCHITECTURE_CACHE_VERSION && version != 5 {
         return Err(ImportError::UnsupportedCacheVersion(version));
     }
     architecture.device.compact_routing_graph()?;
@@ -4852,6 +4855,7 @@ fn resource_kind(bel_type: &str) -> ResourceKind {
         "TRELLIS_COMB" => ResourceKind::Lut(4),
         "TRELLIS_FF" => ResourceKind::Register,
         "DP16KD" => ResourceKind::Memory,
+        "MULT18X18D" => ResourceKind::Dsp,
         "DCCA" => ResourceKind::Clock,
         "PIO" | "TRELLIS_IO" => ResourceKind::Io,
         _ => ResourceKind::Logic,
@@ -5574,6 +5578,22 @@ mod tests {
     }
 
     #[test]
+    fn legacy_cache_5_preserves_io_and_constant_resource_tags() {
+        assert_eq!(postcard::to_stdvec(&ResourceKind::Io).unwrap(), [5]);
+        assert_eq!(postcard::to_stdvec(&ResourceKind::Constant).unwrap(), [6]);
+        let architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let encoded = postcard::to_stdvec(&super::ArchitectureCacheRef {
+            version: 5,
+            architecture: &architecture,
+        })
+        .unwrap();
+        assert_eq!(
+            read_architecture_cache(encoded.as_slice()).unwrap(),
+            architecture
+        );
+    }
+
+    #[test]
     fn architecture_cache_read_preserves_io_errors() {
         struct FailingReader;
 
@@ -5601,7 +5621,7 @@ mod tests {
             &mut scratch,
         ))
         .unwrap();
-        assert_eq!(streamed.version, super::ARCHITECTURE_CACHE_VERSION);
+        assert!([5, super::ARCHITECTURE_CACHE_VERSION].contains(&streamed.version));
         let mut expected = streamed.architecture;
         expected.device.compact_routing_graph().unwrap();
 
