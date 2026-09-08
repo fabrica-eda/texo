@@ -9113,18 +9113,12 @@ fn route_net(
     // representation where absent entries were only ever written by insertion
     // rather than merged with a zero seed.
     tree_arrival_ps[driver_wire.0] = 0;
-    for arc in &arcs {
-        let mut arrival_ps = 0_u64;
-        for (&wire, &pip) in arc.wires.iter().skip(1).zip(&arc.pips) {
-            arrival_ps = arrival_ps.saturating_add(u64::from(
-                costs.map_or(0, |costs| costs.pip_delays_ps[pip.0]),
-            ));
-            tree_arrival_ps[wire.0] = match tree_arrival_ps[wire.0] {
-                UNROUTED_ARRIVAL_PS => arrival_ps,
-                known => known.min(arrival_ps),
-            };
-        }
-    }
+    populate_tree_arrivals(
+        &arcs,
+        costs.map(RoutingCosts::pip_delays_ps),
+        tree_arrival_ps,
+    );
+    let mut tree_uses_minimum_corner = false;
     let driver_point = device.bels()[driver_bel.0].point;
     let sinks = ordered_sinks(net_id, &net.sinks, costs, |sink| {
         let sink_cell = design.pins()[sink.0].cell;
@@ -9142,6 +9136,27 @@ fn route_net(
             .and_then(|costs| costs.sink_min_delays_ps.get(&(net_id, *sink_pin)))
             .copied()
             .unwrap_or(0);
+        let use_minimum_corner = minimum_arrival_ps != 0;
+        if use_minimum_corner != tree_uses_minimum_corner
+            && let Some(costs) = costs
+        {
+            // Every shared prefix must use the same corner as the current
+            // sink search. A retained or earlier setup branch carries maximum
+            // delays; adding minimum delays to that prefix can falsely satisfy
+            // hold. Recompute only when switching corners, reusing the scratch
+            // buffer rather than allocating another device-sized arrival table.
+            for &wire in &tree_wires {
+                tree_arrival_ps[wire.0] = UNROUTED_ARRIVAL_PS;
+            }
+            tree_arrival_ps[driver_wire.0] = 0;
+            let delays = if use_minimum_corner {
+                costs.pip_min_delays_ps()
+            } else {
+                costs.pip_delays_ps()
+            };
+            populate_tree_arrivals(&arcs, Some(delays), tree_arrival_ps);
+            tree_uses_minimum_corner = use_minimum_corner;
+        }
         let criticality = routing_arc_criticality(costs, net_id, *sink_pin);
         if routed_sinks.contains(sink_pin) {
             if tree_arrival_ps[sink_wire.0] >= minimum_arrival_ps {
@@ -9350,6 +9365,19 @@ fn route_net(
         tree_arrival_ps[wire.0] = UNROUTED_ARRIVAL_PS;
     }
     Ok(NetRoute::new(net_id, arcs))
+}
+
+fn populate_tree_arrivals(arcs: &[RouteArc], delays_ps: Option<&[u32]>, tree_delays: &mut [u64]) {
+    for arc in arcs {
+        let mut arrival_ps = 0_u64;
+        for (&wire, &pip) in arc.wires.iter().skip(1).zip(&arc.pips) {
+            arrival_ps = arrival_ps.saturating_add(u64::from(delays_ps.map_or(0, |d| d[pip.0])));
+            tree_delays[wire.0] = match tree_delays[wire.0] {
+                UNROUTED_ARRIVAL_PS => arrival_ps,
+                known => known.min(arrival_ps),
+            };
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13958,6 +13986,165 @@ mod tests {
             ),
             Err(PnrError::InvalidRoutingCosts { .. })
         ));
+    }
+
+    struct HoldSharedPrefixFixture {
+        design: Design,
+        device: Device,
+        placement: Placement,
+        costs: RoutingCosts,
+        endpoints: Vec<CellPinId>,
+        pips: [PipId; 5],
+        wires: [WireId; 5],
+        net: NetId,
+    }
+
+    fn hold_shared_prefix_fixture() -> HoldSharedPrefixFixture {
+        let mut design = Design::new();
+        let mut device = Device::new("hold-shared-prefix", 3, 1).unwrap();
+        let wires = ["driver", "branch", "normal", "hold", "detour"]
+            .map(|name| device.add_wire(name, Point::new(0, 0), 1).unwrap());
+        let [driver, branch, normal, hold, detour] = wires;
+        let mut endpoints = Vec::new();
+        let mut bindings = Vec::new();
+        for (index, (name, wire)) in [("source", driver), ("normal", normal), ("hold", hold)]
+            .into_iter()
+            .enumerate()
+        {
+            let direction = if index == 0 {
+                PinDirection::Output
+            } else {
+                PinDirection::Input
+            };
+            let cell = design.add_cell(name, ResourceKind::Logic);
+            endpoints.push(design.add_pin(cell, "P", direction).unwrap());
+            let bel = device
+                .add_bel(
+                    name,
+                    ResourceKind::Logic,
+                    Point::new(u32::try_from(index).unwrap(), 0),
+                )
+                .unwrap();
+            device.add_bel_pin(bel, "P", direction, wire).unwrap();
+            bindings.push(bel);
+        }
+        let net = design
+            .add_net("shared", endpoints[0], [endpoints[1], endpoints[2]])
+            .unwrap();
+        let pips = [
+            (driver, branch),
+            (branch, normal),
+            (branch, hold),
+            (branch, detour),
+            (detour, hold),
+        ]
+        .map(|(from, to)| device.add_pip(from, to, false, 1).unwrap());
+        let placement = Placement {
+            bindings,
+            pin_bindings: BTreeMap::new(),
+        };
+        let mut costs = RoutingCosts::new(vec![200, 10, 10, 60, 60], BTreeMap::new());
+        costs.set_pip_min_delays_ps(vec![10, 10, 10, 60, 60]);
+        costs.set_sink_criticalities(BTreeMap::from([
+            ((net, endpoints[1]), 64),
+            ((net, endpoints[2]), 1),
+        ]));
+        costs.set_sink_min_delays_ps(BTreeMap::from([((net, endpoints[2]), 100)]));
+        HoldSharedPrefixFixture {
+            design,
+            device,
+            placement,
+            costs,
+            endpoints,
+            pips,
+            wires,
+            net,
+        }
+    }
+
+    #[test]
+    fn hold_routing_uses_the_minimum_corner_of_retained_and_new_shared_prefixes() {
+        let HoldSharedPrefixFixture {
+            design,
+            device,
+            placement,
+            costs,
+            endpoints,
+            pips,
+            wires,
+            net,
+        } = hold_shared_prefix_fixture();
+        let [driver, branch, normal, _, _] = wires;
+        let retained = NetRoute::new(
+            net,
+            vec![RouteArc {
+                sink: Some(endpoints[1]),
+                wires: vec![driver, branch, normal],
+                pips: vec![pips[0], pips[1]],
+            }],
+        );
+        for keep_prefix in [false, true] {
+            let mut constraints = RoutingConstraints::new();
+            if keep_prefix {
+                constraints.add_route(retained.clone());
+            }
+            let result = route_with_timing_costs_and_progress(
+                &design,
+                &device,
+                placement.clone(),
+                &constraints,
+                &costs,
+                |_| {},
+            )
+            .unwrap();
+            let arc = result.routes[0].arc(endpoints[2]).unwrap();
+            // The direct branch is only 20 ps. Reusing its maximum-corner
+            // prefix would falsely accept it as 210 ps; the valid detour is 130 ps.
+            assert_eq!(arc.pips, vec![pips[0], pips[3], pips[4]]);
+            assert_eq!(
+                arc.pips
+                    .iter()
+                    .map(|pip| u64::from(costs.pip_min_delays_ps()[pip.0]))
+                    .sum::<u64>(),
+                130
+            );
+        }
+    }
+
+    #[test]
+    fn setup_routing_restores_the_maximum_corner_after_a_hold_branch() {
+        let mut fixture = hold_shared_prefix_fixture();
+        let shortcut = fixture
+            .device
+            .add_pip(fixture.wires[0], fixture.wires[2], false, 1)
+            .unwrap();
+        let mut costs = RoutingCosts::new(vec![200, 10, 10, 60, 60, 100], BTreeMap::new());
+        costs.set_pip_min_delays_ps(vec![10, 10, 10, 60, 60, 100]);
+        costs.set_sink_criticalities(BTreeMap::from([
+            ((fixture.net, fixture.endpoints[1]), 1),
+            ((fixture.net, fixture.endpoints[2]), 64),
+        ]));
+        costs.set_sink_min_delays_ps(BTreeMap::from([((fixture.net, fixture.endpoints[2]), 100)]));
+        let result = route_with_timing_costs_and_progress(
+            &fixture.design,
+            &fixture.device,
+            fixture.placement,
+            &RoutingConstraints::new(),
+            &costs,
+            |_| {},
+        )
+        .unwrap();
+        // Hold routes first, retaining a shared prefix of min=10/max=200 ps.
+        // Setup must choose the 100 ps shortcut instead of counting the
+        // minimum prefix and treating the 210 ps shared route as 20 ps.
+        assert_eq!(
+            result.routes[0].arc(fixture.endpoints[2]).unwrap().pips,
+            vec![fixture.pips[0], fixture.pips[3], fixture.pips[4]]
+        );
+        assert_eq!(
+            result.routes[0].arc(fixture.endpoints[1]).unwrap().pips,
+            vec![shortcut]
+        );
     }
 
     #[test]

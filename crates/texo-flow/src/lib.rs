@@ -214,6 +214,9 @@ pub struct Ecp5FlowOptions<'a> {
     /// Setup margin reserved on every constrained capture clock, in picoseconds.
     /// This leaves nominal periods, generated-clock relations and hold intact.
     pub setup_uncertainty_ps: u64,
+    /// Hold margin reserved on every constrained capture clock, in picoseconds.
+    /// Setup closure must be preserved when repairing the resulting short paths.
+    pub hold_uncertainty_ps: u64,
     /// Minimum recognized clock-pin fanout for automatic DCCA promotion.
     pub global_clock_fanout: usize,
     /// Exponent in the ECP5 analytical-placement connection weight
@@ -251,6 +254,7 @@ impl Default for Ecp5FlowOptions<'_> {
             timing_exceptions: &[],
             clock_constraints: &[],
             setup_uncertainty_ps: 0,
+            hold_uncertainty_ps: 0,
             global_clock_fanout: DEFAULT_GLOBAL_CLOCK_FANOUT,
             placement_weight_exponent: 4,
             initial_placement: None,
@@ -316,6 +320,8 @@ pub struct Ecp5FlowResult {
     pub clock_constraints: Vec<ClockConstraint>,
     /// Uniform setup margin applied throughout placement, routing and repair.
     pub setup_uncertainty_ps: u64,
+    /// Uniform hold margin applied throughout placement, routing and repair.
+    pub hold_uncertainty_ps: u64,
     /// Placement-weight exponent the flow was configured with.
     pub placement_weight_exponent: u32,
     /// Initial placement algorithm used to build this implementation.
@@ -613,6 +619,7 @@ pub fn implement_struo_ecp5_with_progress(
     )?;
     let mut timing_constraints = ecp5_timing_constraints(&design, &packing, &pll_relations)?;
     apply_setup_uncertainty(&mut timing_constraints, options.setup_uncertainty_ps);
+    apply_hold_uncertainty(&mut timing_constraints, options.hold_uncertainty_ps);
     let mut staged_evidence = evidence.clone();
     staged_evidence.record(Gate::MappedNetlistComplete);
     let use_timing_route = options.optimize_timing || options.initial_timing_reroute;
@@ -978,6 +985,7 @@ pub fn implement_struo_ecp5_with_progress(
         timing_exceptions: options.timing_exceptions.to_vec(),
         clock_constraints: options.clock_constraints.to_vec(),
         setup_uncertainty_ps: options.setup_uncertainty_ps,
+        hold_uncertainty_ps: options.hold_uncertainty_ps,
         placement_weight_exponent,
         initial_placement_algorithm,
     })
@@ -3363,6 +3371,17 @@ fn apply_setup_uncertainty(constraints: &mut TimingConstraints, uncertainty_ps: 
         .collect::<Vec<_>>();
     for clock in clocks {
         constraints.set_setup_uncertainty_ps(clock, uncertainty_ps);
+    }
+}
+
+fn apply_hold_uncertainty(constraints: &mut TimingConstraints, uncertainty_ps: u64) {
+    let clocks = constraints
+        .clock_periods_ps()
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    for clock in clocks {
+        constraints.set_hold_uncertainty_ps(clock, uncertainty_ps);
     }
 }
 

@@ -52,6 +52,7 @@ pub struct TimingConstraints {
     clock_periods_ps: BTreeMap<NetId, u64>,
     generated_clocks: BTreeMap<NetId, GeneratedClockConstraint>,
     setup_uncertainties_ps: BTreeMap<NetId, u64>,
+    hold_uncertainties_ps: BTreeMap<NetId, u64>,
 }
 
 impl TimingConstraints {
@@ -62,6 +63,7 @@ impl TimingConstraints {
             clock_periods_ps: BTreeMap::new(),
             generated_clocks: BTreeMap::new(),
             setup_uncertainties_ps: BTreeMap::new(),
+            hold_uncertainties_ps: BTreeMap::new(),
         }
     }
 
@@ -122,6 +124,27 @@ impl TimingConstraints {
     #[must_use]
     pub fn setup_uncertainty_ps(&self, net: NetId) -> u64 {
         self.setup_uncertainties_ps.get(&net).copied().unwrap_or(0)
+    }
+
+    /// Sets or replaces the hold margin for one capture clock, in picoseconds.
+    ///
+    /// This increases the earliest allowed data arrival without changing clock
+    /// periods, phase relationships, characterized delays or setup checks. The
+    /// capture constraint is applied once, including for related clock paths.
+    pub fn set_hold_uncertainty_ps(&mut self, net: NetId, uncertainty_ps: u64) {
+        self.hold_uncertainties_ps.insert(net, uncertainty_ps);
+    }
+
+    /// Per-clock hold uncertainties in stable net-ID order.
+    #[must_use]
+    pub const fn hold_uncertainties_ps(&self) -> &BTreeMap<NetId, u64> {
+        &self.hold_uncertainties_ps
+    }
+
+    /// Hold uncertainty for one capture clock, or zero when unspecified.
+    #[must_use]
+    pub fn hold_uncertainty_ps(&self, net: NetId) -> u64 {
+        self.hold_uncertainties_ps.get(&net).copied().unwrap_or(0)
     }
 }
 
@@ -373,7 +396,9 @@ pub struct HoldCheck {
     pub clock_arrival_ps: u64,
     /// Latest characterized hold requirement.
     pub hold_ps: u64,
-    /// Earliest allowed data arrival.
+    /// Reserved hold uncertainty for this capture clock domain.
+    pub uncertainty_ps: u64,
+    /// Earliest allowed data arrival, including hold uncertainty.
     pub required_ps: i128,
     /// Actual minus required arrival.
     pub slack_ps: i128,
@@ -825,6 +850,7 @@ fn timing_report_from_net_delays(
                     clock_net,
                     launch_clock_net: launch.clock_net,
                     uncertainty_ps: constraints.setup_uncertainty_ps(clock_net),
+                    hold_uncertainty_ps: constraints.hold_uncertainty_ps(clock_net),
                     arrival: launch.arrival,
                     clock_arrival,
                     common_clock_arrival,
@@ -968,6 +994,7 @@ struct EndpointCheckContext<'a> {
     clock_net: NetId,
     launch_clock_net: NetId,
     uncertainty_ps: u64,
+    hold_uncertainty_ps: u64,
     arrival: DelayRange,
     clock_arrival: DelayRange,
     common_clock_arrival: DelayRange,
@@ -991,6 +1018,7 @@ fn endpoint_checks(
         clock_net,
         launch_clock_net,
         uncertainty_ps,
+        hold_uncertainty_ps,
         arrival,
         clock_arrival,
         common_clock_arrival,
@@ -1013,8 +1041,9 @@ fn endpoint_checks(
         + common_clock_pessimism_ps
         - i128::from(setup.max_ps)
         - i128::from(uncertainty_ps);
-    let hold_required_ps =
-        i128::from(clock_arrival.max_ps) + i128::from(hold.max_ps) - common_clock_pessimism_ps;
+    let hold_required_ps = i128::from(clock_arrival.max_ps) + i128::from(hold.max_ps)
+        - common_clock_pessimism_ps
+        + i128::from(hold_uncertainty_ps);
     (
         SelectedClockCheck {
             launch_clock_net,
@@ -1045,6 +1074,7 @@ fn endpoint_checks(
                 arrival_ps: arrival.min_ps.saturating_add(hold_launch_offset_ps),
                 clock_arrival_ps: clock_arrival.max_ps,
                 hold_ps: hold.max_ps,
+                uncertainty_ps: hold_uncertainty_ps,
                 required_ps: hold_required_ps,
                 slack_ps: i128::from(arrival.min_ps) + i128::from(hold_launch_offset_ps)
                     - hold_required_ps,
@@ -1959,6 +1989,61 @@ mod tests {
             compare_nonnegative_fractions(u128::MAX - 1, u128::MAX, 1, 2),
             Ordering::Greater
         );
+    }
+
+    #[test]
+    fn hold_margin_can_fail_a_passing_path_without_changing_setup_or_edges() {
+        for launch_edge in [ClockEdge::Rising, ClockEdge::Falling] {
+            for capture_edge in [ClockEdge::Rising, ClockEdge::Falling] {
+                let (design, device, clock_net, model) =
+                    registered_path_edges(10, launch_edge, capture_edge);
+                let implementation = place_and_route(&design, &device).unwrap();
+                let pip_delays = device
+                    .pips()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| {
+                        (texo_model::PipId(index), DelayRange::new(100, 100).unwrap())
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let mut constraints = TimingConstraints::new();
+                constraints.set_clock_period_ps(clock_net, 1_000);
+                let analyze = |constraints: &TimingConstraints| {
+                    analyze_timing(
+                        &design,
+                        &device,
+                        &implementation,
+                        &pip_delays,
+                        &model,
+                        constraints,
+                    )
+                    .unwrap()
+                };
+                let nominal = analyze(&constraints);
+                assert!(nominal.met_timing());
+                assert_eq!(constraints.hold_uncertainty_ps(clock_net), 0);
+                constraints.set_hold_uncertainty_ps(clock_net, 0);
+                assert_eq!(nominal, analyze(&constraints));
+
+                let margin = u64::try_from(nominal.worst_hold_slack_ps.unwrap()).unwrap();
+                constraints.set_hold_uncertainty_ps(clock_net, margin);
+                let closed = analyze(&constraints);
+                assert_eq!(closed.worst_hold_slack_ps, Some(0));
+                assert!(closed.met_timing());
+                constraints.set_hold_uncertainty_ps(clock_net, margin + 1);
+                let failed = analyze(&constraints);
+                assert_eq!(failed.worst_hold_slack_ps, Some(-1));
+                assert!(!failed.met_timing());
+                assert_eq!(failed.setup_checks, nominal.setup_checks);
+                assert_eq!(failed.net_setup_slacks, nominal.net_setup_slacks);
+                assert_eq!(failed.net_delays, nominal.net_delays);
+                assert_eq!(failed.unchecked_endpoints, nominal.unchecked_endpoints);
+                assert_eq!(failed.hold_checks[0].uncertainty_ps, margin + 1);
+                assert_eq!(failed.hold_checks[0].launch_edge, launch_edge);
+                assert_eq!(failed.hold_checks[0].capture_edge, capture_edge);
+                assert_eq!(constraints.clock_periods_ps()[&clock_net], 1_000);
+            }
+        }
     }
 
     #[test]

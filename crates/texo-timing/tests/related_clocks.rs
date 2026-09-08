@@ -91,6 +91,56 @@ fn rejects_generated_clock_cycles() {
 }
 
 #[test]
+fn hold_margin_uses_only_the_capture_constraint_for_related_clocks() {
+    let fixture = RelatedClockFixture::new();
+    let mut constraints = fixture.constraints();
+    constraints.set_generated_clock(fixture.fast_clock, fixture.reference, 2, 1, 0);
+    constraints.set_generated_clock(fixture.slow_clock, fixture.reference, 1, 1, 25);
+    let analyze = |constraints: &TimingConstraints| {
+        analyze_timing_from_net_delays(
+            &fixture.design,
+            &fixture.model,
+            constraints,
+            fixture.net_delays.clone(),
+        )
+        .unwrap()
+    };
+    let nominal = analyze(&constraints);
+    constraints.set_hold_uncertainty_ps(fixture.reference, 1_000);
+    constraints.set_hold_uncertainty_ps(fixture.fast_clock, 7);
+    constraints.set_hold_uncertainty_ps(fixture.slow_clock, 80);
+    let guarded = analyze(&constraints);
+    assert_eq!(guarded.setup_checks, nominal.setup_checks);
+    assert_eq!(guarded.net_setup_slacks, nominal.net_setup_slacks);
+    assert_eq!(
+        guarded.net_setup_criticalities,
+        nominal.net_setup_criticalities
+    );
+    assert_eq!(guarded.unchecked_endpoints, nominal.unchecked_endpoints);
+    for check in &guarded.hold_checks {
+        if check.clock_net == fixture.slow_clock {
+            // Fast -> slow: 70 ps nominal, with an 80 ps capture margin.
+            assert_eq!(check.required_ps, 90);
+            assert_eq!(check.arrival_ps, 80);
+            assert_eq!(check.slack_ps, -10);
+            assert_eq!(check.uncertainty_ps, 80);
+        } else {
+            assert_eq!(check.clock_net, fixture.fast_clock);
+            assert_eq!(check.required_ps, 17);
+            assert_eq!(check.arrival_ps, 30);
+            assert_eq!(check.slack_ps, 13);
+            assert_eq!(check.uncertainty_ps, 7);
+        }
+    }
+    assert!(!guarded.met_timing());
+    // Clearing the two capture constraints restores the complete original
+    // report despite the constraint retained on the common reference clock.
+    constraints.set_hold_uncertainty_ps(fixture.fast_clock, 0);
+    constraints.set_hold_uncertainty_ps(fixture.slow_clock, 0);
+    assert_eq!(analyze(&constraints), nominal);
+}
+
+#[test]
 fn rejects_inconsistent_sibling_periods_with_unconstrained_root() {
     let fixture = RelatedClockFixture::new();
     let mut constraints = fixture.constraints();

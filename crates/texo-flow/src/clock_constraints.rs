@@ -182,6 +182,10 @@ mod tests {
         }
 
         fn analyze_with_margin(&self, uncertainty_ps: u64) -> TimingReport {
+            self.analyze_with_margins(uncertainty_ps, 0)
+        }
+
+        fn analyze_with_margins(&self, setup_ps: u64, hold_ps: u64) -> TimingReport {
             let model = ecp5_timing_model(
                 &self.design,
                 &self.packing,
@@ -196,7 +200,8 @@ mod tests {
                 &GeneratedClockRelations::new(),
             )
             .unwrap();
-            crate::apply_setup_uncertainty(&mut constraints, uncertainty_ps);
+            crate::apply_setup_uncertainty(&mut constraints, setup_ps);
+            crate::apply_hold_uncertainty(&mut constraints, hold_ps);
             let delays = self
                 .design
                 .nets()
@@ -244,6 +249,25 @@ mod tests {
             cell: "tap".into(),
             pin: "JTCK".into(),
             period_ps: 166_666,
+        }
+    }
+
+    #[test]
+    fn hold_margin_survives_clock_promotion_without_double_counting() {
+        let mut fixture = Fixture::new();
+        apply_clock_constraints(&fixture.design, &mut fixture.packing, &[jtck()]).unwrap();
+        let nominal = fixture.analyze_with_margins(200, 0);
+        let guarded = fixture.analyze_with_margins(200, 300);
+        assert_eq!(nominal.setup_checks, guarded.setup_checks);
+        assert_eq!(nominal.unchecked_endpoints, guarded.unchecked_endpoints);
+        assert_eq!(nominal.hold_checks.len(), 2);
+        for (before, after) in nominal.hold_checks.iter().zip(&guarded.hold_checks) {
+            assert_eq!(before.slack_ps - 300, after.slack_ps);
+            assert_eq!(before.required_ps + 300, after.required_ps);
+            assert_eq!(after.uncertainty_ps, 300);
+            assert_eq!(before.arrival_ps, after.arrival_ps);
+            assert_eq!(before.launch_edge, after.launch_edge);
+            assert_eq!(before.capture_edge, after.capture_edge);
         }
     }
 
