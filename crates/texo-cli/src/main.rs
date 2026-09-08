@@ -170,6 +170,9 @@ struct PnrArgs {
     /// Reserve this setup margin on all clocks without changing their periods.
     #[arg(long, default_value_t = 0)]
     setup_uncertainty_ps: u64,
+    /// Reserve this hold margin on all capture clocks; repair preserves setup closure.
+    #[arg(long, default_value_t = 0)]
+    hold_uncertainty_ps: u64,
     /// JSON object mapping exact cell names to BEL names for initial placement.
     #[arg(long, value_name = "JSON")]
     initial_placement: Option<PathBuf>,
@@ -470,6 +473,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         timing_exceptions: &timing_exceptions,
         clock_constraints: &clock_constraints,
         setup_uncertainty_ps: args.setup_uncertainty_ps,
+        hold_uncertainty_ps: args.hold_uncertainty_ps,
         initial_placement: initial_placement.as_ref(),
         initial_routes: resumed.as_ref().map(|saved| saved.routes.as_slice()),
         lut_ff_pairs: lut_ff_pairs.as_ref(),
@@ -838,6 +842,8 @@ mod tests {
             "clocks.json",
             "--setup-uncertainty-ps",
             "250",
+            "--hold-uncertainty-ps",
+            "200",
             "--initial-placement",
             "placement.json",
             "--lut-ff-pairs",
@@ -857,6 +863,7 @@ mod tests {
         );
         assert!(!args.no_timing_optimization);
         assert_eq!(args.setup_uncertainty_ps, 250);
+        assert_eq!(args.hold_uncertainty_ps, 200);
         assert_eq!(
             args.initial_placement.as_deref(),
             Some(Path::new("placement.json"))

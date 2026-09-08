@@ -73,3 +73,33 @@ hold-repair trials use the same guarded setup budget. The checkpoint records
 A guarded setup slack of +1 ps with a 250 ps reserve is +251 ps against the
 nominal period. This is a user-selected engineering reserve; it does not
 characterize PLL jitter, clock-tree skew or an unmodeled primitive boundary.
+
+## Reserving hold margin
+
+`pnr --hold-uncertainty-ps 200` reserves 200 ps on every constrained capture
+clock. The API field is `Ecp5FlowOptions::hold_uncertainty_ps`, default zero.
+The reservation increases the earliest allowed data arrival; clock periods,
+phase relationships, characterized delays and setup constraints stay intact.
+It applies once at capture, including opposite-edge paths, related PLL clocks
+and DCCA promotion. `TimingConstraints::set_hold_uncertainty_ps` also supports
+individual capture clocks for API callers.
+
+After setup closes, existing hold repair lengthens short general routes or
+releases a dedicated LUT/FF pair when necessary. Each accepted trial must
+preserve setup closure and improve hold timing. The checkpoint stores
+`timing.hold_uncertainty_ps` and each hold check's `uncertainty_ps`.
+A guarded hold slack of +1 ps with 200 ps reserved is a nominal +201 ps.
+Use both flags to reserve setup and hold margin independently. As with setup,
+this is a requested engineering reserve, not new device characterization.
+
+For an existing implementation, combine `--resume-checkpoint design.json`
+with the two margin flags. Fresh synthesis, route checks and STA still run.
+`--no-timing-optimization` checks the stricter constraints without repairing
+the routes, which is useful for a before/after comparison. The flags default
+to zero on each invocation; repeat the intended values when resuming.
+
+Shared route prefixes are evaluated at the same delay corner as the sink
+being routed. A retained or earlier setup branch must be converted to minimum
+delays before hold search, then back to maximum delays for a later setup sink.
+The router reuses its arrival buffer and recomputes existing prefixes only
+when switching corners. Ordinary setup-only routing does no extra prefix work.

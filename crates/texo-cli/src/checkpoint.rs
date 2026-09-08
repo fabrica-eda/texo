@@ -479,7 +479,7 @@ impl Serialize for TimingRecord<'_> {
         S: Serializer,
     {
         let result = self.0;
-        let mut timing = serializer.serialize_map(Some(17))?;
+        let mut timing = serializer.serialize_map(Some(18))?;
         timing.serialize_entry(
             "all_modeled_endpoints_checked",
             &result.timing.all_modeled_endpoints_checked(),
@@ -491,6 +491,7 @@ impl Serialize for TimingRecord<'_> {
         timing.serialize_entry("coverage_exceptions", &result.timing_exceptions)?;
         timing.serialize_entry("clock_constraints", &result.clock_constraints)?;
         timing.serialize_entry("setup_uncertainty_ps", &result.setup_uncertainty_ps)?;
+        timing.serialize_entry("hold_uncertainty_ps", &result.hold_uncertainty_ps)?;
         timing.serialize_entry("unmodeled_boundaries", &jtagg_timing_boundaries(result))?;
         timing.serialize_entry(
             "modeled_endpoint_count",
@@ -705,6 +706,7 @@ impl Serialize for HoldCheckRecords<'_> {
                 arrival_ps: check.arrival_ps,
                 clock_arrival_ps: check.clock_arrival_ps,
                 hold_ps: check.hold_ps,
+                uncertainty_ps: check.uncertainty_ps,
                 required_ps: check.required_ps,
                 slack_ps: check.slack_ps,
             })?;
@@ -723,6 +725,7 @@ struct HoldCheckRecord<'a> {
     clock_net_id: usize,
     data_pin_id: usize,
     hold_ps: u64,
+    uncertainty_ps: u64,
     launch_edge: &'static str,
     required_ps: i128,
     slack_ps: i128,
