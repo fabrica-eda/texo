@@ -10,7 +10,7 @@ use std::io::{BufReader, BufWriter, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use struo_synth::synthesize;
@@ -176,6 +176,14 @@ struct PnrArgs {
     /// JSON object mapping exact cell names to BEL names for initial placement.
     #[arg(long, value_name = "JSON")]
     initial_placement: Option<PathBuf>,
+    /// Validated physical route trees; fresh synthesis and STA remain mandatory.
+    #[arg(
+        long,
+        value_name = "JSON",
+        requires = "initial_placement",
+        conflicts_with = "resume_checkpoint"
+    )]
+    initial_routes: Option<PathBuf>,
     /// Resume checked routes and placement; fresh synthesis, routing checks and STA still run.
     #[arg(long, value_name = "JSON", conflicts_with_all = ["initial_placement", "lut_ff_pairs"])]
     resume_checkpoint: Option<PathBuf>,
@@ -195,6 +203,13 @@ struct PnrArgs {
     /// Keep the initial legal placement and route without timing closure.
     #[arg(long)]
     no_timing_optimization: bool,
+    /// Soft setup-search limit after initial routing; each candidate finishes STA.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        conflicts_with = "no_timing_optimization"
+    )]
+    setup_optimization_budget_seconds: Option<u64>,
     /// Bind `PIN:INPUT:DRIVE_LOW` as one physical open-drain pad (repeatable).
     #[arg(
         long = "open-drain",
@@ -381,6 +396,14 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         .map(load_bindings)
         .transpose()?;
     let mut lut_ff_pairs = args.lut_ff_pairs.as_ref().map(load_bindings).transpose()?;
+    let partial_routes: Option<Vec<texo_flow::Ecp5InitialRoute>> = args
+        .initial_routes
+        .as_ref()
+        .map(|path| -> Result<_, Box<dyn Error>> {
+            Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?)
+        })
+        .transpose()?;
+
     if let Some(saved) = &resumed {
         initial_placement = Some(saved.placement()?);
         lut_ff_pairs = Some(saved.pairs()?);
@@ -475,10 +498,16 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         setup_uncertainty_ps: args.setup_uncertainty_ps,
         hold_uncertainty_ps: args.hold_uncertainty_ps,
         initial_placement: initial_placement.as_ref(),
-        initial_routes: resumed.as_ref().map(|saved| saved.routes.as_slice()),
+        initial_routes: resumed
+            .as_ref()
+            .map(|saved| saved.routes.as_slice())
+            .or(partial_routes.as_deref()),
         lut_ff_pairs: lut_ff_pairs.as_ref(),
         placement_weight_exponent: args.placement_weight_exponent.get(),
         optimize_timing: !args.no_timing_optimization,
+        setup_optimization_budget: args
+            .setup_optimization_budget_seconds
+            .map(Duration::from_secs),
         ..Ecp5FlowOptions::default()
     };
     if let Some(fanout) = args.global_clock_fanout {
@@ -914,11 +943,78 @@ mod tests {
             args.resume_checkpoint.as_deref(),
             Some(Path::new("saved.json"))
         );
-        for flag in ["--initial-placement", "--lut-ff-pairs"] {
+        for flag in ["--initial-placement", "--lut-ff-pairs", "--initial-routes"] {
             let mut args = base.to_vec();
             args.extend([flag, "other.json"]);
             assert!(Cli::try_parse_from(args).is_err());
         }
+    }
+
+    #[test]
+    fn partial_routes_require_their_placement_and_cannot_replace_resume_routes() {
+        let base = [
+            "texo",
+            "pnr",
+            "project",
+            "--package",
+            "TEST",
+            "--speed",
+            "8",
+        ];
+        let mut arguments = base.to_vec();
+        arguments.extend(["--initial-routes", "routes.json"]);
+        assert!(Cli::try_parse_from(&arguments).is_err());
+        arguments.extend(["--initial-placement", "placement.json"]);
+        let cli = Cli::try_parse_from(&arguments).unwrap();
+        let Command::Pnr(args) = cli.command else {
+            panic!("expected pnr");
+        };
+        assert_eq!(
+            args.initial_routes.as_deref(),
+            Some(Path::new("routes.json"))
+        );
+        assert_eq!(
+            args.initial_placement.as_deref(),
+            Some(Path::new("placement.json"))
+        );
+        arguments.extend(["--resume-checkpoint", "saved.json"]);
+        assert!(Cli::try_parse_from(&arguments).is_err());
+    }
+
+    #[test]
+    fn setup_budget_parses_zero_and_rejects_invalid_or_disabled_search() {
+        let base = [
+            "texo",
+            "pnr",
+            "project",
+            "--package",
+            "TEST",
+            "--speed",
+            "8",
+        ];
+        for seconds in ["0", "900", "18446744073709551615"] {
+            let mut arguments = base.to_vec();
+            arguments.extend(["--setup-optimization-budget-seconds", seconds]);
+            let cli = Cli::try_parse_from(&arguments).unwrap();
+            let Command::Pnr(args) = cli.command else {
+                panic!("expected pnr");
+            };
+            assert_eq!(
+                args.setup_optimization_budget_seconds,
+                Some(seconds.parse().unwrap())
+            );
+            arguments.push("--no-timing-optimization");
+            assert!(Cli::try_parse_from(&arguments).is_err());
+        }
+        for seconds in ["-1", "later"] {
+            let mut arguments = base.to_vec();
+            arguments.extend(["--setup-optimization-budget-seconds", seconds]);
+            assert!(Cli::try_parse_from(&arguments).is_err());
+        }
+        let Command::Pnr(args) = Cli::try_parse_from(base).unwrap().command else {
+            panic!("expected pnr");
+        };
+        assert_eq!(args.setup_optimization_budget_seconds, None);
     }
 
     #[test]

@@ -966,6 +966,11 @@ impl LegalRouteEcoConnection {
 pub struct LegalRouteEcoOptions {
     /// Geometry-to-delay coefficient used by the hard-occupancy A-star search.
     pub estimate_delay_per_tile_ps: u64,
+    /// Additional owner nets which a whole-net ECO may discover and release.
+    /// Zero preserves the explicitly selected cohort. When nonzero, the first
+    /// requested net is probed with only immutable occupancy to identify the
+    /// owners of its preferred route. A complete legal rebuild still follows.
+    pub max_displaced_nets: usize,
 }
 
 impl LegalRouteEcoOptions {
@@ -974,7 +979,15 @@ impl LegalRouteEcoOptions {
     pub const fn new(estimate_delay_per_tile_ps: u64) -> Self {
         Self {
             estimate_delay_per_tile_ps,
+            max_displaced_nets: 0,
         }
+    }
+
+    /// Enables bounded owner discovery for whole-net ECOs only.
+    #[must_use]
+    pub const fn with_displacement_limit(mut self, max_displaced_nets: usize) -> Self {
+        self.max_displaced_nets = max_displaced_nets;
+        self
     }
 }
 
@@ -1692,6 +1705,69 @@ pub fn placement_from_partial_bindings(
     }
 
     finish_placement(&graph, constraints, placed)
+}
+
+/// Place omitted cells near their connected, caller-bound neighbors.
+///
+/// Supplied bindings remain fixed and atomic placement groups are preserved.
+/// Existing pin, shared-resource and complete-placement checks still apply.
+///
+/// # Errors
+///
+/// Returns an error for incompatible bindings or exhausted legal assignments.
+pub fn place_near_partial_bindings(
+    design: &Design,
+    device: &Device,
+    constraints: &PlacementConstraints,
+    bindings: &BTreeMap<CellId, BelId>,
+) -> Result<Placement, PnrError> {
+    let graph = UnifiedGraph::new(design, device);
+    for (&cell, &bel) in bindings {
+        if cell.0 >= design.cells().len() || bel.0 >= device.bels().len() {
+            return Err(PnrError::InvalidPlacement {
+                reason: format!("unknown partial binding cell {} or BEL {}", cell.0, bel.0),
+            });
+        }
+    }
+    let mut candidate_cache = BTreeMap::new();
+    let mut units = placement_units(&graph, constraints, &mut candidate_cache)?;
+    for unit in &mut units {
+        if !unit.cells.iter().any(|cell| bindings.contains_key(cell)) {
+            continue;
+        }
+        let assignments = (0..unit.choices.len())
+            .map(|index| unit.choices.assignment(index))
+            .filter(|assignment| {
+                unit.cells
+                    .iter()
+                    .zip(*assignment)
+                    .all(|(cell, bel)| bindings.get(cell).is_none_or(|wanted| wanted == bel))
+            })
+            .map(<[BelId]>::to_vec)
+            .collect::<Vec<_>>();
+        if assignments.is_empty() {
+            return Err(PnrError::InvalidPlacement {
+                reason: format!(
+                    "cell group beginning at {} has no assignment matching partial bindings",
+                    unit.cells[0].0
+                ),
+            });
+        }
+        // Restrict whole units, including synthetic group members. Greedy
+        // placement and subsequent refinement can then use their normal
+        // legality machinery without ever releasing a caller binding.
+        unit.choices = PlacementChoices::Shared(assignments.into());
+    }
+    let placement = place_units(&graph, constraints, units, None, None)?;
+    if bindings
+        .iter()
+        .any(|(&cell, &bel)| placement.bel(cell) != Some(bel))
+    {
+        return Err(PnrError::InvalidPlacement {
+            reason: "incremental placement changed a caller binding".into(),
+        });
+    }
+    Ok(placement)
 }
 
 /// Validates and materializes a placement from one BEL binding per cell.
@@ -2685,6 +2761,68 @@ impl<'a> PlacementRefiner<'a> {
         max_candidates: usize,
         workspace: &mut PlacementConnectionDelayWorkspace,
     ) -> Result<Vec<Placement>, PnrError> {
+        self.refine_cell_connection_delays_impl(
+            placement,
+            moving_cell,
+            connections,
+            targets_ps,
+            None,
+            pip_delays_ps,
+            capacity_projection,
+            max_move_distance,
+            max_candidates,
+            workspace,
+        )
+    }
+
+    /// Proposes local placements against the incumbent's realized routed
+    /// delays. Unoccupied shortest paths rank candidates, but must not replace
+    /// the routed incumbent when deciding whether a proposal may help.
+    ///
+    /// # Errors
+    /// Returns an error for invalid placement, delay tables or vector lengths.
+    #[allow(clippy::too_many_arguments)]
+    pub fn refine_cell_connection_delays_against_routed(
+        &self,
+        placement: Placement,
+        moving_cell: CellId,
+        connections: &[(CellPinId, CellPinId)],
+        realized_delays_ps: &[u64],
+        targets_ps: &[u64],
+        pip_delays_ps: &[u32],
+        capacity_projection: Option<&RouteCapacityProjection>,
+        max_move_distance: u64,
+        max_candidates: usize,
+    ) -> Result<Vec<Placement>, PnrError> {
+        let mut workspace = PlacementConnectionDelayWorkspace::new();
+        self.refine_cell_connection_delays_impl(
+            placement,
+            moving_cell,
+            connections,
+            targets_ps,
+            Some(realized_delays_ps),
+            pip_delays_ps,
+            capacity_projection,
+            max_move_distance,
+            max_candidates,
+            &mut workspace,
+        )
+    }
+
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    fn refine_cell_connection_delays_impl(
+        &self,
+        placement: Placement,
+        moving_cell: CellId,
+        connections: &[(CellPinId, CellPinId)],
+        targets_ps: &[u64],
+        realized_delays_ps: Option<&[u64]>,
+        pip_delays_ps: &[u32],
+        capacity_projection: Option<&RouteCapacityProjection>,
+        max_move_distance: u64,
+        max_candidates: usize,
+        workspace: &mut PlacementConnectionDelayWorkspace,
+    ) -> Result<Vec<Placement>, PnrError> {
         if pip_delays_ps.len() != self.graph.device().pips().len() {
             return Err(PnrError::InvalidRoutingCosts {
                 reason: format!(
@@ -2701,6 +2839,11 @@ impl<'a> PlacementRefiner<'a> {
                     connections.len(),
                     targets_ps.len()
                 ),
+            });
+        }
+        if realized_delays_ps.is_some_and(|delays| delays.len() != connections.len()) {
+            return Err(PnrError::InvalidPlacement {
+                reason: "realized connection delays do not match the connection count".into(),
             });
         }
         let device = self.graph.device();
@@ -2740,6 +2883,18 @@ impl<'a> PlacementRefiner<'a> {
         // route trial decides.
         let current_excess = if broad_path_move {
             None
+        } else if let Some(realized) = realized_delays_ps {
+            // Congestion and shared-tree loading belong to the incumbent.
+            // Comparing against an unloaded shortcut can make the baseline
+            // falsely appear to meet every allowance and suppress all moves.
+            Some(
+                realized
+                    .iter()
+                    .zip(targets_ps)
+                    .fold(0_u64, |sum, (&delay, &target)| {
+                        sum.saturating_add(delay.saturating_sub(target))
+                    }),
+            )
         } else {
             assignment_connection_excess(
                 &self.graph,
@@ -2771,7 +2926,8 @@ impl<'a> PlacementRefiner<'a> {
 
         let mut occupied = placed.iter().copied().flatten().collect::<BTreeSet<_>>();
         let mut pin_usage = PlacementResourceUsage::default();
-        for known in &self.units {
+        let mut assignment_owners = BTreeMap::new();
+        for (index, known) in self.units.iter().enumerate() {
             let assignment = known
                 .cells
                 .iter()
@@ -2785,6 +2941,7 @@ impl<'a> PlacementRefiner<'a> {
                 &mut pin_usage,
                 true,
             );
+            assignment_owners.insert(assignment, index);
         }
         for &bel in &current {
             occupied.remove(&bel);
@@ -2805,19 +2962,91 @@ impl<'a> PlacementRefiner<'a> {
         {
             let assignment = unit.choices.assignment(choice);
             if assignment == current
-                || assignment.iter().any(|bel| occupied.contains(bel))
                 || device.bels()[assignment[moving_column].0]
                     .point
                     .manhattan(current_point)
                     > max_move_distance
-                || !assignment_resources_are_legal(
+            {
+                continue;
+            }
+            // Exchange only complete, compatible placement units. A partial
+            // overlap must never split a carry chain or displace a fixed unit.
+            let displaced = if assignment.iter().any(|bel| occupied.contains(bel)) {
+                let Some(&index) = assignment_owners.get(assignment) else {
+                    continue;
+                };
+                let other = &self.units[index];
+                if !other.choices.contains(&current)
+                    || connections.iter().any(|&(driver, sink)| {
+                        other
+                            .cells
+                            .contains(&self.graph.design().pins()[driver.0].cell)
+                            || other
+                                .cells
+                                .contains(&self.graph.design().pins()[sink.0].cell)
+                    })
+                {
+                    continue;
+                }
+                Some(other)
+            } else {
+                None
+            };
+            // Both new assignments must be legal against the remaining units,
+            // and against each other, including shared pin/control resources.
+            if let Some(other) = displaced {
+                update_placement_resource_usage(
+                    &self.graph,
+                    self.constraints,
+                    &other.cells,
+                    assignment,
+                    &mut pin_usage,
+                    false,
+                );
+            }
+            let mut legal = assignment_resources_are_legal(
+                &self.graph,
+                self.constraints,
+                &unit.cells,
+                assignment,
+                &pin_usage,
+            );
+            if legal && let Some(other) = displaced {
+                update_placement_resource_usage(
                     &self.graph,
                     self.constraints,
                     &unit.cells,
                     assignment,
+                    &mut pin_usage,
+                    true,
+                );
+                legal = assignment_resources_are_legal(
+                    &self.graph,
+                    self.constraints,
+                    &other.cells,
+                    &current,
                     &pin_usage,
-                )
-            {
+                );
+                update_placement_resource_usage(
+                    &self.graph,
+                    self.constraints,
+                    &unit.cells,
+                    assignment,
+                    &mut pin_usage,
+                    false,
+                );
+            }
+            if let Some(other) = displaced {
+                update_placement_resource_usage(
+                    &self.graph,
+                    self.constraints,
+                    &other.cells,
+                    assignment,
+                    &mut pin_usage,
+                    true,
+                );
+            }
+            if !legal {
                 continue;
             }
             let Some(span) = assignment_connection_span(
@@ -2861,6 +3090,15 @@ impl<'a> PlacementRefiner<'a> {
             (left.0, left.1, left.2.as_slice()).cmp(&(right.0, right.1, right.2.as_slice()))
         });
         best.dedup_by(|left, right| left.2 == right.2);
+        if broad_path_move {
+            // The budget counts coarse physical destinations, not BEL slots.
+            // Deduplicate before either shortlist is limited; otherwise a
+            // tile with many free slots can consume the entire search budget.
+            let mut seen_points = BTreeSet::new();
+            best.retain(|(_, _, assignment)| {
+                seen_points.insert(device.bels()[assignment[moving_column].0].point)
+            });
+        }
         if broad_path_move && let Some(projection) = capacity_projection {
             // Physical span is only a cheap coarse index.  Project a small
             // neighborhood through the incumbent route topology, including
@@ -2912,20 +3150,22 @@ impl<'a> PlacementRefiner<'a> {
             }
         }
         best.truncate(max_candidates.max(1));
-        if broad_path_move {
-            // Broad topology search operates on physical tile nodes.  BEL
-            // slots inside one tile are a lower hierarchy level and produced
-            // nearly identical negotiated routes; detailed local refinement
-            // still resolves those slots later.  Do not spend multiple full
-            // route+STA trials on the same coarse node.
-            let mut seen_points = BTreeSet::new();
-            best.retain(|(_, _, assignment)| {
-                seen_points.insert(device.bels()[assignment[moving_column].0].point)
-            });
-        }
         let mut proposals = Vec::with_capacity(best.len());
         for (_, _, selected) in best {
             let mut proposed = placed.clone();
+            if let Some(&index) = assignment_owners.get(&selected) {
+                let other = &self.units[index];
+                for (&cell, &bel) in other.cells.iter().zip(&current) {
+                    proposed[cell.0] = Some(bel);
+                }
+                if std::env::var_os("TEXO_METRICS").is_some() {
+                    eprintln!(
+                        "[metrics] local_placement_swap moving_cells={} displaced_cells={}",
+                        unit.cells.len(),
+                        other.cells.len(),
+                    );
+                }
+            }
             for (&cell, &bel) in unit.cells.iter().zip(&selected) {
                 proposed[cell.0] = Some(bel);
             }
@@ -3470,12 +3710,21 @@ fn place(
     net_weights: Option<&BTreeMap<NetId, u64>>,
     sink_weights: Option<&BTreeMap<(NetId, CellPinId), u64>>,
 ) -> Result<Placement, PnrError> {
+    let mut candidate_cache = BTreeMap::new();
+    let units = placement_units(graph, constraints, &mut candidate_cache)?;
+    place_units(graph, constraints, units, net_weights, sink_weights)
+}
+
+fn place_units(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    mut units: Vec<PlacementUnit>,
+    net_weights: Option<&BTreeMap<NetId, u64>>,
+    sink_weights: Option<&BTreeMap<(NetId, CellPinId), u64>>,
+) -> Result<Placement, PnrError> {
     let design = graph.design();
     let device = graph.device();
     let (degree, neighbors) = placement_neighbors(design, net_weights, sink_weights, None);
-
-    let mut candidate_cache = BTreeMap::new();
-    let mut units = placement_units(graph, constraints, &mut candidate_cache)?;
     units.sort_by_key(|unit| {
         (
             unit.choices.len(),
@@ -6848,7 +7097,7 @@ fn placement_candidates(
         .collect())
 }
 
-const MAX_ROUTING_ITERATIONS: u32 = 32;
+const MAX_ROUTING_ITERATIONS: u32 = 128;
 
 fn validate_routing_restrictions(
     device: &Device,
@@ -8141,7 +8390,7 @@ fn legal_nets_route_eco_candidate(
             reason: "legal nets route ECO estimate must be positive".into(),
         });
     }
-    let selected = net_ids.iter().copied().collect::<BTreeSet<_>>();
+    let mut selected = net_ids.iter().copied().collect::<BTreeSet<_>>();
     let Some(&first_net) = selected.first() else {
         return Err(PnrError::InvalidRoutingConstraint {
             net: NetId(0),
@@ -8222,6 +8471,48 @@ fn legal_nets_route_eco_candidate(
     }
     validate_legal_eco_capacity(workspace, first_net)?;
 
+    if options.max_displaced_nets != 0 {
+        let owners = discover_route_eco_owners(
+            &graph,
+            &incumbent.placement,
+            &pin_wires,
+            incumbent,
+            routing_constraints,
+            routing_costs,
+            net_ids[0],
+            &selected,
+            options,
+            workspace,
+        );
+        // The probe is never a candidate implementation. Restore all real
+        // occupancy before the checked transactional cohort rebuild.
+        restore_legal_eco_workspace(device, incumbent, workspace);
+        if let Some(owners) = owners? {
+            if std::env::var_os("TEXO_METRICS").is_some() {
+                eprintln!(
+                    "[metrics] legal_eco_displacement target={} selected={} discovered={}",
+                    net_ids[0].0,
+                    selected.len(),
+                    owners.len()
+                );
+            }
+            for &net_id in &owners {
+                let old = &incumbent.routes[net_id.0];
+                if routing_constraints
+                    .routes()
+                    .get(&net_id)
+                    .is_some_and(|fixed| fixed.arcs.iter().any(|arc| !old.arcs.contains(arc)))
+                {
+                    return Err(PnrError::InvalidRoutingConstraint {
+                        net: net_id,
+                        reason: "displaced incumbent does not contain its immutable tree".into(),
+                    });
+                }
+            }
+            selected.extend(owners);
+        }
+    }
+
     // Release the complete cohort before rebuilding any member. Immutable
     // target-owned resources stay occupied and seed their corresponding tree.
     for &net_id in &selected {
@@ -8242,7 +8533,15 @@ fn legal_nets_route_eco_candidate(
             .map(|&sink| routing_arc_criticality(Some(routing_costs), net_id, sink))
             .max()
             .unwrap_or_else(|| routing_criticality(Some(routing_costs), net_id));
-        (Reverse(maximum_sink_criticality), net_id)
+        // The first requested net is the primary ECO target. When the
+        // coarse criticality values tie, let it claim its probed fast track
+        // before an equal-priority displaced owner can reacquire that track.
+        // Higher-priority owners still precede it; full STA judges the result.
+        (
+            Reverse(maximum_sink_criticality),
+            net_id != net_ids[0],
+            net_id,
+        )
     });
 
     let previous_base_estimate = workspace.search.estimate_base_delay_ps;
@@ -8353,6 +8652,94 @@ fn legal_nets_route_eco_candidate(
         routes,
         total_pips,
     }))
+}
+
+/// Probe only immutable occupancy, then identify every foreign owner of the
+/// preferred tree. This suggests a bounded release set; it never publishes a
+/// route. Rebuilding the complete set under real hard occupancy must succeed.
+#[allow(clippy::too_many_arguments)]
+fn discover_route_eco_owners(
+    graph: &UnifiedGraph<'_>,
+    placement: &Placement,
+    pin_wires: &PinWireCache,
+    incumbent: &PnrResult,
+    constraints: &RoutingConstraints,
+    costs: &RoutingCosts,
+    target: NetId,
+    selected: &BTreeSet<NetId>,
+    options: LegalRouteEcoOptions,
+    workspace: &mut RoutingWorkspace,
+) -> Result<Option<BTreeSet<NetId>>, PnrError> {
+    workspace.prepare(graph.device());
+    for route in constraints.routes().values() {
+        add_route_occupancy(workspace, route);
+    }
+    workspace.tree_arrival_ps.fill(UNROUTED_ARRIVAL_PS);
+    let previous_base = workspace.search.estimate_base_delay_ps;
+    let previous_estimate = workspace.search.estimate_delay_per_tile_ps;
+    workspace.search.estimate_base_delay_ps = ROUTING_ESTIMATE_BASE_DELAY_PS;
+    workspace.search.estimate_delay_per_tile_ps = options.estimate_delay_per_tile_ps;
+    let fixed = constraints.routes().get(&target);
+    let probe = route_net(
+        graph,
+        placement,
+        pin_wires,
+        fixed.map(Arc::as_ref),
+        target,
+        &workspace.wire_congestion,
+        &workspace.pip_congestion,
+        constraints.blocked_pip_words(),
+        Some(HardRoutingOccupancy {
+            wires: &workspace.wire_occupancy,
+            pips: &workspace.pip_occupancy,
+            use_estimate: true,
+        }),
+        None,
+        false,
+        Some(costs),
+        &mut workspace.search,
+        &mut workspace.tree_arrival_ps,
+        RoutingResourceMetadata {
+            wire_points: &workspace.wire_points,
+            wire_capacities: &workspace.wire_capacities,
+            pip_capacities: &workspace.pip_capacities,
+        },
+    );
+    workspace.search.estimate_base_delay_ps = previous_base;
+    workspace.search.estimate_delay_per_tile_ps = previous_estimate;
+    workspace.tree_arrival_ps.fill(UNROUTED_ARRIVAL_PS);
+    let probe = match probe {
+        Ok(probe) => probe,
+        Err(PnrError::Unroutable { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let wires = probe.wires().collect::<BTreeSet<_>>();
+    let pips = probe.pips().collect::<BTreeSet<_>>();
+    let mut owners = BTreeSet::new();
+    for route in &incumbent.routes {
+        if selected.contains(&route.net) {
+            continue;
+        }
+        if route.wires().any(|wire| wires.contains(&wire))
+            || route.pips().any(|pip| pips.contains(&pip))
+        {
+            owners.insert(route.net);
+            if owners.len() > options.max_displaced_nets {
+                if std::env::var_os("TEXO_METRICS").is_some() {
+                    eprintln!(
+                        "[metrics] legal_eco_displacement target={} owners_at_least={} limit={} fallback=true",
+                        target.0,
+                        owners.len(),
+                        options.max_displaced_nets
+                    );
+                }
+                // The bounded probe failed to find a small release set.
+                // Retain the original caller-selected cohort in that case.
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(owners))
 }
 
 /// Builds one whole-net, conflict-free route candidate.
@@ -10401,6 +10788,174 @@ mod tests {
         design
     }
 
+    fn swap_proposals(
+        design: &Design,
+        device: &Device,
+        constraints: &PlacementConstraints,
+        bindings: Vec<BelId>,
+    ) -> Vec<Placement> {
+        let placement =
+            placement_from_complete_bindings(design, device, constraints, bindings).unwrap();
+        let net = &design.nets()[0];
+        PlacementRefiner::new(design, device, constraints)
+            .unwrap()
+            .refine_cell_connection_delays(
+                placement,
+                CellId(0),
+                &[(net.driver, net.sinks[0])],
+                &[0],
+                &vec![1; device.pips().len()],
+                None,
+                8,
+                8,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn broad_connection_candidates_cover_distinct_tiles_before_limiting() {
+        let design = two_cell_design();
+        let mut device = Device::new("candidate-tiles", 10, 1).unwrap();
+        // Three legal BELs in the closest tile must not consume a budget
+        // intended to explore three different physical destinations.
+        for (index, x) in [0, 9, 8, 8, 8, 7, 6, 5].into_iter().enumerate() {
+            let point = Point::new(x, 0);
+            let bel = device
+                .add_bel(format!("bel-{index}"), ResourceKind::Logic, point)
+                .unwrap();
+            for (name, direction) in [("in", PinDirection::Input), ("out", PinDirection::Output)] {
+                let wire = device
+                    .add_wire(format!("{index}-{name}"), point, 1)
+                    .unwrap();
+                device.add_bel_pin(bel, name, direction, wire).unwrap();
+            }
+        }
+        let mut constraints = PlacementConstraints::new();
+        constraints.add_group([CellId(1)], [vec![BelId(1)]]);
+        let placement = placement_from_complete_bindings(
+            &design,
+            &device,
+            &constraints,
+            vec![BelId(0), BelId(1)],
+        )
+        .unwrap();
+        let net = &design.nets()[0];
+        let proposals = PlacementRefiner::new(&design, &device, &constraints)
+            .unwrap()
+            .refine_cell_connection_delays(
+                placement,
+                CellId(0),
+                &[(net.driver, net.sinks[0])],
+                &[0],
+                &vec![1; device.pips().len()],
+                None,
+                16,
+                3,
+            )
+            .unwrap();
+        let points = proposals
+            .iter()
+            .map(|p| {
+                assert_eq!(p.bel(CellId(1)), Some(BelId(1)));
+                device.bels()[p.bel(CellId(0)).unwrap().0].point
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            points,
+            vec![Point::new(8, 0), Point::new(7, 0), Point::new(6, 0)]
+        );
+    }
+
+    #[test]
+    fn connection_swap_works_without_empty_bels_and_preserves_fixed_cells() {
+        let mut design = two_cell_design();
+        design.add_cell("neutral", ResourceKind::Logic);
+        design.add_cell("fixed", ResourceKind::Logic);
+        let device = Device::rectangular_logic(4, 1).unwrap();
+        let mut constraints = PlacementConstraints::new();
+        constraints.add_group([CellId(1)], [vec![BelId(3)]]);
+        constraints.add_group([CellId(3)], [vec![BelId(1)]]);
+        let proposals = swap_proposals(
+            &design,
+            &device,
+            &constraints,
+            vec![BelId(0), BelId(3), BelId(2), BelId(1)],
+        );
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            proposals[0].bindings,
+            vec![BelId(2), BelId(3), BelId(0), BelId(1)]
+        );
+    }
+
+    #[test]
+    fn connection_swap_moves_complete_rigid_units_and_rejects_one_way_choices() {
+        let mut design = two_cell_design();
+        for index in 2..6 {
+            design.add_cell(format!("neutral-{index}"), ResourceKind::Logic);
+        }
+        let device = Device::rectangular_logic(6, 1).unwrap();
+        for reciprocal in [true, false] {
+            let mut constraints = PlacementConstraints::new();
+            constraints.add_group([CellId(1)], [vec![BelId(5)]]);
+            constraints.add_group([CellId(5)], [vec![BelId(4)]]);
+            constraints.add_group(
+                [CellId(0), CellId(2)],
+                [vec![BelId(0), BelId(1)], vec![BelId(2), BelId(3)]],
+            );
+            let mut other_choices = vec![vec![BelId(2), BelId(3)]];
+            if reciprocal {
+                other_choices.push(vec![BelId(0), BelId(1)]);
+            }
+            constraints.add_group([CellId(3), CellId(4)], other_choices);
+            let proposals = swap_proposals(
+                &design,
+                &device,
+                &constraints,
+                vec![BelId(0), BelId(5), BelId(1), BelId(2), BelId(3), BelId(4)],
+            );
+            if reciprocal {
+                assert_eq!(proposals.len(), 1);
+                assert_eq!(
+                    proposals[0].bindings,
+                    vec![BelId(2), BelId(5), BelId(3), BelId(0), BelId(1), BelId(4)]
+                );
+            } else {
+                assert!(proposals.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn connection_swap_checks_shared_resources_at_both_destinations() {
+        let mut design = two_cell_design();
+        design.add_cell("neutral", ResourceKind::Logic);
+        design.add_cell("fixed", ResourceKind::Logic);
+        let device = Device::rectangular_logic(4, 1).unwrap();
+        for displaced_conflict in [false, true] {
+            let mut constraints = PlacementConstraints::new();
+            constraints.add_group([CellId(1)], [vec![BelId(3)]]);
+            constraints.add_group([CellId(3)], [vec![BelId(1)]]);
+            constraints.add_group([CellId(0)], [vec![BelId(0)], vec![BelId(2)]]);
+            constraints.add_group([CellId(2)], [vec![BelId(0)], vec![BelId(2)]]);
+            let (cell, domains) = if displaced_conflict {
+                (CellId(2), [(BelId(0), 7), (BelId(1), 7), (BelId(2), 8)])
+            } else {
+                (CellId(0), [(BelId(0), 8), (BelId(1), 7), (BelId(2), 7)])
+            };
+            constraints.add_shared_resource([(cell, 0), (CellId(3), 1)], domains);
+            assert!(
+                swap_proposals(
+                    &design,
+                    &device,
+                    &constraints,
+                    vec![BelId(0), BelId(3), BelId(2), BelId(1)],
+                )
+                .is_empty()
+            );
+        }
+    }
+
     #[test]
     fn legalization_metric_quantiles_use_nearest_rank() {
         let sorted = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
@@ -10445,6 +11000,62 @@ mod tests {
             error
                 .to_string()
                 .contains("does not match one complete legal assignment row")
+        );
+    }
+
+    #[test]
+    fn partial_neighbor_placement_preserves_anchors_and_nearby_group() {
+        let mut design = Design::new();
+        let a = design.add_cell("new-a", ResourceKind::Logic);
+        let b = design.add_cell("new-b", ResourceKind::Logic);
+        let anchor = design.add_cell("anchor", ResourceKind::Logic);
+        let a_out = design.add_pin(a, "O", PinDirection::Output).unwrap();
+        let b_in = design.add_pin(b, "I", PinDirection::Input).unwrap();
+        let b_out = design.add_pin(b, "O", PinDirection::Output).unwrap();
+        let anchor_in = design.add_pin(anchor, "I", PinDirection::Input).unwrap();
+        design.add_net("between-new", a_out, [b_in]).unwrap();
+        design.add_net("to-anchor", b_out, [anchor_in]).unwrap();
+        let mut device = Device::new("incremental-placement", 12, 1).unwrap();
+        let mut bels = Vec::new();
+        for x in 0..12 {
+            let point = Point::new(x, 0);
+            let bel = device
+                .add_bel(format!("L{x}"), ResourceKind::Logic, point)
+                .unwrap();
+            for (name, direction) in [("I", PinDirection::Input), ("O", PinDirection::Output)] {
+                let wire = device.add_wire(format!("{x}-{name}"), point, 1).unwrap();
+                device.add_bel_pin(bel, name, direction, wire).unwrap();
+            }
+            bels.push(bel);
+        }
+        let mut constraints = PlacementConstraints::new();
+        constraints.add_group([a, b], [vec![bels[0], bels[1]], vec![bels[8], bels[9]]]);
+        let bindings = BTreeMap::from([(anchor, bels[10])]);
+        let old =
+            placement_from_partial_bindings(&design, &device, &constraints, &bindings).unwrap();
+        assert_eq!(old.bel(a), Some(bels[0]));
+        let near =
+            super::place_near_partial_bindings(&design, &device, &constraints, &bindings).unwrap();
+        assert_eq!(near.bel(anchor), Some(bels[10]));
+        assert_eq!(
+            (near.bel(a), near.bel(b)),
+            (Some(bels[8]), Some(bels[9])),
+            "new atomic group should be placed beside its fixed consumer"
+        );
+        let partial_group = BTreeMap::from([(anchor, bels[10]), (a, bels[8])]);
+        assert_eq!(
+            super::place_near_partial_bindings(&design, &device, &constraints, &partial_group)
+                .unwrap(),
+            near
+        );
+        let conflicting = BTreeMap::from([(anchor, bels[10]), (a, bels[8]), (b, bels[1])]);
+        assert!(
+            super::place_near_partial_bindings(&design, &device, &constraints, &conflicting)
+                .is_err()
+        );
+        let unknown = BTreeMap::from([(CellId(999), bels[0])]);
+        assert!(
+            super::place_near_partial_bindings(&design, &device, &constraints, &unknown).is_err()
         );
     }
 
@@ -11394,6 +12005,134 @@ mod tests {
     }
 
     #[test]
+    fn primary_eco_target_wins_equal_priority_track_before_its_owner() {
+        let mut fixture = net_cohort_eco_fixture();
+        let fast_b = fixture.incumbent.routes[1].clone();
+        let slow_a = fixture.incumbent.routes[0].clone();
+        for (net, sink, pips) in [
+            (NetId(0), fixture.a_sink, fixture.a_fast_pips),
+            (NetId(1), fixture.b_sink, fixture.b_alternate_pips),
+        ] {
+            let wires = std::iter::once(fixture.device.pips()[pips[0].0].from())
+                .chain(pips.iter().map(|pip| fixture.device.pips()[pip.0].to()))
+                .collect();
+            fixture.incumbent.routes[net.0] = Arc::new(NetRoute::new(
+                net,
+                vec![RouteArc {
+                    sink: Some(sink),
+                    wires,
+                    pips: pips.to_vec(),
+                }],
+            ));
+        }
+        fixture.incumbent.total_pips = fixture
+            .incumbent
+            .routes
+            .iter()
+            .map(|route| route.pips().len())
+            .sum();
+        fixture.costs.set_net_criticalities(BTreeMap::from([
+            (NetId(0), 64),
+            (NetId(1), 64),
+            (NetId(2), 1),
+        ]));
+        fixture.costs.set_sink_criticalities(BTreeMap::from([
+            ((NetId(0), fixture.a_sink), 64),
+            ((NetId(1), fixture.b_sink), 64),
+        ]));
+        let mut workspace = RoutingWorkspace::new(&fixture.device);
+        let candidate = legal_net_route_eco_candidate_with_workspace(
+            &fixture.design,
+            &fixture.device,
+            &fixture.incumbent,
+            &RoutingConstraints::new(),
+            &fixture.costs,
+            NetId(1),
+            LegalRouteEcoOptions::new(1).with_displacement_limit(1),
+            &mut workspace,
+        )
+        .unwrap()
+        .expect("primary target B must obtain the shared track before equal-priority owner A");
+        assert_eq!(candidate.routes[1], fast_b);
+        assert_eq!(candidate.routes[0], slow_a);
+        assert!(Arc::ptr_eq(
+            &candidate.routes[2],
+            &fixture.incumbent.routes[2]
+        ));
+        assert_workspace_matches_incumbent(&fixture.device, &fixture.incumbent, &workspace);
+        // Priority remains authoritative; naming a lower-priority target
+        // must not override a more critical owner's earlier routing turn.
+        fixture.costs.set_net_criticalities(BTreeMap::from([
+            (NetId(0), 64),
+            (NetId(1), 8),
+            (NetId(2), 1),
+        ]));
+        fixture.costs.set_sink_criticalities(BTreeMap::from([
+            ((NetId(0), fixture.a_sink), 64),
+            ((NetId(1), fixture.b_sink), 8),
+        ]));
+        let retained = legal_net_route_eco_candidate_with_workspace(
+            &fixture.design,
+            &fixture.device,
+            &fixture.incumbent,
+            &RoutingConstraints::new(),
+            &fixture.costs,
+            NetId(1),
+            LegalRouteEcoOptions::new(1).with_displacement_limit(1),
+            &mut workspace,
+        )
+        .unwrap();
+        assert!(retained.is_none());
+        assert_workspace_matches_incumbent(&fixture.device, &fixture.incumbent, &workspace);
+    }
+
+    #[test]
+    fn fine_eco_costs_choose_the_faster_path_hidden_by_per_pip_rounding() {
+        let mut fixture = legal_polish_fixture();
+        // Slow = 50+50 = 100 ps, fast = 51+1 = 52 ps. Per-PIP ceiling
+        // assigns cost 2 to the slow path and cost 3 to the fast one.
+        fixture.costs = RoutingCosts::new(
+            vec![50, 50, 51, 1, 1, 1, 10, 10],
+            BTreeMap::from([(NetId(0), 64), (NetId(1), 1)]),
+        );
+        let incumbent = legal_polish_incumbent(&fixture);
+        let mut workspace = RoutingWorkspace::new(&fixture.device);
+        let coarse = legal_net_route_eco_candidate_with_workspace(
+            &fixture.design,
+            &fixture.device,
+            &incumbent,
+            &RoutingConstraints::new(),
+            &fixture.costs,
+            NetId(0),
+            LegalRouteEcoOptions::new(1),
+            &mut workspace,
+        )
+        .unwrap();
+        assert!(coarse.is_none(), "coarse scoring retains the 100 ps path");
+        fixture
+            .costs
+            .set_detailed_timing_nets(BTreeSet::from([NetId(0)]));
+        let fine = legal_net_route_eco_candidate_with_workspace(
+            &fixture.design,
+            &fixture.device,
+            &incumbent,
+            &RoutingConstraints::new(),
+            &fixture.costs,
+            NetId(0),
+            LegalRouteEcoOptions::new(1),
+            &mut workspace,
+        )
+        .unwrap()
+        .expect("fine scoring must find the legal 52 ps path");
+        assert_eq!(
+            fine.routes[0].arc(fixture.target_sink).unwrap().pips,
+            fixture.fast_pips
+        );
+        assert!(Arc::ptr_eq(&fine.routes[1], &incumbent.routes[1]));
+        assert_workspace_matches_incumbent(&fixture.device, &incumbent, &workspace);
+    }
+
+    #[test]
     fn legal_route_eco_changes_only_the_selected_connection_under_hard_occupancy() {
         let fixture = legal_polish_fixture();
         let incumbent = legal_polish_incumbent(&fixture);
@@ -11500,6 +12239,216 @@ mod tests {
                     .is_some_and(|resident| Arc::ptr_eq(resident, incumbent))
             }
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the placement proposal and its legal physical reroute together.
+    fn routed_incumbent_exposes_a_local_move_hidden_by_an_occupied_shortcut() {
+        let mut fixture = net_cohort_eco_fixture();
+        let net = &fixture.design.nets()[0];
+        let source_cell = fixture.design.pins()[net.driver.0].cell;
+        let old_bel = fixture.incumbent.placement.bel(source_cell).unwrap();
+        let goal = *fixture.incumbent.routes[0]
+            .arc(fixture.a_sink)
+            .unwrap()
+            .wires
+            .last()
+            .unwrap();
+        let near_wire = fixture
+            .device
+            .add_wire("near-driver", Point::new(1, 0), 1)
+            .unwrap();
+        let near_bel = fixture
+            .device
+            .add_bel("near-source", ResourceKind::Logic, Point::new(1, 0))
+            .unwrap();
+        fixture
+            .device
+            .add_bel_pin(
+                near_bel,
+                fixture.design.pins()[net.driver.0].name.clone(),
+                PinDirection::Output,
+                near_wire,
+            )
+            .unwrap();
+        let near_pip = fixture.device.add_pip(near_wire, goal, false, 1).unwrap();
+        let mut pip_delays = fixture.costs.pip_delays_ps().to_vec();
+        assert_eq!(near_pip.0, pip_delays.len());
+        pip_delays.push(60);
+        let costs = RoutingCosts::new(
+            pip_delays,
+            BTreeMap::from([(NetId(0), 64), (NetId(1), 8), (NetId(2), 1)]),
+        );
+        let mut placement_constraints = PlacementConstraints::new();
+        for index in 0..fixture.design.cells().len() {
+            let cell = CellId(index);
+            let choices = if cell == source_cell {
+                vec![vec![old_bel], vec![near_bel]]
+            } else {
+                vec![vec![fixture.incumbent.placement.bel(cell).unwrap()]]
+            };
+            placement_constraints.add_group([cell], choices);
+        }
+        let refiner =
+            PlacementRefiner::new(&fixture.design, &fixture.device, &placement_constraints)
+                .unwrap();
+        let connections = [(net.driver, fixture.a_sink)];
+        let old_proposals = refiner
+            .refine_cell_connection_delays(
+                fixture.incumbent.placement.clone(),
+                source_cell,
+                &connections,
+                &[100],
+                costs.pip_delays_ps(),
+                None,
+                2,
+                8,
+            )
+            .unwrap();
+        assert!(
+            old_proposals.is_empty(),
+            "the impossible 40 ps shortcut hides the real 800 ps detour"
+        );
+        let proposals = refiner
+            .refine_cell_connection_delays_against_routed(
+                fixture.incumbent.placement.clone(),
+                source_cell,
+                &connections,
+                &[800],
+                &[100],
+                costs.pip_delays_ps(),
+                None,
+                2,
+                8,
+            )
+            .unwrap();
+        assert_eq!(
+            proposals.len(),
+            1,
+            "realized delay must expose the legal 60 ps move"
+        );
+        assert_eq!(proposals[0].bel(source_cell), Some(near_bel));
+        let invalid = refiner.refine_cell_connection_delays_against_routed(
+            fixture.incumbent.placement.clone(),
+            source_cell,
+            &connections,
+            &[],
+            &[100],
+            costs.pip_delays_ps(),
+            None,
+            2,
+            8,
+        );
+        assert!(invalid.is_err());
+        let mut routing_constraints = RoutingConstraints::new();
+        routing_constraints.add_route(fixture.incumbent.routes[1].clone());
+        routing_constraints.add_route(fixture.incumbent.routes[2].clone());
+        let mut workspace = RoutingWorkspace::new(&fixture.device);
+        let routed = super::route_with_timing_costs_workspace_and_progress(
+            &fixture.design,
+            &fixture.device,
+            proposals[0].clone(),
+            &routing_constraints,
+            &costs,
+            &mut workspace,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            routed.routes[0].arc(fixture.a_sink).unwrap().pips,
+            vec![near_pip]
+        );
+        for index in [1, 2] {
+            assert_eq!(routed.routes[index], fixture.incumbent.routes[index]);
+        }
+    }
+
+    #[test]
+    fn owner_discovery_moves_a_blocking_net_and_restores_every_trial() {
+        let fixture = net_cohort_eco_fixture();
+        let before = fixture.incumbent.clone();
+        let mut workspace = RoutingWorkspace::new(&fixture.device);
+        workspace.search.estimate_delay_per_tile_ps = 73;
+        let options = LegalRouteEcoOptions::new(52).with_displacement_limit(1);
+        let candidate = legal_net_route_eco_candidate_with_workspace(
+            &fixture.design,
+            &fixture.device,
+            &fixture.incumbent,
+            &RoutingConstraints::new(),
+            &fixture.costs,
+            NetId(0),
+            options,
+            &mut workspace,
+        )
+        .unwrap()
+        .expect("discover and release the unselected owner of A's fast track");
+        assert_eq!(
+            candidate.routes[0].arc(fixture.a_sink).unwrap().pips,
+            fixture.a_fast_pips
+        );
+        assert_eq!(
+            candidate.routes[1].arc(fixture.b_sink).unwrap().pips,
+            fixture.b_alternate_pips
+        );
+        assert!(Arc::ptr_eq(
+            &candidate.routes[2],
+            &fixture.incumbent.routes[2]
+        ));
+        assert_eq!(fixture.incumbent, before);
+        assert_workspace_matches_incumbent(&fixture.device, &fixture.incumbent, &workspace);
+        assert_eq!(workspace.search.estimate_delay_per_tile_ps, 73);
+
+        let mut locked = RoutingConstraints::new();
+        locked.add_route(fixture.incumbent.routes[1].clone());
+        let fixed = legal_net_route_eco_candidate_with_workspace(
+            &fixture.design,
+            &fixture.device,
+            &fixture.incumbent,
+            &locked,
+            &fixture.costs,
+            NetId(0),
+            options,
+            &mut workspace,
+        )
+        .unwrap();
+        assert!(
+            fixed.is_none(),
+            "owner discovery must never steal immutable topology"
+        );
+        assert_workspace_matches_incumbent(&fixture.device, &fixture.incumbent, &workspace);
+
+        let mut impossible = fixture.costs.clone();
+        impossible.set_sink_min_delays_ps(BTreeMap::from([((NetId(1), fixture.b_sink), 10_000)]));
+        let failed = legal_net_route_eco_candidate_with_workspace(
+            &fixture.design,
+            &fixture.device,
+            &fixture.incumbent,
+            &RoutingConstraints::new(),
+            &impossible,
+            NetId(0),
+            options,
+            &mut workspace,
+        )
+        .unwrap();
+        assert!(
+            failed.is_none(),
+            "a displaced owner that cannot be rebuilt rejects the whole transaction"
+        );
+        assert_workspace_matches_incumbent(&fixture.device, &fixture.incumbent, &workspace);
+        assert_eq!(fixture.incumbent, before);
+        assert_eq!(workspace.search.estimate_delay_per_tile_ps, 73);
+        let reused = legal_net_route_eco_candidate_with_workspace(
+            &fixture.design,
+            &fixture.device,
+            &fixture.incumbent,
+            &RoutingConstraints::new(),
+            &fixture.costs,
+            NetId(0),
+            options,
+            &mut workspace,
+        )
+        .unwrap();
+        assert_eq!(reused, Some(candidate));
     }
 
     #[test]
