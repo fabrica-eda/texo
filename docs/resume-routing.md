@@ -20,6 +20,11 @@ are reopened against the changed physical state. These passes alternate
 until closure or a fixed point, instead of requiring another complete
 synthesis/checkpoint round trip to reconsider routes.
 
+For a partial placement and a selected set of compatible complete net trees,
+use `--initial-placement` with `--initial-routes`. The normal flow also exposes
+an optional setup-search budget. See [incremental setup closure](incremental-closure.md)
+for the validation rules, routing policy and budget semantics.
+
 ## Fixed-clock ECP5 measurement
 
 The RV64 compact/store design retained CPU 124.8 MHz, memory 62.4 MHz,

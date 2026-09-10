@@ -3,6 +3,7 @@
 mod clock_constraints;
 mod ecp5_pll;
 mod initial_routing;
+mod setup_budget;
 mod timing_coverage;
 
 pub use clock_constraints::ClockConstraint;
@@ -14,7 +15,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use setup_budget::SetupBudget;
 
 use texo_model::{
     BelId, BelPinId, CellId, CellPinId, Design, Device, NetId, PinDirection, PipId, ResourceKind,
@@ -26,7 +29,7 @@ use texo_pnr::{
     PlacementRefiner, PnrError, PnrResult, RegisterControlSet, RoutingConstraints, RoutingCosts,
     RoutingWorkspace, legal_net_route_eco_candidate_with_workspace,
     legal_nets_route_eco_candidate_with_workspace, place_and_route_with_constraints,
-    placement_from_complete_bindings, placement_from_partial_bindings, rebind_placement_pins,
+    placement_from_complete_bindings, rebind_placement_pins,
     route_with_timing_costs_workspace_and_progress, route_with_workspace_and_progress,
     routing_capacity_map,
 };
@@ -241,6 +244,12 @@ pub struct Ecp5FlowOptions<'a> {
     /// Whether post-route timing closure may change the initial placement and
     /// routing. Disable this for placement A/B measurements.
     pub optimize_timing: bool,
+    /// Soft elapsed-time limit for post-route setup optimization in this invocation.
+    /// Starts at the first setup-search step; initial implementation and hold repair
+    /// are outside this budget. The current candidate finishes routing and STA
+    /// before the limit is checked again. Zero skips setup search; `None` is unlimited.
+    /// Expiry never grants timing evidence or changes the setup/hold constraints.
+    pub setup_optimization_budget: Option<Duration>,
 }
 
 impl Default for Ecp5FlowOptions<'_> {
@@ -262,6 +271,7 @@ impl Default for Ecp5FlowOptions<'_> {
             lut_ff_pairs: None,
             initial_timing_reroute: false,
             optimize_timing: true,
+            setup_optimization_budget: None,
         }
     }
 }
@@ -767,6 +777,7 @@ pub fn implement_struo_ecp5_with_progress(
     report_metric_phase("initial_route_and_timing", &mut phase_started);
     let (mut implementation, mut timing) = (initial_implementation, initial_timing);
     let mut route_eco_worklist = WorstSetupRouteEcoWorklist::default();
+    let mut setup_budget = SetupBudget::new(options.setup_optimization_budget);
     if options.optimize_timing
         && timing.worst_slack_ps.is_some_and(|slack| slack < 0)
         && let Some(costs) = timing_routing_costs.as_mut()
@@ -789,6 +800,7 @@ pub fn implement_struo_ecp5_with_progress(
             &mut implementation,
             &mut timing,
             &mut route_eco_worklist,
+            &mut setup_budget,
             &mut progress,
         )?;
     }
@@ -827,6 +839,7 @@ pub fn implement_struo_ecp5_with_progress(
                     timing_constraints: &timing_constraints,
                     delay_predictor,
                     routing_workspace: &mut routing_workspace,
+                    setup_budget: &mut setup_budget,
                 }
                 .improve_setup(
                     implementation,
@@ -872,6 +885,7 @@ pub fn implement_struo_ecp5_with_progress(
             &mut implementation,
             &mut timing,
             &mut route_eco_worklist,
+            &mut setup_budget,
             &mut progress,
         )?;
     }
@@ -893,6 +907,9 @@ pub fn implement_struo_ecp5_with_progress(
         // iterate until closure or a fixed point instead of requiring another
         // synthesis/checkpoint round trip.
         while timing.worst_slack_ps.is_some_and(|slack| slack < 0) {
+            if setup_budget.exhausted() {
+                break;
+            }
             let before = timing_objective(&timing);
             TimingFeedbackContext {
                 design: &design,
@@ -905,6 +922,7 @@ pub fn implement_struo_ecp5_with_progress(
                 timing_constraints: &timing_constraints,
                 delay_predictor,
                 routing_workspace: &mut routing_workspace,
+                setup_budget: &mut setup_budget,
             }
             .improve_local_setup(
                 &mut implementation,
@@ -934,6 +952,7 @@ pub fn implement_struo_ecp5_with_progress(
                 &mut implementation,
                 &mut timing,
                 &mut route_eco_worklist,
+                &mut setup_budget,
                 &mut progress,
             )?;
         }
@@ -1201,6 +1220,7 @@ struct TimingFeedbackContext<'a, 'work, 'cache> {
     timing_constraints: &'a TimingConstraints,
     delay_predictor: &'a Ecp5PlacementDelayPredictor<'a>,
     routing_workspace: &'work mut RoutingWorkspace,
+    setup_budget: &'work mut SetupBudget,
 }
 
 fn report_timing_feedback_stop(round: usize, reason: &str) {
@@ -1266,9 +1286,11 @@ impl TimingFeedbackContext<'_, '_, '_> {
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<(), Ecp5FlowError> {
         let mut seen = BTreeSet::from([placement_identity(self.design, &implementation.placement)]);
-        let mut round = 0_usize;
-        'refresh: while let Some(worst) = timing.worst_slack_ps.filter(|&slack| slack < 0) {
-            round += 1;
+        let round = 1_usize;
+        if let Some(worst) = timing.worst_slack_ps.filter(|&slack| slack < 0) {
+            if self.setup_budget.exhausted() {
+                return Ok(());
+            }
             let delays = timing
                 .net_delays
                 .iter()
@@ -1277,10 +1299,13 @@ impl TimingFeedbackContext<'_, '_, '_> {
             let edges = timing
                 .net_setup_slacks
                 .iter()
-                .filter(|edge| edge.slack_ps == worst)
+                .filter(|edge| edge.slack_ps < 0 && edge.slack_ps <= worst.saturating_add(250))
                 .copied()
                 .collect::<Vec<_>>();
-            let mut cells = BTreeMap::<CellId, u64>::new();
+            // Keep worst paths first, but allow near-critical paths to release
+            // placement/routing resources once exact-worst moves are exhausted.
+            // Candidate acceptance still uses the unchanged full STA objective.
+            let mut cells = BTreeMap::<CellId, (i128, u64)>::new();
             for edge in &edges {
                 let driver = self.design.nets()[edge.net.0].driver;
                 let delay = delays.get(&(edge.net, edge.sink)).copied().unwrap_or(0);
@@ -1290,30 +1315,40 @@ impl TimingFeedbackContext<'_, '_, '_> {
                 ] {
                     cells
                         .entry(cell)
-                        .and_modify(|known| *known = (*known).max(delay))
-                        .or_insert(delay);
+                        .and_modify(|known| {
+                            known.0 = known.0.min(edge.slack_ps);
+                            known.1 = known.1.max(delay);
+                        })
+                        .or_insert((edge.slack_ps, delay));
                 }
             }
             let mut cells = cells.into_iter().collect::<Vec<_>>();
-            cells.sort_unstable_by_key(|&(cell, delay)| (Reverse(delay), cell));
+            cells.sort_unstable_by_key(|&(cell, (slack, delay))| (slack, Reverse(delay), cell));
             for (cell, _) in cells {
+                if self.setup_budget.exhausted() {
+                    return Ok(());
+                }
                 let selected = edges
                     .iter()
                     .filter_map(|edge| {
                         let driver = self.design.nets()[edge.net.0].driver;
                         (self.design.pins()[driver.0].cell == cell
                             || self.design.pins()[edge.sink.0].cell == cell)
-                            .then_some((driver, edge.sink, edge.net))
+                            .then_some((driver, edge.sink, edge.net, edge.slack_ps))
                     })
                     .collect::<Vec<_>>();
                 let connections = selected
                     .iter()
-                    .map(|&(driver, sink, _)| (driver, sink))
+                    .map(|&(driver, sink, _, _)| (driver, sink))
                     .collect::<Vec<_>>();
-                let deficit = u64::try_from(worst.unsigned_abs()).unwrap_or(u64::MAX);
+                let realized_delays = selected
+                    .iter()
+                    .map(|&(_, sink, net, _)| delays.get(&(net, sink)).copied().unwrap_or(0))
+                    .collect::<Vec<_>>();
                 let targets = selected
                     .iter()
-                    .map(|&(_, sink, net)| {
+                    .map(|&(_, sink, net, slack)| {
+                        let deficit = u64::try_from(slack.unsigned_abs()).unwrap_or(u64::MAX);
                         delays
                             .get(&(net, sink))
                             .copied()
@@ -1321,21 +1356,27 @@ impl TimingFeedbackContext<'_, '_, '_> {
                             .saturating_sub(deficit)
                     })
                     .collect::<Vec<_>>();
-                // A broad move contracts long physical detours; a two-tile
-                // move then uses exact local route-delay excess. Both are
-                // proposals only, and full routed STA decides acceptance.
-                for radius in [256, 2] {
-                    let candidates = self.placement_refiner.refine_cell_connection_delays(
-                        implementation.placement.clone(),
-                        cell,
-                        &connections,
-                        &targets,
-                        routing_costs.pip_delays_ps(),
-                        None,
-                        radius,
-                        2,
-                    )?;
+                // Try short, low-disruption moves before broad span moves.
+                // Both use each connection's own timing allowance; full
+                // routed STA remains the only acceptance authority.
+                for radius in [2, 256] {
+                    let candidates = self
+                        .placement_refiner
+                        .refine_cell_connection_delays_against_routed(
+                            implementation.placement.clone(),
+                            cell,
+                            &connections,
+                            &realized_delays,
+                            &targets,
+                            routing_costs.pip_delays_ps(),
+                            None,
+                            radius,
+                            8,
+                        )?;
                     for placement in candidates {
+                        if self.setup_budget.exhausted() {
+                            return Ok(());
+                        }
                         if !seen.insert(placement_identity(self.design, &placement)) {
                             continue;
                         }
@@ -1361,7 +1402,16 @@ impl TimingFeedbackContext<'_, '_, '_> {
                             self.timing_constraints,
                         ));
                         routing_costs.set_sink_min_delays_ps(BTreeMap::new());
-                        let candidate = match route_with_timing_costs_workspace_and_progress(
+                        // Use the same picosecond path costs for moved-cell
+                        // ECOs as for whole-net ECOs. Otherwise per-PIP 50 ps
+                        // rounding can discard the fast path that motivated
+                        // the relocation. Restore the caller's routing mode
+                        // before handling either success or routing failure.
+                        let previous_detailed_nets = routing_costs.detailed_timing_nets().clone();
+                        routing_costs.set_detailed_timing_nets(
+                            (0..self.design.nets().len()).map(NetId).collect(),
+                        );
+                        let routed_candidate = route_with_timing_costs_workspace_and_progress(
                             self.design,
                             self.architecture.device(),
                             placement,
@@ -1369,7 +1419,9 @@ impl TimingFeedbackContext<'_, '_, '_> {
                             routing_costs,
                             self.routing_workspace,
                             |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
-                        ) {
+                        );
+                        routing_costs.set_detailed_timing_nets(previous_detailed_nets);
+                        let candidate = match routed_candidate {
                             Ok(candidate) => candidate,
                             Err(
                                 PnrError::CongestionNotResolved { .. }
@@ -1415,12 +1467,15 @@ impl TimingFeedbackContext<'_, '_, '_> {
                             candidate,
                             candidate_timing,
                         ) {
-                            continue 'refresh;
+                            // Return after one accepted placement so the outer
+                            // loop can immediately rebuild critical routes in
+                            // the new resource topology. A long placement-only
+                            // descent used to consume the entire setup budget.
+                            return Ok(());
                         }
                     }
                 }
             }
-            break;
         }
         Ok(())
     }
@@ -1468,7 +1523,7 @@ impl TimingFeedbackContext<'_, '_, '_> {
         let mut objective = timing_objective(&timing);
         let mut incumbent_predicted = initial_predicted_timing.clone();
         let mut round = 0_usize;
-        loop {
+        while !self.setup_budget.exhausted() {
             if timing.worst_slack_ps.is_none_or(|slack| slack >= 0) {
                 report_timing_feedback_stop(round, "timing_met");
                 break;
@@ -2437,12 +2492,13 @@ impl WorstSetupRouteEcoWorklist {
     }
 }
 
-/// Selects every unique net from the current worst setup cone.
+/// Selects unique nets within 50 ps of the current worst failing setup cone.
 ///
 /// `net_setup_slacks` is built from the same forward maximum arrivals and
 /// backward minimum required times as endpoint STA. A net edge whose slack is
-/// whole-design WNS therefore belongs to a worst-slack timing cone. Nets are
-/// ranked by their largest exact realized edge delay; exact delay on resources
+/// negative therefore belongs to a violating timing cone. A narrow moving
+/// window gives placement another turn before route work on distant cones
+/// consumes the setup budget. Rank by minimum slack and realized delay; resources
 /// shared by sibling arcs is a deterministic tie-breaker, while raw fanout is
 /// deliberately not an optimization heuristic.
 fn worst_setup_net_route_eco_candidates(
@@ -2450,7 +2506,7 @@ fn worst_setup_net_route_eco_candidates(
     routes: &[Arc<NetRoute>],
     pip_delays_ps: &[u32],
 ) -> Vec<WorstSetupNetRouteEcoCandidate> {
-    let Some(worst_slack_ps) = timing.worst_slack_ps else {
+    let Some(worst_slack_ps) = timing.worst_slack_ps.filter(|&slack| slack < 0) else {
         return Vec::new();
     };
     let delays = timing
@@ -2462,7 +2518,7 @@ fn worst_setup_net_route_eco_candidates(
     for edge in timing
         .net_setup_slacks
         .iter()
-        .filter(|edge| edge.slack_ps == worst_slack_ps)
+        .filter(|edge| edge.slack_ps < 0 && edge.slack_ps <= worst_slack_ps + 50)
     {
         let Some(&route_delay_ps) = delays.get(&(edge.net, edge.sink)) else {
             continue;
@@ -2494,20 +2550,31 @@ fn worst_setup_net_route_eco_candidates(
                     },
                     sinks: BTreeSet::new(),
                 });
-        if (route_delay_ps, Reverse(edge.sink))
-            > (
-                aggregate.candidate.route_delay_ps,
-                Reverse(aggregate.candidate.sink),
-            )
-        {
-            aggregate.candidate.route_delay_ps = route_delay_ps;
+        if edge.slack_ps < aggregate.candidate.slack_ps {
+            // Rank the net and choose its cohort using a sink in its worst
+            // cone. A long, less critical sibling must not replace that sink.
+            aggregate.candidate.slack_ps = edge.slack_ps;
             aggregate.candidate.sink = edge.sink;
+            aggregate.candidate.route_delay_ps = 0;
+            aggregate.candidate.shared_prefix_delay_ps = 0;
+            aggregate.sinks.clear();
         }
-        aggregate.candidate.shared_prefix_delay_ps = aggregate
-            .candidate
-            .shared_prefix_delay_ps
-            .max(shared_prefix_delay_ps);
-        aggregate.sinks.insert(edge.sink);
+        if edge.slack_ps == aggregate.candidate.slack_ps {
+            if (route_delay_ps, Reverse(edge.sink))
+                > (
+                    aggregate.candidate.route_delay_ps,
+                    Reverse(aggregate.candidate.sink),
+                )
+            {
+                aggregate.candidate.route_delay_ps = route_delay_ps;
+                aggregate.candidate.sink = edge.sink;
+            }
+            aggregate.candidate.shared_prefix_delay_ps = aggregate
+                .candidate
+                .shared_prefix_delay_ps
+                .max(shared_prefix_delay_ps);
+            aggregate.sinks.insert(edge.sink);
+        }
     }
     let mut candidates = aggregates
         .into_values()
@@ -2518,6 +2585,7 @@ fn worst_setup_net_route_eco_candidates(
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|candidate| {
         (
+            candidate.slack_ps,
             Reverse(candidate.route_delay_ps),
             Reverse(candidate.shared_prefix_delay_ps),
             Reverse(candidate.worst_sinks),
@@ -2580,7 +2648,13 @@ fn legal_worst_setup_route_eco_candidate(
     cohort: &[NetId],
     routing_workspace: &mut RoutingWorkspace,
 ) -> Result<Option<PnrResult>, PnrError> {
-    let options = LegalRouteEcoOptions::new(WORST_SETUP_ROUTE_ECO_ESTIMATE_DELAY_PER_TILE_PS);
+    let options = LegalRouteEcoOptions::new(WORST_SETUP_ROUTE_ECO_ESTIMATE_DELAY_PER_TILE_PS)
+        .with_displacement_limit(32);
+    // The first requested net is the probe target; other explicit LUT inputs
+    // remain in the release set regardless of what owner discovery finds.
+    let ordered_cohort = std::iter::once(candidate.net)
+        .chain(cohort.iter().copied().filter(|&net| net != candidate.net))
+        .collect::<Vec<_>>();
     if cohort.len() == 1 {
         legal_net_route_eco_candidate_with_workspace(
             design,
@@ -2599,7 +2673,7 @@ fn legal_worst_setup_route_eco_candidate(
             implementation,
             routing_constraints,
             routing_costs,
-            cohort,
+            &ordered_cohort,
             options,
             routing_workspace,
         )
@@ -2895,7 +2969,7 @@ fn named_initial_placement(
                 })?;
         bindings.insert(cell, bel);
     }
-    let placement = placement_from_partial_bindings(
+    let placement = texo_pnr::place_near_partial_bindings(
         design,
         architecture.device(),
         packing.constraints(),
@@ -3116,6 +3190,7 @@ fn improve_worst_setup_net_route_ecos(
     implementation: &mut PnrResult,
     timing: &mut TimingReport,
     worklist: &mut WorstSetupRouteEcoWorklist,
+    setup_budget: &mut SetupBudget,
     progress: &mut impl FnMut(Ecp5FlowStage),
 ) -> Result<(), Ecp5FlowError> {
     let eco_started = Instant::now();
@@ -3129,39 +3204,74 @@ fn improve_worst_setup_net_route_ecos(
     let mut objective = timing_objective(timing);
     let initial_trials = worklist.trials();
     let mut accepted = 0_usize;
-    loop {
-        // `timing` and `routes` change together only after a strict commit.
-        // Rebuilding this cheap selector on each iteration makes that refresh
-        // immediate; the worklist filters the unchanged cone after rejection.
-        let candidates = worst_setup_net_route_eco_candidates(
-            timing,
-            &implementation.routes,
-            routing_costs.pip_delays_ps(),
-        );
-        let Some(candidate) = worklist.next(candidates) else {
-            break;
-        };
-        let ordinal = worklist.trials();
-        routing_costs.set_net_criticalities(timing_net_weights(timing, timing_constraints));
-        routing_costs.set_sink_criticalities(timing_arc_weights(timing, timing_constraints));
-        routing_costs.set_sink_min_delays_ps(BTreeMap::new());
-        let cohort = worst_setup_route_eco_cohort(design, candidate);
-        let route_started = Instant::now();
-        let candidate_implementation = legal_worst_setup_route_eco_candidate(
-            design,
-            architecture.device(),
-            implementation,
-            routing_constraints,
-            routing_costs,
-            candidate,
-            &cohort,
-            routing_workspace,
-        )?;
-        let route_elapsed = route_started.elapsed();
-        let Some(candidate_implementation) = candidate_implementation else {
+    let previous_detailed_nets = routing_costs.detailed_timing_nets().clone();
+    // ECOs touch only a small legal cohort. Preserve picosecond differences
+    // here instead of rounding every PIP independently to 50 ps. The ordinary
+    // global router retains its existing cost settings after this phase.
+    routing_costs.set_detailed_timing_nets((0..design.nets().len()).map(NetId).collect());
+    let result = (|| -> Result<(), Ecp5FlowError> {
+        loop {
+            if setup_budget.exhausted() {
+                break;
+            }
+            // `timing` and `routes` change together only after a strict commit.
+            // Rebuilding this cheap selector on each iteration makes that refresh
+            // immediate; the worklist filters the unchanged cone after rejection.
+            let candidates = worst_setup_net_route_eco_candidates(
+                timing,
+                &implementation.routes,
+                routing_costs.pip_delays_ps(),
+            );
+            let Some(candidate) = worklist.next(candidates) else {
+                break;
+            };
+            let ordinal = worklist.trials();
+            routing_costs.set_net_criticalities(timing_net_weights(timing, timing_constraints));
+            routing_costs.set_sink_criticalities(timing_arc_weights(timing, timing_constraints));
+            routing_costs.set_sink_min_delays_ps(BTreeMap::new());
+            let cohort = worst_setup_route_eco_cohort(design, candidate);
+            let route_started = Instant::now();
+            let candidate_implementation = legal_worst_setup_route_eco_candidate(
+                design,
+                architecture.device(),
+                implementation,
+                routing_constraints,
+                routing_costs,
+                candidate,
+                &cohort,
+                routing_workspace,
+            )?;
+            let route_elapsed = route_started.elapsed();
+            let Some(candidate_implementation) = candidate_implementation else {
+                if metrics_enabled() {
+                    eprintln!(
+                        "[metrics] worst_setup_net_route_eco candidate={} net={} sink={} cohort_nets={} slack={} route_delay={} shared_prefix_delay={} worst_sinks={} fanout={} routed=false route_ms={:.3} sta_ms=0.000 accepted=false",
+                        ordinal,
+                        candidate.net.0,
+                        candidate.sink.0,
+                        cohort.len(),
+                        candidate.slack_ps,
+                        candidate.route_delay_ps,
+                        candidate.shared_prefix_delay_ps,
+                        candidate.worst_sinks,
+                        candidate.fanout,
+                        route_elapsed.as_secs_f64() * 1_000.0,
+                    );
+                }
+                continue;
+            };
+            let sta_started = Instant::now();
+            let candidate_timing = timing_session.analyze(&candidate_implementation)?;
+            let sta_elapsed = sta_started.elapsed();
+            progress(timing_snapshot(&candidate_timing));
+            let candidate_objective = timing_objective(&candidate_timing);
+            let improves = strictly_improves_timing_objective(candidate_objective, objective);
+            progress(Ecp5FlowStage::TimingTrialDecision {
+                improves_objective: improves,
+            });
             if metrics_enabled() {
                 eprintln!(
-                    "[metrics] worst_setup_net_route_eco candidate={} net={} sink={} cohort_nets={} slack={} route_delay={} shared_prefix_delay={} worst_sinks={} fanout={} routed=false route_ms={:.3} sta_ms=0.000 accepted=false",
+                    "[metrics] worst_setup_net_route_eco candidate={} net={} sink={} cohort_nets={} slack={} route_delay={} shared_prefix_delay={} worst_sinks={} fanout={} routed=true route_ms={:.3} sta_ms={:.3} wns={:?} accepted={improves}",
                     ordinal,
                     candidate.net.0,
                     candidate.sink.0,
@@ -3172,51 +3282,28 @@ fn improve_worst_setup_net_route_ecos(
                     candidate.worst_sinks,
                     candidate.fanout,
                     route_elapsed.as_secs_f64() * 1_000.0,
+                    sta_elapsed.as_secs_f64() * 1_000.0,
+                    candidate_timing.worst_slack_ps,
                 );
             }
-            continue;
-        };
-        let sta_started = Instant::now();
-        let candidate_timing = timing_session.analyze(&candidate_implementation)?;
-        let sta_elapsed = sta_started.elapsed();
-        progress(timing_snapshot(&candidate_timing));
-        let candidate_objective = timing_objective(&candidate_timing);
-        let improves = strictly_improves_timing_objective(candidate_objective, objective);
-        progress(Ecp5FlowStage::TimingTrialDecision {
-            improves_objective: improves,
-        });
-        if metrics_enabled() {
-            eprintln!(
-                "[metrics] worst_setup_net_route_eco candidate={} net={} sink={} cohort_nets={} slack={} route_delay={} shared_prefix_delay={} worst_sinks={} fanout={} routed=true route_ms={:.3} sta_ms={:.3} wns={:?} accepted={improves}",
-                ordinal,
-                candidate.net.0,
-                candidate.sink.0,
-                cohort.len(),
-                candidate.slack_ps,
-                candidate.route_delay_ps,
-                candidate.shared_prefix_delay_ps,
-                candidate.worst_sinks,
-                candidate.fanout,
-                route_elapsed.as_secs_f64() * 1_000.0,
-                sta_elapsed.as_secs_f64() * 1_000.0,
-                candidate_timing.worst_slack_ps,
+            let committed = commit_strict_route_eco_candidate(
+                implementation,
+                timing,
+                candidate_implementation,
+                candidate_timing,
             );
-        }
-        let committed = commit_strict_route_eco_candidate(
-            implementation,
-            timing,
-            candidate_implementation,
-            candidate_timing,
-        );
-        debug_assert_eq!(committed, improves);
-        if committed {
-            objective = candidate_objective;
-            accepted += 1;
-            if timing.worst_slack_ps.is_some_and(|slack| slack >= 0) {
-                break;
+            debug_assert_eq!(committed, improves);
+            if committed {
+                objective = candidate_objective;
+                accepted += 1;
+                if timing.worst_slack_ps.is_some_and(|slack| slack >= 0) {
+                    break;
+                }
             }
         }
-    }
+        Ok(())
+    })();
+    routing_costs.set_detailed_timing_nets(previous_detailed_nets);
     if metrics_enabled() {
         eprintln!(
             "[metrics] worst_setup_net_route_eco_summary candidates={} accepted={accepted} total_ms={:.3}",
@@ -3224,7 +3311,7 @@ fn improve_worst_setup_net_route_ecos(
             eco_started.elapsed().as_secs_f64() * 1_000.0,
         );
     }
-    Ok(())
+    result
 }
 
 fn staged_timing_objective(
@@ -5573,7 +5660,7 @@ mod tests {
                 },
             ],
         ));
-        // A larger route outside the exact worst-slack cone is ineligible.
+        // A net without a physical tree is ineligible regardless of its slack.
         net_delays.push(NetDelay {
             net: NetId(99),
             sink: CellPinId(99),
@@ -5617,6 +5704,106 @@ mod tests {
                 (NetId(0), 100, 0, 1),
             ]
         );
+    }
+
+    #[test]
+    fn route_eco_visits_nearby_violating_cones_after_the_worst_is_exhausted() {
+        // A zero-delay direct connection still chooses the most critical
+        // sink, even when a longer sibling has a lower pin ID.
+        for critical_delay in [0, 100] {
+            let mut net_delays = Vec::new();
+            let mut net_setup_slacks = Vec::new();
+            let mut routes = Vec::new();
+            for (index, (slack, delay)) in [
+                (-100, critical_delay),
+                (-50, 900),
+                (-49, 2000),
+                (0, 3000),
+                (1, 4000),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let sink = CellPinId(index + 10);
+                net_delays.push(NetDelay {
+                    net: NetId(index),
+                    sink,
+                    delay: DelayRange::new(delay, delay).unwrap(),
+                });
+                net_setup_slacks.push(NetSetupSlack {
+                    net: NetId(index),
+                    sink,
+                    slack_ps: slack,
+                });
+                routes.push(Arc::new(NetRoute::new(
+                    NetId(index),
+                    vec![RouteArc {
+                        sink: Some(sink),
+                        wires: vec![WireId(index * 2), WireId(index * 2 + 1)],
+                        pips: vec![PipId(index)],
+                    }],
+                )));
+            }
+            // Visit a less critical, longer sibling first in the input report.
+            // The net must still be represented by its most critical sink.
+            net_delays.insert(
+                0,
+                NetDelay {
+                    net: NetId(0),
+                    sink: CellPinId(1),
+                    delay: DelayRange::new(4000, 4000).unwrap(),
+                },
+            );
+            net_setup_slacks.insert(
+                0,
+                NetSetupSlack {
+                    net: NetId(0),
+                    sink: CellPinId(1),
+                    slack_ps: -10,
+                },
+            );
+            let mut first_arcs = routes[0].arcs.clone();
+            first_arcs.push(RouteArc {
+                sink: Some(CellPinId(1)),
+                wires: vec![WireId(0), WireId(100)],
+                pips: vec![PipId(5)],
+            });
+            routes[0] = Arc::new(NetRoute::new(NetId(0), first_arcs));
+            let mut timing = TimingReport {
+                net_delays,
+                net_setup_slacks,
+                net_setup_criticalities: Vec::new(),
+                setup_checks: Vec::new(),
+                hold_checks: Vec::new(),
+                unchecked_endpoints: Vec::new(),
+                worst_slack_ps: Some(-100),
+                worst_hold_slack_ps: Some(0),
+            };
+            let costs = [100, 900, 2000, 3000, 4000, 4000];
+            let candidates = worst_setup_net_route_eco_candidates(&timing, &routes, &costs);
+            assert_eq!(
+                candidates
+                    .iter()
+                    .map(|c| (c.net, c.sink, c.slack_ps, c.route_delay_ps, c.worst_sinks))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (NetId(0), CellPinId(10), -100, critical_delay, 1),
+                    (NetId(1), CellPinId(11), -50, 900, 1)
+                ]
+            );
+            let mut worklist = WorstSetupRouteEcoWorklist::default();
+            assert_eq!(worklist.next(candidates.clone()).unwrap().net, NetId(0));
+            // Rejecting the worst cone must not prematurely terminate route work.
+            assert_eq!(worklist.next(candidates.clone()).unwrap().net, NetId(1));
+            assert!(worklist.next(candidates.clone()).is_none());
+            timing.net_setup_slacks.reverse();
+            assert_eq!(
+                worst_setup_net_route_eco_candidates(&timing, &routes, &costs),
+                candidates
+            );
+            timing.worst_slack_ps = Some(0);
+            assert!(worst_setup_net_route_eco_candidates(&timing, &routes, &costs).is_empty());
+        }
     }
 
     #[test]

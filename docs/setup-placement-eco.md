@@ -1,10 +1,12 @@
 # Local setup placement repair
 
 After route ECOs and global placement feedback stall on negative setup slack,
-Texo now proposes moves for cells on the exact worst-slack cone. It ranks these
-cells by realized incident route delay, tries broad span reductions followed by
-local characterized-delay reductions, and refreshes the cone after each accepted
-move. Previously the RV64 store-latency candidate stopped with WNS -706 ps.
+Texo proposes moves for cells in the worst failing cones. It ranks cells by
+slack and realized incident route delay, tries local characterized-delay moves
+before broad span reductions, and returns to route repair after each accepted
+move. The current [incremental closure flow](incremental-closure.md) also uses
+measured incumbent delays and distinct-tile broad shortlists. The historical
+RV64 store-latency result below stopped with WNS -706 ps before these passes.
 
 Each trial retains routes whose endpoints and physical pin bindings remain
 unchanged. Moving a driver releases its net; moving a sink releases its branch
