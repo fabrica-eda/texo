@@ -6913,6 +6913,7 @@ mod tests {
             MappingOptions {
                 timing_goal_mhz: 250,
                 arithmetic: ArithmeticMapping::CarryChain,
+                ..MappingOptions::default()
             },
         )
         .unwrap();

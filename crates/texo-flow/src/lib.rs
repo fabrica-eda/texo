@@ -30,6 +30,7 @@ use texo_pnr::{
     RoutingWorkspace, legal_net_route_eco_candidate_with_workspace,
     legal_nets_route_eco_candidate_with_workspace, place_and_route_with_constraints,
     placement_from_complete_bindings, rebind_placement_pins,
+    route_with_initial_routes_workspace_and_progress,
     route_with_timing_costs_workspace_and_progress, route_with_workspace_and_progress,
     routing_capacity_map,
 };
@@ -230,8 +231,11 @@ pub struct Ecp5FlowOptions<'a> {
     /// Optional cell-name to BEL-name bindings used instead of native initial
     /// placement. Missing synthetic cells are completed from packing groups.
     pub initial_placement: Option<&'a BTreeMap<String, String>>,
-    /// Validated physical trees to preserve in the initial route. Requires imported placement.
+    /// Validated physical trees used to start routing. Requires imported placement.
+    /// Congested branches may be rerouted; target-owned routing stays immutable.
     pub initial_routes: Option<&'a [Ecp5InitialRoute]>,
+    /// Named initial trees fixed during initial routing; later STA-gated ECOs may replace them.
+    pub preserved_initial_routes: &'a [String],
     /// Optional explicit dedicated-path LUT-to-FF pairs, named as
     /// `LUT -> FF`. This must accompany placements imported after packing.
     pub lut_ff_pairs: Option<&'a BTreeMap<String, String>>,
@@ -268,6 +272,7 @@ impl Default for Ecp5FlowOptions<'_> {
             placement_weight_exponent: 4,
             initial_placement: None,
             initial_routes: None,
+            preserved_initial_routes: &[],
             lut_ff_pairs: None,
             initial_timing_reroute: false,
             optimize_timing: true,
@@ -728,6 +733,7 @@ pub fn implement_struo_ecp5_with_progress(
         &placement,
         &mut global_routing_cache,
     )?;
+    let mut immutable_routing = routing.clone();
     if let Some(routes) = options.initial_routes {
         initial_routing::import_routes(
             &design,
@@ -737,10 +743,28 @@ pub fn implement_struo_ecp5_with_progress(
             &mut routing,
         )?;
     }
+    initial_routing::preserve_routes(
+        &design,
+        options.preserved_initial_routes,
+        &routing,
+        &mut immutable_routing,
+    )?;
     progress(Ecp5FlowStage::GlobalClocksRouted);
     report_metric_phase("initial_global_routing", &mut phase_started);
     let mut routing_workspace = RoutingWorkspace::new(architecture.device());
-    let initial_implementation = if let Some(costs) = timing_routing_costs.as_ref() {
+    let initial_implementation = if options.initial_routes.is_some() {
+        let seeds = routing.routes().values().cloned().collect::<Vec<_>>();
+        route_with_initial_routes_workspace_and_progress(
+            &design,
+            architecture.device(),
+            placement,
+            &immutable_routing,
+            &seeds,
+            timing_routing_costs.as_ref(),
+            &mut routing_workspace,
+            |event| progress(Ecp5FlowStage::Routing(event)),
+        )?
+    } else if let Some(costs) = timing_routing_costs.as_ref() {
         route_with_timing_costs_workspace_and_progress(
             &design,
             architecture.device(),
@@ -1408,19 +1432,58 @@ impl TimingFeedbackContext<'_, '_, '_> {
                         // the relocation. Restore the caller's routing mode
                         // before handling either success or routing failure.
                         let previous_detailed_nets = routing_costs.detailed_timing_nets().clone();
+                        // A disposable local move must not monopolize the setup
+                        // budget while a few connections repeatedly conflict.
+                        // Try other placements after eight routing iterations;
+                        // only complete routes proceed to the full STA gate.
+                        let previous_max_iterations = routing_costs.max_iterations();
+                        routing_costs.set_max_iterations(previous_max_iterations.min(8));
                         routing_costs.set_detailed_timing_nets(
                             (0..self.design.nets().len()).map(NetId).collect(),
                         );
-                        let routed_candidate = route_with_timing_costs_workspace_and_progress(
+                        let mut routed_candidate = route_with_timing_costs_workspace_and_progress(
                             self.design,
                             self.architecture.device(),
-                            placement,
+                            placement.clone(),
                             &frozen,
                             routing_costs,
                             self.routing_workspace,
                             |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
                         );
+                        if matches!(
+                            routed_candidate,
+                            Err(PnrError::CongestionNotResolved { .. }
+                                | PnrError::Unroutable { .. })
+                        ) {
+                            // An unchanged neighbor can block an otherwise legal
+                            // placement move. Retry from the retained trees while
+                            // allowing ordinary branches to move; target routing
+                            // stays mandatory. This remains a bounded disposable
+                            // candidate and must pass the same full STA objective.
+                            if metrics_enabled() {
+                                eprintln!(
+                                    "[metrics] local_placement_route_displacement cell={} radius={radius}",
+                                    cell.0
+                                );
+                            }
+                            // Moving ordinary neighbors needs more negotiation
+                            // than a trial against a fixed background. Keep that
+                            // fallback bounded, but allow congestion to settle.
+                            routing_costs.set_max_iterations(previous_max_iterations.min(32));
+                            let seeds = frozen.routes().values().cloned().collect::<Vec<_>>();
+                            routed_candidate = route_with_initial_routes_workspace_and_progress(
+                                self.design,
+                                self.architecture.device(),
+                                placement,
+                                &routing,
+                                &seeds,
+                                Some(routing_costs),
+                                self.routing_workspace,
+                                |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
+                            );
+                        }
                         routing_costs.set_detailed_timing_nets(previous_detailed_nets);
+                        routing_costs.set_max_iterations(previous_max_iterations);
                         let candidate = match routed_candidate {
                             Ok(candidate) => candidate,
                             Err(
@@ -3231,7 +3294,7 @@ fn improve_worst_setup_net_route_ecos(
             routing_costs.set_sink_min_delays_ps(BTreeMap::new());
             let cohort = worst_setup_route_eco_cohort(design, candidate);
             let route_started = Instant::now();
-            let candidate_implementation = legal_worst_setup_route_eco_candidate(
+            let mut candidate_implementation = legal_worst_setup_route_eco_candidate(
                 design,
                 architecture.device(),
                 implementation,
@@ -3241,8 +3304,49 @@ fn improve_worst_setup_net_route_ecos(
                 &cohort,
                 routing_workspace,
             )?;
+            let used_negotiation = candidate_implementation.is_none();
+            if used_negotiation {
+                // The hard-occupancy ECO rebuilds its cohort greedily. A
+                // displaced neighbor may need another owner to move before a
+                // legal route exists. Retry with ordinary retained trees as
+                // negotiable seeds; mandatory target topology remains fixed.
+                // This candidate still passes the same complete routed STA.
+                let seeds = implementation
+                    .routes
+                    .iter()
+                    .filter(|route| !cohort.contains(&route.net))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let previous_max_iterations = routing_costs.max_iterations();
+                routing_costs.set_max_iterations(previous_max_iterations.min(32));
+                if metrics_enabled() {
+                    eprintln!(
+                        "[metrics] worst_setup_route_negotiation net={} cohort_nets={}",
+                        candidate.net.0,
+                        cohort.len()
+                    );
+                }
+                let retried = route_with_initial_routes_workspace_and_progress(
+                    design,
+                    architecture.device(),
+                    implementation.placement.clone(),
+                    routing_constraints,
+                    &seeds,
+                    Some(routing_costs),
+                    routing_workspace,
+                    |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
+                );
+                routing_costs.set_max_iterations(previous_max_iterations);
+                candidate_implementation = match retried {
+                    Ok(candidate) => Some(candidate),
+                    Err(PnrError::CongestionNotResolved { .. } | PnrError::Unroutable { .. }) => {
+                        None
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+            }
             let route_elapsed = route_started.elapsed();
-            let Some(candidate_implementation) = candidate_implementation else {
+            let Some(mut candidate_implementation) = candidate_implementation else {
                 if metrics_enabled() {
                     eprintln!(
                         "[metrics] worst_setup_net_route_eco candidate={} net={} sink={} cohort_nets={} slack={} route_delay={} shared_prefix_delay={} worst_sinks={} fanout={} routed=false route_ms={:.3} sta_ms=0.000 accepted=false",
@@ -3261,8 +3365,89 @@ fn improve_worst_setup_net_route_ecos(
                 continue;
             };
             let sta_started = Instant::now();
-            let candidate_timing = timing_session.analyze(&candidate_implementation)?;
+            let mut candidate_timing = timing_session.analyze(&candidate_implementation)?;
             let sta_elapsed = sta_started.elapsed();
+            let target_slack = candidate_timing
+                .net_setup_slacks
+                .iter()
+                .find(|edge| edge.net == candidate.net && edge.sink == candidate.sink)
+                .map(|edge| edge.slack_ps);
+            if used_negotiation && metrics_enabled() {
+                let worst = candidate_timing
+                    .setup_checks
+                    .iter()
+                    .min_by_key(|check| check.slack_ps);
+                eprintln!(
+                    "[metrics] negotiated_route_trial net={} target_slack={target_slack:?} incumbent_target_slack={} worst_cell={:?} wns={:?}",
+                    candidate.net.0,
+                    candidate.slack_ps,
+                    worst.map(|check| design.cells()[check.cell.0].name.as_str()),
+                    candidate_timing.worst_slack_ps
+                );
+            }
+            // A successful negotiated route can improve its target while
+            // displacing another important path. Repair that disposable state
+            // before judging the entire batch against the incumbent. No
+            // intermediate implementation or timing report is published.
+            if used_negotiation && target_slack.is_some_and(|slack| slack > candidate.slack_ps) {
+                let mut repair_worklist = WorstSetupRouteEcoWorklist::default();
+                for repair_index in 0..16 {
+                    if setup_budget.exhausted()
+                        || strictly_improves_timing_objective(
+                            timing_objective(&candidate_timing),
+                            objective,
+                        )
+                    {
+                        break;
+                    }
+                    let repairs = worst_setup_net_route_eco_candidates(
+                        &candidate_timing,
+                        &candidate_implementation.routes,
+                        routing_costs.pip_delays_ps(),
+                    );
+                    let Some(repair) = repair_worklist.next(repairs) else {
+                        break;
+                    };
+                    routing_costs.set_net_criticalities(timing_net_weights(
+                        &candidate_timing,
+                        timing_constraints,
+                    ));
+                    routing_costs.set_sink_criticalities(timing_arc_weights(
+                        &candidate_timing,
+                        timing_constraints,
+                    ));
+                    let repair_cohort = worst_setup_route_eco_cohort(design, repair);
+                    let Some(repaired) = legal_worst_setup_route_eco_candidate(
+                        design,
+                        architecture.device(),
+                        &candidate_implementation,
+                        routing_constraints,
+                        routing_costs,
+                        repair,
+                        &repair_cohort,
+                        routing_workspace,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let repaired_timing = timing_session.analyze(&repaired)?;
+                    let improves_trial = strictly_improves_timing_objective(
+                        timing_objective(&repaired_timing),
+                        timing_objective(&candidate_timing),
+                    );
+                    if metrics_enabled() {
+                        eprintln!(
+                            "[metrics] route_eco_lookahead trial={repair_index} net={} wns={:?} accepted_in_trial={improves_trial}",
+                            repair.net.0, repaired_timing.worst_slack_ps,
+                        );
+                    }
+                    if improves_trial {
+                        candidate_implementation = repaired;
+                        candidate_timing = repaired_timing;
+                        repair_worklist.reset_attempted_after_global_change();
+                    }
+                }
+            }
             progress(timing_snapshot(&candidate_timing));
             let candidate_objective = timing_objective(&candidate_timing);
             let improves = strictly_improves_timing_objective(candidate_objective, objective);

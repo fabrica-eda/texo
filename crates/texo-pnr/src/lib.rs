@@ -1488,6 +1488,38 @@ fn finish_routing(
     )
 }
 
+/// Routes from validated initial trees without locking their movable branches.
+///
+/// Only `routing_constraints` are immutable. Initial trees must preserve every
+/// locked wire and PIP on nets they replace; omitted locked nets are supplied
+/// automatically. Congestion may reroute initial branches while other branches
+/// remain in place. The same routing legality and cost validation applies.
+///
+/// # Errors
+///
+/// Returns an invalid initial route, cost, constraint, or routability error.
+#[allow(clippy::too_many_arguments)]
+pub fn route_with_initial_routes_workspace_and_progress(
+    design: &Design,
+    device: &Device,
+    placement: Placement,
+    routing_constraints: &RoutingConstraints,
+    initial_routes: &[Arc<NetRoute>],
+    routing_costs: Option<&RoutingCosts>,
+    workspace: &mut RoutingWorkspace,
+    mut progress: impl FnMut(RoutingProgress),
+) -> Result<PnrResult, PnrError> {
+    finish_routing_with_seeds_workspace(
+        &UnifiedGraph::new(design, device),
+        placement,
+        routing_constraints,
+        initial_routes,
+        routing_costs,
+        workspace,
+        &mut progress,
+    )
+}
+
 fn finish_routing_with_workspace(
     graph: &UnifiedGraph<'_>,
     placement: Placement,
@@ -1496,13 +1528,67 @@ fn finish_routing_with_workspace(
     workspace: &mut RoutingWorkspace,
     progress: &mut impl FnMut(RoutingProgress),
 ) -> Result<PnrResult, PnrError> {
+    finish_routing_with_seeds_workspace(
+        graph,
+        placement,
+        routing_constraints,
+        &[],
+        routing_costs,
+        workspace,
+        progress,
+    )
+}
+
+fn seeded_routing_constraints(
+    locked: &RoutingConstraints,
+    seeds: &[Arc<NetRoute>],
+) -> Result<RoutingConstraints, PnrError> {
+    let mut initial = locked.clone();
+    let mut seen = BTreeSet::new();
+    for seed in seeds {
+        if !seen.insert(seed.net) {
+            return Err(PnrError::InvalidRoutingConstraint {
+                net: seed.net,
+                reason: "duplicate initial route".into(),
+            });
+        }
+        if let Some(fixed) = locked.routes().get(&seed.net)
+            && (fixed.wires().any(|wire| seed.wire_ref_count(wire) == 0)
+                || fixed.pips().any(|pip| seed.pip_ref_count(pip) == 0))
+        {
+            return Err(PnrError::InvalidRoutingConstraint {
+                net: seed.net,
+                reason: "initial route omits immutable routing".into(),
+            });
+        }
+        initial.add_route(seed.clone());
+    }
+    Ok(initial)
+}
+
+fn finish_routing_with_seeds_workspace(
+    graph: &UnifiedGraph<'_>,
+    placement: Placement,
+    routing_constraints: &RoutingConstraints,
+    initial_routes: &[Arc<NetRoute>],
+    routing_costs: Option<&RoutingCosts>,
+    workspace: &mut RoutingWorkspace,
+    progress: &mut impl FnMut(RoutingProgress),
+) -> Result<PnrResult, PnrError> {
     let pin_wires = PinWireCache::build(graph, &placement);
     validate_routing_constraints(graph, &placement, &pin_wires, routing_constraints)?;
     validate_routing_costs(graph, routing_costs)?;
+    let seeded = if initial_routes.is_empty() {
+        None
+    } else {
+        let seeded = seeded_routing_constraints(routing_constraints, initial_routes)?;
+        validate_routing_constraints(graph, &placement, &pin_wires, &seeded)?;
+        Some(seeded)
+    };
     let routes = workspace.prepare_routes(
         graph.device(),
         graph.design().nets().len(),
-        routing_constraints,
+        seeded.as_ref().unwrap_or(routing_constraints),
     );
     let alternate_attempts_before = workspace.search.alternate_source_attempts;
     let alternate_improvements_before = workspace.search.alternate_source_improvements;
@@ -14309,6 +14395,82 @@ mod tests {
     }
 
     #[test]
+    fn initial_routes_are_reused_without_requiring_locked_constraints() {
+        let design = two_cell_design();
+        let device = Device::rectangular_logic(4, 1).unwrap();
+        let initial = place_and_route(&design, &device).unwrap();
+        let mut workspace = RoutingWorkspace::new(&device);
+        let mut iterations = Vec::new();
+        let result = super::route_with_initial_routes_workspace_and_progress(
+            &design,
+            &device,
+            initial.placement.clone(),
+            &RoutingConstraints::new(),
+            &initial.routes,
+            None,
+            &mut workspace,
+            |event| {
+                if let RoutingProgress::Iteration { nets, .. } = event {
+                    iterations.push(nets);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(iterations, [0]);
+        assert_eq!(result, initial);
+    }
+
+    #[test]
+    fn initial_routes_reject_invalid_duplicates_and_immutable_replacement() {
+        let design = two_cell_design();
+        let device = Device::rectangular_logic(4, 1).unwrap();
+        let initial = place_and_route(&design, &device).unwrap();
+        let mut workspace = RoutingWorkspace::new(&device);
+        let empty = RoutingConstraints::new();
+        let mut locked = RoutingConstraints::new();
+        locked.add_route(initial.routes[0].clone());
+        let mut blocked = RoutingConstraints::new();
+        blocked.block_pips([initial.routes[0].pips().next().unwrap()]);
+        let cases = [
+            (
+                &empty,
+                vec![initial.routes[0].clone(), initial.routes[0].clone()],
+            ),
+            (&empty, vec![Arc::new(NetRoute::new(NetId(99), vec![]))]),
+            (&locked, vec![Arc::new(NetRoute::new(NetId(0), vec![]))]),
+            (&blocked, initial.routes.clone()),
+        ];
+        for (constraints, seeds) in cases {
+            let result = super::route_with_initial_routes_workspace_and_progress(
+                &design,
+                &device,
+                initial.placement.clone(),
+                constraints,
+                &seeds,
+                None,
+                &mut workspace,
+                |_| {},
+            );
+            assert!(matches!(
+                result,
+                Err(PnrError::InvalidRoutingConstraint { .. })
+            ));
+        }
+        let result = super::route_with_initial_routes_workspace_and_progress(
+            &design,
+            &device,
+            initial.placement.clone(),
+            &locked,
+            &[],
+            None,
+            &mut workspace,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(result, initial);
+    }
+
+    #[test]
     fn partial_route_preserves_shared_tree_and_routes_only_missing_sink_arc() {
         let mut design = Design::new();
         let source = design.add_cell("source", ResourceKind::Logic);
@@ -15493,10 +15655,10 @@ mod tests {
             )
             .unwrap();
 
-        device
+        let seed_first = device
             .add_pip(movable_source_wire, shared, false, 1)
             .unwrap();
-        device.add_pip(shared, movable_sink_wire, false, 1).unwrap();
+        let seed_last = device.add_pip(shared, movable_sink_wire, false, 1).unwrap();
         device
             .add_pip(movable_source_wire, alternate_a, false, 1)
             .unwrap();
@@ -15527,7 +15689,7 @@ mod tests {
         let routed = route_with_placement_and_progress(
             &design,
             &device,
-            placement,
+            placement.clone(),
             &RoutingConstraints::new(),
             |_| {},
         )
@@ -15535,6 +15697,43 @@ mod tests {
 
         assert!(!routed.routes[0].wires().any(|wire| wire == shared));
         assert!(routed.routes[1].wires().any(|wire| wire == shared));
+
+        let seed = Arc::new(NetRoute::new(
+            NetId(0),
+            vec![RouteArc {
+                sink: Some(movable_input),
+                wires: vec![movable_source_wire, shared, movable_sink_wire],
+                pips: vec![seed_first, seed_last],
+            }],
+        ));
+        let mut workspace = RoutingWorkspace::new(&device);
+        let seeded = super::route_with_initial_routes_workspace_and_progress(
+            &design,
+            &device,
+            placement.clone(),
+            &RoutingConstraints::new(),
+            std::slice::from_ref(&seed),
+            None,
+            &mut workspace,
+            |_| {},
+        )
+        .unwrap();
+        assert!(!seeded.routes[0].wires().any(|wire| wire == shared));
+        assert!(seeded.routes[1].wires().any(|wire| wire == shared));
+
+        let mut immutable = RoutingConstraints::new();
+        immutable.add_route(seed.clone());
+        let fixed = super::route_with_initial_routes_workspace_and_progress(
+            &design,
+            &device,
+            placement,
+            &immutable,
+            &[seed],
+            None,
+            &mut workspace,
+            |_| {},
+        );
+        assert!(matches!(fixed, Err(PnrError::CongestionNotResolved { .. })));
     }
 
     #[test]
