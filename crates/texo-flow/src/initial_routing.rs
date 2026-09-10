@@ -122,6 +122,40 @@ pub(super) fn import_routes(
     Ok(())
 }
 
+pub(super) fn preserve_routes(
+    design: &Design,
+    names: &[String],
+    initial: &RoutingConstraints,
+    immutable: &mut RoutingConstraints,
+) -> Result<(), PnrError> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let by_name = initial
+        .routes()
+        .iter()
+        .map(|(net, route)| (design.nets()[net.0].name.as_str(), route))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut seen = BTreeSet::new();
+    let selected = names
+        .iter()
+        .map(|name| {
+            let invalid = |reason| PnrError::InvalidRoutingRestriction { reason };
+            if !seen.insert(name) {
+                return Err(invalid(format!("duplicate preserved initial route {name}")));
+            }
+            by_name
+                .get(name.as_str())
+                .copied()
+                .ok_or_else(|| invalid(format!("preserved route {name} has no initial tree")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for route in selected {
+        immutable.add_route(std::sync::Arc::clone(route));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +209,25 @@ mod tests {
             }],
         };
         (design, device, placement, record)
+    }
+
+    #[test]
+    fn preserved_names_select_imported_trees_and_reject_invalid_lists_atomically() {
+        let (design, device, placement, record) = fixture(false);
+        let mut initial = RoutingConstraints::new();
+        import_routes(&design, &device, &placement, &[record], &mut initial).unwrap();
+        let mut immutable = RoutingConstraints::new();
+        for names in [
+            vec!["data".into(), "missing".into()],
+            vec!["data".into(), "data".into()],
+        ] {
+            assert!(preserve_routes(&design, &names, &initial, &mut immutable).is_err());
+            assert!(immutable.routes().is_empty());
+        }
+        preserve_routes(&design, &[], &initial, &mut immutable).unwrap();
+        assert!(immutable.routes().is_empty());
+        preserve_routes(&design, &["data".into()], &initial, &mut immutable).unwrap();
+        assert_eq!(immutable.routes(), initial.routes());
     }
 
     #[test]

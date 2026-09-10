@@ -138,11 +138,27 @@ These expose the corresponding `Ecp5FlowOptions` inputs. The flow completes
 partial placements and validates packing, resource sharing and placement
 legality before routing. Incompatible atomic groups are rejected.
 
-These options import placement only: routing and timing are computed again,
-and cell names can change after synthesis. They do not import checkpoint
-equivalence or timing evidence, preserve previous routes, or guarantee the
-previous timing result. Full checkpoint-guided incremental PnR and its design
-compatibility checks remain future work.
+With imported placement, `--initial-routes routes.json` accepts an array of
+physical route records from a checkpoint. The flow validates their endpoints,
+BEL bindings and PIPs, then uses them as routing seeds. Congested ordinary
+branches can move; target-owned routing remains fixed. Optional
+`--preserve-initial-routes preserved.json` names trees to fix during initial
+routing, as a JSON array of exact net names. Later STA-gated ECOs can still
+replace those trees.
+
+For a compatible checkpoint, `--resume-checkpoint checkpoint.json` imports
+placement and routes together. Fresh synthesis, routing checks and routed STA
+still run. Imported data carries no equivalence or timing evidence, and does
+not guarantee the previous timing result. Cell names can change after
+synthesis; `--no-retiming` disables automatic retiming when source register
+boundaries need to be preserved. Retiming remains enabled by default, and
+mapping equivalence checks run in either mode.
+
+Timing optimization can reopen ordinary neighboring routes when a local move
+or route ECO is blocked. Negotiation and subsequent repair are bounded; only
+a complete candidate that improves the existing routed-STA objective replaces
+the incumbent. `--setup-optimization-budget-seconds` sets a soft setup-search
+budget: an in-progress candidate finishes its routing and timing checks.
 
 Board-level open-drain buses keep a two-state verification interface in the
 Veryl design and are fused into one physical bidirectional ECP5 pad at the

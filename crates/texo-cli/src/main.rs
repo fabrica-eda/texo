@@ -128,6 +128,16 @@ enum TargetCommand {
 }
 
 #[derive(Debug, Args)]
+struct MappingArgs {
+    /// Mapping/retiming optimization target in MHz.
+    #[arg(long, default_value_t = default_synthesis_goal())]
+    synthesis_goal_mhz: NonZeroU32,
+    /// Preserve register boundaries by disabling automatic mapping retiming.
+    #[arg(long)]
+    no_retiming: bool,
+}
+
+#[derive(Debug, Args)]
 struct PnrArgs {
     /// Project directory or `Veryl.toml`.
     input: PathBuf,
@@ -152,9 +162,8 @@ struct PnrArgs {
     /// Checkpoint destination; defaults to `target/texo/<top>.json` for projects.
     #[arg(short, long)]
     output: Option<PathBuf>,
-    /// Mapping/retiming optimization target in MHz.
-    #[arg(long, default_value_t = default_synthesis_goal())]
-    synthesis_goal_mhz: NonZeroU32,
+    #[command(flatten)]
+    mapping: MappingArgs,
     /// Exponent in the ECP5 placement weight 1+10*criticality^exponent.
     #[arg(long, default_value = "4")]
     placement_weight_exponent: NonZeroU32,
@@ -184,6 +193,9 @@ struct PnrArgs {
         conflicts_with = "resume_checkpoint"
     )]
     initial_routes: Option<PathBuf>,
+    /// JSON array of initial net names fixed during initial routing; later STA-gated ECOs may replace them.
+    #[arg(long, value_name = "JSON", requires = "initial_routes")]
+    preserve_initial_routes: Option<PathBuf>,
     /// Resume checked routes and placement; fresh synthesis, routing checks and STA still run.
     #[arg(long, value_name = "JSON", conflicts_with_all = ["initial_placement", "lut_ff_pairs"])]
     resume_checkpoint: Option<PathBuf>,
@@ -404,6 +416,15 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         })
         .transpose()?;
 
+    let preserved_initial_routes: Vec<String> = args
+        .preserve_initial_routes
+        .as_ref()
+        .map(|path| -> Result<_, Box<dyn Error>> {
+            Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?)
+        })
+        .transpose()?
+        .unwrap_or_default();
+
     if let Some(saved) = &resumed {
         initial_placement = Some(saved.placement()?);
         lut_ff_pairs = Some(saved.pairs()?);
@@ -436,7 +457,8 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
     let mut mapped = map_to_ecp5_with_options(
         &synthesized.netlist,
         MappingOptions {
-            timing_goal_mhz: args.synthesis_goal_mhz.get(),
+            timing_goal_mhz: args.mapping.synthesis_goal_mhz.get(),
+            retiming: !args.mapping.no_retiming,
             ..MappingOptions::default()
         },
     )?;
@@ -452,6 +474,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
     if !mapped.retiming().equivalence_signed_off {
         return Err("Struo mapping/retiming equivalence sign-off failed".into());
     }
+    println!("mapping retiming: {:?}", mapped.retiming());
     let mut evidence = Evidence::new();
     evidence.record(Gate::SynthesisEquivalence);
     println!(
@@ -459,7 +482,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         synthesized.netlist.nodes().len(),
         synthesized.netlist.registers().len(),
         mapped.cells().len(),
-        args.synthesis_goal_mhz,
+        args.mapping.synthesis_goal_mhz,
     );
 
     let imported = import_ecp5(&mapped)?;
@@ -502,6 +525,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
             .as_ref()
             .map(|saved| saved.routes.as_slice())
             .or(partial_routes.as_deref()),
+        preserved_initial_routes: &preserved_initial_routes,
         lut_ff_pairs: lut_ff_pairs.as_ref(),
         placement_weight_exponent: args.placement_weight_exponent.get(),
         optimize_timing: !args.no_timing_optimization,
@@ -976,6 +1000,38 @@ mod tests {
         assert_eq!(
             args.initial_placement.as_deref(),
             Some(Path::new("placement.json"))
+        );
+        arguments.extend(["--resume-checkpoint", "saved.json"]);
+        assert!(Cli::try_parse_from(&arguments).is_err());
+    }
+
+    #[test]
+    fn preserved_route_names_require_explicit_initial_trees() {
+        let mut arguments = vec![
+            "texo",
+            "pnr",
+            "project",
+            "--package",
+            "TEST",
+            "--speed",
+            "8",
+            "--preserve-initial-routes",
+            "protected.json",
+        ];
+        assert!(Cli::try_parse_from(&arguments).is_err());
+        arguments.extend([
+            "--initial-routes",
+            "routes.json",
+            "--initial-placement",
+            "placement.json",
+        ]);
+        let cli = Cli::try_parse_from(&arguments).unwrap();
+        let Command::Pnr(args) = cli.command else {
+            panic!("expected pnr");
+        };
+        assert_eq!(
+            args.preserve_initial_routes.as_deref(),
+            Some(Path::new("protected.json"))
         );
         arguments.extend(["--resume-checkpoint", "saved.json"]);
         assert!(Cli::try_parse_from(&arguments).is_err());
