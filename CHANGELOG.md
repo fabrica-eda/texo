@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7](https://github.com/fabrica-eda/texo/compare/v0.1.6...v0.1.7) (2026-09-11)
+
+
+### Features
+
+* **ecp5:** support characterized DSP multipliers through native bitgen ([#68](https://github.com/fabrica-eda/texo/issues/68)) ([2a8c4b0](https://github.com/fabrica-eda/texo/commit/2a8c4b0794265a8565f240b29c95b5b60e0fdd86))
+* **ecp5:** support Struo distributed RAM ([#57](https://github.com/fabrica-eda/texo/issues/57)) ([bc7498e](https://github.com/fabrica-eda/texo/commit/bc7498eb0eabfcd02851724c6aa9b224c491027f))
+* **flow:** resume checked routed checkpoints for local timing repair ([#67](https://github.com/fabrica-eda/texo/issues/67)) ([a5fa008](https://github.com/fabrica-eda/texo/commit/a5fa008cae3faa30a79df88f4689d4fd350b1466))
+* **timing:** constrain internal clock sources and report JTAGG scope ([#62](https://github.com/fabrica-eda/texo/issues/62)) ([fd261c7](https://github.com/fabrica-eda/texo/commit/fd261c773ed14f4eec38a6c5dfe16480b4d25bfe))
+* **timing:** preserve explicit setup margin through physical optimization ([#63](https://github.com/fabrica-eda/texo/issues/63)) ([41a1dc3](https://github.com/fabrica-eda/texo/commit/41a1dc30f2316ee696432622e856be9b6fab84ee))
+
+
+### Bug Fixes
+
+* **ecp5:** repair congestion around incremental routing candidates ([#71](https://github.com/fabrica-eda/texo/issues/71)) ([342672b](https://github.com/fabrica-eda/texo/commit/342672be484e99ff0d41f0ab15cbe7d4df7a2252))
+* **flow:** close setup with local placement and retained routes ([#65](https://github.com/fabrica-eda/texo/issues/65)) ([f067cdf](https://github.com/fabrica-eda/texo/commit/f067cdf4eded898773f84bece847508898369830))
+* **timing:** require reviewed endpoint coverage before bitgen ([#61](https://github.com/fabrica-eda/texo/issues/61)) ([f1db5e4](https://github.com/fabrica-eda/texo/commit/f1db5e4cbc8a728621a5fe79b5e7482b845c7024))
+* **timing:** reserve hold margin and preserve route delay corners ([#69](https://github.com/fabrica-eda/texo/issues/69)) ([33e6ad6](https://github.com/fabrica-eda/texo/commit/33e6ad6de4214d2af31821732d7a7006b2df1127))
+
 ## [0.1.6](https://github.com/fabrica-eda/texo/compare/v0.1.5...v0.1.6) (2026-08-31)
 
 
