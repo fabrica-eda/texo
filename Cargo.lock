@@ -345,8 +345,8 @@ dependencies = [
 
 [[package]]
 name = "celox"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "bit-set",
  "celox-analysis",
@@ -390,16 +390,16 @@ dependencies = [
 
 [[package]]
 name = "celox-analysis"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "fxhash",
 ]
 
 [[package]]
 name = "celox-backend-arm64"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "celox-analysis",
  "celox-backend-common",
@@ -415,16 +415,16 @@ dependencies = [
 
 [[package]]
 name = "celox-backend-common"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "fxhash",
 ]
 
 [[package]]
 name = "celox-backend-cranelift"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "celox-design",
  "celox-sir",
@@ -441,8 +441,8 @@ dependencies = [
 
 [[package]]
 name = "celox-backend-wasm"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "celox-design",
  "celox-sir",
@@ -453,8 +453,8 @@ dependencies = [
 
 [[package]]
 name = "celox-backend-x86"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "celox-analysis",
  "celox-backend-common",
@@ -471,8 +471,8 @@ dependencies = [
 
 [[package]]
 name = "celox-design"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "fxhash",
  "num-bigint",
@@ -481,8 +481,8 @@ dependencies = [
 
 [[package]]
 name = "celox-frontend-core"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "celox-design",
  "celox-frontend-sdk",
@@ -498,8 +498,8 @@ dependencies = [
 
 [[package]]
 name = "celox-frontend-sdk"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "fxhash",
  "num-bigint",
@@ -510,8 +510,8 @@ dependencies = [
 
 [[package]]
 name = "celox-frontend-veryl"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "bit-set",
  "celox-design",
@@ -532,8 +532,8 @@ dependencies = [
 
 [[package]]
 name = "celox-macros"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "fxhash",
  "num-bigint",
@@ -547,8 +547,8 @@ dependencies = [
 
 [[package]]
 name = "celox-runtime"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "bit-set",
  "celox-design",
@@ -562,8 +562,8 @@ dependencies = [
 
 [[package]]
 name = "celox-sir"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "celox-analysis",
  "celox-design",
@@ -575,8 +575,8 @@ dependencies = [
 
 [[package]]
 name = "celox-sir-opt"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "bit-set",
  "celox-analysis",
@@ -593,8 +593,8 @@ dependencies = [
 
 [[package]]
 name = "celox-slt"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "celox-analysis",
  "celox-design",
@@ -609,8 +609,8 @@ dependencies = [
 
 [[package]]
 name = "celox-state-layout"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "celox-design",
  "fxhash",
@@ -619,8 +619,8 @@ dependencies = [
 
 [[package]]
 name = "celox-testbench"
-version = "0.4.6"
-source = "git+https://github.com/celox-sim/celox.git?rev=7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9#7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9"
+version = "0.4.7"
+source = "git+https://github.com/celox-sim/celox.git?rev=ab63d6cf16ce702be7feed1c197808c30aad690d#ab63d6cf16ce702be7feed1c197808c30aad690d"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -3053,7 +3053,7 @@ dependencies = [
 [[package]]
 name = "struo"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67#72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=70058b6f6af4de25c7b075802692f371c914c01f#70058b6f6af4de25c7b075802692f371c914c01f"
 dependencies = [
  "struo-celox",
  "struo-formal",
@@ -3068,7 +3068,7 @@ dependencies = [
 [[package]]
 name = "struo-celox"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67#72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=70058b6f6af4de25c7b075802692f371c914c01f#70058b6f6af4de25c7b075802692f371c914c01f"
 dependencies = [
  "celox",
  "struo-ir",
@@ -3078,7 +3078,7 @@ dependencies = [
 [[package]]
 name = "struo-example-axi4-smartconnect"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67#72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=70058b6f6af4de25c7b075802692f371c914c01f#70058b6f6af4de25c7b075802692f371c914c01f"
 dependencies = [
  "struo",
 ]
@@ -3086,7 +3086,7 @@ dependencies = [
 [[package]]
 name = "struo-formal"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67#72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=70058b6f6af4de25c7b075802692f371c914c01f#70058b6f6af4de25c7b075802692f371c914c01f"
 dependencies = [
  "struo-ir",
 ]
@@ -3094,7 +3094,7 @@ dependencies = [
 [[package]]
 name = "struo-frontend-veryl"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67#72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=70058b6f6af4de25c7b075802692f371c914c01f#70058b6f6af4de25c7b075802692f371c914c01f"
 dependencies = [
  "struo-rtl",
  "veryl-analyzer",
@@ -3105,22 +3105,22 @@ dependencies = [
 [[package]]
 name = "struo-ir"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67#72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=70058b6f6af4de25c7b075802692f371c914c01f#70058b6f6af4de25c7b075802692f371c914c01f"
 
 [[package]]
 name = "struo-rtl"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67#72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=70058b6f6af4de25c7b075802692f371c914c01f#70058b6f6af4de25c7b075802692f371c914c01f"
 
 [[package]]
 name = "struo-sim"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67#72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=70058b6f6af4de25c7b075802692f371c914c01f#70058b6f6af4de25c7b075802692f371c914c01f"
 
 [[package]]
 name = "struo-synth"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67#72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=70058b6f6af4de25c7b075802692f371c914c01f#70058b6f6af4de25c7b075802692f371c914c01f"
 dependencies = [
  "struo-ir",
  "struo-rtl",
@@ -3129,7 +3129,7 @@ dependencies = [
 [[package]]
 name = "struo-target-ecp5"
 version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67#72a22dfc2c734dddb6059d39cbd58cbc0c6c0d67"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=70058b6f6af4de25c7b075802692f371c914c01f#70058b6f6af4de25c7b075802692f371c914c01f"
 dependencies = [
  "serde",
  "serde_json",
