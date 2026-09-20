@@ -3,3 +3,8 @@
 /artifacts/
 __pycache__/
 *.log
+
+# Local Nix/direnv environment
+/.direnv/
+/result
+/result-*/
