@@ -8740,6 +8740,67 @@ fn legal_nets_route_eco_candidate(
     }))
 }
 
+/// Suggest a bounded set of neighboring nets to release for a placement trial.
+///
+/// The incumbent must be a legal routed implementation. Its routes are used only
+/// to identify owners, never as connectivity evidence for the new placement.
+/// The caller must reroute and check the complete candidate before accepting it.
+/// Immutable routes in `constraints` remain hard obstacles during every probe.
+///
+/// # Errors
+/// Returns invalid placement, routing constraint, or routing cost errors.
+#[allow(clippy::too_many_arguments)]
+pub fn placement_route_eco_owners(
+    design: &Design,
+    device: &Device,
+    incumbent: &PnrResult,
+    placement: &Placement,
+    constraints: &RoutingConstraints,
+    costs: &RoutingCosts,
+    targets: &[NetId],
+    options: LegalRouteEcoOptions,
+    workspace: &mut RoutingWorkspace,
+) -> Result<BTreeSet<NetId>, PnrError> {
+    let graph = UnifiedGraph::new(design, device);
+    let pin_wires = PinWireCache::build(&graph, placement);
+    validate_routing_constraints(&graph, placement, &pin_wires, constraints)?;
+    validate_routing_costs(&graph, Some(costs))?;
+    let selected = targets.iter().copied().collect::<BTreeSet<_>>();
+    for &target in &selected {
+        if target.0 >= design.nets().len() {
+            return Err(PnrError::InvalidRoutingConstraint {
+                net: target,
+                reason: "placement ECO target does not exist".into(),
+            });
+        }
+    }
+    let mut owners = BTreeSet::new();
+    // The accumulated release set is bounded, even when many trial nets share
+    // separate bottlenecks. Failed probes merely leave more routes frozen.
+    for &target in targets.iter().take(8) {
+        let discovered = discover_route_eco_owners(
+            &graph,
+            placement,
+            &pin_wires,
+            incumbent,
+            constraints,
+            costs,
+            target,
+            &selected,
+            options,
+            workspace,
+        );
+        restore_legal_eco_workspace(device, incumbent, workspace);
+        if let Some(discovered) = discovered? {
+            let union = owners.union(&discovered).copied().collect::<BTreeSet<_>>();
+            if union.len() <= options.max_displaced_nets {
+                owners = union;
+            }
+        }
+    }
+    Ok(owners)
+}
+
 /// Probe only immutable occupancy, then identify every foreign owner of the
 /// preferred tree. This suggests a bounded release set; it never publishes a
 /// route. Rebuilding the complete set under real hard occupancy must succeed.
@@ -12447,6 +12508,103 @@ mod tests {
         for index in [1, 2] {
             assert_eq!(routed.routes[index], fixture.incumbent.routes[index]);
         }
+    }
+
+    #[test]
+    fn placement_owner_probe_releases_a_blocker_but_never_an_immutable_route() {
+        let mut fixture = net_cohort_eco_fixture();
+        let before = fixture.incumbent.clone();
+        let driver = fixture.design.nets()[0].driver;
+        let cell = fixture.design.pins()[driver.0].cell;
+        let wire = fixture
+            .device
+            .add_wire("moved-driver", Point::new(1, 0), 1)
+            .unwrap();
+        let bel = fixture
+            .device
+            .add_bel("moved-source", ResourceKind::Logic, Point::new(1, 0))
+            .unwrap();
+        fixture
+            .device
+            .add_bel_pin(bel, "AO", PinDirection::Output, wire)
+            .unwrap();
+        let shared = fixture.device.pips()[fixture.a_fast_pips[0].0].to();
+        let pip = fixture.device.add_pip(wire, shared, false, 1).unwrap();
+        let mut delays = fixture.costs.pip_delays_ps().to_vec();
+        assert_eq!(pip.0, delays.len());
+        delays.push(10);
+        let costs = RoutingCosts::new(delays, BTreeMap::from([(NetId(0), 64), (NetId(1), 8)]));
+        let mut moved = fixture.incumbent.placement.clone();
+        moved.bindings[cell.0] = bel;
+        let mut workspace = RoutingWorkspace::new(&fixture.device);
+        workspace.search.estimate_delay_per_tile_ps = 73;
+        let options = LegalRouteEcoOptions::new(52).with_displacement_limit(1);
+        let mut base = RoutingConstraints::new();
+        base.add_route(fixture.incumbent.routes[2].clone());
+        let owners = super::placement_route_eco_owners(
+            &fixture.design,
+            &fixture.device,
+            &fixture.incumbent,
+            &moved,
+            &base,
+            &costs,
+            &[NetId(0)],
+            options,
+            &mut workspace,
+        )
+        .unwrap();
+        assert_eq!(owners, BTreeSet::from([NetId(1)]));
+        assert_eq!(fixture.incumbent, before);
+        assert_workspace_matches_incumbent(&fixture.device, &fixture.incumbent, &workspace);
+        assert_eq!(workspace.search.estimate_delay_per_tile_ps, 73);
+        let routed = super::route_with_timing_costs_workspace_and_progress(
+            &fixture.design,
+            &fixture.device,
+            moved.clone(),
+            &base,
+            &costs,
+            &mut workspace,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            routed.routes[0].arc(fixture.a_sink).unwrap().pips,
+            vec![pip, fixture.a_fast_pips[1]]
+        );
+        assert_eq!(
+            routed.routes[1].arc(fixture.b_sink).unwrap().pips,
+            fixture.b_alternate_pips
+        );
+        assert_eq!(routed.routes[2], fixture.incumbent.routes[2]);
+        let bounded = super::placement_route_eco_owners(
+            &fixture.design,
+            &fixture.device,
+            &fixture.incumbent,
+            &moved,
+            &base,
+            &costs,
+            &[NetId(0)],
+            options.with_displacement_limit(0),
+            &mut workspace,
+        )
+        .unwrap();
+        assert!(bounded.is_empty());
+        base.add_route(fixture.incumbent.routes[1].clone());
+        let locked = super::placement_route_eco_owners(
+            &fixture.design,
+            &fixture.device,
+            &fixture.incumbent,
+            &moved,
+            &base,
+            &costs,
+            &[NetId(0)],
+            options,
+            &mut workspace,
+        )
+        .unwrap();
+        assert!(locked.is_empty());
+        assert_workspace_matches_incumbent(&fixture.device, &fixture.incumbent, &workspace);
+        assert_eq!(fixture.incumbent, before);
     }
 
     #[test]

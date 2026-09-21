@@ -142,9 +142,12 @@ With imported placement, `--initial-routes routes.json` accepts an array of
 physical route records from a checkpoint. The flow validates their endpoints,
 BEL bindings and PIPs, then uses them as routing seeds. Congested ordinary
 branches can move; target-owned routing remains fixed. Optional
-`--preserve-initial-routes preserved.json` names trees to fix during initial
-routing, as a JSON array of exact net names. Later STA-gated ECOs can still
-replace those trees.
+`--preserve-initial-routes preserved.json` names trees to preserve through routing
+and timing optimization, as a JSON array of exact net names. With preserved
+trees, placement and hold-repair moves are disabled; route-only setup repair
+retains those trees, and any remaining timing deficit is reported. Without a
+preserve list, ordinary initial trees remain advisory and placement repair is
+allowed.
 
 For a compatible checkpoint, `--resume-checkpoint checkpoint.json` imports
 placement and routes together. Fresh synthesis, routing checks and routed STA

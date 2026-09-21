@@ -29,7 +29,7 @@ use texo_pnr::{
     PlacementRefiner, PnrError, PnrResult, RegisterControlSet, RoutingConstraints, RoutingCosts,
     RoutingWorkspace, legal_net_route_eco_candidate_with_workspace,
     legal_nets_route_eco_candidate_with_workspace, place_and_route_with_constraints,
-    placement_from_complete_bindings, rebind_placement_pins,
+    placement_from_complete_bindings, placement_route_eco_owners, rebind_placement_pins,
     route_with_initial_routes_workspace_and_progress,
     route_with_timing_costs_workspace_and_progress, route_with_workspace_and_progress,
     routing_capacity_map,
@@ -234,7 +234,8 @@ pub struct Ecp5FlowOptions<'a> {
     /// Validated physical trees used to start routing. Requires imported placement.
     /// Congested branches may be rerouted; target-owned routing stays immutable.
     pub initial_routes: Option<&'a [Ecp5InitialRoute]>,
-    /// Named initial trees fixed during initial routing; later STA-gated ECOs may replace them.
+    /// Named initial trees preserved through routing and timing optimization.
+    /// Nonempty lists disable placement/hold moves; remaining timing deficits are reported.
     pub preserved_initial_routes: &'a [String],
     /// Optional explicit dedicated-path LUT-to-FF pairs, named as
     /// `LUT -> FF`. This must accompany placements imported after packing.
@@ -806,12 +807,9 @@ pub fn implement_struo_ecp5_with_progress(
         && timing.worst_slack_ps.is_some_and(|slack| slack < 0)
         && let Some(costs) = timing_routing_costs.as_mut()
     {
-        let eco_routing = packing.global_routing_constraints_cached(
-            &design,
-            architecture,
-            &implementation.placement,
-            &mut global_routing_cache,
-        )?;
+        // Placement is unchanged; retain explicitly preserved imports as well
+        // as architecture-required routing during setup route ECOs.
+        let eco_routing = immutable_routing.clone();
         improve_worst_setup_net_route_ecos(
             &design,
             architecture,
@@ -830,7 +828,7 @@ pub fn implement_struo_ecp5_with_progress(
     }
     let mut placement_feedback_changed_implementation = false;
     if options.optimize_timing
-        && options.initial_routes.is_none()
+        && options.preserved_initial_routes.is_empty()
         && let (Some(costs), Some(delay_predictor), Some(initial_predicted_timing)) = (
             timing_routing_costs.as_mut(),
             placement_delay_predictor.as_ref(),
@@ -914,6 +912,7 @@ pub fn implement_struo_ecp5_with_progress(
         )?;
     }
     if options.optimize_timing
+        && options.preserved_initial_routes.is_empty()
         && timing.worst_slack_ps.is_some_and(|slack| slack < 0)
         && let (Some(costs), Some(delay_predictor)) = (
             timing_routing_costs.as_mut(),
@@ -981,7 +980,10 @@ pub fn implement_struo_ecp5_with_progress(
             )?;
         }
     }
+    // Hold repair can move cells too. Report deficits rather than replacing
+    // a tree the caller explicitly preserved.
     if let Some(costs) = timing_routing_costs.as_mut()
+        && options.preserved_initial_routes.is_empty()
         && timing.worst_slack_ps.is_some_and(|slack| slack >= 0)
         && timing.worst_hold_slack_ps.is_some_and(|slack| slack < 0)
     {
@@ -1001,6 +1003,12 @@ pub fn implement_struo_ecp5_with_progress(
             &mut progress,
         )?;
     }
+    initial_routing::verify_preserved_routes(
+        &design,
+        options.preserved_initial_routes,
+        &immutable_routing,
+        &implementation,
+    )?;
     emit_placement_metric(
         "final_place",
         &design,
@@ -1410,13 +1418,46 @@ impl TimingFeedbackContext<'_, '_, '_> {
                             &placement,
                             self.global_routing_cache,
                         )?;
+                        let targets = selected
+                            .iter()
+                            .map(|&(_, _, net, _)| net)
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        let owners = placement_route_eco_owners(
+                            self.design,
+                            self.architecture.device(),
+                            implementation,
+                            &placement,
+                            &routing,
+                            routing_costs,
+                            &targets,
+                            LegalRouteEcoOptions::new(52).with_displacement_limit(32),
+                            self.routing_workspace,
+                        )?;
+                        let released = owners
+                            .iter()
+                            .flat_map(|&net| {
+                                self.design.nets()[net.0]
+                                    .sinks
+                                    .iter()
+                                    .map(move |&sink| (net, sink))
+                            })
+                            .collect();
                         let frozen = freeze_unchanged_routes(
                             self.design,
                             implementation,
                             &placement,
                             &routing,
-                            &BTreeSet::new(),
+                            &released,
                         );
+                        if metrics_enabled() {
+                            eprintln!(
+                                "[metrics] setup_placement_owners cell={} released_nets={}",
+                                cell.0,
+                                owners.len()
+                            );
+                        }
                         routing_costs.set_net_criticalities(timing_net_weights(
                             timing,
                             self.timing_constraints,

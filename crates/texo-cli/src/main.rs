@@ -193,7 +193,7 @@ struct PnrArgs {
         conflicts_with = "resume_checkpoint"
     )]
     initial_routes: Option<PathBuf>,
-    /// JSON array of initial net names fixed during initial routing; later STA-gated ECOs may replace them.
+    /// JSON array of initial net names preserved through routing and timing optimization.
     #[arg(long, value_name = "JSON", requires = "initial_routes")]
     preserve_initial_routes: Option<PathBuf>,
     /// Resume checked routes and placement; fresh synthesis, routing checks and STA still run.
