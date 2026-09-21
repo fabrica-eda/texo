@@ -27,6 +27,41 @@ struct InitialPip {
     bidirectional: bool,
 }
 
+// Enforce the import contract again before emitting timing/bitgen evidence.
+// An ECO must not silently replace a tree declared immutable by the caller.
+pub(super) fn verify_preserved_routes(
+    design: &Design,
+    preserved: &[String],
+    initial: &RoutingConstraints,
+    implementation: &texo_pnr::PnrResult,
+) -> Result<(), PnrError> {
+    if preserved.is_empty() {
+        return Ok(());
+    }
+    let names = design
+        .nets()
+        .iter()
+        .enumerate()
+        .map(|(id, net)| (net.name.as_str(), NetId(id)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for name in preserved {
+        let net = *names
+            .get(name.as_str())
+            .ok_or_else(|| PnrError::InvalidRoutingRestriction {
+                reason: format!("unknown immutable net {name}"),
+            })?;
+        let expected = initial.routes().get(&net);
+        let actual = implementation.routes.get(net.0);
+        if expected.is_none() || actual != expected {
+            return Err(PnrError::InvalidRoutingConstraint {
+                net,
+                reason: "timing feedback changed an immutable imported route".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn pin_wire(
     design: &Design,
     device: &Device,
@@ -228,6 +263,39 @@ mod tests {
         assert!(immutable.routes().is_empty());
         preserve_routes(&design, &["data".into()], &initial, &mut immutable).unwrap();
         assert_eq!(immutable.routes(), initial.routes());
+    }
+
+    #[test]
+    fn final_check_rejects_a_legal_replacement_of_an_immutable_import() {
+        let (design, mut device, placement, record) = fixture(false);
+        let middle = device
+            .add_wire("alternate", Point { x: 1, y: 0 }, 1)
+            .unwrap();
+        let first = device.add_pip(WireId(0), middle, false, 1).unwrap();
+        let second = device.add_pip(middle, WireId(1), false, 1).unwrap();
+        let mut constraints = RoutingConstraints::new();
+        import_routes(
+            &design,
+            &device,
+            &placement,
+            std::slice::from_ref(&record),
+            &mut constraints,
+        )
+        .unwrap();
+        let mut result = route_with_placement(&design, &device, placement, &constraints).unwrap();
+        verify_preserved_routes(&design, &["data".into()], &constraints, &result).unwrap();
+        let alternate = NetRoute::from_tree(
+            NetId(0),
+            WireId(0),
+            [(CellPinId(1), WireId(1))],
+            [first, second],
+            &device,
+        )
+        .unwrap();
+        result.routes[0] = std::sync::Arc::new(alternate);
+        result.total_pips = 2;
+        assert!(verify_preserved_routes(&design, &["data".into()], &constraints, &result).is_err());
+        verify_preserved_routes(&design, &[], &constraints, &result).unwrap();
     }
 
     #[test]

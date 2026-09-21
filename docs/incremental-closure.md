@@ -20,6 +20,16 @@ every current sink and mandatory target routes are checked against the newly
 mapped design. Missing nets are routed normally. The importer accepts neither
 old timing evidence nor disconnected fragments as a shortcut to sign-off.
 
+Imported ordinary trees are advisory. To keep particular trees unchanged through
+all timing feedback, pass `--preserve-initial-routes preserved.json` containing
+exact net names, for example `["critical_data"]`. Preserved trees stay mandatory
+during route-only setup repair and are compared with the final implementation
+before evidence is emitted. Placement and hold-repair moves are disabled when
+this list is nonempty, because those moves can invalidate the preserved trees.
+Any remaining setup/hold failure still prevents timing closure. This strengthens
+the previous option's initial-routing-only guarantee. Omit the preserve list to
+allow placement feedback with advisory route imports.
+
 Use `--resume-checkpoint` for an unchanged compatible mapped design. It
 conflicts with independent placement, route and LUT/FF-pair files; use a new
 output path. See [checked resume](resume-routing.md).
@@ -45,6 +55,14 @@ goes first, so its displaced owner cannot immediately reacquire the track.
 Higher-criticality owners retain precedence. Failed probes, illegal rebuilds
 and rejected STA trials keep the incumbent. Routing cost modes and workspace
 occupancy are restored before returning to the caller.
+
+A placement trial also probes up to eight selected incident nets at their new
+pin locations. It releases at most 32 neighboring owners before rebuilding the
+candidate, retaining other unchanged trees and all mandatory routing. Each
+probe restores incumbent occupancy, including unsuccessful probes. The existing
+bounded broader retry remains available if the local rebuild fails. Neither
+owner discovery nor shortest-path estimates count as timing evidence: only a
+legally rerouted candidate with a strictly better full STA objective is accepted.
 
 The negotiated router retains a finite 128-iteration ceiling, increased from
 32 for congested designs. This can spend more time on designs that previously
