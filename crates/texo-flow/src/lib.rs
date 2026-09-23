@@ -2327,7 +2327,7 @@ fn repair_general_hold_routes(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn route_hold_trial(
     design: &Design,
     architecture: &Ecp5Architecture,
@@ -2413,12 +2413,16 @@ fn route_hold_trial(
             // the incumbent's placement for this fallback.
             let nets = released.iter().map(|key| key.0).collect::<BTreeSet<_>>();
             let candidate = if same_placement {
+                let mut owner_costs = costs.clone();
+                let mut owner_minimums = hold_sink_min_delays_with_protection(timing, true);
+                accumulate_hold_minimums(&mut owner_minimums, costs.sink_min_delays_ps().clone());
+                owner_costs.set_sink_min_delays_ps(owner_minimums);
                 legal_nets_route_eco_candidate_with_workspace(
                     design,
                     architecture.device(),
                     implementation,
                     base,
-                    &costs,
+                    &owner_costs,
                     &nets.into_iter().collect::<Vec<_>>(),
                     LegalRouteEcoOptions::new(WORST_SETUP_ROUTE_ECO_ESTIMATE_DELAY_PER_TILE_PS)
                         .with_displacement_limit(32),
@@ -2715,6 +2719,17 @@ fn ecp5_timing_placement_weights(
 }
 
 fn hold_sink_min_delays(timing: &TimingReport) -> BTreeMap<(NetId, CellPinId), u64> {
+    hold_sink_min_delays_with_protection(timing, false)
+}
+
+fn hold_route_floor(delay_ps: u64, slack_ps: i128) -> u64 {
+    u64::try_from(i128::from(delay_ps).saturating_sub(slack_ps).max(0)).unwrap_or(u64::MAX)
+}
+
+fn hold_sink_min_delays_with_protection(
+    timing: &TimingReport,
+    protect_met_checks: bool,
+) -> BTreeMap<(NetId, CellPinId), u64> {
     let delays_by_sink = timing
         .net_delays
         .iter()
@@ -2722,14 +2737,16 @@ fn hold_sink_min_delays(timing: &TimingReport) -> BTreeMap<(NetId, CellPinId), u
         .collect::<BTreeMap<_, _>>();
     let mut minimums = BTreeMap::<(NetId, CellPinId), u64>::new();
     for check in &timing.hold_checks {
-        if check.slack_ps >= 0 {
+        if !protect_met_checks && check.slack_ps >= 0 {
             continue;
         }
         let Some(delay) = delays_by_sink.get(&check.data_pin) else {
             continue;
         };
-        let deficit_ps = u64::try_from(check.slack_ps.unsigned_abs()).unwrap_or(u64::MAX);
-        let minimum_ps = delay.delay.min_ps.saturating_add(deficit_ps);
+        let minimum_ps = hold_route_floor(delay.delay.min_ps, check.slack_ps);
+        if minimum_ps == 0 {
+            continue;
+        }
         minimums
             .entry((delay.net, delay.sink))
             .and_modify(|known| *known = (*known).max(minimum_ps))
@@ -6557,6 +6574,16 @@ mod tests {
             session.analyze(&implementation),
             Err(Ecp5FlowError::Timing(TimingError::UnknownRoutedPip(pip))) if pip == unknown
         ));
+    }
+
+    #[test]
+    fn hold_owner_floor_spends_only_existing_positive_slack() {
+        assert_eq!(super::hold_route_floor(47, -15), 62);
+        assert_eq!(super::hold_route_floor(80, 18), 62);
+        assert_eq!(super::hold_route_floor(62, 0), 62);
+        assert_eq!(super::hold_route_floor(20, 40), 0);
+        assert_eq!(super::hold_route_floor(u64::MAX, -1), u64::MAX);
+        assert_eq!(super::hold_route_floor(1, i128::MIN), u64::MAX);
     }
 
     #[test]
