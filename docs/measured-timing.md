@@ -63,3 +63,5 @@ without numeric delay labels. `measured_surface` exports table structure for
 coverage auditing. `measured_jtag_sta` reconstructs the internal JTCK graph using
 the exact checkpoint library, allowing comparison against integrated STA; it
 does not characterize the external JTAGG boundary.
+
+Hold repair first tries collective routing, then isolates each currently violating net while retaining all of its sink floors. If frozen neighbors block a detour, bounded owner discovery releases the conflicting routes and preserves their existing hold requirements. When routing alone stalls, at most 128 legal trials move violating cells to nearby vacant sites (radii 2, 4 and 8). Complete placement validation preserves fixed bindings, atomic groups, pin compatibility and shared resources. Every trial must keep setup closed and strictly improve the whole-design timing objective before it commits.

@@ -2132,6 +2132,7 @@ fn repair_hold_after_setup(
                 &trial_model,
                 timing_constraints,
                 requested_minimums.clone(),
+                None,
                 routing_costs,
                 global_routing_cache,
                 routing_workspace,
@@ -2164,6 +2165,7 @@ fn repair_hold_after_setup(
                     &trial_model,
                     timing_constraints,
                     requested_minimums.clone(),
+                    None,
                     routing_costs,
                     global_routing_cache,
                     routing_workspace,
@@ -2231,7 +2233,157 @@ fn repair_hold_after_setup(
         global_routing_cache,
         routing_workspace,
         progress,
+    )?;
+    repair_local_hold_placement(
+        design,
+        architecture,
+        speed_grade,
+        constant_cells,
+        metadata,
+        timing_constraints,
+        packing,
+        implementation,
+        timing,
+        routing_costs,
+        global_routing_cache,
+        routing_workspace,
+        progress,
     )
+}
+
+/// Try legal vacant sites when a hold-safe detour is unavailable in place.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn repair_local_hold_placement(
+    design: &Design,
+    architecture: &Ecp5Architecture,
+    speed_grade: &SpeedGradeRecord,
+    constant_cells: &BTreeSet<CellId>,
+    metadata: &BTreeMap<CellId, PrimitiveMetadata>,
+    timing_constraints: &TimingConstraints,
+    packing: &Ecp5Packing,
+    implementation: &mut PnrResult,
+    timing: &mut TimingReport,
+    routing_costs: &RoutingCosts,
+    global_routing_cache: &mut Ecp5GlobalRoutingCache<'_>,
+    routing_workspace: &mut RoutingWorkspace,
+    progress: &mut impl FnMut(Ecp5FlowStage),
+) -> Result<(), Ecp5FlowError> {
+    let model = ecp5_timing_model(design, packing, speed_grade, constant_cells, metadata)?;
+    let mut tried = BTreeSet::new();
+    let mut trials = 0;
+    loop {
+        if timing.met_timing() || trials >= 128 {
+            break;
+        }
+        let cells = timing
+            .hold_checks
+            .iter()
+            .filter(|check| check.slack_ps < 0)
+            .map(|check| (check.slack_ps, check.cell))
+            .collect::<BTreeSet<_>>();
+        let bindings = implementation.placement.bindings().to_vec();
+        let occupied = bindings.iter().copied().collect::<BTreeSet<_>>();
+        let mut accepted = false;
+        'search: for radius in [2, 4, 8] {
+            for &(_, cell) in &cells {
+                let old = bindings[cell.0];
+                let point = architecture.device().bels()[old.0].point;
+                let mut destinations = architecture
+                    .device()
+                    .bels()
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, bel)| {
+                        bel.kind == design.cells()[cell.0].kind
+                            && !occupied.contains(&BelId(*index))
+                            && bel.point.manhattan(point) <= radius
+                    })
+                    .map(|(index, bel)| (bel.point.manhattan(point), BelId(index)))
+                    .collect::<Vec<_>>();
+                destinations.sort_unstable();
+                let mut legal_trials = 0;
+                for (_, destination) in destinations {
+                    if !tried.insert((cell, old, destination)) {
+                        continue;
+                    }
+                    let mut next = bindings.clone();
+                    next[cell.0] = destination;
+                    let placement = match placement_from_complete_bindings(
+                        design,
+                        architecture.device(),
+                        packing.constraints(),
+                        next,
+                    ) {
+                        Ok(placement) => placement,
+                        Err(PnrError::InvalidPlacement { .. }) => continue,
+                        Err(error) => return Err(error.into()),
+                    };
+                    legal_trials += 1;
+                    trials += 1;
+                    let mut costs = routing_costs.clone();
+                    costs.set_max_iterations(costs.max_iterations().min(32));
+                    let violating = hold_sink_min_delays(timing);
+                    let mut minimums = hold_sink_min_delays_with_protection(timing, true);
+                    minimums.retain(|&(net, sink), _| {
+                        !violating.contains_key(&(net, sink))
+                            || design.pins()[sink.0].cell == cell
+                            || design.pins()[design.nets()[net.0].driver.0].cell == cell
+                    });
+                    let trial = route_hold_trial(
+                        design,
+                        architecture,
+                        speed_grade,
+                        packing,
+                        implementation,
+                        timing,
+                        &model,
+                        timing_constraints,
+                        minimums,
+                        Some(placement),
+                        &costs,
+                        global_routing_cache,
+                        routing_workspace,
+                        progress,
+                    )?;
+                    if let Some((candidate, report)) = trial {
+                        let improves = report.worst_slack_ps.is_some_and(|slack| slack >= 0)
+                            && strictly_improves_timing_objective(
+                                timing_objective(&report),
+                                timing_objective(timing),
+                            );
+                        if metrics_enabled() {
+                            eprintln!(
+                                "[metrics] hold_placement cell={} destination={} wns={:?} whs={:?} accepted={improves}",
+                                cell.0,
+                                destination.0,
+                                report.worst_slack_ps,
+                                report.worst_hold_slack_ps
+                            );
+                        }
+                        progress(Ecp5FlowStage::TimingTrialDecision {
+                            improves_objective: improves,
+                        });
+                        if improves {
+                            *implementation = candidate;
+                            *timing = report;
+                            accepted = true;
+                            break 'search;
+                        }
+                    }
+                    if trials >= 128 {
+                        break 'search;
+                    }
+                    if legal_trials >= 8 {
+                        break;
+                    }
+                }
+            }
+        }
+        if !accepted {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Repairs all general-routing hold arcs together after setup has closed.
@@ -2285,6 +2437,7 @@ fn repair_general_hold_routes(
                 &model,
                 timing_constraints,
                 minimums,
+                None,
                 routing_costs,
                 global_routing_cache,
                 routing_workspace,
@@ -2338,21 +2491,30 @@ fn route_hold_trial(
     timing_model: &TimingModel,
     timing_constraints: &TimingConstraints,
     minimums: BTreeMap<(NetId, CellPinId), u64>,
+    proposed_placement: Option<Placement>,
     routing_costs: &RoutingCosts,
     global_routing_cache: &mut Ecp5GlobalRoutingCache<'_>,
     routing_workspace: &mut RoutingWorkspace,
     progress: &mut impl FnMut(Ecp5FlowStage),
 ) -> Result<Option<TimingCandidate>, Ecp5FlowError> {
-    let released = minimums.keys().copied().collect::<BTreeSet<_>>();
+    let mut released = if proposed_placement.is_some() {
+        BTreeSet::new()
+    } else {
+        minimums.keys().copied().collect::<BTreeSet<_>>()
+    };
     // Re-resolve physical pin bindings under the trial packing. Merely
     // cloning the incumbent placement would retain the old dedicated `DI`
     // binding even after the logical FF input was rebound to general `M`.
-    let trial_placement = rebind_placement_pins(
-        design,
-        architecture.device(),
-        packing.constraints(),
-        &implementation.placement,
-    )?;
+    let trial_placement = if let Some(placement) = proposed_placement {
+        placement
+    } else {
+        rebind_placement_pins(
+            design,
+            architecture.device(),
+            packing.constraints(),
+            &implementation.placement,
+        )?
+    };
     let recomputed_global_routing;
     let base = if global_clock_endpoints_unchanged(
         design,
@@ -2390,12 +2552,46 @@ fn route_hold_trial(
         &recomputed_global_routing
     };
     progress(Ecp5FlowStage::TimingDrivenGlobalClocksRouted);
-    let frozen = freeze_unchanged_routes(design, implementation, &trial_placement, base, &released);
     let mut costs = routing_costs.clone();
     costs.set_net_criticalities(timing_net_weights(timing, timing_constraints));
     costs.set_sink_criticalities(timing_arc_weights(timing, timing_constraints));
     costs.set_sink_min_delays_ps(minimums);
     let same_placement = trial_placement == implementation.placement;
+    if !same_placement {
+        let targets = hold_sink_min_delays(timing)
+            .keys()
+            .filter(|&&(net, sink)| {
+                [
+                    design.pins()[sink.0].cell,
+                    design.pins()[design.nets()[net.0].driver.0].cell,
+                ]
+                .iter()
+                .any(|&cell| implementation.placement.bel(cell) != trial_placement.bel(cell))
+            })
+            .map(|key| key.0)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let owners = placement_route_eco_owners(
+            design,
+            architecture.device(),
+            implementation,
+            &trial_placement,
+            base,
+            &costs,
+            &targets,
+            LegalRouteEcoOptions::new(WORST_SETUP_ROUTE_ECO_ESTIMATE_DELAY_PER_TILE_PS)
+                .with_displacement_limit(32),
+            routing_workspace,
+        )?;
+        released.extend(owners.iter().flat_map(|&net| {
+            design.nets()[net.0]
+                .sinks
+                .iter()
+                .map(move |&sink| (net, sink))
+        }));
+    }
+    let frozen = freeze_unchanged_routes(design, implementation, &trial_placement, base, &released);
     let routed = match route_with_timing_costs_workspace_and_progress(
         design,
         architecture.device(),
