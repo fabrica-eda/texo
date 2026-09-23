@@ -2259,47 +2259,59 @@ fn repair_general_hold_routes(
             break;
         }
         accumulate_hold_minimums(&mut accumulated_minimums, new_minimums);
-        let Some((trial_implementation, trial_timing)) = route_hold_trial(
-            design,
-            architecture,
-            speed_grade,
-            packing,
-            implementation,
-            timing,
-            &model,
-            timing_constraints,
-            accumulated_minimums.clone(),
-            routing_costs,
-            global_routing_cache,
-            routing_workspace,
-            progress,
-        )?
-        else {
-            break;
-        };
-        if trial_timing.worst_slack_ps.is_none_or(|setup| setup < 0) {
-            break;
+        // A congested net must not prevent independent hold repairs. Try the
+        // full request first, then isolate each net while retaining all of its
+        // sink floors. Every accepted trial still passes whole-design STA.
+        let mut requests = vec![accumulated_minimums.clone()];
+        requests.extend(hold_minimums_by_net(&accumulated_minimums));
+        let mut accepted = false;
+        for (trial_index, minimums) in requests.into_iter().enumerate() {
+            let Some((trial_implementation, trial_timing)) = route_hold_trial(
+                design,
+                architecture,
+                speed_grade,
+                packing,
+                implementation,
+                timing,
+                &model,
+                timing_constraints,
+                minimums,
+                routing_costs,
+                global_routing_cache,
+                routing_workspace,
+                progress,
+            )?
+            else {
+                continue;
+            };
+            let improves = trial_timing.worst_slack_ps.is_some_and(|setup| setup >= 0)
+                && strictly_improves_timing_objective(
+                    timing_objective(&trial_timing),
+                    timing_objective(timing),
+                );
+            progress(Ecp5FlowStage::TimingTrialDecision {
+                improves_objective: improves,
+            });
+            if metrics_enabled() {
+                eprintln!(
+                    "[metrics] general_hold_feedback trial={trial_index} wns={:?} whs={:?} accepted={improves}",
+                    trial_timing.worst_slack_ps, trial_timing.worst_hold_slack_ps,
+                );
+            }
+            if !improves {
+                continue;
+            }
+            *implementation = trial_implementation;
+            *timing = trial_timing;
+            accepted = true;
+            if timing.met_timing() {
+                return Ok(());
+            }
+            if trial_index == 0 {
+                break;
+            }
         }
-        let improves = strictly_improves_timing_objective(
-            timing_objective(&trial_timing),
-            timing_objective(timing),
-        );
-        progress(Ecp5FlowStage::TimingTrialDecision {
-            improves_objective: improves,
-        });
-        if metrics_enabled() {
-            eprintln!(
-                "[metrics] general_hold_feedback wns={:?} whs={:?} accepted={improves}",
-                trial_timing.worst_slack_ps, trial_timing.worst_hold_slack_ps,
-            );
-        }
-        if !improves {
-            break;
-        }
-        let closed = trial_timing.met_timing();
-        *implementation = trial_implementation;
-        *timing = trial_timing;
-        if closed {
+        if !accepted {
             break;
         }
     }
@@ -2690,6 +2702,19 @@ fn hold_sink_min_delays(timing: &TimingReport) -> BTreeMap<(NetId, CellPinId), u
             .or_insert(minimum_ps);
     }
     minimums
+}
+
+fn hold_minimums_by_net(
+    minimums: &BTreeMap<(NetId, CellPinId), u64>,
+) -> Vec<BTreeMap<(NetId, CellPinId), u64>> {
+    let mut groups = BTreeMap::<NetId, BTreeMap<(NetId, CellPinId), u64>>::new();
+    for (&key, &minimum) in minimums {
+        groups.entry(key.0).or_default().insert(key, minimum);
+    }
+    if groups.len() <= 1 {
+        return Vec::new();
+    }
+    groups.into_values().collect()
 }
 
 fn accumulate_hold_minimums(
@@ -6498,6 +6523,22 @@ mod tests {
             session.analyze(&implementation),
             Err(Ecp5FlowError::Timing(TimingError::UnknownRoutedPip(pip))) if pip == unknown
         ));
+    }
+
+    #[test]
+    fn isolated_hold_trials_preserve_all_fanout_sink_floors() {
+        let a = (NetId(1), texo_model::CellPinId(10));
+        let b = (NetId(1), texo_model::CellPinId(11));
+        let c = (NetId(2), texo_model::CellPinId(20));
+        let first = BTreeMap::from([(a, 120), (b, 190)]);
+        let second = BTreeMap::from([(c, 80)]);
+        let all = BTreeMap::from([(a, 120), (b, 190), (c, 80)]);
+        assert_eq!(
+            super::hold_minimums_by_net(&all),
+            vec![first.clone(), second]
+        );
+        assert!(super::hold_minimums_by_net(&first).is_empty());
+        assert!(super::hold_minimums_by_net(&BTreeMap::new()).is_empty());
     }
 
     #[test]
