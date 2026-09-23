@@ -241,6 +241,21 @@ impl TimingModel {
         }
     }
 
+    /// Replaces a combinational delay without changing the timing graph.
+    /// Returns false when the pin pair is not an existing cell arc.
+    pub fn update_cell_arc_delay(
+        &mut self,
+        from: CellPinId,
+        to: CellPinId,
+        delay: DelayRange,
+    ) -> bool {
+        let Some(current) = self.cell_arcs.get_mut(&(from, to)) else {
+            return false;
+        };
+        *current = delay;
+        true
+    }
+
     /// Adds a sequential clock-to-output arc.
     ///
     /// # Errors

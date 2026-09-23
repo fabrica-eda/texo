@@ -153,6 +153,8 @@ impl Serialize for Ecp5CheckpointRef<'_> {
                 "package": self.package,
                 "speed_grade": self.result.speed_grade,
                 "placement_weight_exponent": self.result.placement_weight_exponent,
+                "measured_placement": self.result.measured_placement,
+                "measured_timing": self.result.measured_timing,
                 "placement_model": checkpoint_placement_model(
                     self.result.initial_placement_algorithm,
                     self.result.placement_weight_exponent,
@@ -484,7 +486,14 @@ impl Serialize for TimingRecord<'_> {
             "all_modeled_endpoints_checked",
             &result.timing.all_modeled_endpoints_checked(),
         )?;
-        timing.serialize_entry("delay_model", "nextpnr_ecp5_project_trellis_min_max_ps")?;
+        timing.serialize_entry(
+            "delay_model",
+            if result.measured_timing.is_some() {
+                "measured_joint_cell_route_min_max_ps"
+            } else {
+                "nextpnr_ecp5_project_trellis_min_max_ps"
+            },
+        )?;
         timing.serialize_entry("hold_checks", &HoldCheckRecords(result))?;
         timing.serialize_entry("met_timing", &result.timing.met_timing())?;
         timing.serialize_entry("meets_timing_closure", &result.meets_timing_closure())?;

@@ -6,7 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde_json.workspace = true
 serde.workspace = true
+sha2.workspace = true
 texo-model.workspace = true
 texo-pnr.workspace = true
 texo-struo.workspace = true
@@ -14,7 +16,6 @@ texo-target-ecp5.workspace = true
 texo-timing.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 struo-celox.workspace = true
 struo-ir.workspace = true
 struo-target-ecp5.workspace = true

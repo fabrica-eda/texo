@@ -1040,7 +1040,7 @@ mod tests {
         assert_eq!(first_bytes, second_bytes);
         assert_eq!(
             format!("{:x}", Sha256::digest(&first_bytes)),
-            "61e48e38354290235825c42f2a601e529d3e39396944f06def8d4f4b13e2e1d5"
+            "cae143fe61de15a43900cfb92a0f17ff0f47cff0a9208c79581b4c6c7da24ce5"
         );
         assert_eq!(checkpoint["schema_version"], 3);
         assert_eq!(checkpoint["target"]["package"], "CABGA381");

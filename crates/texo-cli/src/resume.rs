@@ -21,6 +21,8 @@ pub(super) struct Checkpoint {
 
 #[derive(Deserialize)]
 struct Target {
+    #[serde(default)]
+    measured_timing: Option<serde_json::Value>,
     device: String,
     package: String,
     database_revision: String,
@@ -52,6 +54,16 @@ impl Checkpoint {
             return Err("resume requires checkpoint schema 3".into());
         }
         Ok(saved)
+    }
+
+    pub fn validate_timing_selection(
+        &self,
+        selected: Option<&serde_json::Value>,
+    ) -> Result<(), Box<dyn Error>> {
+        if self.target.measured_timing.is_some() && selected.is_none() {
+            return Err("resuming measured STA requires an explicit measured library; legacy fallback forbidden".into());
+        }
+        Ok(())
     }
 
     pub fn validate_target(

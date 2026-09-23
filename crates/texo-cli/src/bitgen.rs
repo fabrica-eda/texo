@@ -158,7 +158,44 @@ fn bitgen_inner(options: &Ecp5BitgenOptions) -> Result<Ecp5BitgenOutput, Box<dyn
         .or_else(|| pack.as_ref().map(|pack| &pack.ecppack))
         .expect("an explicit runtime or target pack was resolved");
 
-    let architecture = load_architecture(architecture_path)?;
+    let mut architecture = load_architecture(architecture_path)?;
+    if let Some(measured) = checkpoint
+        .pointer("/target/measured_timing")
+        .filter(|v| !v.is_null())
+    {
+        let path = measured["path"]
+            .as_str()
+            .ok_or("measured library path missing")?;
+        let digest = measured["sha256"]
+            .as_str()
+            .ok_or("measured library digest missing")?;
+        let package = checkpoint
+            .pointer("/target/package")
+            .and_then(Value::as_str)
+            .ok_or("package missing")?;
+        let loaded = crate::measured_timing::install(
+            Path::new(path),
+            &mut architecture,
+            package,
+            Some(digest),
+        )?;
+        if checkpoint.pointer("/target/speed_grade") != Some(&loaded["timing_grade"]) {
+            return Err("bitgen measured timing grade mismatch".into());
+        }
+        let guard = loaded["required_setup_hold_guard_ps"]
+            .as_u64()
+            .ok_or("measured guard missing")?;
+        for field in ["setup_uncertainty_ps", "hold_uncertainty_ps"] {
+            if checkpoint["timing"][field]
+                .as_u64()
+                .is_none_or(|value| value < guard)
+            {
+                return Err(
+                    format!("checkpoint does not retain the measured {field} requirement").into(),
+                );
+            }
+        }
+    }
     let base_config = fs::read_to_string(base_config_path)?;
     let iodb_path = pack.as_ref().map_or_else(
         || database.join("ECP5").join(device).join("iodb.json"),

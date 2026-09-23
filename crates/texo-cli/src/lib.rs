@@ -3,6 +3,7 @@
 mod bitgen;
 mod bitstream;
 mod checkpoint;
+pub mod measured_timing;
 mod target_pack;
 mod veryl_project;
 mod visualizer;
