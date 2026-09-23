@@ -13,7 +13,10 @@ large BRAM trial cannot starve small LUT repairs. Two-, four- and eight-tile
 moves are ranked by actual PIP costs, including equal-span alternatives; only
 broad relocations use the coarse span filter. Local scoring runs Dijkstra within
 a finite spatial corridor, without the old 16-hop cutoff that could reject
-reachable paths. Zero-cost cycles terminate with one best label per wire. BRAM relocations retain the normal retry budget because they affect wide data
+reachable paths. Zero-cost cycles terminate with one best label per wire. A placement trial with
+a setup deficit no greater than twice the incumbent's deficit can receive fresh
+route ECO feedback before final comparison. The entire trial remains disposable;
+only a strict improvement over the original whole-design STA is committed. BRAM relocations retain the normal retry budget because they affect wide data
 and address/control ports; small ordinary moves keep the shorter trial budget. Imported trees
 must be advisory, with no explicitly preserved initial routes.
 

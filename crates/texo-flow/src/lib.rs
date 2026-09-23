@@ -1742,7 +1742,7 @@ impl TimingFeedbackContext<'_, '_, '_> {
                         }
                         routing_costs.set_detailed_timing_nets(previous_detailed_nets);
                         routing_costs.set_max_iterations(previous_max_iterations);
-                        let candidate = match routed_candidate {
+                        let mut candidate = match routed_candidate {
                             Ok(candidate) => candidate,
                             Err(
                                 PnrError::CongestionNotResolved { .. }
@@ -1758,7 +1758,7 @@ impl TimingFeedbackContext<'_, '_, '_> {
                             }
                             Err(error) => return Err(error.into()),
                         };
-                        let candidate_timing = analyze_ecp5_implementation(
+                        let mut candidate_timing = analyze_ecp5_implementation(
                             self.design,
                             self.architecture,
                             self.speed_grade,
@@ -1766,6 +1766,38 @@ impl TimingFeedbackContext<'_, '_, '_> {
                             self.timing_model,
                             self.timing_constraints,
                         )?;
+                        // A move may expose another near-critical route. Give
+                        // a close trial fresh timing-driven route feedback before
+                        // judging the whole transaction against the incumbent.
+                        // No intermediate placement or timing is committed.
+                        if !strictly_improves_timing_objective(
+                            timing_objective(&candidate_timing),
+                            timing_objective(timing),
+                        ) && candidate_timing
+                            .worst_slack_ps
+                            .is_some_and(|slack| slack >= worst.saturating_mul(2))
+                            && !self.setup_budget.exhausted()
+                        {
+                            eprintln!(
+                                "[metrics] setup_placement_trial_refinement cell={} radius={radius} before={:?}",
+                                cell.0, candidate_timing.worst_slack_ps
+                            );
+                            improve_worst_setup_net_route_ecos(
+                                self.design,
+                                self.architecture,
+                                self.speed_grade,
+                                self.timing_model,
+                                self.timing_constraints,
+                                &routing,
+                                routing_costs,
+                                self.routing_workspace,
+                                &mut candidate,
+                                &mut candidate_timing,
+                                &mut WorstSetupRouteEcoWorklist::default(),
+                                self.setup_budget,
+                                progress,
+                            )?;
+                        }
                         progress(timing_snapshot(&candidate_timing));
                         let improves = strictly_improves_timing_objective(
                             timing_objective(&candidate_timing),
