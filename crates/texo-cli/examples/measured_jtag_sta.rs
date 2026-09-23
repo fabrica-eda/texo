@@ -24,6 +24,7 @@ fn delay(v: DelayRangeRecord) -> DelayRange {
     DelayRange::new(v.min_ps, v.max_ps).unwrap()
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     assert_eq!(args.len(), 3, "ARCH CHECKPOINT OUTPUT");
@@ -130,8 +131,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(u)
         .collect();
     let constants: BTreeSet<_> = by_net
-        .iter()
-        .filter_map(|(_, ds)| {
+        .values()
+        .filter_map(|ds| {
             s(&ds[0]["driver_cell"])
                 .starts_with("$PACKER_")
                 .then_some(nets[&u(&ds[0]["net_id"])])

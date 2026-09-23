@@ -925,7 +925,9 @@ pub fn implement_struo_ecp5_with_progress(
                 break;
             }
         }
-        measured_placement.as_mut().expect("model provenance")["attempts"] = attempts.into();
+        if let Some(provenance) = measured_placement.as_mut() {
+            provenance["attempts"] = attempts.into();
+        }
     }
     let mut route_eco_worklist = WorstSetupRouteEcoWorklist::default();
     let mut setup_budget = SetupBudget::new(options.setup_optimization_budget);
@@ -7004,6 +7006,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn multiplier_timing_includes_high_product_bits_and_rejects_partial_tables() {
         use texo_target_ecp5::{
             CellArcTimingRecord, CellTimingRecord, DelayRangeRecord, Ecp5Packing,

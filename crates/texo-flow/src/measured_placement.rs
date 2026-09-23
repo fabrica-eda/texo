@@ -1,5 +1,8 @@
 //! Measured LUT-hop ranking. Combined LUT/route measurements are never inserted
 //! into a net-only STA arc. Unmeasured edges receive no synthetic delay.
+// BEL names are case-sensitive architecture identifiers, not file extensions.
+#![allow(clippy::case_sensitive_file_extension_comparisons)]
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
