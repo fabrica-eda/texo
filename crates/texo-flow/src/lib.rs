@@ -2258,12 +2258,21 @@ fn repair_general_hold_routes(
         if new_minimums.is_empty() {
             break;
         }
+        let active_nets = new_minimums
+            .keys()
+            .map(|key| key.0)
+            .collect::<BTreeSet<_>>();
         accumulate_hold_minimums(&mut accumulated_minimums, new_minimums);
+        let requested_minimums = accumulated_minimums
+            .iter()
+            .filter(|(key, _)| active_nets.contains(&key.0))
+            .map(|(&key, &minimum)| (key, minimum))
+            .collect::<BTreeMap<_, _>>();
         // A congested net must not prevent independent hold repairs. Try the
         // full request first, then isolate each net while retaining all of its
         // sink floors. Every accepted trial still passes whole-design STA.
-        let mut requests = vec![accumulated_minimums.clone()];
-        requests.extend(hold_minimums_by_net(&accumulated_minimums));
+        let mut requests = vec![requested_minimums.clone()];
+        requests.extend(hold_minimums_by_net(&requested_minimums));
         let mut accepted = false;
         for (trial_index, minimums) in requests.into_iter().enumerate() {
             let Some((trial_implementation, trial_timing)) = route_hold_trial(
@@ -2386,6 +2395,7 @@ fn route_hold_trial(
     costs.set_net_criticalities(timing_net_weights(timing, timing_constraints));
     costs.set_sink_criticalities(timing_arc_weights(timing, timing_constraints));
     costs.set_sink_min_delays_ps(minimums);
+    let same_placement = trial_placement == implementation.placement;
     let routed = match route_with_timing_costs_workspace_and_progress(
         design,
         architecture.device(),
@@ -2397,10 +2407,34 @@ fn route_hold_trial(
     ) {
         Ok(routed) => routed,
         Err(PnrError::CongestionNotResolved { .. } | PnrError::Unroutable { .. }) => {
-            progress(Ecp5FlowStage::TimingTrialDecision {
-                improves_objective: false,
-            });
-            return Ok(None);
+            // Frozen neighbors can block a longer hold-safe route. Discover
+            // and release only the conflicting owners, just as setup ECOs do.
+            // Pair-release trials have changed pin bindings and cannot use
+            // the incumbent's placement for this fallback.
+            let nets = released.iter().map(|key| key.0).collect::<BTreeSet<_>>();
+            let candidate = if same_placement {
+                legal_nets_route_eco_candidate_with_workspace(
+                    design,
+                    architecture.device(),
+                    implementation,
+                    base,
+                    &costs,
+                    &nets.into_iter().collect::<Vec<_>>(),
+                    LegalRouteEcoOptions::new(WORST_SETUP_ROUTE_ECO_ESTIMATE_DELAY_PER_TILE_PS)
+                        .with_displacement_limit(32),
+                    routing_workspace,
+                )?
+            } else {
+                None
+            };
+            if let Some(routed) = candidate {
+                routed
+            } else {
+                progress(Ecp5FlowStage::TimingTrialDecision {
+                    improves_objective: false,
+                });
+                return Ok(None);
+            }
         }
         Err(error) => return Err(error.into()),
     };
