@@ -3194,7 +3194,11 @@ impl<'a> PlacementRefiner<'a> {
             // which lower-criticality arcs would have to retreat, before
             // paying for a complete negotiated route and STA trial.
             const PROJECTION_SHORTLIST: usize = 16;
-            best.truncate(PROJECTION_SHORTLIST.max(max_candidates));
+            shortlist_vacant_and_swap_moves(
+                &mut best,
+                &assignment_owners,
+                PROJECTION_SHORTLIST.max(max_candidates),
+            );
             let fallback = best.clone();
             // Moving one member moves the complete rigid placement unit.  A
             // carry/FF macro therefore has to project every connection that
@@ -3238,7 +3242,11 @@ impl<'a> PlacementRefiner<'a> {
                 best = projected;
             }
         }
-        best.truncate(max_candidates.max(1));
+        if broad_path_move {
+            shortlist_vacant_and_swap_moves(&mut best, &assignment_owners, max_candidates.max(1));
+        } else {
+            best.truncate(max_candidates.max(1));
+        }
         let mut proposals = Vec::with_capacity(best.len());
         for (_, _, selected) in best {
             let mut proposed = placed.clone();
@@ -3478,6 +3486,29 @@ fn projected_resource_penalty(
                 RIPUP_BASE_PS.saturating_add(criticality.saturating_mul(CRITICALITY_PENALTY_PS)),
             )
         })
+}
+
+/// Keep vacant destinations visible even when nearer occupied sites dominate
+/// the geometric ranking. A swap can damage the displaced macro's other paths.
+fn shortlist_vacant_and_swap_moves(
+    candidates: &mut Vec<(u64, u64, Vec<BelId>)>,
+    owners: &BTreeMap<Vec<BelId>, usize>,
+    limit: usize,
+) {
+    let (vacant, swaps): (Vec<_>, Vec<_>) = std::mem::take(candidates)
+        .into_iter()
+        .partition(|(_, _, assignment)| !owners.contains_key(assignment));
+    let mut vacant = vacant.into_iter();
+    let mut swaps = swaps.into_iter();
+    for ordinal in 0..limit {
+        let next = if ordinal % 2 == 0 {
+            vacant.next().or_else(|| swaps.next())
+        } else {
+            swaps.next().or_else(|| vacant.next())
+        };
+        let Some(next) = next else { break };
+        candidates.push(next);
+    }
 }
 
 fn assignment_connection_span(
@@ -11002,6 +11033,44 @@ mod tests {
             points,
             vec![Point::new(8, 0), Point::new(7, 0), Point::new(6, 0)]
         );
+    }
+
+    #[test]
+    fn broad_shortlist_keeps_a_vacant_destination_beside_nearer_swaps() {
+        let mut design = two_cell_design();
+        design.add_cell("near-occupant", ResourceKind::Logic);
+        design.add_cell("second-occupant", ResourceKind::Logic);
+        let device = Device::rectangular_logic(6, 1).unwrap();
+        let mut constraints = PlacementConstraints::new();
+        constraints.add_group([CellId(1)], [vec![BelId(5)]]);
+        let placement = placement_from_complete_bindings(
+            &design,
+            &device,
+            &constraints,
+            vec![BelId(0), BelId(5), BelId(4), BelId(3)],
+        )
+        .unwrap();
+        let net = &design.nets()[0];
+        let proposals = PlacementRefiner::new(&design, &device, &constraints)
+            .unwrap()
+            .refine_cell_connection_delays(
+                placement,
+                CellId(0),
+                &[(net.driver, net.sinks[0])],
+                &[0],
+                &vec![1; device.pips().len()],
+                None,
+                16,
+                2,
+            )
+            .unwrap();
+        assert_eq!(proposals.len(), 2);
+        assert_eq!(proposals[0].bel(CellId(0)), Some(BelId(2)));
+        assert_eq!(proposals[0].bel(CellId(2)), Some(BelId(4)));
+        assert_eq!(proposals[0].bel(CellId(3)), Some(BelId(3)));
+        assert_eq!(proposals[1].bel(CellId(0)), Some(BelId(4)));
+        assert_eq!(proposals[1].bel(CellId(2)), Some(BelId(0)));
+        assert!(proposals.iter().all(|p| p.bel(CellId(1)) == Some(BelId(5))));
     }
 
     #[test]
