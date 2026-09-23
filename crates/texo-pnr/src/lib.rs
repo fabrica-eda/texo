@@ -2137,8 +2137,8 @@ pub struct PlacementRefinementWorkspace {
 #[derive(Default)]
 pub struct PlacementConnectionDelayWorkspace {
     delays: PackedRouteMap<Option<u64>>,
-    queue: BinaryHeap<Reverse<(u64, u8, WireId)>>,
-    best: PackedRouteMap<[u64; LOCAL_HOP_STATES]>,
+    queue: BinaryHeap<Reverse<(u64, WireId)>>,
+    best: PackedRouteMap<u64>,
 }
 
 #[derive(Default)]
@@ -2960,7 +2960,10 @@ impl<'a> PlacementRefiner<'a> {
             .iter()
             .position(|&cell| cell == moving_cell)
             .expect("the selected unit contains its moving cell");
-        let broad_path_move = max_move_distance > 2;
+        // Intermediate moves can cross routing-channel boundaries without
+        // shortening Manhattan span. Use actual PIP costs through radius 8;
+        // reserve the coarse span filter for truly broad relocations.
+        let broad_path_move = max_move_distance > 8;
         // Local moves score by the routed-delay excess over the per-connection
         // allowance targets so already-satisfied connections stop absorbing
         // moves. Broad path moves stay span-ranked: measuring excess on every
@@ -3575,13 +3578,13 @@ fn local_connection_delay(
     start: WireId,
     goal: WireId,
     pip_delays_ps: &[u32],
-    queue: &mut BinaryHeap<Reverse<(u64, u8, WireId)>>,
-    best: &mut PackedRouteMap<[u64; LOCAL_HOP_STATES]>,
+    queue: &mut BinaryHeap<Reverse<(u64, WireId)>>,
+    best: &mut PackedRouteMap<u64>,
 ) -> Option<u64> {
-    // Long-line entry/exit PIPs can put even a modest tile displacement over
-    // eight graph edges.  A too-small bound made a badly displaced critical
-    // vertex impossible to score, so the detailed placer could never move it
-    // back toward its path.  The one-tile corridor keeps this search local.
+    // The finite spatial corridor bounds the search. A hop-count cutoff can
+    // reject a reachable long connection (including zero-delay access PIPs).
+    // Nonnegative PIP costs allow ordinary Dijkstra with one label per wire;
+    // equal-cost and zero-cost cycles never need another queue entry.
     const LOCAL_MARGIN: u32 = 1;
     let device = graph.device();
     let corridor = routing_corridor(
@@ -3592,45 +3595,33 @@ fn local_connection_delay(
     );
     queue.clear();
     best.clear();
-    queue.push(Reverse((0_u64, 0_u8, start)));
-    best.insert(start.0 as u64, [0; LOCAL_HOP_STATES]);
-    while let Some(Reverse((delay, hops, wire))) = queue.pop() {
-        if wire == goal {
-            return Some(delay);
-        }
-        if hops == MAX_LOCAL_HOPS
-            || best
-                .get(&(wire.0 as u64))
-                .is_some_and(|frontier| frontier[usize::from(hops)] < delay)
+    queue.push(Reverse((0_u64, start)));
+    best.insert(start.0 as u64, 0);
+    while let Some(Reverse((delay, wire))) = queue.pop() {
+        if best
+            .get(&(wire.0 as u64))
+            .is_some_and(|known| *known < delay)
         {
             continue;
+        }
+        if wire == goal {
+            return Some(delay);
         }
         for (neighbor, pip) in graph.routing_neighbors(wire).ok()? {
             if !point_inside_corridor(device.wires()[neighbor.0].point, corridor) {
                 continue;
             }
-            let next_hops = hops + 1;
             let next_delay = delay.saturating_add(u64::from(pip_delays_ps[pip.0]));
-            let frontier = best
-                .entry(neighbor.0 as u64)
-                .or_insert([u64::MAX; LOCAL_HOP_STATES]);
-            if frontier[usize::from(next_hops)] <= next_delay {
+            let known = best.entry(neighbor.0 as u64).or_insert(u64::MAX);
+            if *known <= next_delay {
                 continue;
             }
-            // A route reaching the same wire in fewer hops and no more delay
-            // dominates this state for every remaining hop budget.  Store the
-            // cumulative Pareto frontier so those states never enter the heap.
-            for known in &mut frontier[usize::from(next_hops)..] {
-                *known = (*known).min(next_delay);
-            }
-            queue.push(Reverse((next_delay, next_hops, neighbor)));
+            *known = next_delay;
+            queue.push(Reverse((next_delay, neighbor)));
         }
     }
     None
 }
-
-const MAX_LOCAL_HOPS: u8 = 16;
-const LOCAL_HOP_STATES: usize = MAX_LOCAL_HOPS as usize + 1;
 
 #[derive(Clone, Debug)]
 struct PlacementUnit {
@@ -12388,9 +12379,8 @@ mod tests {
         ));
     }
 
-    #[test]
     #[allow(clippy::too_many_lines)] // Keep the placement proposal and its legal physical reroute together.
-    fn routed_incumbent_exposes_a_local_move_hidden_by_an_occupied_shortcut() {
+    fn check_routed_incumbent_move(point: Point, radius: u64) {
         let mut fixture = net_cohort_eco_fixture();
         let net = &fixture.design.nets()[0];
         let source_cell = fixture.design.pins()[net.driver.0].cell;
@@ -12401,13 +12391,10 @@ mod tests {
             .wires
             .last()
             .unwrap();
-        let near_wire = fixture
-            .device
-            .add_wire("near-driver", Point::new(1, 0), 1)
-            .unwrap();
+        let near_wire = fixture.device.add_wire("near-driver", point, 1).unwrap();
         let near_bel = fixture
             .device
-            .add_bel("near-source", ResourceKind::Logic, Point::new(1, 0))
+            .add_bel("near-source", ResourceKind::Logic, point)
             .unwrap();
         fixture
             .device
@@ -12448,7 +12435,7 @@ mod tests {
                 &[100],
                 costs.pip_delays_ps(),
                 None,
-                2,
+                radius,
                 8,
             )
             .unwrap();
@@ -12465,7 +12452,7 @@ mod tests {
                 &[100],
                 costs.pip_delays_ps(),
                 None,
-                2,
+                radius,
                 8,
             )
             .unwrap();
@@ -12483,7 +12470,7 @@ mod tests {
             &[100],
             costs.pip_delays_ps(),
             None,
-            2,
+            radius,
             8,
         );
         assert!(invalid.is_err());
@@ -12508,6 +12495,64 @@ mod tests {
         for index in [1, 2] {
             assert_eq!(routed.routes[index], fixture.incumbent.routes[index]);
         }
+    }
+
+    #[test]
+    fn routed_incumbent_exposes_a_local_move_hidden_by_an_occupied_shortcut() {
+        check_routed_incumbent_move(Point::new(1, 0), 2);
+    }
+
+    #[test]
+    fn local_delay_search_handles_long_paths_and_zero_cost_cycles() {
+        let design = Design::new();
+        let mut device = Device::new("long-local-path", 3, 1).unwrap();
+        let wires = (0..=24)
+            .map(|i| {
+                device
+                    .add_wire(format!("w{i}"), Point::new(1, 0), 1)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut delays = Vec::new();
+        for pair in wires.windows(2) {
+            device.add_pip(pair[0], pair[1], false, 1).unwrap();
+            delays.push(3);
+        }
+        device.add_pip(wires[12], wires[11], false, 1).unwrap();
+        delays.push(0);
+        delays[11] = 0; // w11 <-> w12 is a zero-cost cycle.
+        let unreachable = device.add_wire("unreachable", Point::new(1, 0), 1).unwrap();
+        let graph = UnifiedGraph::new(&design, &device);
+        let mut workspace = super::PlacementConnectionDelayWorkspace::new();
+        assert_eq!(
+            super::local_connection_delay(
+                &graph,
+                wires[0],
+                wires[24],
+                &delays,
+                &mut workspace.queue,
+                &mut workspace.best
+            ),
+            Some(69)
+        );
+        assert_eq!(
+            super::local_connection_delay(
+                &graph,
+                wires[0],
+                unreachable,
+                &delays,
+                &mut workspace.queue,
+                &mut workspace.best
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn intermediate_move_uses_pip_delay_even_when_manhattan_span_is_unchanged() {
+        // (0,0)->(4,0) and (2,2)->(4,0) both span four tiles, but
+        // the latter has a legal 60 ps path instead of the 800 ps detour.
+        check_routed_incumbent_move(Point::new(2, 2), 4);
     }
 
     #[test]

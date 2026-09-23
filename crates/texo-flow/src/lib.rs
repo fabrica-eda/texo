@@ -1556,7 +1556,7 @@ impl TimingFeedbackContext<'_, '_, '_> {
             // Try every cell's nearby moves before a wide relocation can
             // consume the budget. In particular, a critical BRAM must not
             // starve small LUT moves on the same path.
-            for radius in [2, 256] {
+            for radius in [2, 4, 8, 256] {
                 for &(cell, _) in &cells {
                     if self.setup_budget.exhausted() {
                         return Ok(());

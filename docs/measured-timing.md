@@ -9,7 +9,11 @@ repair remain enabled. Their candidates use the installed table and fresh STA,
 without constructing the heuristic predictor. Repeated local moves are memoized
 within an improving search epoch, then reconsidered once at a fixed point.
 All critical cells receive nearby-move trials before broad relocations, so a
-large BRAM trial cannot starve small LUT repairs. BRAM relocations retain the normal retry budget because they affect wide data
+large BRAM trial cannot starve small LUT repairs. Two-, four- and eight-tile
+moves are ranked by actual PIP costs, including equal-span alternatives; only
+broad relocations use the coarse span filter. Local scoring runs Dijkstra within
+a finite spatial corridor, without the old 16-hop cutoff that could reject
+reachable paths. Zero-cost cycles terminate with one best label per wire. BRAM relocations retain the normal retry budget because they affect wide data
 and address/control ports; small ordinary moves keep the shorter trial budget. Imported trees
 must be advisory, with no explicitly preserved initial routes.
 
