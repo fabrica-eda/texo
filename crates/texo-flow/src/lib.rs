@@ -1484,8 +1484,29 @@ impl TimingFeedbackContext<'_, '_, '_> {
         tried_moves: &mut BTreeSet<PlacementMoveIdentity>,
         progress: &mut impl FnMut(Ecp5FlowStage),
     ) -> Result<(), Ecp5FlowError> {
+        self.improve_local_setup_trial(
+            implementation,
+            timing,
+            routing_costs,
+            tried_moves,
+            true,
+            progress,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn improve_local_setup_trial(
+        &mut self,
+        implementation: &mut PnrResult,
+        timing: &mut TimingReport,
+        routing_costs: &mut RoutingCosts,
+        tried_moves: &mut BTreeSet<PlacementMoveIdentity>,
+        allow_compound: bool,
+        progress: &mut impl FnMut(Ecp5FlowStage),
+    ) -> Result<(), Ecp5FlowError> {
         let mut seen = BTreeSet::from([placement_identity(self.design, &implementation.placement)]);
         let round = 1_usize;
+        let mut bridges = Vec::<(PnrResult, TimingReport)>::new();
         if let Some(worst) = timing.worst_slack_ps.filter(|&slack| slack < 0) {
             if self.setup_budget.exhausted() {
                 return Ok(());
@@ -1814,20 +1835,63 @@ impl TimingFeedbackContext<'_, '_, '_> {
                                 candidate_timing.worst_slack_ps
                             );
                         }
-                        if commit_strict_route_eco_candidate(
-                            implementation,
-                            timing,
-                            candidate,
-                            candidate_timing,
-                        ) {
+                        if improves {
+                            commit_strict_route_eco_candidate(
+                                implementation,
+                                timing,
+                                candidate,
+                                candidate_timing,
+                            );
                             // Return after one accepted placement so the outer
                             // loop can immediately rebuild critical routes in
                             // the new resource topology. A long placement-only
                             // descent used to consume the entire setup budget.
                             return Ok(());
                         }
+                        // Preserve a small near-miss frontier only after a
+                        // complete route/STA trial. Explore a second placement
+                        // after exhausting single moves, never by committing
+                        // a worse intermediate implementation.
+                        if allow_compound
+                            && candidate_timing
+                                .worst_slack_ps
+                                .is_some_and(|slack| slack >= worst.saturating_mul(2))
+                        {
+                            bridges.push((candidate, candidate_timing));
+                            bridges.sort_by_key(|(_, report)| Reverse(timing_objective(report)));
+                            bridges.truncate(3);
+                        }
                     }
                 }
+            }
+        }
+        for (mut bridge, mut report) in bridges {
+            if self.setup_budget.exhausted() {
+                break;
+            }
+            // Do not spend the second move simply undoing the first one.
+            let mut tried = BTreeSet::from([placement_move_identity(
+                self.design,
+                &bridge.placement,
+                &implementation.placement,
+            )]);
+            let before = report.worst_slack_ps;
+            self.improve_local_setup_trial(
+                &mut bridge,
+                &mut report,
+                routing_costs,
+                &mut tried,
+                false,
+                progress,
+            )?;
+            let after = report.worst_slack_ps;
+            let accepted =
+                commit_strict_route_eco_candidate(implementation, timing, bridge, report);
+            eprintln!(
+                "[metrics] setup_compound_placement before={before:?} after={after:?} accepted={accepted}"
+            );
+            if accepted {
+                return Ok(());
             }
         }
         Ok(())
@@ -6334,7 +6398,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_route_eco_sta_trial_keeps_the_incumbent_bit_exact() {
+    fn compound_trial_must_beat_original_incumbent_not_intermediate_trial() {
         let design = Design::new();
         let device = Device::rectangular_logic(1, 1).unwrap();
         let placement = placement_from_partial_bindings(
@@ -6365,14 +6429,26 @@ mod tests {
         let mut candidate = implementation.clone();
         candidate.total_pips = 99;
 
-        assert!(!commit_strict_route_eco_candidate(
+        // A second move can improve a -200 ps bridge to -150 ps without
+        // beating the -100 ps original. Neither that nor a plateau may commit.
+        for slack in [-150, -100] {
+            assert!(!commit_strict_route_eco_candidate(
+                &mut implementation,
+                &mut timing,
+                candidate.clone(),
+                timing_at(slack),
+            ));
+            assert_eq!(implementation, before_implementation);
+            assert_eq!(timing, before_timing);
+        }
+        assert!(commit_strict_route_eco_candidate(
             &mut implementation,
             &mut timing,
-            candidate,
-            timing_at(-100),
+            candidate.clone(),
+            timing_at(-90),
         ));
-        assert_eq!(implementation, before_implementation);
-        assert_eq!(timing, before_timing);
+        assert_eq!(implementation, candidate);
+        assert_eq!(timing, timing_at(-90));
     }
 
     #[test]
