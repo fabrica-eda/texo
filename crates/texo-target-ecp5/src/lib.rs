@@ -683,6 +683,95 @@ impl Ecp5Architecture {
         &self.speed_grades
     }
 
+    /// Replace an entire timing grade. Missing classes/arcs are errors, never fallback.
+    ///
+    /// # Errors
+    /// Rejects a different surface, duplicate arcs, or inverted delay ranges.
+    pub fn replace_timing_grade(&mut self, replacement: SpeedGradeRecord) -> Result<(), String> {
+        fn surface(
+            grade: &SpeedGradeRecord,
+            remove_impossible_dsp_arcs: bool,
+        ) -> Result<BTreeSet<String>, String> {
+            let mut result = BTreeSet::new();
+            let mut add = |key: String| {
+                if result.insert(key) {
+                    Ok(())
+                } else {
+                    Err("duplicate timing entry".to_string())
+                }
+            };
+            for c in &grade.cells {
+                add(format!("cell:{}", c.cell_type))?;
+                for a in &c.arcs {
+                    // Multiplication modulo 2^j is independent of input bits
+                    // numbered j or above. Signed correction is a multiple of
+                    // 2^18. Legacy dense tables contain these non-existent arcs;
+                    // a complete measured library must omit, not fit, them.
+                    if remove_impossible_dsp_arcs
+                        && c.cell_type == "MULT18X18D:REGS=NONE"
+                        && a.to_pin
+                            .strip_prefix('P')
+                            .and_then(|p| p.parse::<u32>().ok())
+                            .is_some_and(|output| {
+                                output < 36
+                                    && if matches!(a.from_pin.as_str(), "SIGNEDA" | "SIGNEDB") {
+                                        output < 18
+                                    } else {
+                                        a.from_pin
+                                            .strip_prefix('A')
+                                            .or_else(|| a.from_pin.strip_prefix('B'))
+                                            .and_then(|p| p.parse::<u32>().ok())
+                                            .is_some_and(|input| input < 18 && output < input)
+                                    }
+                            })
+                    {
+                        continue;
+                    }
+                    if a.delay.min_ps > a.delay.max_ps {
+                        return Err("inverted cell delay range".into());
+                    }
+                    add(format!("arc:{}:{}:{}", c.cell_type, a.from_pin, a.to_pin))?;
+                }
+                for h in &c.setup_holds {
+                    if h.setup.min_ps > h.setup.max_ps || h.hold.min_ps > h.hold.max_ps {
+                        return Err("inverted setup/hold range".into());
+                    }
+                    add(format!(
+                        "check:{}:{}:{}",
+                        c.cell_type, h.signal_pin, h.clock_pin
+                    ))?;
+                }
+            }
+            Ok(result)
+        }
+        let original = self
+            .speed_grades
+            .get(&replacement.name)
+            .ok_or("unknown timing grade")?;
+        if original
+            .pip_classes
+            .keys()
+            .ne(replacement.pip_classes.keys())
+        {
+            return Err("replacement must cover every PIP timing class exactly".into());
+        }
+        if surface(original, true)? != surface(&replacement, false)? {
+            return Err(
+                "replacement must cover every cell arc and setup/hold check exactly".into(),
+            );
+        }
+        for p in replacement.pip_classes.values() {
+            for corner in [p.base, p.fanout_adder] {
+                if corner.min_ps > corner.typ_ps || corner.typ_ps > corner.max_ps {
+                    return Err("inverted measured PIP corners".into());
+                }
+            }
+        }
+        self.speed_grades
+            .insert(replacement.name.clone(), replacement);
+        Ok(())
+    }
+
     fn metadata_string(&self, id: u32) -> &str {
         &self.metadata_strings[id as usize]
     }
@@ -5151,6 +5240,82 @@ mod tests {
     };
 
     const FIXTURE: &str = include_str!("../fixtures/minimal-ecp5.json");
+
+    #[test]
+    fn complete_timing_replacement_is_atomic_and_has_no_partial_fallback() {
+        let mut architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let original = architecture.speed_grades()["6"].clone();
+        let mut replacement = original.clone();
+        for timing in replacement.pip_classes.values_mut() {
+            timing.base.min_ps = 7;
+            timing.base.typ_ps = 8;
+            timing.base.max_ps = 9;
+        }
+        let mut missing_pip = replacement.clone();
+        missing_pip.pip_classes.remove("default");
+        assert!(architecture.replace_timing_grade(missing_pip).is_err());
+        let mut missing_arc = replacement.clone();
+        missing_arc.cells[0].arcs.pop();
+        assert!(architecture.replace_timing_grade(missing_arc).is_err());
+        let mut missing_check = replacement.clone();
+        missing_check
+            .cells
+            .iter_mut()
+            .find(|c| !c.setup_holds.is_empty())
+            .unwrap()
+            .setup_holds
+            .pop();
+        assert!(architecture.replace_timing_grade(missing_check).is_err());
+        let mut duplicate = replacement.clone();
+        duplicate.cells.push(duplicate.cells[0].clone());
+        assert!(architecture.replace_timing_grade(duplicate).is_err());
+        let mut inverted = replacement.clone();
+        inverted.pip_classes.get_mut("default").unwrap().base.min_ps = 10;
+        assert!(architecture.replace_timing_grade(inverted).is_err());
+        assert_eq!(architecture.speed_grades()["6"], original);
+        architecture
+            .replace_timing_grade(replacement.clone())
+            .unwrap();
+        assert_eq!(architecture.speed_grades()["6"], replacement);
+    }
+
+    #[test]
+    fn measured_library_removes_only_provably_absent_multiplier_arcs() {
+        let mut architecture = read_architecture(FIXTURE.as_bytes()).unwrap();
+        let mut dsp = architecture.speed_grades()["6"].cells[0].clone();
+        dsp.cell_type = "MULT18X18D:REGS=NONE".into();
+        let mut arc = dsp.arcs[0].clone();
+        arc.from_pin = "A1".into();
+        arc.to_pin = "P0".into();
+        dsp.arcs = vec![arc.clone()];
+        arc.to_pin = "P1".into();
+        dsp.arcs.push(arc.clone());
+        arc.from_pin = "SIGNEDA".into();
+        arc.to_pin = "P17".into();
+        dsp.arcs.push(arc.clone());
+        arc.to_pin = "P18".into();
+        dsp.arcs.push(arc);
+        architecture
+            .speed_grades
+            .get_mut("6")
+            .unwrap()
+            .cells
+            .push(dsp);
+        let original = architecture.speed_grades()["6"].clone();
+        assert!(architecture.replace_timing_grade(original.clone()).is_err());
+        let mut replacement = original.clone();
+        let dsp = replacement.cells.last_mut().unwrap();
+        dsp.arcs
+            .retain(|a| matches!(a.to_pin.as_str(), "P1" | "P18"));
+        let mut missing_real_arc = replacement.clone();
+        missing_real_arc.cells.last_mut().unwrap().arcs.pop();
+        assert!(architecture.replace_timing_grade(missing_real_arc).is_err());
+        assert_eq!(architecture.speed_grades()["6"], original);
+        architecture
+            .replace_timing_grade(replacement.clone())
+            .unwrap();
+        assert_eq!(architecture.speed_grades()["6"], replacement);
+    }
 
     #[derive(Clone, Copy)]
     struct TestCarryHalf {

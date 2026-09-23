@@ -3280,6 +3280,7 @@ dependencies = [
  "texo-model",
  "texo-struo",
  "texo-target-ecp5",
+ "texo-timing",
  "ureq",
  "veryl-analyzer",
  "veryl-metadata",
@@ -3293,6 +3294,7 @@ version = "0.1.7"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "struo-celox",
  "struo-ir",
  "struo-target-ecp5",

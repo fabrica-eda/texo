@@ -139,6 +139,12 @@ struct MappingArgs {
 
 #[derive(Debug, Args)]
 struct PnrArgs {
+    /// Complete measured replacement for routing, cell and setup/hold timing.
+    #[arg(long, value_name = "JSON")]
+    measured_timing_library: Option<PathBuf>,
+    /// Verified board-measured LUT-hop model; replaces guessed placement prediction.
+    #[arg(long, value_name = "JSON")]
+    measured_placement_model: Option<PathBuf>,
     /// Project directory or `Veryl.toml`.
     input: PathBuf,
     /// Top module; overrides `[synth].top`.
@@ -497,8 +503,39 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         .as_deref()
         .or_else(|| pack.as_ref().map(|pack| pack.architecture.as_path()))
         .expect("an explicit architecture or target pack was resolved");
-    let architecture = load_architecture(architecture_path)?;
+    let mut architecture = load_architecture(architecture_path)?;
+    let measured_timing = args
+        .measured_timing_library
+        .as_deref()
+        .map(|path| {
+            texo_cli::measured_timing::install(path, &mut architecture, &args.package, None)
+        })
+        .transpose()?;
+    if let Some(record) = measured_timing.as_ref() {
+        let guard = record["required_setup_hold_guard_ps"]
+            .as_u64()
+            .ok_or("measured guard missing")?;
+        if args.setup_uncertainty_ps < guard || args.hold_uncertainty_ps < guard {
+            return Err(format!(
+                "measured STA requires setup and hold uncertainty of at least {guard} ps"
+            )
+            .into());
+        }
+        let expected = if args.speed == "8" && architecture.device().name().starts_with("LFE5UM5G")
+        {
+            "8_5G"
+        } else {
+            args.speed.as_str()
+        };
+        if record["timing_grade"].as_str() != Some(expected) {
+            return Err(
+                "measured timing grade does not match requested speed; legacy fallback forbidden"
+                    .into(),
+            );
+        }
+    }
     if let Some(saved) = &resumed {
+        saved.validate_timing_selection(measured_timing.as_ref())?;
         saved.validate_target(&architecture, &args.package)?;
     }
     println!(
@@ -510,7 +547,14 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
+    let measured_model = args
+        .measured_placement_model
+        .as_deref()
+        .map(texo_flow::MeasuredPlacementModel::load)
+        .transpose()?;
     let mut options = Ecp5FlowOptions {
+        measured_placement_model: measured_model.as_ref(),
+        measured_timing: measured_timing.as_ref(),
         post_map_simulation: PostMapSimulationPolicy::AllowMissing,
         speed_grade: Some(&args.speed),
         package: Some(&args.package),

@@ -29,6 +29,7 @@ veryl-parser.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+texo-timing.workspace = true
 celox.workspace = true
 struo-celox.workspace = true
 struo-example-axi4-smartconnect.workspace = true
