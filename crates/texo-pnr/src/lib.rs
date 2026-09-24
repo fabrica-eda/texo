@@ -7496,6 +7496,31 @@ fn route(
     progress: &mut impl FnMut(RoutingProgress),
 ) -> Result<Vec<Arc<NetRoute>>, PnrError> {
     let design = graph.design();
+    // These trees cannot be released by congestion negotiation. Treat their
+    // saturated resources as hard obstacles to other trees from the first
+    // search, rather than repeatedly charging penalties for an impossible
+    // displacement. An owning partial tree is already among its net's search
+    // starts, so it can still grow branches from its mandatory resources.
+    let fixed_occupancy = (!constraints.routes.is_empty()).then(|| {
+        let mut wires = vec![0_u16; graph.device().wires().len()];
+        let mut pips = vec![0_u16; graph.device().pips().len()];
+        for route in constraints.routes.values() {
+            for wire in route.wires() {
+                wires[wire.0] += 1;
+            }
+            for pip in route.pips() {
+                pips[pip.0] += 1;
+            }
+        }
+        (wires, pips)
+    });
+    let hard_fixed = fixed_occupancy
+        .as_ref()
+        .map(|(wires, pips)| HardRoutingOccupancy {
+            wires,
+            pips,
+            use_estimate: true,
+        });
     let metadata = RoutingResourceMetadata {
         wire_points: &workspace.wire_points,
         wire_capacities: &workspace.wire_capacities,
@@ -7643,7 +7668,7 @@ fn route(
                 wire_congestion,
                 pip_congestion,
                 constraints.blocked_pip_words(),
-                None,
+                hard_fixed,
                 None,
                 iteration == 0,
                 costs,
@@ -12928,6 +12953,26 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_routing_avoids_immutable_capacity_on_the_first_iteration() {
+        let fixture = net_cohort_eco_fixture();
+        let mut constraints = RoutingConstraints::new();
+        constraints.add_route(fixture.incumbent.routes[1].clone());
+        constraints.add_route(fixture.incumbent.routes[2].clone());
+        let mut costs = fixture.costs.clone();
+        costs.set_max_iterations(1);
+        let routed = route_with_timing_costs_and_progress(
+            &fixture.design,
+            &fixture.device,
+            fixture.incumbent.placement.clone(),
+            &constraints,
+            &costs,
+            |_| {},
+        )
+        .expect("the locked owner's capacity cannot become available in later iterations");
+        assert_eq!(routed.routes, fixture.incumbent.routes);
+    }
+
+    #[test]
     fn whole_net_eco_rebuilds_a_shared_slow_prefix_transactionally() {
         let fixture = whole_net_eco_fixture();
         let before = fixture.incumbent.clone();
@@ -15995,6 +16040,7 @@ mod tests {
 
         let mut immutable = RoutingConstraints::new();
         immutable.add_route(seed.clone());
+        let mut fixed_iterations = Vec::new();
         let fixed = super::route_with_initial_routes_workspace_and_progress(
             &design,
             &device,
@@ -16003,9 +16049,18 @@ mod tests {
             &[seed],
             None,
             &mut workspace,
-            |_| {},
+            |event| {
+                if let super::RoutingProgress::Iteration { iteration, .. } = event {
+                    fixed_iterations.push(iteration);
+                }
+            },
         );
-        assert!(matches!(fixed, Err(PnrError::CongestionNotResolved { .. })));
+        assert!(matches!(fixed, Err(PnrError::Unroutable { net, .. }) if net == "bottlenecked"));
+        assert_eq!(
+            fixed_iterations,
+            [0],
+            "an immutable blockage cannot be negotiated away"
+        );
     }
 
     #[test]
