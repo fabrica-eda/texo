@@ -1574,10 +1574,10 @@ impl TimingFeedbackContext<'_, '_, '_> {
             }
             let mut cells = cells.into_iter().collect::<Vec<_>>();
             cells.sort_unstable_by_key(|&(cell, (slack, delay))| (slack, Reverse(delay), cell));
-            // Try every cell's nearby moves before a wide relocation can
-            // consume the budget. In particular, a critical BRAM must not
-            // starve small LUT moves on the same path.
-            for radius in [2, 4, 8, 256] {
+            // Visit each cell/radius before spending the budget on another
+            // candidate for the same pair. Failed nearby alternatives must not
+            // starve independent critical cells or wider relocations.
+            for (radius, candidate_rank) in local_setup_search_order() {
                 for &(cell, _) in &cells {
                     if self.setup_budget.exhausted() {
                         return Ok(());
@@ -1626,7 +1626,7 @@ impl TimingFeedbackContext<'_, '_, '_> {
                             radius,
                             8,
                         )?;
-                    for placement in candidates {
+                    for placement in candidates.into_iter().skip(candidate_rank).take(1) {
                         if self.setup_budget.exhausted() {
                             return Ok(());
                         }
@@ -1735,20 +1735,10 @@ impl TimingFeedbackContext<'_, '_, '_> {
                                     cell.0
                                 );
                             }
-                            // Moving ordinary neighbors needs more negotiation
-                            // than a trial against a fixed background. Keep that
-                            // fallback bounded, but allow congestion to settle.
-                            // A BRAM relocation changes both wide data ports and
-                            // many address/control branches. Board runs reduced
-                            // >1,500 conflicting nets to four by iteration 32;
-                            // retain the normal budget for these larger trials.
-                            let retry_limit =
-                                if self.design.cells()[cell.0].kind == ResourceKind::Memory {
-                                    previous_max_iterations
-                                } else {
-                                    previous_max_iterations.min(32)
-                                };
-                            routing_costs.set_max_iterations(retry_limit);
+                            // Detailed timing costs can spread a local conflict
+                            // across the retained fabric. Retry with ordinary
+                            // congestion routing and its normal iteration limit.
+                            // Full STA below still decides acceptance.
                             let seeds = frozen.routes().values().cloned().collect::<Vec<_>>();
                             routed_candidate = route_with_initial_routes_workspace_and_progress(
                                 self.design,
@@ -1756,7 +1746,7 @@ impl TimingFeedbackContext<'_, '_, '_> {
                                 placement,
                                 &routing,
                                 &seeds,
-                                Some(routing_costs),
+                                None,
                                 self.routing_workspace,
                                 |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
                             );
@@ -3049,6 +3039,10 @@ fn freeze_unchanged_routes(
         }
     }
     frozen
+}
+
+fn local_setup_search_order() -> impl Iterator<Item = (u64, usize)> {
+    (0..8).flat_map(|rank| [2, 4, 8, 256].into_iter().map(move |radius| (radius, rank)))
 }
 
 fn criticality_weight(urgency: i128, period_ps: i128) -> u64 {
@@ -7001,6 +6995,28 @@ mod tests {
                 assert_eq!(frozen.routes()[&fanout].arcs, vec![arcs[1].clone()]);
             }
             assert_eq!(implementation, before);
+        }
+    }
+
+    #[test]
+    fn local_setup_search_reaches_wide_moves_before_repeating_nearby_candidates() {
+        let order = super::local_setup_search_order().collect::<Vec<_>>();
+        let wide = order
+            .iter()
+            .position(|&(radius, rank)| radius == 256 && rank == 0)
+            .unwrap();
+        let second_near = order
+            .iter()
+            .position(|&(radius, rank)| radius == 2 && rank == 1)
+            .unwrap();
+        assert!(wide < second_near);
+        let unique = order.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(unique.len(), 32);
+        assert_eq!(order[0], (2, 0));
+        for radius in [2, 4, 8, 256] {
+            for rank in 0..8 {
+                assert!(unique.contains(&(radius, rank)));
+            }
         }
     }
 
