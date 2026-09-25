@@ -4066,13 +4066,98 @@ fn analytical_place(
             reason: format!("electrostatic global placement failed: {error:?}"),
         })?
     };
-    let placed = legalization::project(graph, constraints, units, spatial_indexes, &targets)?;
+    let placed = if let Some((anchor, _)) = anchor {
+        project_anchored_targets(graph, constraints, units, spatial_indexes, &targets, anchor)
+    } else {
+        legalization::project(graph, constraints, units, spatial_indexes, &targets)?
+    };
     if global_placement == AnalyticalGlobalPlacement::Electrostatic
         && std::env::var_os("TEXO_PNR_METRICS").is_some()
     {
         emit_eplace_legalization_metrics(graph, units, &targets, &placed);
     }
     finish_placement(graph, constraints, placed)
+}
+
+/// Project a timing proposal from its legal incumbent, retaining each exact
+/// assignment unless a free, resource-compatible assignment is closer to the
+/// unit's proposed tile. Rebuilding an auction from empty occupancy loses BEL
+/// identity even when every continuous target rounds to its original tile.
+fn project_anchored_targets(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    units: &[PlacementUnit],
+    spatial_indexes: &BTreeMap<(u8, usize), Arc<SpatialChoiceIndex>>,
+    targets: &[Point],
+    anchor: &Placement,
+) -> Vec<Option<BelId>> {
+    let device = graph.device();
+    let mut placed = vec![None; graph.design().cells().len()];
+    let mut occupied = BTreeSet::new();
+    let mut usage = PlacementResourceUsage::default();
+    for unit in units {
+        let assignment = unit
+            .cells
+            .iter()
+            .map(|cell| anchor.bindings()[cell.0])
+            .collect::<Vec<_>>();
+        install_assignment(
+            graph,
+            constraints,
+            unit,
+            &assignment,
+            &mut placed,
+            &mut occupied,
+            &mut usage,
+        );
+    }
+    let mut order = (0..units.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&index| {
+        let origin = device.bels()[anchor.bindings()[units[index].cells[0].0].0].point;
+        (Reverse(origin.manhattan(targets[index])), index)
+    });
+    for index in order {
+        let unit = &units[index];
+        if unit.choices.len() == 1 {
+            continue;
+        }
+        let old = unit
+            .cells
+            .iter()
+            .map(|cell| placed[cell.0].expect("complete incumbent"))
+            .collect::<Vec<_>>();
+        let distance = device.bels()[old[0].0].point.manhattan(targets[index]);
+        if distance == 0 {
+            continue;
+        }
+        update_placement_resource_usage(graph, constraints, &unit.cells, &old, &mut usage, false);
+        for (&cell, &bel) in unit.cells.iter().zip(&old) {
+            occupied.remove(&bel);
+            placed[cell.0] = None;
+        }
+        let spatial_index = &spatial_indexes[&unit.choices.cache_key()];
+        let selected = spatial_choices_within(spatial_index, targets[index], distance - 1, device)
+            .into_iter()
+            .find_map(|choice| {
+                let assignment = unit.choices.assignment(choice);
+                if assignment.iter().any(|bel| occupied.contains(bel)) {
+                    return None;
+                }
+                assignment_resources_are_legal(graph, constraints, &unit.cells, assignment, &usage)
+                    .then_some(assignment)
+            })
+            .unwrap_or(&old);
+        install_assignment(
+            graph,
+            constraints,
+            unit,
+            selected,
+            &mut placed,
+            &mut occupied,
+            &mut usage,
+        );
+    }
+    placed
 }
 
 #[derive(Default)]
@@ -14380,6 +14465,98 @@ mod tests {
             .unwrap();
 
         assert_eq!(refined, initial);
+    }
+
+    #[test]
+    fn anchored_projection_preserves_existing_bels_at_unchanged_tile_targets() {
+        let design = two_cell_design();
+        let mut device = Device::new("same-tile-anchor", 1, 1).unwrap();
+        for index in 0..2 {
+            let point = Point::new(0, 0);
+            let bel = device
+                .add_bel(format!("bel-{index}"), ResourceKind::Logic, point)
+                .unwrap();
+            for (name, direction) in [("in", PinDirection::Input), ("out", PinDirection::Output)] {
+                let wire = device
+                    .add_wire(format!("{index}-{name}"), point, 1)
+                    .unwrap();
+                device.add_bel_pin(bel, name, direction, wire).unwrap();
+            }
+        }
+        let constraints = PlacementConstraints::new();
+        let refiner = PlacementRefiner::new(&design, &device, &constraints).unwrap();
+        for bindings in [vec![BelId(0), BelId(1)], vec![BelId(1), BelId(0)]] {
+            let anchor =
+                placement_from_complete_bindings(&design, &device, &constraints, bindings).unwrap();
+            let projected = refiner
+                .place_analytically_anchored(&BTreeMap::new(), &anchor, 100)
+                .unwrap();
+            assert_eq!(
+                projected.bindings(),
+                anchor.bindings(),
+                "an unchanged tile target must not permute routed BELs"
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_projection_moves_whole_groups_and_preserves_shared_resources() {
+        for shared_conflict in [false, true] {
+            let mut design = two_cell_design();
+            let (fixed, _, _) = add_equivalent_logic_cell(&mut design, "fixed");
+            let device = Device::rectangular_logic(5, 1).unwrap();
+            let mut constraints = PlacementConstraints::new();
+            constraints.add_group(
+                [CellId(0), CellId(1)],
+                [
+                    vec![BelId(0), BelId(1)],
+                    vec![BelId(2), BelId(3)],
+                    vec![BelId(3), BelId(4)],
+                ],
+            );
+            constraints.add_group([fixed], [vec![BelId(4)]]);
+            if shared_conflict {
+                constraints.add_shared_resource(
+                    [(CellId(0), 0), (fixed, 1)],
+                    [(BelId(0), 0), (BelId(2), 1), (BelId(4), 1)],
+                );
+            }
+            let anchor = placement_from_complete_bindings(
+                &design,
+                &device,
+                &constraints,
+                vec![BelId(0), BelId(1), BelId(4)],
+            )
+            .unwrap();
+            let refiner = PlacementRefiner::new(&design, &device, &constraints).unwrap();
+            let targets = refiner
+                .units
+                .iter()
+                .map(|unit| {
+                    if unit.cells.contains(&CellId(0)) {
+                        Point::new(3, 0)
+                    } else {
+                        Point::new(4, 0)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let projected = super::project_anchored_targets(
+                &refiner.graph,
+                &constraints,
+                &refiner.units,
+                &refiner.spatial_indexes,
+                &targets,
+                &anchor,
+            );
+            let placed = super::finish_placement(&refiner.graph, &constraints, projected).unwrap();
+            assert_eq!(placed.bel(fixed), Some(BelId(4)));
+            let expected = if shared_conflict {
+                [BelId(0), BelId(1)]
+            } else {
+                [BelId(2), BelId(3)]
+            };
+            assert_eq!(&placed.bindings()[..2], &expected);
+        }
     }
 
     #[test]
