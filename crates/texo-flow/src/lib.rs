@@ -766,12 +766,13 @@ pub fn implement_struo_ecp5_with_progress(
         })
         .transpose()?;
     if timing_routing_costs.is_none() && use_timing_route {
-        // Physical PIP costs come from the installed measured table. Actual
-        // routed STA supplies criticalities immediately after the first route.
+        // Use installed PIP delays with a uniform timing-enabled priority.
+        // Empty priorities select hop-first routing despite these costs.
+        // Actual routed STA supplies path criticalities after the first route.
         timing_routing_costs = Some(ecp5_routing_costs(
             architecture,
             speed_grade,
-            BTreeMap::new(),
+            initial_measured_net_weights(&design),
         )?);
     }
     let mut routing = packing.global_routing_constraints_cached(
@@ -2649,6 +2650,15 @@ fn route_hold_trial(
     )?;
     progress(timing_snapshot(&report));
     Ok(Some((routed, report)))
+}
+
+// Priority zero selects hop-first search. Use the minimum timing-enabled
+// priority uniformly until actual STA supplies per-net criticalities. This
+// enables installed PIP delays without inventing estimated path slack.
+fn initial_measured_net_weights(design: &Design) -> BTreeMap<NetId, u64> {
+    (0..design.nets().len())
+        .map(|index| (NetId(index), 1))
+        .collect()
 }
 
 fn ecp5_routing_costs(
@@ -6380,6 +6390,73 @@ mod tests {
             worst_setup_route_eco_cohort(&design, candidate),
             vec![first_net, second_net],
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn initial_measured_routing_uses_installed_delays_without_estimated_slack() {
+        let mut device = Device::new("measured_initial_costs", 3, 1).unwrap();
+        let mut design = Design::new();
+        let mut bindings = BTreeMap::new();
+        let mut pins = Vec::new();
+        for x in [0, 2] {
+            let direction = if x == 0 {
+                PinDirection::Output
+            } else {
+                PinDirection::Input
+            };
+            let wire = device
+                .add_wire(format!("w{x}"), Point::new(x, 0), 1)
+                .unwrap();
+            let bel = device
+                .add_bel(format!("b{x}"), ResourceKind::Logic, Point::new(x, 0))
+                .unwrap();
+            device.add_bel_pin(bel, "P", direction, wire).unwrap();
+            let cell = design.add_cell(format!("c{x}"), ResourceKind::Logic);
+            pins.push(design.add_pin(cell, "P", direction).unwrap());
+            bindings.insert(cell, bel);
+        }
+        let fast = device.add_wire("fast", Point::new(1, 0), 1).unwrap();
+        device.add_pip(WireId(0), WireId(1), false, 1).unwrap();
+        device.add_pip(WireId(0), fast, false, 1).unwrap();
+        device.add_pip(fast, WireId(1), false, 1).unwrap();
+        let net = design.add_net("data", pins[0], [pins[1]]).unwrap();
+        let placement = placement_from_partial_bindings(
+            &design,
+            &device,
+            &PlacementConstraints::new(),
+            &bindings,
+        )
+        .unwrap();
+        // A slow direct PIP competes with a faster two-PIP detour. Swap only
+        // the table: timing must outrank hop count, not merely break hop ties.
+        for delays in [vec![2000, 50, 50], vec![50, 1000, 1000]] {
+            let mut costs = super::RoutingCosts::new(
+                delays.clone(),
+                super::initial_measured_net_weights(&design),
+            );
+            costs.set_pip_min_delays_ps(delays.iter().map(|d| d - 10).collect());
+            let before = costs.clone();
+            let implementation = texo_pnr::route_with_timing_costs_and_progress(
+                &design,
+                &device,
+                placement.clone(),
+                &RoutingConstraints::new(),
+                &costs,
+                |_| {},
+            )
+            .unwrap();
+            let delay = implementation.routes[net.0]
+                .pips()
+                .map(|pip| delays[pip.0])
+                .sum::<u32>();
+            assert_eq!(
+                delay,
+                delays[0].min(delays[1] + delays[2]),
+                "empty priorities prioritize hops over installed delay costs"
+            );
+            assert_eq!(costs, before);
+        }
     }
 
     #[test]
