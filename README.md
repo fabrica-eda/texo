@@ -148,6 +148,10 @@ trees, placement and hold-repair moves are disabled; route-only setup repair
 retains those trees, and any remaining timing deficit is reported. Without a
 preserve list, ordinary initial trees remain advisory and placement repair is
 allowed.
+Route records can optionally select reusable sink branches and supply initial
+routing priorities through `advisory_sink_wire_ids` and
+`advisory_sink_criticalities`; see [incremental closure](docs/incremental-closure.md).
+Omitted sinks still require legal routing and fresh STA.
 
 For a compatible checkpoint, `--resume-checkpoint checkpoint.json` imports
 placement and routes together. Fresh synthesis, routing checks and routed STA

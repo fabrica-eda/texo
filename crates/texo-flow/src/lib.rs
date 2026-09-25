@@ -789,6 +789,15 @@ pub fn implement_struo_ecp5_with_progress(
             routes,
             &mut routing,
         )?;
+        if let Some(costs) = timing_routing_costs.as_mut() {
+            initial_routing::apply_advisory_weights(
+                &design,
+                architecture.device(),
+                &placement,
+                routes,
+                costs,
+            )?;
+        }
     }
     initial_routing::preserve_routes(
         &design,
