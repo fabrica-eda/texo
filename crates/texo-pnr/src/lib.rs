@@ -10068,8 +10068,8 @@ struct RouteSearch {
     /// Epoch-stamped members of the currently growing tree. Replaces
     /// `starts.contains` on every edge relaxation with one array load.
     start_mark: Vec<u32>,
-    distance: Vec<u32>,
-    arrival_ps: Vec<u32>,
+    distance: Vec<u64>,
+    arrival_ps: Vec<u64>,
     previous_wire: Vec<u32>,
     previous_pip: Vec<u32>,
     /// Frontier storage retained across sink and placement trials. Large
@@ -10084,31 +10084,20 @@ struct RouteSearch {
 
 /// Lexicographically ordered `(estimate, distance, arrival, wire)` A* key.
 ///
-/// Packing the four `u32` fields most-significant-field first preserves the
-/// tuple's exact ordering while reducing each heap comparison to at most two
-/// 64-bit comparisons on 64-bit targets instead of up to four field
-/// comparisons. The entry remains 16 bytes, so queue capacity growth has the
-/// same byte footprint.
-type RouteQueueEntry = u128;
+/// Negotiated congestion accumulates across the path and is scaled to the
+/// timing quantum. Even with u32 per-resource costs, its sum can exceed u32.
+/// Preserve full-width costs and arrival times instead of truncating or
+/// saturating distinct route priorities into the same value.
+type RouteQueueEntry = (u64, u64, u64, u32);
 
 #[inline]
-fn route_queue_entry(estimate: u32, distance: u32, arrival: u32, wire: u32) -> RouteQueueEntry {
-    (u128::from(estimate) << 96)
-        | (u128::from(distance) << 64)
-        | (u128::from(arrival) << 32)
-        | u128::from(wire)
+fn route_queue_entry(estimate: u64, distance: u64, arrival: u64, wire: u32) -> RouteQueueEntry {
+    (estimate, distance, arrival, wire)
 }
 
 #[inline]
-#[allow(clippy::cast_possible_truncation)]
-fn route_queue_payload(entry: RouteQueueEntry) -> (u32, u32, u32) {
-    ((entry >> 64) as u32, (entry >> 32) as u32, entry as u32)
-}
-
-fn compact_route_value(value: u64) -> u32 {
-    value
-        .try_into()
-        .expect("physical route delay and cost fit u32")
+fn route_queue_payload(entry: RouteQueueEntry) -> (u64, u64, u32) {
+    (entry.1, entry.2, entry.3)
 }
 
 fn compact_route_index(index: usize) -> u32 {
@@ -10337,8 +10326,8 @@ impl RouteSearch {
             }
             let arrival_ps = tree_delays_ps[start.0];
             let distance = timing_tree_cost(arrival_ps, criticality, delay_quantum_ps);
-            let compact_arrival = compact_route_value(arrival_ps);
-            let compact_distance = compact_route_value(distance);
+            let compact_arrival = arrival_ps;
+            let compact_distance = distance;
             self.seen[start.0] = epoch;
             self.distance[start.0] = compact_distance;
             self.arrival_ps[start.0] = compact_arrival;
@@ -10355,7 +10344,7 @@ impl RouteSearch {
                 distance
             };
             self.queue.push(Reverse(route_queue_entry(
-                compact_route_value(estimate),
+                estimate,
                 compact_distance,
                 compact_arrival,
                 compact_route_index(start.0),
@@ -10371,8 +10360,8 @@ impl RouteSearch {
             {
                 continue;
             }
-            let distance = u64::from(compact_distance);
-            let arrival_ps = u64::from(compact_arrival);
+            let distance = compact_distance;
+            let arrival_ps = compact_arrival;
             if wire == goal {
                 let mut path_wires = vec![wire];
                 let mut path_pips = Vec::new();
@@ -10429,8 +10418,8 @@ impl RouteSearch {
                     )
                 };
                 let next_distance = distance.saturating_add(step);
-                let compact_next_distance = compact_route_value(next_distance);
-                let compact_next_arrival = compact_route_value(next_arrival_ps);
+                let compact_next_distance = next_distance;
+                let compact_next_arrival = next_arrival_ps;
                 if neighbor == goal && next_arrival_ps < minimum_arrival_ps {
                     continue;
                 }
@@ -10456,7 +10445,7 @@ impl RouteSearch {
                     next_distance
                 };
                 self.queue.push(Reverse(route_queue_entry(
-                    compact_route_value(estimate),
+                    estimate,
                     compact_next_distance,
                     compact_next_arrival,
                     compact_route_index(neighbor.0),
@@ -14909,18 +14898,18 @@ mod tests {
     }
 
     #[test]
-    fn route_frontier_entry_stays_compact() {
-        assert_eq!(std::mem::size_of::<RouteQueueEntry>(), 16);
+    fn route_frontier_entry_preserves_full_width_costs() {
+        assert_eq!(std::mem::size_of::<RouteQueueEntry>(), 32);
     }
 
     #[test]
-    fn packed_route_frontier_preserves_tuple_order_and_payload() {
-        let values = [0, 1, 0x7fff_ffff, u32::MAX];
+    fn route_frontier_preserves_tuple_order_and_payload() {
+        let values = [0, 1, u64::from(u32::MAX), u64::from(u32::MAX) + 1, u64::MAX];
         let mut entries = Vec::new();
         for estimate in values {
             for distance in values {
                 for arrival in values {
-                    for wire in values {
+                    for wire in [0, 1, u32::MAX] {
                         let tuple = (estimate, distance, arrival, wire);
                         let packed = route_queue_entry(estimate, distance, arrival, wire);
                         assert_eq!(route_queue_payload(packed), (distance, arrival, wire));
@@ -14985,6 +14974,65 @@ mod tests {
                 Some(&costs),
                 64,
                 50,
+                &tree_delays,
+                0,
+                metadata,
+            )
+            .unwrap();
+
+        assert_eq!(wires.last(), Some(&fast_tree));
+        assert_ne!(wires.last(), Some(&WireId(0)));
+    }
+
+    #[test]
+    fn timing_routing_keeps_costs_above_u32_distinct() {
+        let design = Design::new();
+        let mut device = Device::new("tree-delay", 1, 1).unwrap();
+        let slow_tree = device.add_wire("slow-tree", Point::new(0, 0), 1).unwrap();
+        let fast_tree = device.add_wire("fast-tree", Point::new(0, 0), 1).unwrap();
+        let goal = device.add_wire("goal", Point::new(0, 0), 1).unwrap();
+        device.add_pip(slow_tree, goal, false, 1).unwrap();
+        device.add_pip(fast_tree, goal, false, 1).unwrap();
+        let graph = UnifiedGraph::new(&design, &device);
+        let costs = RoutingCosts::new(vec![10, 10], BTreeMap::new());
+        let mut search = RouteSearch::new(device.wires().len());
+        let starts = [slow_tree, fast_tree].into_iter().collect();
+        let tree_delays = vec![0, 0];
+        let wire_points = device
+            .wires()
+            .iter()
+            .map(|wire| wire.point)
+            .collect::<Vec<_>>();
+        let wire_capacities = device
+            .wires()
+            .iter()
+            .map(|wire| wire.capacity)
+            .collect::<Vec<_>>();
+        let pip_capacities = device
+            .pips()
+            .iter()
+            .map(texo_model::Pip::capacity)
+            .collect::<Vec<_>>();
+        let metadata = RoutingResourceMetadata {
+            wire_points: &wire_points,
+            wire_capacities: &wire_capacities,
+            pip_capacities: &pip_capacities,
+        };
+
+        let (wires, _) = search
+            .shortest_path(
+                &graph,
+                &starts,
+                None,
+                goal,
+                &[0; 3],
+                &[u32::MAX, u32::MAX - 1],
+                &[],
+                None,
+                None,
+                Some(&costs),
+                64,
+                1,
                 &tree_delays,
                 0,
                 metadata,
