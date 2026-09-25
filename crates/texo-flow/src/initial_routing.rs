@@ -2,15 +2,23 @@
 //! nor evidence from the input checkpoint is trusted; the normal router and STA
 //! verify the fresh design, placement, occupancy and constraints.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 use texo_model::{CellPinId, Design, Device, NetId, PipId, WireId};
-use texo_pnr::{NetRoute, Placement, PnrError, RoutingConstraints};
+use texo_pnr::{NetRoute, Placement, PnrError, RoutingConstraints, RoutingCosts};
 
 /// A named physical tree from a schema-v3 checkpoint.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Ecp5InitialRoute {
+    /// Optional endpoints of an advisory subtree. Omitted design sinks must
+    /// still be connected by ordinary routing before sign-off.
+    #[serde(default)]
+    advisory_sink_wire_ids: Option<Vec<usize>>,
+    /// Search priorities only, keyed by current physical sink wire. These do
+    /// not supply delays or timing evidence and are replaced after routed STA.
+    #[serde(default)]
+    advisory_sink_criticalities: BTreeMap<usize, u64>,
     net: String,
     driver_wire: String,
     driver_wire_id: usize,
@@ -143,7 +151,26 @@ pub(super) fn import_routes(
                     .ok_or_else(|| invalid(format!("initial sink {} has no physical pin", pin.0)))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let route = NetRoute::from_tree(net_id, driver, sinks, pips, device).map_err(invalid)?;
+        let sinks = select_imported_sinks(
+            record,
+            net_id,
+            sinks,
+            routing.routes().contains_key(&net_id),
+        )?;
+        let mut route =
+            NetRoute::from_tree(net_id, driver, sinks, pips, device).map_err(invalid)?;
+        if record.advisory_sink_wire_ids.is_some() {
+            // from_tree validates every supplied PIP before obsolete branches
+            // are discarded. They must not survive as immutable topology arcs.
+            route = NetRoute::new(
+                net_id,
+                route
+                    .arcs
+                    .into_iter()
+                    .filter(|arc| arc.sink.is_some())
+                    .collect(),
+            );
+        }
         if let Some(required) = routing.routes().get(&net_id) {
             let imported_pips = route.pips().collect::<BTreeSet<_>>();
             if required.pips().any(|pip| !imported_pips.contains(&pip)) {
@@ -179,15 +206,124 @@ pub(super) fn preserve_routes(
             if !seen.insert(name) {
                 return Err(invalid(format!("duplicate preserved initial route {name}")));
             }
-            by_name
+            let route = by_name
                 .get(name.as_str())
                 .copied()
-                .ok_or_else(|| invalid(format!("preserved route {name} has no initial tree")))
+                .ok_or_else(|| invalid(format!("preserved route {name} has no initial tree")))?;
+            if design.nets()[route.net.0]
+                .sinks
+                .iter()
+                .any(|&sink| route.arc(sink).is_none())
+            {
+                return Err(invalid(format!(
+                    "preserved route {name} has incomplete endpoints"
+                )));
+            }
+            Ok(route)
         })
         .collect::<Result<Vec<_>, _>>()?;
     for route in selected {
         immutable.add_route(std::sync::Arc::clone(route));
     }
+    Ok(())
+}
+
+fn select_imported_sinks(
+    record: &Ecp5InitialRoute,
+    net: NetId,
+    mut sinks: Vec<(CellPinId, WireId)>,
+    mandatory: bool,
+) -> Result<Vec<(CellPinId, WireId)>, PnrError> {
+    let invalid = |reason| PnrError::InvalidRoutingConstraint { net, reason };
+    if let Some(ids) = &record.advisory_sink_wire_ids {
+        if mandatory {
+            return Err(invalid(
+                "partial endpoints require a non-mandatory advisory route".into(),
+            ));
+        }
+        let requested = ids.iter().copied().collect::<BTreeSet<_>>();
+        let available = sinks
+            .iter()
+            .map(|(_, wire)| wire.0)
+            .collect::<BTreeSet<_>>();
+        if requested.is_empty() || requested.len() != ids.len() || !requested.is_subset(&available)
+        {
+            return Err(invalid(
+                "partial endpoints must name distinct current sink wires".into(),
+            ));
+        }
+        sinks.retain(|(_, wire)| requested.contains(&wire.0));
+    }
+    Ok(sinks)
+}
+
+// Called only after import_routes has checked driver identity and topology.
+// Merge by maximum so an advisory priority cannot weaken a freshly predicted
+// criticality. Missing sinks and values outside the router's range are errors.
+pub(super) fn apply_advisory_weights(
+    design: &Design,
+    device: &Device,
+    placement: &Placement,
+    records: &[Ecp5InitialRoute],
+    costs: &mut RoutingCosts,
+) -> Result<(), PnrError> {
+    let names = design
+        .nets()
+        .iter()
+        .enumerate()
+        .map(|(id, net)| (net.name.as_str(), NetId(id)))
+        .collect::<BTreeMap<_, _>>();
+    let mut nets = costs.net_criticalities().clone();
+    let mut sinks = costs.sink_criticalities().clone();
+    for record in records {
+        if record.advisory_sink_criticalities.is_empty() {
+            continue;
+        }
+        let net =
+            *names
+                .get(record.net.as_str())
+                .ok_or_else(|| PnrError::InvalidRoutingRestriction {
+                    reason: "advisory weight names an unknown net".into(),
+                })?;
+        let invalid = || PnrError::InvalidRoutingConstraint {
+            net,
+            reason: "advisory criticalities require current sink wires and weights in 1..=64"
+                .into(),
+        };
+        if record
+            .advisory_sink_criticalities
+            .values()
+            .any(|weight| !(1..=64).contains(weight))
+        {
+            return Err(invalid());
+        }
+        let mut seen = BTreeSet::new();
+        for &sink in &design.nets()[net.0].sinks {
+            let wire = pin_wire(design, device, placement, sink).ok_or_else(invalid)?;
+            if let Some(&weight) = record.advisory_sink_criticalities.get(&wire.0) {
+                seen.insert(wire.0);
+                let existing = costs
+                    .sink_criticalities()
+                    .get(&(net, sink))
+                    .or_else(|| costs.net_criticalities().get(&net))
+                    .copied()
+                    .unwrap_or(1);
+                let weight = weight.max(existing);
+                sinks
+                    .entry((net, sink))
+                    .and_modify(|old| *old = (*old).max(weight))
+                    .or_insert(weight);
+                nets.entry(net)
+                    .and_modify(|old| *old = (*old).max(weight))
+                    .or_insert(weight);
+            }
+        }
+        if seen.len() != record.advisory_sink_criticalities.len() {
+            return Err(invalid());
+        }
+    }
+    costs.set_net_criticalities(nets);
+    costs.set_sink_criticalities(sinks);
     Ok(())
 }
 
@@ -231,6 +367,8 @@ mod tests {
         )
         .unwrap();
         let record = Ecp5InitialRoute {
+            advisory_sink_wire_ids: None,
+            advisory_sink_criticalities: BTreeMap::new(),
             net: "data".into(),
             driver_wire: "w0".into(),
             driver_wire_id: 0,
@@ -244,6 +382,136 @@ mod tests {
             }],
         };
         (design, device, placement, record)
+    }
+
+    fn route_seeded(
+        design: &Design,
+        device: &Device,
+        placement: Placement,
+        seeds: &RoutingConstraints,
+    ) -> Result<texo_pnr::PnrResult, PnrError> {
+        texo_pnr::route_with_initial_routes_workspace_and_progress(
+            design,
+            device,
+            placement,
+            &RoutingConstraints::new(),
+            &seeds.routes().values().cloned().collect::<Vec<_>>(),
+            None,
+            &mut texo_pnr::RoutingWorkspace::new(device),
+            |_| {},
+        )
+    }
+
+    #[test]
+    fn partial_advisory_tree_preserves_old_sink_and_routes_new_sink() {
+        let (design, mut device, placement, mut record) = fixture(true);
+        device.add_pip(WireId(1), WireId(2), false, 1).unwrap();
+        record.advisory_sink_wire_ids = Some(vec![1]);
+        let mut constraints = RoutingConstraints::new();
+        import_routes(&design, &device, &placement, &[record], &mut constraints).unwrap();
+        let old = constraints.routes()[&NetId(0)]
+            .arc(CellPinId(1))
+            .unwrap()
+            .clone();
+        assert!(constraints.routes()[&NetId(0)].arc(CellPinId(2)).is_none());
+        let result = route_seeded(&design, &device, placement, &constraints).unwrap();
+        assert_eq!(result.routes[0].arc(CellPinId(1)), Some(&old));
+        assert!(result.routes[0].arc(CellPinId(2)).is_some());
+        assert_eq!(result.total_pips, 2);
+    }
+
+    #[test]
+    fn partial_advisory_endpoints_do_not_hide_invalid_or_unroutable_sinks() {
+        let (design, device, placement, mut record) = fixture(true);
+        for endpoints in [vec![], vec![1, 1], vec![99], vec![2]] {
+            record.advisory_sink_wire_ids = Some(endpoints);
+            assert!(
+                import_routes(
+                    &design,
+                    &device,
+                    &placement,
+                    &[record.clone()],
+                    &mut RoutingConstraints::new()
+                )
+                .is_err()
+            );
+        }
+        record.advisory_sink_wire_ids = Some(vec![1]);
+        let mut constraints = RoutingConstraints::new();
+        import_routes(
+            &design,
+            &device,
+            &placement,
+            &[record.clone()],
+            &mut constraints,
+        )
+        .unwrap();
+        // The missing second sink has no physical path in this fixture.
+        assert!(route_seeded(&design, &device, placement.clone(), &constraints).is_err());
+        assert!(
+            preserve_routes(
+                &design,
+                &["data".into()],
+                &constraints,
+                &mut RoutingConstraints::new()
+            )
+            .is_err()
+        );
+        let required = constraints.routes()[&NetId(0)].clone();
+        let mut locked = RoutingConstraints::new();
+        locked.add_route(required);
+        assert!(import_routes(&design, &device, &placement, &[record], &mut locked).is_err());
+    }
+
+    #[test]
+    fn partial_advisory_tree_discards_obsolete_topology_leaves() {
+        let (design, mut device, placement, mut record) = fixture(false);
+        let orphan = device
+            .add_wire("old_sink", Point { x: 2, y: 0 }, 1)
+            .unwrap();
+        let extra = device.add_pip(WireId(0), orphan, false, 1).unwrap();
+        record.pips.push(InitialPip {
+            pip_id: extra.0,
+            from: "w0".into(),
+            to: "old_sink".into(),
+            from_wire_id: 0,
+            to_wire_id: orphan.0,
+            bidirectional: false,
+        });
+        record.advisory_sink_wire_ids = Some(vec![1]);
+        let mut constraints = RoutingConstraints::new();
+        import_routes(&design, &device, &placement, &[record], &mut constraints).unwrap();
+        let route = &constraints.routes()[&NetId(0)];
+        assert_eq!(route.pips().collect::<Vec<_>>(), vec![texo_model::PipId(0)]);
+        assert!(route.arcs.iter().all(|arc| arc.sink.is_some()));
+        let result = route_seeded(&design, &device, placement, &constraints).unwrap();
+        assert_eq!(result.total_pips, 1);
+    }
+
+    #[test]
+    fn advisory_weights_only_raise_priorities_and_reject_stale_inputs() {
+        let (design, device, placement, mut record) = fixture(false);
+        record.advisory_sink_criticalities.insert(1, 17);
+        let mut costs = texo_pnr::RoutingCosts::new(vec![23], BTreeMap::from([(NetId(0), 20)]));
+        super::apply_advisory_weights(&design, &device, &placement, &[record.clone()], &mut costs)
+            .unwrap();
+        assert_eq!(costs.net_criticalities()[&NetId(0)], 20);
+        assert_eq!(costs.sink_criticalities()[&(NetId(0), CellPinId(1))], 20);
+        let before = costs.sink_criticalities().clone();
+        for (wire, weight) in [(1, 0), (1, 65), (99, 17)] {
+            record.advisory_sink_criticalities = BTreeMap::from([(wire, weight)]);
+            assert!(
+                super::apply_advisory_weights(
+                    &design,
+                    &device,
+                    &placement,
+                    &[record.clone()],
+                    &mut costs
+                )
+                .is_err()
+            );
+            assert_eq!(costs.sink_criticalities(), &before);
+        }
     }
 
     #[test]

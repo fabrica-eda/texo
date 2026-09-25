@@ -20,6 +20,23 @@ every current sink and mandatory target routes are checked against the newly
 mapped design. Missing nets are routed normally. The importer accepts neither
 old timing evidence nor disconnected fragments as a shortcut to sign-off.
 
+To reuse unchanged branches after a net gains or loses sinks, a route record may
+add `"advisory_sink_wire_ids": [1234, 5678]`. These are distinct, nonempty
+physical wire IDs of current sinks, all reachable from the current driver through
+the supplied PIPs. Every supplied PIP is validated before obsolete branches are
+removed. Ordinary routing must connect all omitted sinks; an unreachable omitted
+sink still fails the flow. Partial endpoint records cannot replace target-owned
+routing, and an incomplete tree cannot enter the preserved-route list.
+
+A record may also provide `"advisory_sink_criticalities": {"1234": 48, "5678": 8}`.
+Values must be in `1..=64` and name current physical sink wires. When timing-driven
+routing is enabled, these priorities can bootstrap the first routing pass from
+previous measured observations. They only raise existing routing priorities;
+they supply no delay values or timing evidence. The first fresh routed STA
+replaces them with current criticalities. Unspecified records retain the existing
+behavior. These optional priorities can increase routing search time and do not
+guarantee a timing improvement.
+
 Imported ordinary trees are advisory. To keep particular trees unchanged through
 all timing feedback, pass `--preserve-initial-routes preserved.json` containing
 exact net names, for example `["critical_data"]`. Preserved trees stay mandatory
