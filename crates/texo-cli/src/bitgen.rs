@@ -111,8 +111,7 @@ pub fn bitgen(options: &Ecp5BitgenOptions) -> Result<Ecp5BitgenOutput, Ecp5Bitge
 
 #[allow(clippy::too_many_lines)]
 fn bitgen_inner(options: &Ecp5BitgenOptions) -> Result<Ecp5BitgenOutput, Box<dyn Error>> {
-    let checkpoint: Value =
-        serde_json::from_reader(BufReader::new(File::open(&options.checkpoint)?))?;
+    let checkpoint: Value = crate::read_checkpoint(&options.checkpoint)?;
     // Reject missing evidence/coverage before loading or fetching the runtime
     // and before writing a configuration or invoking the bitstream codec.
     crate::bitstream::validate_checkpoint(&checkpoint)?;
