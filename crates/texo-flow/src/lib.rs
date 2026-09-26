@@ -790,6 +790,15 @@ pub fn implement_struo_ecp5_with_progress(
             routes,
             &mut routing,
         )?;
+        if let Some(costs) = timing_routing_costs.as_mut() {
+            initial_routing::apply_advisory_weights(
+                &design,
+                architecture.device(),
+                &placement,
+                routes,
+                costs,
+            )?;
+        }
     }
     initial_routing::preserve_routes(
         &design,
@@ -1575,10 +1584,10 @@ impl TimingFeedbackContext<'_, '_, '_> {
             }
             let mut cells = cells.into_iter().collect::<Vec<_>>();
             cells.sort_unstable_by_key(|&(cell, (slack, delay))| (slack, Reverse(delay), cell));
-            // Try every cell's nearby moves before a wide relocation can
-            // consume the budget. In particular, a critical BRAM must not
-            // starve small LUT moves on the same path.
-            for radius in [2, 4, 8, 256] {
+            // Visit each cell/radius before spending the budget on another
+            // candidate for the same pair. Failed nearby alternatives must not
+            // starve independent critical cells or wider relocations.
+            for (radius, candidate_rank) in local_setup_search_order() {
                 for &(cell, _) in &cells {
                     if self.setup_budget.exhausted() {
                         return Ok(());
@@ -1627,7 +1636,7 @@ impl TimingFeedbackContext<'_, '_, '_> {
                             radius,
                             8,
                         )?;
-                    for placement in candidates {
+                    for placement in candidates.into_iter().skip(candidate_rank).take(1) {
                         if self.setup_budget.exhausted() {
                             return Ok(());
                         }
@@ -1736,20 +1745,10 @@ impl TimingFeedbackContext<'_, '_, '_> {
                                     cell.0
                                 );
                             }
-                            // Moving ordinary neighbors needs more negotiation
-                            // than a trial against a fixed background. Keep that
-                            // fallback bounded, but allow congestion to settle.
-                            // A BRAM relocation changes both wide data ports and
-                            // many address/control branches. Board runs reduced
-                            // >1,500 conflicting nets to four by iteration 32;
-                            // retain the normal budget for these larger trials.
-                            let retry_limit =
-                                if self.design.cells()[cell.0].kind == ResourceKind::Memory {
-                                    previous_max_iterations
-                                } else {
-                                    previous_max_iterations.min(32)
-                                };
-                            routing_costs.set_max_iterations(retry_limit);
+                            // Detailed timing costs can spread a local conflict
+                            // across the retained fabric. Retry with ordinary
+                            // congestion routing and its normal iteration limit.
+                            // Full STA below still decides acceptance.
                             let seeds = frozen.routes().values().cloned().collect::<Vec<_>>();
                             routed_candidate = route_with_initial_routes_workspace_and_progress(
                                 self.design,
@@ -1757,7 +1756,7 @@ impl TimingFeedbackContext<'_, '_, '_> {
                                 placement,
                                 &routing,
                                 &seeds,
-                                Some(routing_costs),
+                                None,
                                 self.routing_workspace,
                                 |event| progress(Ecp5FlowStage::TimingDrivenRouting(event)),
                             );
@@ -3061,6 +3060,10 @@ fn freeze_unchanged_routes(
     frozen
 }
 
+fn local_setup_search_order() -> impl Iterator<Item = (u64, usize)> {
+    (0..8).flat_map(|rank| [2, 4, 8, 256].into_iter().map(move |radius| (radius, rank)))
+}
+
 fn criticality_weight(urgency: i128, period_ps: i128) -> u64 {
     const SCALE: u64 = 1 << 10;
     const MAX_EXTRA_WEIGHT: u64 = 63;
@@ -3174,10 +3177,11 @@ struct WorstSetupNetRouteEcoAggregate {
 
 /// Deterministic finite scheduler for whole-net route ECO trials.
 ///
-/// A rejected item must not be retried: a strict commit changes another net
-/// and the global timing objective, but leaves every rejected net's incumbent
-/// route unchanged. Filtering attempted nets makes exhaustion of the finite
-/// design-net set the natural stop when no candidate closes setup.
+/// A rejected item is not retried while routing and timing remain unchanged.
+/// A strict commit starts a new epoch: even an unchanged net may now use
+/// resources released by another net or have different required times.
+/// Each epoch exhausts the finite candidate set; every new epoch requires a
+/// strict measured timing improvement and remains under the setup budget.
 #[derive(Debug, Default)]
 struct WorstSetupRouteEcoWorklist {
     trials: usize,
@@ -3202,6 +3206,23 @@ impl WorstSetupRouteEcoWorklist {
 
     fn reset_attempted_after_global_change(&mut self) {
         self.attempted.clear();
+    }
+
+    fn commit_route_candidate(
+        &mut self,
+        implementation: &mut PnrResult,
+        timing: &mut TimingReport,
+        candidate: PnrResult,
+        candidate_timing: TimingReport,
+    ) -> bool {
+        let committed =
+            commit_strict_route_eco_candidate(implementation, timing, candidate, candidate_timing);
+        if committed {
+            // A different net can free resources needed by a previously
+            // rejected trial, or change its required-time propagation.
+            self.reset_attempted_after_global_change();
+        }
+        committed
     }
 }
 
@@ -4140,7 +4161,7 @@ fn improve_worst_setup_net_route_ecos(
                     candidate_timing.worst_slack_ps,
                 );
             }
-            let committed = commit_strict_route_eco_candidate(
+            let committed = worklist.commit_route_candidate(
                 implementation,
                 timing,
                 candidate_implementation,
@@ -6460,6 +6481,166 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn route_eco_retries_after_another_net_frees_its_shortcut() {
+        // A's shortcut is initially occupied by B. A cannot improve until B
+        // commits its own shorter route, even though A's incumbent is unchanged.
+        let mut device = Device::new("route_epoch", 7, 1).unwrap();
+        let mut design = Design::new();
+        let mut bindings = BTreeMap::new();
+        let mut pins = Vec::new();
+        for x in 0..7 {
+            let point = Point { x, y: 0 };
+            let wire = device.add_wire(format!("w{x}"), point, 1).unwrap();
+            if x >= 4 {
+                continue;
+            }
+            let direction = if x % 2 == 0 {
+                PinDirection::Output
+            } else {
+                PinDirection::Input
+            };
+            let bel = device
+                .add_bel(format!("b{x}"), ResourceKind::Logic, point)
+                .unwrap();
+            device.add_bel_pin(bel, "P", direction, wire).unwrap();
+            let cell = design.add_cell(format!("c{x}"), ResourceKind::Logic);
+            pins.push(design.add_pin(cell, "P", direction).unwrap());
+            bindings.insert(cell, bel);
+        }
+        let a = design.add_net("a", pins[0], [pins[1]]).unwrap();
+        let b = design.add_net("b", pins[2], [pins[3]]).unwrap();
+        let edges = [
+            (0, 5),
+            (5, 1),
+            (0, 4),
+            (4, 1),
+            (2, 4),
+            (4, 3),
+            (2, 6),
+            (6, 3),
+        ];
+        for (from, to) in edges {
+            device.add_pip(WireId(from), WireId(to), false, 1).unwrap();
+        }
+        let delays = vec![200, 200, 50, 50, 195, 195, 25, 25];
+        let mut costs =
+            super::RoutingCosts::new(delays.clone(), BTreeMap::from([(a, 64), (b, 64)]));
+        costs.set_detailed_timing_nets(BTreeSet::from([a, b]));
+        let placement = placement_from_partial_bindings(
+            &design,
+            &device,
+            &PlacementConstraints::new(),
+            &bindings,
+        )
+        .unwrap();
+        let mut fixed = RoutingConstraints::new();
+        fixed.add_route(
+            NetRoute::from_tree(
+                a,
+                WireId(0),
+                [(pins[1], WireId(1))],
+                [PipId(0), PipId(1)],
+                &device,
+            )
+            .unwrap(),
+        );
+        fixed.add_route(
+            NetRoute::from_tree(
+                b,
+                WireId(2),
+                [(pins[3], WireId(3))],
+                [PipId(4), PipId(5)],
+                &device,
+            )
+            .unwrap(),
+        );
+        let mut implementation = texo_pnr::route_with_timing_costs_and_progress(
+            &design,
+            &device,
+            placement,
+            &fixed,
+            &costs,
+            |_| {},
+        )
+        .unwrap();
+        let report = |result: &PnrResult| {
+            let slacks = result
+                .routes
+                .iter()
+                .map(|route| {
+                    200_i128
+                        - route
+                            .pips()
+                            .map(|pip| i128::from(delays[pip.0]))
+                            .sum::<i128>()
+                })
+                .collect::<Vec<_>>();
+            predicted_setup_report(&slacks)
+        };
+        let reroute = |result: &PnrResult, net| {
+            let mut fixed = RoutingConstraints::new();
+            for route in &result.routes {
+                if route.net != net {
+                    fixed.add_route(Arc::clone(route));
+                }
+            }
+            texo_pnr::route_with_timing_costs_and_progress(
+                &design,
+                &device,
+                result.placement.clone(),
+                &fixed,
+                &costs,
+                |_| {},
+            )
+            .unwrap()
+        };
+        let candidates = [route_eco_candidate(a.0, 400), route_eco_candidate(b.0, 390)];
+        let mut timing = report(&implementation);
+        assert_eq!(timing.worst_slack_ps, Some(-200));
+        let mut worklist = WorstSetupRouteEcoWorklist::default();
+        assert_eq!(worklist.next(candidates).unwrap().net, a);
+        let trial = reroute(&implementation, a);
+        let trial_report = report(&trial);
+        assert!(!worklist.commit_route_candidate(
+            &mut implementation,
+            &mut timing,
+            trial,
+            trial_report
+        ));
+        assert_eq!(worklist.next(candidates).unwrap().net, b);
+        let trial = reroute(&implementation, b);
+        let trial_report = report(&trial);
+        assert_eq!(
+            trial_report
+                .setup_checks
+                .iter()
+                .map(|c| c.slack_ps)
+                .collect::<Vec<_>>(),
+            vec![-200, 150]
+        );
+        assert!(worklist.commit_route_candidate(
+            &mut implementation,
+            &mut timing,
+            trial,
+            trial_report
+        ));
+        assert_eq!(timing.worst_slack_ps, Some(-200));
+        // Real routing now has a legal 100ps path for A, previously blocked.
+        let trial = reroute(&implementation, a);
+        let trial_report = report(&trial);
+        assert_eq!(trial_report.worst_slack_ps, Some(100));
+        assert_eq!(worklist.next([candidates[0]]), Some(candidates[0]));
+        assert!(worklist.commit_route_candidate(
+            &mut implementation,
+            &mut timing,
+            trial,
+            trial_report
+        ));
+        assert_eq!(timing.worst_slack_ps, Some(100));
+    }
+
+    #[test]
     fn worst_setup_route_eco_worklist_uses_refreshed_cone_order_after_commit() {
         let mut worklist = WorstSetupRouteEcoWorklist::default();
 
@@ -6470,8 +6651,8 @@ mod tests {
                 .net,
             NetId(1),
         );
-        // Model a strict exact-STA commit.  The refreshed cone introduces net
-        // 3 ahead of the stale second candidate and must take precedence.
+        // A refreshed selector may introduce a previously unseen candidate.
+        // No committed implementation change is simulated in this test.
         assert_eq!(
             worklist
                 .next([
@@ -6486,7 +6667,7 @@ mod tests {
     }
 
     #[test]
-    fn worst_setup_route_eco_worklist_never_retries_an_unchanged_net() {
+    fn worst_setup_route_eco_worklist_never_retries_without_a_commit() {
         let candidate = route_eco_candidate(1, 500);
         let mut worklist = WorstSetupRouteEcoWorklist::default();
 
@@ -6525,7 +6706,7 @@ mod tests {
     }
 
     #[test]
-    fn worst_setup_route_eco_worklist_advances_after_reject_reject_accept_refresh() {
+    fn worst_setup_route_eco_worklist_advances_without_committed_change() {
         let candidates = [
             route_eco_candidate(1, 700),
             route_eco_candidate(2, 600),
@@ -6534,14 +6715,13 @@ mod tests {
         ];
         let mut worklist = WorstSetupRouteEcoWorklist::default();
 
-        // Reject A, reject B, then accept C under exact STA.
+        // Visit A, B, and C without committing an implementation change.
         assert_eq!(worklist.next(candidates).unwrap().net, NetId(1));
         assert_eq!(worklist.next(candidates).unwrap().net, NetId(2));
         assert_eq!(worklist.next(candidates).unwrap().net, NetId(3));
 
-        // Recomputing the exact-WNS cone can rank A first again, but A's
-        // incumbent route is unchanged. The worklist must inspect newly
-        // exposed D instead of retrying A.
+        // Without a commit, re-enumeration must not repeat attempted A.
+        // Newly exposed D remains eligible.
         let refreshed = [route_eco_candidate(1, 800), route_eco_candidate(4, 750)];
         assert_eq!(worklist.next(refreshed).unwrap().net, NetId(4));
     }
@@ -7078,6 +7258,28 @@ mod tests {
                 assert_eq!(frozen.routes()[&fanout].arcs, vec![arcs[1].clone()]);
             }
             assert_eq!(implementation, before);
+        }
+    }
+
+    #[test]
+    fn local_setup_search_reaches_wide_moves_before_repeating_nearby_candidates() {
+        let order = super::local_setup_search_order().collect::<Vec<_>>();
+        let wide = order
+            .iter()
+            .position(|&(radius, rank)| radius == 256 && rank == 0)
+            .unwrap();
+        let second_near = order
+            .iter()
+            .position(|&(radius, rank)| radius == 2 && rank == 1)
+            .unwrap();
+        assert!(wide < second_near);
+        let unique = order.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(unique.len(), 32);
+        assert_eq!(order[0], (2, 0));
+        for radius in [2, 4, 8, 256] {
+            for rank in 0..8 {
+                assert!(unique.contains(&(radius, rank)));
+            }
         }
     }
 

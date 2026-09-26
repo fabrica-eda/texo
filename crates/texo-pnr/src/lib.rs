@@ -4066,13 +4066,98 @@ fn analytical_place(
             reason: format!("electrostatic global placement failed: {error:?}"),
         })?
     };
-    let placed = legalization::project(graph, constraints, units, spatial_indexes, &targets)?;
+    let placed = if let Some((anchor, _)) = anchor {
+        project_anchored_targets(graph, constraints, units, spatial_indexes, &targets, anchor)
+    } else {
+        legalization::project(graph, constraints, units, spatial_indexes, &targets)?
+    };
     if global_placement == AnalyticalGlobalPlacement::Electrostatic
         && std::env::var_os("TEXO_PNR_METRICS").is_some()
     {
         emit_eplace_legalization_metrics(graph, units, &targets, &placed);
     }
     finish_placement(graph, constraints, placed)
+}
+
+/// Project a timing proposal from its legal incumbent, retaining each exact
+/// assignment unless a free, resource-compatible assignment is closer to the
+/// unit's proposed tile. Rebuilding an auction from empty occupancy loses BEL
+/// identity even when every continuous target rounds to its original tile.
+fn project_anchored_targets(
+    graph: &UnifiedGraph<'_>,
+    constraints: &PlacementConstraints,
+    units: &[PlacementUnit],
+    spatial_indexes: &BTreeMap<(u8, usize), Arc<SpatialChoiceIndex>>,
+    targets: &[Point],
+    anchor: &Placement,
+) -> Vec<Option<BelId>> {
+    let device = graph.device();
+    let mut placed = vec![None; graph.design().cells().len()];
+    let mut occupied = BTreeSet::new();
+    let mut usage = PlacementResourceUsage::default();
+    for unit in units {
+        let assignment = unit
+            .cells
+            .iter()
+            .map(|cell| anchor.bindings()[cell.0])
+            .collect::<Vec<_>>();
+        install_assignment(
+            graph,
+            constraints,
+            unit,
+            &assignment,
+            &mut placed,
+            &mut occupied,
+            &mut usage,
+        );
+    }
+    let mut order = (0..units.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&index| {
+        let origin = device.bels()[anchor.bindings()[units[index].cells[0].0].0].point;
+        (Reverse(origin.manhattan(targets[index])), index)
+    });
+    for index in order {
+        let unit = &units[index];
+        if unit.choices.len() == 1 {
+            continue;
+        }
+        let old = unit
+            .cells
+            .iter()
+            .map(|cell| placed[cell.0].expect("complete incumbent"))
+            .collect::<Vec<_>>();
+        let distance = device.bels()[old[0].0].point.manhattan(targets[index]);
+        if distance == 0 {
+            continue;
+        }
+        update_placement_resource_usage(graph, constraints, &unit.cells, &old, &mut usage, false);
+        for (&cell, &bel) in unit.cells.iter().zip(&old) {
+            occupied.remove(&bel);
+            placed[cell.0] = None;
+        }
+        let spatial_index = &spatial_indexes[&unit.choices.cache_key()];
+        let selected = spatial_choices_within(spatial_index, targets[index], distance - 1, device)
+            .into_iter()
+            .find_map(|choice| {
+                let assignment = unit.choices.assignment(choice);
+                if assignment.iter().any(|bel| occupied.contains(bel)) {
+                    return None;
+                }
+                assignment_resources_are_legal(graph, constraints, &unit.cells, assignment, &usage)
+                    .then_some(assignment)
+            })
+            .unwrap_or(&old);
+        install_assignment(
+            graph,
+            constraints,
+            unit,
+            selected,
+            &mut placed,
+            &mut occupied,
+            &mut usage,
+        );
+    }
+    placed
 }
 
 #[derive(Default)]
@@ -7496,6 +7581,31 @@ fn route(
     progress: &mut impl FnMut(RoutingProgress),
 ) -> Result<Vec<Arc<NetRoute>>, PnrError> {
     let design = graph.design();
+    // These trees cannot be released by congestion negotiation. Treat their
+    // saturated resources as hard obstacles to other trees from the first
+    // search, rather than repeatedly charging penalties for an impossible
+    // displacement. An owning partial tree is already among its net's search
+    // starts, so it can still grow branches from its mandatory resources.
+    let fixed_occupancy = (!constraints.routes.is_empty()).then(|| {
+        let mut wires = vec![0_u16; graph.device().wires().len()];
+        let mut pips = vec![0_u16; graph.device().pips().len()];
+        for route in constraints.routes.values() {
+            for wire in route.wires() {
+                wires[wire.0] += 1;
+            }
+            for pip in route.pips() {
+                pips[pip.0] += 1;
+            }
+        }
+        (wires, pips)
+    });
+    let hard_fixed = fixed_occupancy
+        .as_ref()
+        .map(|(wires, pips)| HardRoutingOccupancy {
+            wires,
+            pips,
+            use_estimate: true,
+        });
     let metadata = RoutingResourceMetadata {
         wire_points: &workspace.wire_points,
         wire_capacities: &workspace.wire_capacities,
@@ -7643,7 +7753,7 @@ fn route(
                 wire_congestion,
                 pip_congestion,
                 constraints.blocked_pip_words(),
-                None,
+                hard_fixed,
                 None,
                 iteration == 0,
                 costs,
@@ -10068,8 +10178,8 @@ struct RouteSearch {
     /// Epoch-stamped members of the currently growing tree. Replaces
     /// `starts.contains` on every edge relaxation with one array load.
     start_mark: Vec<u32>,
-    distance: Vec<u32>,
-    arrival_ps: Vec<u32>,
+    distance: Vec<u64>,
+    arrival_ps: Vec<u64>,
     previous_wire: Vec<u32>,
     previous_pip: Vec<u32>,
     /// Frontier storage retained across sink and placement trials. Large
@@ -10084,31 +10194,20 @@ struct RouteSearch {
 
 /// Lexicographically ordered `(estimate, distance, arrival, wire)` A* key.
 ///
-/// Packing the four `u32` fields most-significant-field first preserves the
-/// tuple's exact ordering while reducing each heap comparison to at most two
-/// 64-bit comparisons on 64-bit targets instead of up to four field
-/// comparisons. The entry remains 16 bytes, so queue capacity growth has the
-/// same byte footprint.
-type RouteQueueEntry = u128;
+/// Negotiated congestion accumulates across the path and is scaled to the
+/// timing quantum. Even with u32 per-resource costs, its sum can exceed u32.
+/// Preserve full-width costs and arrival times instead of truncating or
+/// saturating distinct route priorities into the same value.
+type RouteQueueEntry = (u64, u64, u64, u32);
 
 #[inline]
-fn route_queue_entry(estimate: u32, distance: u32, arrival: u32, wire: u32) -> RouteQueueEntry {
-    (u128::from(estimate) << 96)
-        | (u128::from(distance) << 64)
-        | (u128::from(arrival) << 32)
-        | u128::from(wire)
+fn route_queue_entry(estimate: u64, distance: u64, arrival: u64, wire: u32) -> RouteQueueEntry {
+    (estimate, distance, arrival, wire)
 }
 
 #[inline]
-#[allow(clippy::cast_possible_truncation)]
-fn route_queue_payload(entry: RouteQueueEntry) -> (u32, u32, u32) {
-    ((entry >> 64) as u32, (entry >> 32) as u32, entry as u32)
-}
-
-fn compact_route_value(value: u64) -> u32 {
-    value
-        .try_into()
-        .expect("physical route delay and cost fit u32")
+fn route_queue_payload(entry: RouteQueueEntry) -> (u64, u64, u32) {
+    (entry.1, entry.2, entry.3)
 }
 
 fn compact_route_index(index: usize) -> u32 {
@@ -10337,8 +10436,8 @@ impl RouteSearch {
             }
             let arrival_ps = tree_delays_ps[start.0];
             let distance = timing_tree_cost(arrival_ps, criticality, delay_quantum_ps);
-            let compact_arrival = compact_route_value(arrival_ps);
-            let compact_distance = compact_route_value(distance);
+            let compact_arrival = arrival_ps;
+            let compact_distance = distance;
             self.seen[start.0] = epoch;
             self.distance[start.0] = compact_distance;
             self.arrival_ps[start.0] = compact_arrival;
@@ -10355,7 +10454,7 @@ impl RouteSearch {
                 distance
             };
             self.queue.push(Reverse(route_queue_entry(
-                compact_route_value(estimate),
+                estimate,
                 compact_distance,
                 compact_arrival,
                 compact_route_index(start.0),
@@ -10371,8 +10470,8 @@ impl RouteSearch {
             {
                 continue;
             }
-            let distance = u64::from(compact_distance);
-            let arrival_ps = u64::from(compact_arrival);
+            let distance = compact_distance;
+            let arrival_ps = compact_arrival;
             if wire == goal {
                 let mut path_wires = vec![wire];
                 let mut path_pips = Vec::new();
@@ -10429,8 +10528,8 @@ impl RouteSearch {
                     )
                 };
                 let next_distance = distance.saturating_add(step);
-                let compact_next_distance = compact_route_value(next_distance);
-                let compact_next_arrival = compact_route_value(next_arrival_ps);
+                let compact_next_distance = next_distance;
+                let compact_next_arrival = next_arrival_ps;
                 if neighbor == goal && next_arrival_ps < minimum_arrival_ps {
                     continue;
                 }
@@ -10456,7 +10555,7 @@ impl RouteSearch {
                     next_distance
                 };
                 self.queue.push(Reverse(route_queue_entry(
-                    compact_route_value(estimate),
+                    estimate,
                     compact_next_distance,
                     compact_next_arrival,
                     compact_route_index(neighbor.0),
@@ -12928,6 +13027,26 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_routing_avoids_immutable_capacity_on_the_first_iteration() {
+        let fixture = net_cohort_eco_fixture();
+        let mut constraints = RoutingConstraints::new();
+        constraints.add_route(fixture.incumbent.routes[1].clone());
+        constraints.add_route(fixture.incumbent.routes[2].clone());
+        let mut costs = fixture.costs.clone();
+        costs.set_max_iterations(1);
+        let routed = route_with_timing_costs_and_progress(
+            &fixture.design,
+            &fixture.device,
+            fixture.incumbent.placement.clone(),
+            &constraints,
+            &costs,
+            |_| {},
+        )
+        .expect("the locked owner's capacity cannot become available in later iterations");
+        assert_eq!(routed.routes, fixture.incumbent.routes);
+    }
+
+    #[test]
     fn whole_net_eco_rebuilds_a_shared_slow_prefix_transactionally() {
         let fixture = whole_net_eco_fixture();
         let before = fixture.incumbent.clone();
@@ -14349,6 +14468,98 @@ mod tests {
     }
 
     #[test]
+    fn anchored_projection_preserves_existing_bels_at_unchanged_tile_targets() {
+        let design = two_cell_design();
+        let mut device = Device::new("same-tile-anchor", 1, 1).unwrap();
+        for index in 0..2 {
+            let point = Point::new(0, 0);
+            let bel = device
+                .add_bel(format!("bel-{index}"), ResourceKind::Logic, point)
+                .unwrap();
+            for (name, direction) in [("in", PinDirection::Input), ("out", PinDirection::Output)] {
+                let wire = device
+                    .add_wire(format!("{index}-{name}"), point, 1)
+                    .unwrap();
+                device.add_bel_pin(bel, name, direction, wire).unwrap();
+            }
+        }
+        let constraints = PlacementConstraints::new();
+        let refiner = PlacementRefiner::new(&design, &device, &constraints).unwrap();
+        for bindings in [vec![BelId(0), BelId(1)], vec![BelId(1), BelId(0)]] {
+            let anchor =
+                placement_from_complete_bindings(&design, &device, &constraints, bindings).unwrap();
+            let projected = refiner
+                .place_analytically_anchored(&BTreeMap::new(), &anchor, 100)
+                .unwrap();
+            assert_eq!(
+                projected.bindings(),
+                anchor.bindings(),
+                "an unchanged tile target must not permute routed BELs"
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_projection_moves_whole_groups_and_preserves_shared_resources() {
+        for shared_conflict in [false, true] {
+            let mut design = two_cell_design();
+            let (fixed, _, _) = add_equivalent_logic_cell(&mut design, "fixed");
+            let device = Device::rectangular_logic(5, 1).unwrap();
+            let mut constraints = PlacementConstraints::new();
+            constraints.add_group(
+                [CellId(0), CellId(1)],
+                [
+                    vec![BelId(0), BelId(1)],
+                    vec![BelId(2), BelId(3)],
+                    vec![BelId(3), BelId(4)],
+                ],
+            );
+            constraints.add_group([fixed], [vec![BelId(4)]]);
+            if shared_conflict {
+                constraints.add_shared_resource(
+                    [(CellId(0), 0), (fixed, 1)],
+                    [(BelId(0), 0), (BelId(2), 1), (BelId(4), 1)],
+                );
+            }
+            let anchor = placement_from_complete_bindings(
+                &design,
+                &device,
+                &constraints,
+                vec![BelId(0), BelId(1), BelId(4)],
+            )
+            .unwrap();
+            let refiner = PlacementRefiner::new(&design, &device, &constraints).unwrap();
+            let targets = refiner
+                .units
+                .iter()
+                .map(|unit| {
+                    if unit.cells.contains(&CellId(0)) {
+                        Point::new(3, 0)
+                    } else {
+                        Point::new(4, 0)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let projected = super::project_anchored_targets(
+                &refiner.graph,
+                &constraints,
+                &refiner.units,
+                &refiner.spatial_indexes,
+                &targets,
+                &anchor,
+            );
+            let placed = super::finish_placement(&refiner.graph, &constraints, projected).unwrap();
+            assert_eq!(placed.bel(fixed), Some(BelId(4)));
+            let expected = if shared_conflict {
+                [BelId(0), BelId(1)]
+            } else {
+                [BelId(2), BelId(3)]
+            };
+            assert_eq!(&placed.bindings()[..2], &expected);
+        }
+    }
+
+    #[test]
     fn anchored_analytical_placement_stays_near_the_legalized_incumbent() {
         let design = two_cell_design();
         let device = Device::rectangular_logic(9, 1).unwrap();
@@ -14909,18 +15120,18 @@ mod tests {
     }
 
     #[test]
-    fn route_frontier_entry_stays_compact() {
-        assert_eq!(std::mem::size_of::<RouteQueueEntry>(), 16);
+    fn route_frontier_entry_preserves_full_width_costs() {
+        assert_eq!(std::mem::size_of::<RouteQueueEntry>(), 32);
     }
 
     #[test]
-    fn packed_route_frontier_preserves_tuple_order_and_payload() {
-        let values = [0, 1, 0x7fff_ffff, u32::MAX];
+    fn route_frontier_preserves_tuple_order_and_payload() {
+        let values = [0, 1, u64::from(u32::MAX), u64::from(u32::MAX) + 1, u64::MAX];
         let mut entries = Vec::new();
         for estimate in values {
             for distance in values {
                 for arrival in values {
-                    for wire in values {
+                    for wire in [0, 1, u32::MAX] {
                         let tuple = (estimate, distance, arrival, wire);
                         let packed = route_queue_entry(estimate, distance, arrival, wire);
                         assert_eq!(route_queue_payload(packed), (distance, arrival, wire));
@@ -14985,6 +15196,65 @@ mod tests {
                 Some(&costs),
                 64,
                 50,
+                &tree_delays,
+                0,
+                metadata,
+            )
+            .unwrap();
+
+        assert_eq!(wires.last(), Some(&fast_tree));
+        assert_ne!(wires.last(), Some(&WireId(0)));
+    }
+
+    #[test]
+    fn timing_routing_keeps_costs_above_u32_distinct() {
+        let design = Design::new();
+        let mut device = Device::new("tree-delay", 1, 1).unwrap();
+        let slow_tree = device.add_wire("slow-tree", Point::new(0, 0), 1).unwrap();
+        let fast_tree = device.add_wire("fast-tree", Point::new(0, 0), 1).unwrap();
+        let goal = device.add_wire("goal", Point::new(0, 0), 1).unwrap();
+        device.add_pip(slow_tree, goal, false, 1).unwrap();
+        device.add_pip(fast_tree, goal, false, 1).unwrap();
+        let graph = UnifiedGraph::new(&design, &device);
+        let costs = RoutingCosts::new(vec![10, 10], BTreeMap::new());
+        let mut search = RouteSearch::new(device.wires().len());
+        let starts = [slow_tree, fast_tree].into_iter().collect();
+        let tree_delays = vec![0, 0];
+        let wire_points = device
+            .wires()
+            .iter()
+            .map(|wire| wire.point)
+            .collect::<Vec<_>>();
+        let wire_capacities = device
+            .wires()
+            .iter()
+            .map(|wire| wire.capacity)
+            .collect::<Vec<_>>();
+        let pip_capacities = device
+            .pips()
+            .iter()
+            .map(texo_model::Pip::capacity)
+            .collect::<Vec<_>>();
+        let metadata = RoutingResourceMetadata {
+            wire_points: &wire_points,
+            wire_capacities: &wire_capacities,
+            pip_capacities: &pip_capacities,
+        };
+
+        let (wires, _) = search
+            .shortest_path(
+                &graph,
+                &starts,
+                None,
+                goal,
+                &[0; 3],
+                &[u32::MAX, u32::MAX - 1],
+                &[],
+                None,
+                None,
+                Some(&costs),
+                64,
+                1,
                 &tree_delays,
                 0,
                 metadata,
@@ -15995,6 +16265,7 @@ mod tests {
 
         let mut immutable = RoutingConstraints::new();
         immutable.add_route(seed.clone());
+        let mut fixed_iterations = Vec::new();
         let fixed = super::route_with_initial_routes_workspace_and_progress(
             &design,
             &device,
@@ -16003,9 +16274,18 @@ mod tests {
             &[seed],
             None,
             &mut workspace,
-            |_| {},
+            |event| {
+                if let super::RoutingProgress::Iteration { iteration, .. } = event {
+                    fixed_iterations.push(iteration);
+                }
+            },
         );
-        assert!(matches!(fixed, Err(PnrError::CongestionNotResolved { .. })));
+        assert!(matches!(fixed, Err(PnrError::Unroutable { net, .. }) if net == "bottlenecked"));
+        assert_eq!(
+            fixed_iterations,
+            [0],
+            "an immutable blockage cannot be negotiated away"
+        );
     }
 
     #[test]
