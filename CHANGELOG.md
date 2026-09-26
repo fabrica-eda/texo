@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8](https://github.com/fabrica-eda/texo/compare/v0.1.7...v0.1.8) (2026-09-26)
+
+
+### Bug Fixes
+
+* **pnr:** preserve imported trees and release placement blockers ([#75](https://github.com/fabrica-eda/texo/issues/75)) ([422b022](https://github.com/fabrica-eda/texo/commit/422b022e0f811a39552e0c65ddac2defc7e84d8c))
+* retry setup route ECOs after committed changes ([#83](https://github.com/fabrica-eda/texo/issues/83)) ([bf6b1f1](https://github.com/fabrica-eda/texo/commit/bf6b1f191408a7b755dd3c55b019230136f50e23))
+* use measured PIP costs in initial timing routing ([#84](https://github.com/fabrica-eda/texo/issues/84)) ([151060c](https://github.com/fabrica-eda/texo/commit/151060c3e1bd65f6615716835da5e549e8aae1c9))
+
 ## [0.1.7](https://github.com/fabrica-eda/texo/compare/v0.1.6...v0.1.7) (2026-09-11)
 
 
