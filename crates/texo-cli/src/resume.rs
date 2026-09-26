@@ -2,8 +2,6 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -49,7 +47,7 @@ struct Pair {
 
 impl Checkpoint {
     pub fn read(path: &Path) -> Result<Self, Box<dyn Error>> {
-        let saved: Self = serde_json::from_reader(BufReader::new(File::open(path)?))?;
+        let saved: Self = texo_cli::read_checkpoint(path)?;
         if saved.schema_version != 3 {
             return Err("resume requires checkpoint schema 3".into());
         }

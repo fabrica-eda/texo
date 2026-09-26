@@ -3,6 +3,8 @@
 mod bitgen;
 mod bitstream;
 mod checkpoint;
+mod checkpoint_io;
+pub use checkpoint_io::{read_checkpoint, write_checkpoint_binary};
 pub mod measured_timing;
 mod target_pack;
 mod veryl_project;

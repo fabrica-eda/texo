@@ -67,7 +67,7 @@ for further Celox verification.
 
 The `texo pnr` command exercises that boundary for a complete Veryl project,
 including its compilation units and dependencies, without intermediate netlist
-serialization. Its schema-versioned JSON checkpoint is deterministic
+serialization. Its schema-versioned CBOR/Zstd checkpoint is deterministic
 and records architecture/database provenance, verification evidence, mapped
 primitive configuration, absorbed inputs, target packing, final Cell-to-BEL
 bindings, selected speed grade, every routed Wire/PIP ID and name, exact

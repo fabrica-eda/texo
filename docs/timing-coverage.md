@@ -39,8 +39,8 @@ Example `timing-review.json` (use the names from **your** checkpoint):
 ```sh
 texo pnr path/to/project --package CABGA381 --speed 8 \
   --lpf board.lpf --timing-exceptions timing-review.json \
-  --output design.json
-texo bitgen design.json --bit design.bit
+  --output design.txcp
+texo bitgen design.txcp --bit design.bit
 ```
 
 Library callers use `Ecp5FlowOptions::timing_exceptions`. The result owns a copy
