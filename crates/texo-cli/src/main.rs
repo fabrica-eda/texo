@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -43,6 +43,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Convert a legacy checkpoint to compressed binary without changing evidence.
+    CheckpointConvert {
+        /// Existing JSON or binary checkpoint.
+        source: PathBuf,
+        /// Binary checkpoint destination (.txcp).
+        destination: PathBuf,
+    },
     /// Synthesize, place, route, and time a Veryl project.
     Pnr(Box<PnrArgs>),
     /// Cache an expanded JSON architecture for fast subsequent loads.
@@ -165,7 +172,7 @@ struct PnrArgs {
     /// LPF pin, IO, and clock constraints.
     #[arg(short, long)]
     lpf: Option<PathBuf>,
-    /// Checkpoint destination; defaults to `target/texo/<top>.json` for projects.
+    /// Checkpoint destination; defaults to `target/texo/<top>.txcp` for projects.
     #[arg(short, long)]
     output: Option<PathBuf>,
     #[command(flatten)]
@@ -320,6 +327,28 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
+        Command::CheckpointConvert {
+            source,
+            destination,
+        } => {
+            ensure_distinct_paths(&source, &destination, "source checkpoint", "destination")?;
+            if destination.extension().is_some_and(|ext| ext == "json") {
+                return Err("binary checkpoint destination must not use .json".into());
+            }
+            let value: serde_json::Value = texo_cli::read_checkpoint(&source)?;
+            texo_cli::write_checkpoint_binary(&destination, &value)?;
+            let restored: serde_json::Value = texo_cli::read_checkpoint(&destination)?;
+            if restored != value {
+                return Err("checkpoint conversion changed content".into());
+            }
+            println!(
+                "checkpoint: {} ({} -> {} bytes; content verified)",
+                destination.display(),
+                source.metadata()?.len(),
+                destination.metadata()?.len()
+            );
+            Ok(())
+        }
         Command::Pnr(args) => pnr(&args),
         Command::CacheArchitecture {
             source,
@@ -401,7 +430,7 @@ fn target(args: &TargetArgs) -> Result<(), Box<dyn Error>> {
 fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
     let flow_started = Instant::now();
     let load_bindings = |path: &PathBuf| -> Result<BTreeMap<String, String>, Box<dyn Error>> {
-        Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?)
+        texo_cli::read_checkpoint(path)
     };
     let resumed = args
         .resume_checkpoint
@@ -417,17 +446,13 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
     let partial_routes: Option<Vec<texo_flow::Ecp5InitialRoute>> = args
         .initial_routes
         .as_ref()
-        .map(|path| -> Result<_, Box<dyn Error>> {
-            Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?)
-        })
+        .map(|path| -> Result<_, Box<dyn Error>> { texo_cli::read_checkpoint(path) })
         .transpose()?;
 
     let preserved_initial_routes: Vec<String> = args
         .preserve_initial_routes
         .as_ref()
-        .map(|path| -> Result<_, Box<dyn Error>> {
-            Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?)
-        })
+        .map(|path| -> Result<_, Box<dyn Error>> { texo_cli::read_checkpoint(path) })
         .transpose()?
         .unwrap_or_default();
 
@@ -438,17 +463,13 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
     let clock_constraints: Vec<texo_flow::ClockConstraint> = args
         .clock_constraints
         .as_ref()
-        .map(|path| -> Result<_, Box<dyn Error>> {
-            Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?)
-        })
+        .map(|path| -> Result<_, Box<dyn Error>> { texo_cli::read_checkpoint(path) })
         .transpose()?
         .unwrap_or_default();
     let timing_exceptions: Vec<texo_flow::TimingEndpointException> = args
         .timing_exceptions
         .as_ref()
-        .map(|path| -> Result<_, Box<dyn Error>> {
-            Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?)
-        })
+        .map(|path| -> Result<_, Box<dyn Error>> { texo_cli::read_checkpoint(path) })
         .transpose()?
         .unwrap_or_default();
     let (loaded, output) = prepare_veryl_input(args)?;
@@ -653,6 +674,9 @@ fn prepare_veryl_input(args: &PnrArgs) -> Result<(VerylProject, PathBuf), Box<dy
         .output
         .clone()
         .unwrap_or_else(|| default_checkpoint_path(&loaded));
+    if output.extension().is_some_and(|ext| ext == "json") {
+        return Err("checkpoint output is binary; use a .txcp path instead of .json".into());
+    }
     ensure_distinct_paths(&args.input, &output, "Veryl input", "checkpoint")?;
     ensure_distinct_paths(&loaded.manifest, &output, "Veryl.toml", "checkpoint")?;
     for source in &loaded.source_paths {
@@ -683,10 +707,7 @@ fn write_checkpoint(
         std::fs::create_dir_all(parent)?;
     }
     let checkpoint = ecp5_checkpoint_ref(design_name, result, architecture, package, evidence);
-    let mut writer = BufWriter::new(File::create(output)?);
-    serde_json::to_writer_pretty(&mut writer, &checkpoint)?;
-    writer.write_all(b"\n")?;
-    writer.flush()?;
+    texo_cli::write_checkpoint_binary(output, &checkpoint)?;
     Ok(())
 }
 
@@ -871,7 +892,7 @@ fn default_checkpoint_path(loaded: &VerylProject) -> PathBuf {
         .root
         .join("target")
         .join("texo")
-        .join(format!("{}.json", loaded.top))
+        .join(format!("{}.txcp", loaded.top))
 }
 
 fn checkpoint_html_path(checkpoint: &Path) -> PathBuf {

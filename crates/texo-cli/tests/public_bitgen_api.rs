@@ -28,7 +28,7 @@ fn uncovered_timing_is_rejected_before_runtime_lookup_or_output() {
     std::fs::create_dir(&temporary).unwrap();
     let options = Ecp5BitgenOptions {
         runtime: Ecp5BitgenRuntime::TargetPack(temporary.join("missing-target-pack")),
-        ..Ecp5BitgenOptions::new(temporary.join("bad.json"), temporary.join("bad.bit"))
+        ..Ecp5BitgenOptions::new(temporary.join("bad.checkpoint"), temporary.join("bad.bit"))
     };
     let checkpoint = serde_json::json!({
         "schema_version": 3,
@@ -45,15 +45,20 @@ fn uncovered_timing_is_rejected_before_runtime_lookup_or_output() {
             }]
         }
     });
-    std::fs::write(
-        &options.checkpoint,
-        serde_json::to_vec(&checkpoint).unwrap(),
-    )
-    .unwrap();
-
-    let error = bitgen(&options).unwrap_err().to_string();
-    assert!(error.contains("unconstrained_clock"), "{error}");
-    assert!(!options.bitstream.exists());
-    assert_eq!(std::fs::read_dir(&temporary).unwrap().count(), 1);
+    for binary in [false, true] {
+        if binary {
+            texo_cli::write_checkpoint_binary(&options.checkpoint, &checkpoint).unwrap();
+        } else {
+            std::fs::write(
+                &options.checkpoint,
+                serde_json::to_vec(&checkpoint).unwrap(),
+            )
+            .unwrap();
+        }
+        let error = bitgen(&options).unwrap_err().to_string();
+        assert!(error.contains("unconstrained_clock"), "{error}");
+        assert!(!options.bitstream.exists());
+        assert_eq!(std::fs::read_dir(&temporary).unwrap().count(), 1);
+    }
     std::fs::remove_dir_all(temporary).unwrap();
 }

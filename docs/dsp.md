@@ -28,7 +28,7 @@ For example, with an exported cache:
 ```sh
 texo pnr examples/dsp-pipeline --architecture dsp.txdb \
   --package CABGA381 --speed 8 --lpf examples/dsp-pipeline/timing.lpf \
-  --synthesis-goal-mhz 175 --setup-uncertainty-ps 200 --output dsp.json
+  --synthesis-goal-mhz 175 --setup-uncertainty-ps 200 --output dsp.txcp
 ```
 
 Its LPF is an STA fixture with a 124.8 MHz input-clock constraint. It does not

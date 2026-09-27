@@ -10,6 +10,8 @@ name = "texo"
 path = "src/main.rs"
 
 [dependencies]
+ciborium = "0.2.2"
+tempfile = "3.27.0"
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

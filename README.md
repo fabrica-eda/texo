@@ -61,7 +61,7 @@ cargo run --release -- pnr examples/xor \
   --package CABGA381 \
   --speed 6 \
   --lpf examples/xor/xor.lpf \
-  --output /tmp/texo-xor-checkpoint.json
+  --output /tmp/texo-xor.txcp
 cargo run -- target-info crates/texo-target-ecp5/fixtures/minimal-ecp5.json
 cargo run -- lpf-info examples/xor/xor.lpf
 cargo test --workspace
@@ -78,7 +78,7 @@ directional routing-capacity/RUDY area adjustment and connection weight
 configurable with `--placement-weight-exponent`. Run `texo pnr --help` for the
 other synthesis-goal, unconstrained-IO, global-clock, and timing-closure
 controls. Without `--output`, project checkpoints go to
-`target/texo/<top>.json`.
+`target/texo/<top>.txcp`.
 
 `timing.met_timing` describes only the checked paths. Bit generation also
 requires coverage of modeled endpoints: an unconnected or unconstrained
@@ -153,7 +153,7 @@ routing priorities through `advisory_sink_wire_ids` and
 `advisory_sink_criticalities`; see [incremental closure](docs/incremental-closure.md).
 Omitted sinks still require legal routing and fresh STA.
 
-For a compatible checkpoint, `--resume-checkpoint checkpoint.json` imports
+For a compatible checkpoint, `--resume-checkpoint checkpoint.txcp` imports
 placement and routes together. Fresh synthesis, routing checks and routed STA
 still run. Imported data carries no equivalence or timing evidence, and does
 not guarantee the previous timing result. Cell names can change after
@@ -214,7 +214,7 @@ Render any such checkpoint as a self-contained interactive physical-design
 view (no server or architecture database is required):
 
 ```sh
-cargo run --release -- visualize artifacts/axi4.checkpoint.json \
+cargo run --release -- visualize artifacts/axi4.txcp \
   --output artifacts/axi4.html
 ```
 
@@ -231,8 +231,8 @@ needed to serialize an ECP5 bitstream. It does not contain Python.
 ```sh
 texo target fetch LFE5UM5G-85F                 # optional eager download
 texo pnr path/to/veryl-project --package CABGA381 --speed 8 \
-  --lpf board.lpf --output design.checkpoint.json
-texo bitgen design.checkpoint.json --bit design.bit
+  --lpf board.lpf --output design.txcp
+texo bitgen design.txcp --bit design.bit
 ```
 
 To use the dedicated ECP5 JTAG block, expose the scalar
@@ -250,7 +250,7 @@ the logical generated clock/lock signals as scalar inputs, then pass Struo's
 ```sh
 texo pnr path/to/veryl-project --package CABGA381 --speed 8 \
   --lpf board.lpf --pll-binding pll-12-to-250.json \
-  --output design.checkpoint.json
+  --output design.txcp
 ```
 
 The binding keeps `reference_clock_port` as a package input, removes
@@ -280,8 +280,8 @@ cargo build --release --locked -p texo-cli
 cargo run --release -p texo-cli --example design-specific-flows -- axi4-pnr \
   artifacts/architecture/texo-LFE5UM5G-85F-schema7-cache5.txdb CABGA381 8 \
   examples/axi4-self-test/lfe5um5g-85f-evn-250mhz.lpf \
-  artifacts/axi4.checkpoint.json
-cargo run --release -- bitgen artifacts/axi4.checkpoint.json \
+  artifacts/axi4.txcp
+cargo run --release -- bitgen artifacts/axi4.txcp \
   --bit artifacts/axi4.bit
 ```
 
@@ -324,3 +324,16 @@ and board programming tools still follow the project-specific instructions above
 
 Update the shared cache package with `nix flake update nix-packages`, or all
 pinned development dependencies with `nix flake update`.
+
+### Checkpoint storage
+
+New checkpoints use `.txcp` (CBOR plus checksummed Zstd) by default. Resume,
+bitgen, visualization and physical-hint readers auto-detect the binary header
+and continue to accept legacy JSON. New `.json` checkpoint output paths are
+rejected rather than silently storing binary under a JSON filename.
+
+`texo checkpoint-convert old.json new.txcp` converts existing files and verifies
+full content equality after rereading the output. Writes stream through a
+same-directory temporary file, synchronize it, and atomically replace the
+destination. Conversion does not qualify timing or reuse saved timing during
+PNR. See [the format specification](docs/checkpoint-format.md).

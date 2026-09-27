@@ -14,7 +14,7 @@ Use a clock-constraint JSON file to constrain the exact mapped cell output:
 texo pnr path/to/project --package CABGA381 --speed 8 \
   --lpf board.lpf --jtagg-prefix jtag \
   --clock-constraints clocks.json --timing-exceptions timing-review.json \
-  --output design.json
+  --output design.txcp
 ```
 
 Here 166,666 ps conservatively represents the minimum period at 6 MHz TCK.
@@ -92,7 +92,7 @@ A guarded hold slack of +1 ps with 200 ps reserved is a nominal +201 ps.
 Use both flags to reserve setup and hold margin independently. As with setup,
 this is a requested engineering reserve, not new device characterization.
 
-For an existing implementation, combine `--resume-checkpoint design.json`
+For an existing implementation, combine `--resume-checkpoint design.txcp`
 with the two margin flags. Fresh synthesis, route checks and STA still run.
 `--no-timing-optimization` checks the stricter constraints without repairing
 the routes, which is useful for a before/after comparison. The flags default

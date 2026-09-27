@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 
 use serde_json::{Value, json};
 
@@ -99,7 +99,7 @@ pub fn write_checkpoint_visualizer(
     checkpoint_path: &str,
     output_path: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let checkpoint: Value = serde_json::from_reader(BufReader::new(File::open(checkpoint_path)?))?;
+    let checkpoint: Value = crate::read_checkpoint(std::path::Path::new(checkpoint_path))?;
     let html = checkpoint_visualizer(&checkpoint)?;
     let mut output = BufWriter::new(File::create(output_path)?);
     output.write_all(html.as_bytes())?;
