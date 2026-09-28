@@ -4,8 +4,47 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::path::Path;
+use std::fs::File;
+use std::io::{ErrorKind, Read};
+use std::path::{Path, PathBuf};
 use texo_target_ecp5::{Ecp5Architecture, SpeedGradeRecord};
+
+// Evidence hashes bind the original bytes, regardless of their storage encoding.
+// Prefer the named file, and only look for its archive if it is missing.
+fn open_input(path: &Path) -> Result<(Box<dyn Read>, PathBuf), Box<dyn Error>> {
+    let (file, source) = match File::open(path) {
+        Ok(file) => (file, path.to_owned()),
+        Err(error)
+            if error.kind() == ErrorKind::NotFound
+                && path.extension().is_none_or(|ext| ext != "zst") =>
+        {
+            let mut archive = path.as_os_str().to_os_string();
+            archive.push(".zst");
+            let archive = PathBuf::from(archive);
+            (File::open(&archive)?, archive)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let reader: Box<dyn Read> = if source.extension().is_some_and(|ext| ext == "zst") {
+        Box::new(zstd::stream::read::Decoder::new(file)?)
+    } else {
+        Box::new(file)
+    };
+    Ok((reader, source))
+}
+
+fn input_digest(path: &Path) -> Result<String, Box<dyn Error>> {
+    let (mut reader, _) = open_input(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 8_192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(format!("{:x}", digest.finalize()));
+        }
+        digest.update(&buffer[..count]);
+    }
+}
 
 #[derive(Deserialize)]
 struct Library {
@@ -29,6 +68,7 @@ struct Qualification {
 }
 
 /// Verify measurements and atomically replace the complete selected timing grade.
+/// Compressed `.zst` libraries and archived evidence retain their original hashes.
 ///
 /// # Errors
 /// Rejects hash mismatches, failed holdouts, unsupported targets and missing entries.
@@ -38,7 +78,9 @@ pub fn install(
     package: &str,
     expected_sha256: Option<&str>,
 ) -> Result<Value, Box<dyn Error>> {
-    let bytes = std::fs::read(path)?;
+    let (mut reader, source) = open_input(path)?;
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
     let digest = format!("{:x}", Sha256::digest(&bytes));
     if expected_sha256.is_some_and(|expected| expected != digest) {
         return Err("STA library differs from the implemented checkpoint".into());
@@ -59,7 +101,7 @@ pub fn install(
         return Err("unqualified or incompatible measured STA library".into());
     }
     for (name, expected) in &library.input_sha256 {
-        if format!("{:x}", Sha256::digest(std::fs::read(name)?)) != *expected {
+        if input_digest(Path::new(name))? != *expected {
             return Err(format!("measurement input changed: {name}").into());
         }
     }
@@ -102,7 +144,7 @@ pub fn install(
             return Err(format!("missing measurement support for {key}").into());
         }
     }
-    let result = json!({"path":path.canonicalize()?.display().to_string(),"sha256":digest,
+    let result = json!({"path":source.canonicalize()?.display().to_string(),"sha256":digest,
         "kind":library.kind,"timing_grade":library.timing.name,"entries":keys.len(),
         "legacy_table_fallback":false,"lut_input_timing":"routed_physical_pin","temperature_fraction":library.qualification.temperature_fraction,
         "voltage_sweep_measured":library.qualification.independent_voltage_sweep,
@@ -117,6 +159,20 @@ pub fn install(
 mod tests {
     use super::*;
 
+    fn archive(path: &Path) -> PathBuf {
+        use std::io::Write;
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".zst");
+        let compressed = PathBuf::from(name);
+        let mut encoder =
+            zstd::stream::write::Encoder::new(File::create(&compressed).unwrap(), 3).unwrap();
+        encoder.include_checksum(true).unwrap();
+        encoder.write_all(&std::fs::read(path).unwrap()).unwrap();
+        encoder.finish().unwrap();
+        std::fs::remove_file(path).unwrap();
+        compressed
+    }
+
     #[test]
     fn changed_measurement_and_incomplete_surface_never_install() {
         let mut architecture = texo_target_ecp5::read_architecture(
@@ -124,15 +180,8 @@ mod tests {
         )
         .unwrap();
         let original = architecture.speed_grades()["6"].clone();
-        let directory = std::env::temp_dir().join(format!(
-            "texo-measured-library-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&directory).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path();
         let evidence = directory.join("explicit-synthetic-unit-test.txt");
         std::fs::write(
             &evidence,
@@ -203,6 +252,31 @@ mod tests {
         let provenance = install(&file, &mut architecture, "test-package", None).unwrap();
         assert_eq!(provenance["legacy_table_fallback"], false);
         assert_eq!(provenance["required_setup_hold_guard_ps"], 201);
-        std::fs::remove_dir_all(directory).unwrap();
+
+        // Compress both artifacts without changing any hash-bound input paths.
+        // Both the legacy path and the explicit archive must remain usable.
+        let compressed_library = archive(&file);
+        let compressed_evidence = archive(&evidence);
+        for path in [&file, &compressed_library] {
+            let restored = install(
+                path,
+                &mut architecture,
+                "test-package",
+                provenance["sha256"].as_str(),
+            )
+            .unwrap();
+            assert_eq!(restored["sha256"], provenance["sha256"]);
+            assert_eq!(restored["required_setup_hold_guard_ps"], 201);
+            assert!(!file.exists() && !evidence.exists());
+        }
+        // An existing changed input must not be hidden by a valid archive.
+        std::fs::write(&evidence, b"changed measurement").unwrap();
+        assert!(install(&file, &mut architecture, "test-package", None).is_err());
+        std::fs::remove_file(&evidence).unwrap();
+        let mut damaged = std::fs::read(&compressed_evidence).unwrap();
+        damaged.pop();
+        std::fs::write(&compressed_evidence, damaged).unwrap();
+        assert!(install(&file, &mut architecture, "test-package", None).is_err());
+        assert_eq!(architecture.speed_grades()["6"], original);
     }
 }
