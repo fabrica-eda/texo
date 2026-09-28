@@ -317,6 +317,7 @@ const fn default_synthesis_goal() -> NonZeroU32 {
 }
 
 /// Parse process arguments and run the Texo command-line interface.
+#[must_use]
 pub fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
