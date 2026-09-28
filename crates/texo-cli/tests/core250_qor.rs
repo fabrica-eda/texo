@@ -18,7 +18,9 @@ fn core250_qor_fixture_preserves_its_mapped_shape() {
     assert_eq!(loaded.project_sources, 6);
 
     let synthesized = synthesize(&loaded.design).expect("synthesize Core250 fixture");
-    assert_eq!(synthesized.netlist.nodes().len(), 6_228);
+    // Nested self-hold enable inference adds shared CE logic to the IR while
+    // removing six mapped cells relative to the pre-enable-fix Struo pin.
+    assert_eq!(synthesized.netlist.nodes().len(), 6_307);
     assert_eq!(synthesized.netlist.registers().len(), 1_167);
     assert_eq!(synthesized.netlist.memories().len(), 4);
 
@@ -40,7 +42,7 @@ fn core250_qor_fixture_preserves_its_mapped_shape() {
     mapped.bind_pll(&pll).expect("bind PLL");
 
     assert!(mapped.retiming().equivalence_signed_off);
-    assert_eq!(mapped.cells().len(), 3_514);
+    assert_eq!(mapped.cells().len(), 3_508);
     assert_eq!(
         count_cells(mapped.cells(), |cell| matches!(
             cell,

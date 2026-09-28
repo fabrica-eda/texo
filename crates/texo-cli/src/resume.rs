@@ -47,7 +47,7 @@ struct Pair {
 
 impl Checkpoint {
     pub fn read(path: &Path) -> Result<Self, Box<dyn Error>> {
-        let saved: Self = texo_cli::read_checkpoint(path)?;
+        let saved: Self = crate::read_checkpoint(path)?;
         if saved.schema_version != 3 {
             return Err("resume requires checkpoint schema 3".into());
         }
