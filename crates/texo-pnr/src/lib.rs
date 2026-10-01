@@ -1004,8 +1004,8 @@ pub struct RoutingWorkspace {
     pip_occupancy: Vec<u16>,
     wire_history: Vec<u32>,
     pip_history: Vec<u32>,
-    wire_congestion: Vec<u32>,
-    pip_congestion: Vec<u32>,
+    wire_congestion: Vec<u64>,
+    pip_congestion: Vec<u64>,
     touched_wires: Vec<usize>,
     touched_pips: Vec<usize>,
     search: RouteSearch,
@@ -8127,8 +8127,8 @@ fn polish_legal_timing_routes(
     routes: &mut [Option<Arc<NetRoute>>],
     wire_occupancy: &mut [u16],
     pip_occupancy: &mut [u16],
-    wire_congestion: &[u32],
-    pip_congestion: &[u32],
+    wire_congestion: &[u64],
+    pip_congestion: &[u64],
     touched_wires: &mut Vec<usize>,
     touched_pips: &mut Vec<usize>,
     search: &mut RouteSearch,
@@ -9760,8 +9760,8 @@ fn route_net(
     pin_wires: &PinWireCache,
     fixed: Option<&NetRoute>,
     net_id: NetId,
-    wire_congestion: &[u32],
-    pip_congestion: &[u32],
+    wire_congestion: &[u64],
+    pip_congestion: &[u64],
     blocked_pip_words: &[u64],
     hard_occupancy: Option<HardRoutingOccupancy<'_>>,
     mut hard_blockers: Option<&mut HardRoutingBlockers>,
@@ -10084,8 +10084,8 @@ fn populate_tree_arrivals(arcs: &[RouteArc], delays_ps: Option<&[u32]>, tree_del
 fn route_path_score(
     path_wires: &[WireId],
     path_pips: &[PipId],
-    wire_congestion: &[u32],
-    pip_congestion: &[u32],
+    wire_congestion: &[u64],
+    pip_congestion: &[u64],
     costs: &RoutingCosts,
     criticality: u64,
     delay_quantum_ps: u64,
@@ -10098,7 +10098,7 @@ fn route_path_score(
     let mut score = timing_tree_cost(arrival_ps, criticality, delay_quantum_ps);
     for (&wire, &pip) in path_wires.iter().rev().skip(1).zip(path_pips.iter().rev()) {
         let next_arrival_ps = arrival_ps.saturating_add(u64::from(costs.pip_delays_ps[pip.0]));
-        let congestion = u64::from(wire_congestion[wire.0]) + u64::from(pip_congestion[pip.0]);
+        let congestion = wire_congestion[wire.0].saturating_add(pip_congestion[pip.0]);
         let step = if delay_quantum_ps == ROUTING_DELAY_QUANTUM_PS {
             routing_step_cost(
                 costs.pip_delays_ps[pip.0],
@@ -10229,7 +10229,7 @@ struct RouteSearch {
 /// Lexicographically ordered `(estimate, distance, arrival, wire)` A* key.
 ///
 /// Negotiated congestion accumulates across the path and is scaled to the
-/// timing quantum. Even with u32 per-resource costs, its sum can exceed u32.
+/// timing quantum. Both individual resource scores and their sum can exceed u32.
 /// Preserve full-width costs and arrival times instead of truncating or
 /// saturating distinct route priorities into the same value.
 type RouteQueueEntry = (u64, u64, u64, u32);
@@ -10323,8 +10323,8 @@ impl RouteSearch {
         starts: &BTreeSet<WireId>,
         avoid_wires: Option<&BTreeSet<WireId>>,
         goal: WireId,
-        wire_congestion: &[u32],
-        pip_congestion: &[u32],
+        wire_congestion: &[u64],
+        pip_congestion: &[u64],
         blocked_pip_words: &[u64],
         hard_occupancy: Option<HardRoutingOccupancy<'_>>,
         mut hard_blockers: Option<&mut HardRoutingBlockers>,
@@ -10422,8 +10422,8 @@ impl RouteSearch {
         starts: &BTreeSet<WireId>,
         avoid_wires: Option<&BTreeSet<WireId>>,
         goal: WireId,
-        wire_congestion: &[u32],
-        pip_congestion: &[u32],
+        wire_congestion: &[u64],
+        pip_congestion: &[u64],
         blocked_pip_words: &[u64],
         hard_occupancy: Option<HardRoutingOccupancy<'_>>,
         mut hard_blockers: Option<&mut HardRoutingBlockers>,
@@ -10546,8 +10546,7 @@ impl RouteSearch {
                         continue;
                     }
                 }
-                let congestion =
-                    u64::from(wire_congestion[neighbor.0]) + u64::from(pip_congestion[pip.0]);
+                let congestion = wire_congestion[neighbor.0].saturating_add(pip_congestion[pip.0]);
                 let pip_delay_ps = costs.map_or(0, |costs| costs.pip_delays_ps[pip.0]);
                 let next_arrival_ps = arrival_ps.saturating_add(u64::from(pip_delay_ps));
                 let step = if delay_quantum_ps == ROUTING_DELAY_QUANTUM_PS {
@@ -10634,8 +10633,8 @@ fn shortest_hold_path(
     graph: &UnifiedGraph<'_>,
     starts: &BTreeSet<WireId>,
     goal: WireId,
-    wire_congestion: &[u32],
-    pip_congestion: &[u32],
+    wire_congestion: &[u64],
+    pip_congestion: &[u64],
     blocked_pip_words: &[u64],
     hard_occupancy: Option<HardRoutingOccupancy<'_>>,
     mut hard_blockers: Option<&mut HardRoutingBlockers>,
@@ -10724,8 +10723,7 @@ fn shortest_hold_path(
                     continue;
                 }
             }
-            let congestion =
-                u64::from(wire_congestion[neighbor.0]) + u64::from(pip_congestion[pip.0]);
+            let congestion = wire_congestion[neighbor.0].saturating_add(pip_congestion[pip.0]);
             let pip_delay_ps = costs.pip_min_delays_ps[pip.0];
             let next_distance = distance.saturating_add(routing_step_cost(
                 pip_delay_ps,
@@ -10856,16 +10854,22 @@ fn routing_transition_cost(
 
 fn congestion_cost(occupancy: u16, capacity: u16, history: u32, present: u32) -> u64 {
     let prospective_overuse = occupancy.saturating_add(1).saturating_sub(capacity);
-    u64::from(history) + u64::from(present) * u64::from(prospective_overuse)
+    // Repeating an old conflict must become more expensive than temporarily
+    // displacing several previously unconflicted neighbors. Adding history to
+    // present overuse alone makes the exponentially growing present penalty
+    // dominate the accumulated history throughout the negotiation budget.
+    let history = u64::from(history);
+    history.saturating_add(
+        (history + 1)
+            .saturating_mul(u64::from(present))
+            .saturating_mul(u64::from(prospective_overuse)),
+    )
 }
 
-fn cached_congestion_cost(occupancy: u16, capacity: u16, history: u32, present: u32) -> u32 {
-    // `present` is capped at 4096 and history can grow for at most 32 routing
-    // iterations. Even the maximum u16 occupancy therefore remains below
-    // u32::MAX, while the search accumulator itself stays u64.
+fn cached_congestion_cost(occupancy: u16, capacity: u16, history: u32, present: u32) -> u64 {
+    // Recurrent conflicts can exceed a 32-bit resource score. Preserve that
+    // ordering in the resource caches as well as the existing u64 path queue.
     congestion_cost(occupancy, capacity, history, present)
-        .try_into()
-        .expect("negotiated congestion fits u32")
 }
 
 /// `PnR` failure with the responsible object identified.
@@ -13762,9 +13766,12 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        assert_eq!(iterations, [(0, 3), (1, 3), (2, 2)]);
+        // Every conflicting owner is released together. History-weighted
+        // congestion then resolves the overlap in this second iteration,
+        // letting B use the fast X channel after A takes its private route.
+        assert_eq!(iterations, [(0, 3), (1, 3)]);
         assert_eq!(arc_pips(0), [9, 10, 11, 12, 13]);
-        assert_eq!(arc_pips(1), [14, 15, 16]);
+        assert_eq!(arc_pips(1), [1, 2, 7]);
         assert_eq!(arc_pips(2), [4, 5, 8]);
         assert_eq!(routed.total_pips, 11);
     }
@@ -15206,6 +15213,114 @@ mod tests {
     }
 
     #[test]
+    fn cached_history_cost_preserves_large_resource_ordering() {
+        let smaller = super::cached_congestion_cost(u16::MAX, 1, 65_534, 4096);
+        let larger = super::cached_congestion_cost(u16::MAX, 1, 65_535, 4096);
+        assert!(smaller > u64::from(u32::MAX));
+        assert!(
+            larger > smaller,
+            "large scores must not collapse to one capped value"
+        );
+    }
+
+    #[test]
+    fn negotiation_can_displace_two_bystanders_to_resolve_a_recurrent_conflict() {
+        let mut design = Design::new();
+        let mut device = Device::new("history-detour", 1, 1).unwrap();
+        let point = Point::new(0, 0);
+        let mut pins = Vec::new();
+        let mut endpoints = Vec::new();
+        let mut bindings = Vec::new();
+        for index in 0..8 {
+            let name = format!("endpoint-{index}");
+            let direction = if index % 2 == 0 {
+                PinDirection::Output
+            } else {
+                PinDirection::Input
+            };
+            let cell = design.add_cell(&name, ResourceKind::Logic);
+            pins.push(design.add_pin(cell, "pin", direction).unwrap());
+            let wire = device.add_wire(&name, point, 1).unwrap();
+            endpoints.push(wire);
+            let bel = device.add_bel(&name, ResourceKind::Logic, point).unwrap();
+            device.add_bel_pin(bel, "pin", direction, wire).unwrap();
+            bindings.push(bel);
+        }
+        let nets = (0..4)
+            .map(|index| {
+                design
+                    .add_net(
+                        format!("net-{index}"),
+                        pins[index * 2],
+                        [pins[index * 2 + 1]],
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let shared = device.add_wire("shared", point, 1).unwrap();
+        let first = device.add_wire("first-bystander", point, 1).unwrap();
+        let second = device.add_wire("second-bystander", point, 1).unwrap();
+        let c1 = device.add_wire("c-detour-1", point, 1).unwrap();
+        let c2 = device.add_wire("c-detour-2", point, 1).unwrap();
+        let d1 = device.add_wire("d-detour-1", point, 1).unwrap();
+        let d2 = device.add_wire("d-detour-2", point, 1).unwrap();
+        // A needs shared. B can escape shared only by displacing both C and D;
+        // each bystander has its own slightly longer private alternative.
+        for (from, to) in [
+            (endpoints[0], shared),
+            (shared, endpoints[1]),
+            (endpoints[2], shared),
+            (shared, endpoints[3]),
+            (endpoints[2], first),
+            (first, second),
+            (second, endpoints[3]),
+            (endpoints[4], first),
+            (first, endpoints[5]),
+            (endpoints[6], second),
+            (second, endpoints[7]),
+            (endpoints[4], c1),
+            (c1, c2),
+            (c2, endpoints[5]),
+            (endpoints[6], d1),
+            (d1, d2),
+            (d2, endpoints[7]),
+        ] {
+            device.add_pip(from, to, false, 1).unwrap();
+        }
+        let placement = placement_from_complete_bindings(
+            &design,
+            &device,
+            &PlacementConstraints::new(),
+            bindings,
+        )
+        .unwrap();
+        let costs = RoutingCosts::new(
+            vec![50; device.pips().len()],
+            BTreeMap::from([(nets[0], 32), (nets[1], 32), (nets[2], 64), (nets[3], 64)]),
+        );
+        let routed = route_with_timing_costs_and_progress(
+            &design,
+            &device,
+            placement,
+            &RoutingConstraints::new(),
+            &costs,
+            |_| {},
+        )
+        .expect("recurrent conflicts must eventually outweigh temporary bystander displacement");
+        assert!(routed.routes[0].wires().any(|wire| wire == shared));
+        assert!(routed.routes[1].wires().any(|wire| wire == first));
+        assert!(routed.routes[1].wires().any(|wire| wire == second));
+        assert!(routed.routes[2].wires().any(|wire| wire == c1));
+        assert!(routed.routes[3].wires().any(|wire| wire == d1));
+        let mut occupied = BTreeSet::new();
+        for route in &routed.routes {
+            for wire in route.wires() {
+                assert!(occupied.insert(wire));
+            }
+        }
+    }
+
+    #[test]
     fn alternate_source_estimate_is_explicit_and_positive() {
         let mut costs = RoutingCosts::new(Vec::new(), BTreeMap::new());
         assert_eq!(costs.alternate_source_delay_per_tile_ps(), None);
@@ -15353,7 +15468,7 @@ mod tests {
                 None,
                 goal,
                 &[0; 3],
-                &[u32::MAX, u32::MAX - 1],
+                &[u64::from(u32::MAX), u64::from(u32::MAX) - 1],
                 &[],
                 None,
                 None,
