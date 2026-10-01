@@ -7662,57 +7662,6 @@ fn route(
             iteration,
             nets: dirty.len(),
         });
-        for (&index, dirty_sinks) in &dirty {
-            if let Some(previous) = routes[index].take() {
-                let preserved = NetRoute::new(
-                    previous.net,
-                    previous
-                        .arcs
-                        .iter()
-                        .filter(|arc| arc.sink.is_none_or(|sink| !dirty_sinks.contains(&sink)))
-                        .cloned()
-                        .collect(),
-                );
-                for wire in previous
-                    .wires()
-                    .filter(|&wire| preserved.wire_ref_count(wire) == 0)
-                {
-                    wire_occupancy[wire.0] -= 1;
-                    resource_owners.release_wire(
-                        wire,
-                        previous.net,
-                        metadata.wire_capacities[wire.0],
-                        wire_occupancy[wire.0],
-                    );
-                    track_entry(
-                        &mut overuse.wires,
-                        wire_occupancy[wire.0],
-                        metadata.wire_capacities[wire.0],
-                        wire.0,
-                    );
-                }
-                for pip in previous
-                    .pips()
-                    .filter(|&pip| preserved.pip_ref_count(pip) == 0)
-                {
-                    pip_occupancy[pip.0] -= 1;
-                    resource_owners.release_pip(
-                        pip,
-                        previous.net,
-                        metadata.pip_capacities[pip.0],
-                        pip_occupancy[pip.0],
-                    );
-                    track_entry(
-                        &mut overuse.pips,
-                        pip_occupancy[pip.0],
-                        metadata.pip_capacities[pip.0],
-                        pip.0,
-                    );
-                }
-                routes[index] = Some(Arc::new(preserved));
-            }
-        }
-        resource_owners.repair_stale(&routes);
         for &index in &workspace.touched_wires {
             wire_congestion[index] = cached_congestion_cost(
                 wire_occupancy[index],
@@ -7745,6 +7694,72 @@ fn route(
                 total: dirty.len(),
                 net: NetId(index),
             });
+            // Keep other nets' old paths visible to present congestion until
+            // their own replacement search. Bulk rip-up makes early nets see
+            // contested resources as vacant on every iteration, leaving only
+            // the much smaller history term to persuade them to move.
+            let dirty_sinks = &dirty[&index];
+            if let Some(previous) = routes[index].take() {
+                let preserved = NetRoute::new(
+                    previous.net,
+                    previous
+                        .arcs
+                        .iter()
+                        .filter(|arc| arc.sink.is_none_or(|sink| !dirty_sinks.contains(&sink)))
+                        .cloned()
+                        .collect(),
+                );
+                for wire in previous
+                    .wires()
+                    .filter(|&wire| preserved.wire_ref_count(wire) == 0)
+                {
+                    wire_occupancy[wire.0] -= 1;
+                    wire_congestion[wire.0] = cached_congestion_cost(
+                        wire_occupancy[wire.0],
+                        metadata.wire_capacities[wire.0],
+                        wire_history[wire.0],
+                        present_factor,
+                    );
+                    resource_owners.release_wire(
+                        wire,
+                        previous.net,
+                        metadata.wire_capacities[wire.0],
+                        wire_occupancy[wire.0],
+                    );
+                    track_entry(
+                        &mut overuse.wires,
+                        wire_occupancy[wire.0],
+                        metadata.wire_capacities[wire.0],
+                        wire.0,
+                    );
+                }
+                for pip in previous
+                    .pips()
+                    .filter(|&pip| preserved.pip_ref_count(pip) == 0)
+                {
+                    pip_occupancy[pip.0] -= 1;
+                    pip_congestion[pip.0] = cached_congestion_cost(
+                        pip_occupancy[pip.0],
+                        metadata.pip_capacities[pip.0],
+                        pip_history[pip.0],
+                        present_factor,
+                    );
+                    resource_owners.release_pip(
+                        pip,
+                        previous.net,
+                        metadata.pip_capacities[pip.0],
+                        pip_occupancy[pip.0],
+                    );
+                    track_entry(
+                        &mut overuse.pips,
+                        pip_occupancy[pip.0],
+                        metadata.pip_capacities[pip.0],
+                        pip.0,
+                    );
+                }
+                routes[index] = Some(Arc::new(preserved));
+            }
+            resource_owners.repair_stale(&routes);
             let net_id = NetId(index);
             let preserved = routes[index].take();
             let route = route_net(
@@ -7898,7 +7913,9 @@ fn route(
             }
         }
         dirty = next_dirty;
-        resource_owners.resolve_conflicts(&routes, &dirty);
+        // These routes are still occupied. Dirty connections will be
+        // released individually in the next iteration, not all at once.
+        resource_owners.resolve_conflicts(&routes, &BTreeMap::new());
     }
 
     if std::env::var_os("TEXO_PNR_METRICS").is_some() {
@@ -13766,8 +13783,8 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        // Every conflicting owner is released together. History-weighted
-        // congestion then resolves the overlap in this second iteration,
+        // Every conflicting owner is eligible for rerouting. History-weighted
+        // congestion resolves the overlap in this second iteration,
         // letting B use the fast X channel after A takes its private route.
         assert_eq!(iterations, [(0, 3), (1, 3)]);
         assert_eq!(arc_pips(0), [9, 10, 11, 12, 13]);
@@ -15194,6 +15211,95 @@ mod tests {
             for wire in route.wires() {
                 occupancy[wire.0] += 1;
                 assert!(occupancy[wire.0] <= device.wires()[wire.0].capacity);
+            }
+        }
+    }
+
+    #[test]
+    fn negotiation_retains_other_dirty_nets_while_searching_a_replacement() {
+        let mut design = Design::new();
+        let mut device = Device::new("occupied-detour", 1, 1).unwrap();
+        let point = Point::new(0, 0);
+        let mut pins = Vec::new();
+        let mut wires = Vec::new();
+        let mut bindings = Vec::new();
+        for index in 0..4 {
+            let name = format!("endpoint-{index}");
+            let direction = if index % 2 == 0 {
+                PinDirection::Output
+            } else {
+                PinDirection::Input
+            };
+            let cell = design.add_cell(&name, ResourceKind::Logic);
+            pins.push(design.add_pin(cell, "pin", direction).unwrap());
+            let wire = device.add_wire(&name, point, 1).unwrap();
+            wires.push(wire);
+            let bel = device.add_bel(&name, ResourceKind::Logic, point).unwrap();
+            device.add_bel_pin(bel, "pin", direction, wire).unwrap();
+            bindings.push(bel);
+        }
+        let a = design.add_net("a", pins[0], [pins[1]]).unwrap();
+        let b = design.add_net("b", pins[2], [pins[3]]).unwrap();
+        let shared = (0..129)
+            .map(|index| {
+                device
+                    .add_wire(format!("shared-{index}"), point, 1)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut previous = wires[2];
+        for &wire in &shared {
+            device.add_pip(wires[0], wire, false, 1).unwrap();
+            device.add_pip(wire, wires[1], false, 1).unwrap();
+            device.add_pip(previous, wire, false, 1).unwrap();
+            previous = wire;
+        }
+        device.add_pip(previous, wires[3], false, 1).unwrap();
+        let detour = device.add_pip(wires[0], wires[1], false, 1).unwrap();
+        let placement = placement_from_complete_bindings(
+            &design,
+            &device,
+            &PlacementConstraints::new(),
+            bindings,
+        )
+        .unwrap();
+        let mut delays = vec![50; device.pips().len()];
+        delays[detour.0] = 10_000;
+        // A can cross B's mandatory chain at any of 129 locations, or take
+        // its slower private path. Bulk rip-up hides all of B's occupancy:
+        // A walks through every fresh conflict before the exact-state cycle
+        // detector could repeat, exhausting the 128-iteration budget.
+        let costs = RoutingCosts::new(delays, BTreeMap::from([(a, 64), (b, 32)]));
+        let mut iterations = 0;
+        let routed = route_with_timing_costs_and_progress(
+            &design,
+            &device,
+            placement,
+            &RoutingConstraints::new(),
+            &costs,
+            |event| {
+                if let RoutingProgress::Iteration { .. } = event {
+                    iterations += 1;
+                }
+            },
+        )
+        .expect("A can yield the shared wire while B's occupancy remains visible");
+        assert!(iterations <= 10);
+        assert_eq!(routed.routes[a.0].pips().collect::<Vec<_>>(), [detour]);
+        assert!(
+            !routed.routes[a.0]
+                .wires()
+                .any(|wire| shared.contains(&wire))
+        );
+        assert!(
+            shared
+                .iter()
+                .all(|wire| routed.routes[b.0].wires().any(|w| w == *wire))
+        );
+        let mut occupied = BTreeSet::new();
+        for route in &routed.routes {
+            for wire in route.wires() {
+                assert!(occupied.insert(wire));
             }
         }
     }
