@@ -7,7 +7,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::fs::File;
+use std::io::{ErrorKind, Read};
+use std::path::{Path, PathBuf};
 use texo_model::{BelId, CellId, CellPinId, Design, NetId, ResourceKind};
 use texo_pnr::{Placement, PlacementConstraints, placement_from_complete_bindings};
 use texo_target_ecp5::Ecp5Architecture;
@@ -35,13 +37,53 @@ struct Record {
     sta_qualified: bool,
 }
 
+// Evidence hashes bind the original bytes, including when stored as archives.
+// Never fall back from a present but unreadable or tampered original input.
+fn open_input(path: &Path) -> Result<(Box<dyn Read>, PathBuf), Box<dyn std::error::Error>> {
+    let (file, source) = match File::open(path) {
+        Ok(file) => (file, path.to_owned()),
+        Err(error)
+            if error.kind() == ErrorKind::NotFound
+                && path.extension().is_none_or(|ext| ext != "zst") =>
+        {
+            let mut archive = path.as_os_str().to_os_string();
+            archive.push(".zst");
+            let archive = PathBuf::from(archive);
+            (File::open(&archive)?, archive)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let reader: Box<dyn Read> = if source.extension().is_some_and(|ext| ext == "zst") {
+        Box::new(zstd::stream::read::Decoder::new(file)?)
+    } else {
+        Box::new(file)
+    };
+    Ok((reader, source))
+}
+
+fn input_digest(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let (mut reader, _) = open_input(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 8_192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(format!("{:x}", digest.finalize()));
+        }
+        digest.update(&buffer[..count]);
+    }
+}
+
 impl MeasuredPlacementModel {
-    /// Load and verify every measured input hash. No guessed-model fallback.
+    /// Load and verify every measured input hash, including archived `.zst`
+    /// models and evidence. No guessed-model fallback.
     ///
     /// # Errors
     /// Rejects missing/tampered inputs, incompatible target or invalid fit.
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let bytes = std::fs::read(path)?;
+        let (mut reader, source) = open_input(path)?;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
         let r: Record = serde_json::from_slice(&bytes)?;
         if r.schema != 1
             || r.kind != "measured_loop_average_lut_plus_route_cost"
@@ -73,7 +115,8 @@ impl MeasuredPlacementModel {
             return Err("invalid measured placement model or failed independent holdout".into());
         }
         for (file, expected) in &r.input_sha256 {
-            let actual = format!("{:x}", Sha256::digest(std::fs::read(file)?));
+            let actual = input_digest(Path::new(file))
+                .map_err(|error| format!("cannot read measured input {file}: {error}"))?;
             if actual != *expected {
                 return Err(format!("measured input hash mismatch: {file}").into());
             }
@@ -82,7 +125,7 @@ impl MeasuredPlacementModel {
             coefficients: r.coefficients_by_input_pin_ps,
             holdout_error: r.holdout_max_abs_relative_error,
             sha256: format!("{:x}", Sha256::digest(&bytes)),
-            source: path.canonicalize()?.display().to_string(),
+            source: source.canonicalize()?.display().to_string(),
         })
     }
 
@@ -418,7 +461,38 @@ mod tests {
             "input_sha256":{sample.display().to_string():format!("{:x}",Sha256::digest(b"measured counts"))}});
         std::fs::write(&model_path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(MeasuredPlacementModel::load(&model_path).is_ok());
+        let plain = MeasuredPlacementModel::load(&model_path).unwrap();
+        let archive = dir.join("sample.json.zst");
+        std::fs::write(
+            &archive,
+            zstd::stream::encode_all(&b"measured counts"[..], 1).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(&sample).unwrap();
+        assert!(MeasuredPlacementModel::load(&model_path).is_ok());
+        let model_archive = dir.join("model.json.zst");
+        std::fs::write(
+            &model_archive,
+            zstd::stream::encode_all(std::fs::read(&model_path).unwrap().as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(&model_path).unwrap();
+        for path in [&model_path, &model_archive] {
+            let restored = MeasuredPlacementModel::load(path).unwrap();
+            assert_eq!(restored.sha256, plain.sha256);
+            assert_eq!(restored.coefficients, plain.coefficients);
+        }
+        // A bad original must not be hidden by its valid compressed copy.
         std::fs::write(&sample, b"different counts").unwrap();
+        assert!(MeasuredPlacementModel::load(&model_path).is_err());
+        std::fs::remove_file(&sample).unwrap();
+        std::fs::write(
+            &archive,
+            zstd::stream::encode_all(&b"different counts"[..], 1).unwrap(),
+        )
+        .unwrap();
+        assert!(MeasuredPlacementModel::load(&model_path).is_err());
+        std::fs::write(&archive, b"broken zstd frame").unwrap();
         assert!(MeasuredPlacementModel::load(&model_path).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }

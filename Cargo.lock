@@ -3372,6 +3372,7 @@ dependencies = [
  "texo-struo",
  "texo-target-ecp5",
  "texo-timing",
+ "zstd",
 ]
 
 [[package]]
