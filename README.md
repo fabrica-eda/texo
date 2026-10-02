@@ -93,6 +93,22 @@ For internal sources such as `JTAGG.JTCK`, use
 and minimum period. Periods propagate through DCCA buffers and coexist with
 PLL-derived clock relationships. See [internal clocks](docs/internal-clocks.md).
 
+For equivalent physical-synthesis changes, `--measured-synthesis-feedback prior.txcp`
+uses routed delays and setup slack from a schema-3 measured-STA checkpoint to
+propose branch replication. Repeat the option in checkpoint order to retain
+earlier transformations. Observations guide search only: they do not supply
+critical-path/Fmax claims or satisfy any new implementation gate.
+
+`--register-branch-replication branches.txcp` requests whole register branches
+explicitly, including noncritical bits of a shared bus. The payload is an array
+of `{"driver":"ff_bounds[0]","sinks":["ccu_compare0_0"]}` records, encoded as a
+compressed checkpoint or legacy JSON. Names refer to mapped flip-flops and
+LUT4/CCU2C consumers, before physical `$slice0`/`$slice1` expansion. This step runs
+before measured-feedback passes. Invalid requests fail atomically; clock/reset/
+enable behavior and pipeline boundaries are preserved. Both options require
+fresh synthesis, equivalence, placement, routing and STA and cannot accompany
+`--resume-checkpoint`.
+
 ## PnR search model
 
 Texo is intended to support two entry points into the same deterministic,

@@ -4,6 +4,8 @@ mod bitgen;
 mod bitstream;
 mod checkpoint;
 mod checkpoint_io;
+mod synthesis_feedback;
+pub use synthesis_feedback::{measured_synthesis_feedback, validate_feedback_replica_names};
 pub mod cli;
 pub use checkpoint_io::{read_checkpoint, write_checkpoint_binary};
 pub mod measured_timing;
