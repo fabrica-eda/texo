@@ -22,7 +22,7 @@ use clap::{Args, Parser, Subcommand};
 use struo_synth::synthesize;
 use struo_target_ecp5::{
     ECP5_QOR_TARGET_MHZ, Ecp5Netlist, JtaggBinding, MappingOptions, OpenDrainIo, PllBinding,
-    RegisterEnableFanoutConstraint, map_to_ecp5_with_options,
+    RegisterEnableFanoutConstraint, RegisterEnablePlacement, map_to_ecp5_with_options,
 };
 use texo_flow::{
     Ecp5FlowOptions, Ecp5FlowResult, Ecp5FlowStage, Evidence, Gate, PostMapSimulationPolicy,
@@ -232,6 +232,14 @@ struct PnrArgs {
         value_parser = parse_register_enable_fanout
     )]
     register_enable_fanout: Vec<RegisterEnableFanoutConstraint>,
+    /// Advisory register positions for grouping CE branches; fresh PNR is required.
+    #[arg(
+        long,
+        value_name = "TXCP",
+        requires = "register_enable_fanout",
+        conflicts_with = "resume_checkpoint"
+    )]
+    register_enable_placement: Option<PathBuf>,
     /// Keep the initial legal placement and route without timing closure.
     #[arg(long)]
     no_timing_optimization: bool,
@@ -499,8 +507,16 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         },
     )?;
     bind_target_primitives(&mut mapped, args)?;
-    let enable_report =
-        mapped.apply_register_enable_fanout_constraints(&args.register_enable_fanout)?;
+    let enable_placement: BTreeMap<String, RegisterEnablePlacement> = args
+        .register_enable_placement
+        .as_deref()
+        .map(crate::read_checkpoint)
+        .transpose()?
+        .unwrap_or_default();
+    let enable_report = mapped.apply_register_enable_fanout_with_placement(
+        &args.register_enable_fanout,
+        &enable_placement,
+    )?;
     if enable_report.matched_registers != 0 {
         println!(
             "register-enable fanout constraints: {} FFs rewired onto {} branches",
@@ -1157,6 +1173,32 @@ mod tests {
             Some(Path::new("protected.json"))
         );
         arguments.extend(["--resume-checkpoint", "saved.json"]);
+        assert!(Cli::try_parse_from(&arguments).is_err());
+    }
+
+    #[test]
+    fn register_enable_placement_requires_fanout_and_fresh_synthesis() {
+        let mut arguments = vec![
+            "texo",
+            "pnr",
+            "project",
+            "--package",
+            "TEST",
+            "--speed",
+            "8",
+            "--register-enable-placement",
+            "ff-placement.txcp",
+        ];
+        assert!(Cli::try_parse_from(&arguments).is_err());
+        arguments.extend(["--register-enable-fanout", "ff_data[*]=8"]);
+        let Command::Pnr(args) = Cli::try_parse_from(&arguments).unwrap().command else {
+            panic!("expected pnr");
+        };
+        assert_eq!(
+            args.register_enable_placement.as_deref(),
+            Some(Path::new("ff-placement.txcp"))
+        );
+        arguments.extend(["--resume-checkpoint", "saved.txcp"]);
         assert!(Cli::try_parse_from(&arguments).is_err());
     }
 

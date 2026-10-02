@@ -109,6 +109,15 @@ enable behavior and pipeline boundaries are preserved. Both options require
 fresh synthesis, equivalence, placement, routing and STA and cannot accompany
 `--resume-checkpoint`.
 
+`--register-enable-placement ff-placement.txcp` groups equivalent enable branches
+using prior register coordinates when `--register-enable-fanout` is supplied.
+The compressed checkpoint maps mapped flip-flop names to
+`{"x":26,"y":54,"shared_enable":"R54C26/CE0"}` records; `shared_enable` is optional
+and identifies the physical CE wire shared by co-located registers. Distinct
+logical enables remain separate. Missing coordinates keep the previous grouping;
+coordinates guide grouping only and do not fix placement or establish timing.
+This option requires fresh synthesis and cannot accompany `--resume-checkpoint`.
+
 ## PnR search model
 
 Texo is intended to support two entry points into the same deterministic,
