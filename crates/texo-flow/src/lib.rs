@@ -2279,35 +2279,49 @@ fn repair_local_hold_placement(
             .hold_checks
             .iter()
             .filter(|check| check.slack_ps < 0)
-            .map(|check| (check.slack_ps, check.cell))
+            .flat_map(|check| {
+                // Either endpoint of a direct register path can provide the
+                // missing route delay. Capture-only moves miss legal repairs
+                // when its CE/control group prevents a useful relocation.
+                let launch = design.pins()[check.data_pin.0]
+                    .net()
+                    .map(|net| design.pins()[design.nets()[net.0].driver.0].cell)
+                    .filter(|&cell| design.cells()[cell.0].kind == ResourceKind::Register);
+                [
+                    Some((check.slack_ps, check.cell)),
+                    launch.map(|cell| (check.slack_ps, cell)),
+                ]
+                .into_iter()
+                .flatten()
+            })
             .collect::<BTreeSet<_>>();
         let bindings = implementation.placement.bindings().to_vec();
-        let occupied = bindings.iter().copied().collect::<BTreeSet<_>>();
         let mut accepted = false;
         'search: for radius in [2, 4, 8] {
             for &(_, cell) in &cells {
                 let old = bindings[cell.0];
-                let point = architecture.device().bels()[old.0].point;
-                let mut destinations = architecture
-                    .device()
-                    .bels()
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, bel)| {
-                        bel.kind == design.cells()[cell.0].kind
-                            && !occupied.contains(&BelId(*index))
-                            && bel.point.manhattan(point) <= radius
-                    })
-                    .map(|(index, bel)| (bel.point.manhattan(point), BelId(index)))
-                    .collect::<Vec<_>>();
-                destinations.sort_unstable();
+                let destinations = local_hold_moves(
+                    design,
+                    architecture.device(),
+                    packing.constraints(),
+                    &bindings,
+                    cell,
+                    radius,
+                );
                 let mut legal_trials = 0;
-                for (_, destination) in destinations {
+                for relocation in destinations {
+                    let destination = relocation
+                        .iter()
+                        .find(|(member, _)| *member == cell)
+                        .unwrap()
+                        .1;
                     if !tried.insert((cell, old, destination)) {
                         continue;
                     }
                     let mut next = bindings.clone();
-                    next[cell.0] = destination;
+                    for (member, bel) in relocation {
+                        next[member.0] = bel;
+                    }
                     let placement = match placement_from_complete_bindings(
                         design,
                         architecture.device(),
@@ -2384,6 +2398,77 @@ fn repair_local_hold_placement(
         }
     }
     Ok(())
+}
+
+/// Enumerate vacant atomic group moves before full placement validation.
+/// A paired FF cannot move alone: its dedicated LUT and any wider packing
+/// group must retain one of the packer's complete legal assignments.
+fn local_hold_moves(
+    design: &Design,
+    device: &Device,
+    constraints: &PlacementConstraints,
+    bindings: &[BelId],
+    cell: CellId,
+    radius: u32,
+) -> Vec<Vec<(CellId, BelId)>> {
+    let occupied = bindings.iter().copied().collect::<BTreeSet<_>>();
+    let old = bindings[cell.0];
+    let point = device.bels()[old.0].point;
+    let mut candidates = Vec::new();
+    if let Some(group) = constraints
+        .groups()
+        .iter()
+        .find(|group| group.cells.contains(&cell))
+    {
+        let column = group
+            .cells
+            .iter()
+            .position(|&member| member == cell)
+            .unwrap();
+        let vacated = group
+            .cells
+            .iter()
+            .map(|member| bindings[member.0])
+            .collect::<BTreeSet<_>>();
+        for row in group.assignments.iter() {
+            if row[column] != old
+                && device.bels()[row[column].0].point.manhattan(point) <= u64::from(radius)
+                && row
+                    .iter()
+                    .all(|bel| !occupied.contains(bel) || vacated.contains(bel))
+            {
+                candidates.push(
+                    group
+                        .cells
+                        .iter()
+                        .copied()
+                        .zip(row.iter().copied())
+                        .collect(),
+                );
+            }
+        }
+    } else {
+        for (index, bel) in device.bels().iter().enumerate() {
+            if bel.kind == design.cells()[cell.0].kind
+                && !occupied.contains(&BelId(index))
+                && bel.point.manhattan(point) <= u64::from(radius)
+            {
+                candidates.push(vec![(cell, BelId(index))]);
+            }
+        }
+    }
+    candidates.sort_unstable_by_key(|relocation| {
+        let destination = relocation
+            .iter()
+            .find(|(member, _)| *member == cell)
+            .unwrap()
+            .1;
+        (
+            device.bels()[destination.0].point.manhattan(point),
+            destination,
+        )
+    });
+    candidates
 }
 
 /// Repairs all general-routing hold arcs together after setup has closed.
@@ -7027,6 +7112,55 @@ mod tests {
             session.analyze(&implementation),
             Err(Ecp5FlowError::Timing(TimingError::UnknownRoutedPip(pip))) if pip == unknown
         ));
+    }
+
+    #[test]
+    fn local_hold_move_keeps_a_launch_pair_together_when_capture_is_fixed() {
+        let mut design = Design::new();
+        let lut = design.add_cell("launch_lut", ResourceKind::Logic);
+        let launch = design.add_cell("launch", ResourceKind::Register);
+        let capture = design.add_cell("capture", ResourceKind::Register);
+        let obstacle = design.add_cell("obstacle", ResourceKind::Logic);
+        let mut device = Device::new("hold-pair", 4, 1).unwrap();
+        let sites = (0..3)
+            .map(|x| {
+                let point = Point::new(x, 0);
+                (
+                    device
+                        .add_bel(format!("lut{x}"), ResourceKind::Logic, point)
+                        .unwrap(),
+                    device
+                        .add_bel(format!("ff{x}"), ResourceKind::Register, point)
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let capture_site = device
+            .add_bel("capture", ResourceKind::Register, Point::new(3, 0))
+            .unwrap();
+        let mut constraints = PlacementConstraints::new();
+        constraints.add_group([lut, launch], sites.iter().map(|&(l, f)| vec![l, f]));
+        constraints.add_group([capture], [vec![capture_site]]);
+        let bindings = vec![sites[0].0, sites[0].1, capture_site, sites[1].0];
+        let before = bindings.clone();
+        let capture_moves =
+            super::local_hold_moves(&design, &device, &constraints, &bindings, capture, 8);
+        assert!(capture_moves.is_empty());
+        let launch_moves =
+            super::local_hold_moves(&design, &device, &constraints, &bindings, launch, 2);
+        assert_eq!(launch_moves.len(), 1);
+        let mut next = bindings.clone();
+        for &(cell, bel) in &launch_moves[0] {
+            next[cell.0] = bel;
+        }
+        let candidate =
+            texo_pnr::placement_from_complete_bindings(&design, &device, &constraints, next)
+                .unwrap();
+        assert_eq!(candidate.bel(lut), Some(sites[2].0));
+        assert_eq!(candidate.bel(launch), Some(sites[2].1));
+        assert_eq!(candidate.bel(capture), Some(capture_site));
+        assert_eq!(candidate.bel(obstacle), Some(sites[1].0));
+        assert_eq!(bindings, before);
     }
 
     #[test]
