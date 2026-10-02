@@ -7643,6 +7643,9 @@ fn route(
     let mut dirty = BTreeMap::<usize, BTreeSet<CellPinId>>::new();
     let mut cycle_priority = BTreeSet::<usize>::new();
     let mut conflict_cycles = RoutingConflictCycleDetector::default();
+    let mut timing_margin = TIMING_ROUTE_MARGIN;
+    let mut best_congestion = None;
+    let mut stagnant_iterations = 0_u32;
     for (index, (net, route)) in design.nets().iter().zip(&routes).enumerate() {
         let route = route.as_ref();
         for &sink in &net.sinks {
@@ -7760,6 +7763,7 @@ fn route(
                 &mut workspace.search,
                 &mut workspace.tree_arrival_ps,
                 metadata,
+                timing_margin,
             )?;
             for wire in route.wires().filter(|&wire| {
                 preserved
@@ -7853,6 +7857,29 @@ fn route(
         };
         let objective =
             routing_congestion_objective(&overuse, wire_occupancy, pip_occupancy, metadata);
+        // A bounded search can keep finding an over-capacity path forever,
+        // so failure to find *any* path is not a sufficient widening trigger.
+        // Only unresolved negotiation expands; legal route ECOs stay local.
+        if best_congestion.is_none_or(|best| objective < best) {
+            best_congestion = Some(objective);
+            stagnant_iterations = 0;
+        } else {
+            stagnant_iterations += 1;
+            if stagnant_iterations >= 8 {
+                let limit = graph.device().width().max(graph.device().height());
+                let expanded = timing_margin.saturating_mul(2).min(limit);
+                if expanded > timing_margin {
+                    timing_margin = expanded;
+                    if std::env::var_os("TEXO_PNR_METRICS").is_some() {
+                        eprintln!(
+                            "[metrics] routing_corridor_expansion margin={timing_margin} excess={} resources={}",
+                            objective.0, objective.1,
+                        );
+                    }
+                }
+                stagnant_iterations = 0;
+            }
+        }
         if let Some(cycle) =
             conflict_cycles.observe(objective, &overuse.wires, &overuse.pips, &next_dirty)
         {
@@ -8226,6 +8253,7 @@ fn polish_legal_timing_routes(
             search,
             tree_arrival_ps,
             metadata,
+            TIMING_ROUTE_MARGIN,
         );
         subscriptions.replace(connection, blockers);
         let Ok(replacement) = replacement else {
@@ -8511,6 +8539,7 @@ pub fn legal_route_eco_candidate_with_workspace(
         &mut workspace.search,
         &mut workspace.tree_arrival_ps,
         metadata,
+        TIMING_ROUTE_MARGIN,
     );
     workspace.search.estimate_base_delay_ps = previous_base_estimate;
     workspace.search.estimate_delay_per_tile_ps = previous_estimate;
@@ -8797,6 +8826,7 @@ fn legal_nets_route_eco_candidate(
                 &mut workspace.search,
                 &mut workspace.tree_arrival_ps,
                 metadata,
+                TIMING_ROUTE_MARGIN,
             ) {
                 Ok(replacement) => replacement,
                 Err(PnrError::Unroutable { .. }) => return Ok(false),
@@ -8983,6 +9013,7 @@ fn discover_route_eco_owners(
             wire_capacities: &workspace.wire_capacities,
             pip_capacities: &workspace.pip_capacities,
         },
+        TIMING_ROUTE_MARGIN,
     );
     workspace.search.estimate_base_delay_ps = previous_base;
     workspace.search.estimate_delay_per_tile_ps = previous_estimate;
@@ -9739,6 +9770,7 @@ fn route_net(
     search: &mut RouteSearch,
     tree_arrival_ps: &mut [u64],
     metadata: RoutingResourceMetadata<'_>,
+    timing_margin: u32,
 ) -> Result<NetRoute, PnrError> {
     let design = graph.design();
     let device = graph.device();
@@ -9887,6 +9919,7 @@ fn route_net(
                 tree_arrival_ps,
                 minimum_arrival_ps,
                 metadata,
+                timing_margin,
             )
             .ok_or_else(|| PnrError::Unroutable {
                 net: net.name.clone(),
@@ -9973,6 +10006,7 @@ fn route_net(
                     tree_arrival_ps,
                     minimum_arrival_ps,
                     metadata,
+                    timing_margin,
                 ) {
                     let alternate_score = route_path_score(
                         &alternate_wires,
@@ -10300,6 +10334,7 @@ impl RouteSearch {
         tree_delays_ps: &[u64],
         minimum_arrival_ps: u64,
         metadata: RoutingResourceMetadata<'_>,
+        timing_margin: u32,
     ) -> Option<(Vec<WireId>, Vec<PipId>)> {
         if minimum_arrival_ps != 0 {
             return shortest_hold_path(
@@ -10338,8 +10373,7 @@ impl RouteSearch {
                 })
                 .map(|start| metadata.wire_points[start.0])
                 .expect("a route tree always contains its driver");
-            let corridor =
-                routing_corridor(start_point, goal_point, graph.device(), TIMING_ROUTE_MARGIN);
+            let corridor = routing_corridor(start_point, goal_point, graph.device(), timing_margin);
             if let Some(path) = self.shortest_path_attempt(
                 graph,
                 starts,
@@ -10568,9 +10602,9 @@ impl RouteSearch {
 
 type RoutingCorridor = (u32, u32, u32, u32);
 
-// The 85K AXI4 closure search reaches every timing sink without falling back
-// at this margin. Larger margins explore resources that never win; smaller
-// margins perturb the critical topology enough to lose timing closure.
+// Initial timing searches and local ECOs use this bounded window. Negotiated
+// routing widens it when congestion stops improving, because a path inside
+// this window can exist without any capacity-legal route inside it.
 const TIMING_ROUTE_MARGIN: u32 = 4;
 
 fn routing_corridor(start: Point, goal: Point, device: &Device, margin: u32) -> RoutingCorridor {
@@ -15088,6 +15122,76 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_routing_escapes_a_congested_timing_corridor() {
+        let mut design = Design::new();
+        let mut device = Device::new("corridor-detour", 16, 16).unwrap();
+        let mut pins = Vec::new();
+        let mut wires = Vec::new();
+        let mut bindings = Vec::new();
+        for (name, point, direction) in [
+            ("a-driver", Point::new(6, 6), PinDirection::Output),
+            ("a-sink", Point::new(7, 6), PinDirection::Input),
+            ("b-driver", Point::new(7, 7), PinDirection::Output),
+            ("b-sink", Point::new(8, 7), PinDirection::Input),
+        ] {
+            let cell = design.add_cell(name, ResourceKind::Logic);
+            pins.push(design.add_pin(cell, "pin", direction).unwrap());
+            let wire = device.add_wire(name, point, 1).unwrap();
+            wires.push(wire);
+            let bel = device.add_bel(name, ResourceKind::Logic, point).unwrap();
+            device.add_bel_pin(bel, "pin", direction, wire).unwrap();
+            bindings.push(bel);
+        }
+        let a = design.add_net("a", pins[0], [pins[1]]).unwrap();
+        let b = design.add_net("b", pins[2], [pins[3]]).unwrap();
+        let shared = device.add_wire("shared", Point::new(6, 7), 1).unwrap();
+        // A legal alternative exists, but falls outside the initial four-tile
+        // corridor. Merely finding an over-capacity in-corridor path must not
+        // prevent the negotiator from ever considering this alternative.
+        let detour = device.add_wire("detour", Point::new(6, 12), 1).unwrap();
+        for (from, to) in [
+            (wires[0], shared),
+            (shared, wires[1]),
+            (wires[2], shared),
+            (shared, wires[3]),
+            (wires[0], detour),
+            (detour, wires[1]),
+        ] {
+            device.add_pip(from, to, false, 1).unwrap();
+        }
+        let placement = placement_from_complete_bindings(
+            &design,
+            &device,
+            &PlacementConstraints::new(),
+            bindings,
+        )
+        .unwrap();
+        let costs = RoutingCosts::new(
+            vec![50; device.pips().len()],
+            BTreeMap::from([(a, 32), (b, 64)]),
+        );
+        let routed = route_with_timing_costs_and_progress(
+            &design,
+            &device,
+            placement,
+            &RoutingConstraints::new(),
+            &costs,
+            |_| {},
+        )
+        .expect("a legal route exists outside the initial corridor");
+        assert!(routed.routes[a.0].wires().any(|wire| wire == detour));
+        assert!(!routed.routes[a.0].wires().any(|wire| wire == shared));
+        assert!(routed.routes[b.0].wires().any(|wire| wire == shared));
+        let mut occupancy = vec![0; device.wires().len()];
+        for route in &routed.routes {
+            for wire in route.wires() {
+                occupancy[wire.0] += 1;
+                assert!(occupancy[wire.0] <= device.wires()[wire.0].capacity);
+            }
+        }
+    }
+
+    #[test]
     fn local_routing_iteration_limit_stays_within_negotiator_bounds() {
         let mut costs = RoutingCosts::new(Vec::new(), BTreeMap::new());
         assert_eq!(costs.max_iterations(), MAX_ROUTING_ITERATIONS);
@@ -15199,6 +15303,7 @@ mod tests {
                 &tree_delays,
                 0,
                 metadata,
+                super::TIMING_ROUTE_MARGIN,
             )
             .unwrap();
 
@@ -15258,6 +15363,7 @@ mod tests {
                 &tree_delays,
                 0,
                 metadata,
+                super::TIMING_ROUTE_MARGIN,
             )
             .unwrap();
 
@@ -15337,6 +15443,7 @@ mod tests {
                 &tree_delays,
                 0,
                 metadata,
+                super::TIMING_ROUTE_MARGIN,
             )
             .unwrap();
 
@@ -15400,6 +15507,7 @@ mod tests {
                 &tree_delays,
                 0,
                 metadata,
+                super::TIMING_ROUTE_MARGIN,
             )
             .unwrap();
 
@@ -15469,6 +15577,7 @@ mod tests {
                 &tree_delays,
                 0,
                 metadata,
+                super::TIMING_ROUTE_MARGIN,
             )
             .unwrap();
 
@@ -15555,6 +15664,7 @@ mod tests {
                 &[0; 4],
                 0,
                 metadata,
+                super::TIMING_ROUTE_MARGIN,
             )
             .unwrap();
 
@@ -15614,6 +15724,7 @@ mod tests {
                 &[0],
                 500,
                 metadata,
+                super::TIMING_ROUTE_MARGIN,
             )
             .unwrap();
 
