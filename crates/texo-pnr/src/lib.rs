@@ -10661,6 +10661,58 @@ fn shortest_hold_path(
     minimum_arrival_ps: u64,
     metadata: RoutingResourceMetadata<'_>,
 ) -> Option<(Vec<WireId>, Vec<PipId>)> {
+    // Coarse buckets can discard a slightly slower prefix that is the only
+    // one capable of meeting a downstream hold floor. Retain the fast search
+    // for ordinary repairs, then refine failed searches down to individual ps.
+    // Every attempt keeps the same corridor, occupancy and simple-path checks.
+    for quantum_ps in [HOLD_DELAY_QUANTUM_PS, 5, 1] {
+        let path = shortest_hold_path_attempt(
+            graph,
+            starts,
+            goal,
+            wire_congestion,
+            pip_congestion,
+            blocked_pip_words,
+            hard_occupancy,
+            hard_blockers.as_deref_mut(),
+            costs,
+            criticality,
+            tree_delays_ps,
+            minimum_arrival_ps,
+            metadata,
+            quantum_ps,
+        );
+        if quantum_ps != HOLD_DELAY_QUANTUM_PS && std::env::var_os("TEXO_PNR_METRICS").is_some() {
+            eprintln!(
+                "[metrics] hold_delay_refinement goal={} minimum_ps={minimum_arrival_ps} quantum_ps={quantum_ps} found={}",
+                goal.0,
+                path.is_some(),
+            );
+        }
+        if path.is_some() {
+            return path;
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn shortest_hold_path_attempt(
+    graph: &UnifiedGraph<'_>,
+    starts: &BTreeSet<WireId>,
+    goal: WireId,
+    wire_congestion: &[u64],
+    pip_congestion: &[u64],
+    blocked_pip_words: &[u64],
+    hard_occupancy: Option<HardRoutingOccupancy<'_>>,
+    mut hard_blockers: Option<&mut HardRoutingBlockers>,
+    costs: &RoutingCosts,
+    criticality: u64,
+    tree_delays_ps: &[u64],
+    minimum_arrival_ps: u64,
+    metadata: RoutingResourceMetadata<'_>,
+    quantum_ps: u64,
+) -> Option<(Vec<WireId>, Vec<PipId>)> {
     let goal_point = metadata.wire_points[goal.0];
     // Hold repair is a local ECO. Searching the whole device in the
     // (wire, delay-bucket) state space is both disproportionately expensive
@@ -10685,7 +10737,10 @@ fn shortest_hold_path(
             continue;
         }
         let arrival_ps = tree_delays_ps[start.0];
-        let state = (start, hold_delay_bucket(arrival_ps, minimum_arrival_ps));
+        let state = (
+            start,
+            hold_delay_bucket(arrival_ps, minimum_arrival_ps, quantum_ps),
+        );
         let distance = timing_tree_cost(arrival_ps, criticality, ROUTING_DELAY_QUANTUM_PS);
         visits.insert(state, (distance, arrival_ps, None));
         let estimate = if hard_occupancy.is_some() {
@@ -10718,7 +10773,11 @@ fn shortest_hold_path(
             if pip_is_blocked(blocked_pip_words, pip) {
                 continue;
             }
-            if starts.contains(&neighbor) {
+            // Reject cycles before they enter the visited-state table. A
+            // cheap cyclic walk reaching the saturated delay bucket would
+            // otherwise suppress a more expensive, legal simple path; checking
+            // only after reaching the goal is too late to recover that path.
+            if starts.contains(&neighbor) || hold_prefix_contains_wire(state, neighbor, &visits) {
                 continue;
             }
             if !point_inside_corridor(metadata.wire_points[neighbor.0], corridor) {
@@ -10751,7 +10810,7 @@ fn shortest_hold_path(
             let next_arrival_ps = arrival_ps.saturating_add(u64::from(pip_delay_ps));
             let next_state = (
                 neighbor,
-                hold_delay_bucket(next_arrival_ps, minimum_arrival_ps),
+                hold_delay_bucket(next_arrival_ps, minimum_arrival_ps, quantum_ps),
             );
             let improves =
                 visits
@@ -10785,16 +10844,30 @@ fn shortest_hold_path(
 
 const HOLD_DELAY_QUANTUM_PS: u64 = 50;
 
-fn hold_delay_bucket(arrival_ps: u64, minimum_arrival_ps: u64) -> u32 {
+fn hold_delay_bucket(arrival_ps: u64, minimum_arrival_ps: u64, quantum_ps: u64) -> u32 {
     if arrival_ps >= minimum_arrival_ps {
         return minimum_arrival_ps
-            .div_ceil(HOLD_DELAY_QUANTUM_PS)
+            .div_ceil(quantum_ps)
             .try_into()
             .unwrap_or(u32::MAX);
     }
-    (arrival_ps / HOLD_DELAY_QUANTUM_PS)
-        .try_into()
-        .unwrap_or(u32::MAX - 1)
+    (arrival_ps / quantum_ps).try_into().unwrap_or(u32::MAX - 1)
+}
+
+fn hold_prefix_contains_wire(
+    mut state: HoldRouteState,
+    wire: WireId,
+    visits: &HashMap<HoldRouteState, HoldRouteVisit>,
+) -> bool {
+    loop {
+        if state.0 == wire {
+            return true;
+        }
+        let Some((previous, _)) = visits[&state].2 else {
+            return false;
+        };
+        state = previous;
+    }
 }
 
 fn reconstruct_hold_path(
@@ -15971,6 +16044,133 @@ mod tests {
             ),
             Err(PnrError::InvalidRoutingCosts { .. })
         ));
+    }
+
+    #[test]
+    fn hold_routing_keeps_a_feasible_path_within_a_coarse_delay_bucket() {
+        let mut design = Design::new();
+        let mut device = Device::new("hold-sub-bucket", 1, 1).unwrap();
+        let [source, detour, merge, sink] = ["source", "detour", "merge", "sink"]
+            .map(|name| device.add_wire(name, Point::new(0, 0), 1).unwrap());
+        let mut endpoints = Vec::new();
+        let mut bindings = Vec::new();
+        for (name, wire, direction) in [
+            ("source", source, PinDirection::Output),
+            ("sink", sink, PinDirection::Input),
+        ] {
+            let cell = design.add_cell(name, ResourceKind::Logic);
+            endpoints.push(design.add_pin(cell, "P", direction).unwrap());
+            let bel = device
+                .add_bel(name, ResourceKind::Logic, Point::new(0, 0))
+                .unwrap();
+            device.add_bel_pin(bel, "P", direction, wire).unwrap();
+            bindings.push(bel);
+        }
+        let net = design
+            .add_net("hold", endpoints[0], [endpoints[1]])
+            .unwrap();
+        let pips = [
+            (source, merge),
+            (source, detour),
+            (detour, merge),
+            (merge, sink),
+        ]
+        .map(|(from, to)| device.add_pip(from, to, false, 1).unwrap());
+        let placement = Placement {
+            bindings,
+            pin_bindings: BTreeMap::new(),
+        };
+        for (second_delay, minimum_ps) in [(30, 62), (29, 61)] {
+            let mut costs = RoutingCosts::new(vec![57, 30, second_delay, 2], BTreeMap::new());
+            costs.set_pip_min_delays_ps(vec![57, 30, second_delay, 2]);
+            costs.set_sink_min_delays_ps(BTreeMap::from([((net, endpoints[1]), minimum_ps)]));
+            let result = route_with_timing_costs_and_progress(
+                &design,
+                &device,
+                placement.clone(),
+                &RoutingConstraints::new(),
+                &costs,
+                |_| {},
+            )
+            .unwrap();
+            // The cheaper 57 ps prefix cannot meet either floor. The 60 ps
+            // prefix needs 5 ps buckets; the 59 ps prefix needs 1 ps buckets.
+            let arc = result.routes[0].arc(endpoints[1]).unwrap();
+            assert_eq!(arc.pips, vec![pips[1], pips[2], pips[3]]);
+            costs.set_sink_min_delays_ps(BTreeMap::from([((net, endpoints[1]), minimum_ps + 1)]));
+            assert!(
+                route_with_timing_costs_and_progress(
+                    &design,
+                    &device,
+                    placement.clone(),
+                    &RoutingConstraints::new(),
+                    &costs,
+                    |_| {},
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn hold_routing_does_not_let_a_cheap_cycle_suppress_a_legal_detour() {
+        let mut design = Design::new();
+        let mut device = Device::new("hold-cycle", 1, 1).unwrap();
+        let wires = ["source", "a", "b", "c", "d", "e", "f", "sink"]
+            .map(|name| device.add_wire(name, Point::new(0, 0), 1).unwrap());
+        let mut endpoints = Vec::new();
+        let mut bindings = Vec::new();
+        for (name, wire, direction) in [
+            ("source", wires[0], PinDirection::Output),
+            ("sink", wires[7], PinDirection::Input),
+        ] {
+            let cell = design.add_cell(name, ResourceKind::Logic);
+            endpoints.push(design.add_pin(cell, "P", direction).unwrap());
+            let bel = device
+                .add_bel(name, ResourceKind::Logic, Point::new(0, 0))
+                .unwrap();
+            device.add_bel_pin(bel, "P", direction, wire).unwrap();
+            bindings.push(bel);
+        }
+        let net = design
+            .add_net("hold", endpoints[0], [endpoints[1]])
+            .unwrap();
+        let pips = [
+            (0, 1),
+            (1, 2),
+            (2, 1),
+            (1, 7),
+            (0, 3),
+            (3, 4),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+        ]
+        .map(|(from, to)| device.add_pip(wires[from], wires[to], false, 1).unwrap());
+        let delays = vec![10, 50, 0, 10, 20, 20, 20, 20, 20];
+        let mut costs = RoutingCosts::new(delays.clone(), BTreeMap::new());
+        costs.set_pip_min_delays_ps(delays);
+        costs.set_sink_min_delays_ps(BTreeMap::from([((net, endpoints[1]), 62)]));
+        let result = route_with_timing_costs_and_progress(
+            &design,
+            &device,
+            Placement {
+                bindings,
+                pin_bindings: BTreeMap::new(),
+            },
+            &RoutingConstraints::new(),
+            &costs,
+            |_| {},
+        )
+        .unwrap();
+        // The four-hop source/a/b/a/sink walk meets the delay floor but
+        // contains a cycle. It must not dominate the legal five-hop path.
+        let arc = result.routes[0].arc(endpoints[1]).unwrap();
+        assert_eq!(arc.pips, pips[4..].to_vec());
+        assert_eq!(
+            arc.wires.iter().copied().collect::<BTreeSet<_>>().len(),
+            arc.wires.len()
+        );
     }
 
     struct HoldSharedPrefixFixture {
