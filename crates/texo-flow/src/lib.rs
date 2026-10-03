@@ -202,6 +202,7 @@ pub enum PostMapSimulationPolicy {
 
 /// Configuration for the complete Struo-to-ECP5 physical implementation flow.
 #[derive(Clone, Copy, Debug)]
+#[allow(clippy::struct_excessive_bools)] // Independent opt-in flow policies.
 pub struct Ecp5FlowOptions<'a> {
     /// Policy for caller-provided post-map functional-simulation evidence.
     pub post_map_simulation: PostMapSimulationPolicy,
@@ -253,6 +254,9 @@ pub struct Ecp5FlowOptions<'a> {
     /// Timing optimization now uses one characterized route from the start,
     /// so enabling this no longer adds a second bootstrap reroute.
     pub initial_timing_reroute: bool,
+    /// Try widening spatial corridors for hop-first routing, with full-device
+    /// fallback when no local path exists. Does not alter the STA model.
+    pub bounded_hop_routing: bool,
     /// Whether post-route timing closure may change the initial placement and
     /// routing. Disable this for placement A/B measurements.
     pub optimize_timing: bool,
@@ -285,6 +289,7 @@ impl Default for Ecp5FlowOptions<'_> {
             preserved_initial_routes: &[],
             lut_ff_pairs: None,
             initial_timing_reroute: false,
+            bounded_hop_routing: false,
             optimize_timing: true,
             setup_optimization_budget: None,
         }
@@ -774,6 +779,20 @@ pub fn implement_struo_ecp5_with_progress(
             speed_grade,
             initial_measured_net_weights(&design),
         )?);
+    }
+    if options.bounded_hop_routing {
+        if timing_routing_costs.is_none() {
+            // Retain the actual installed delay tables. Empty criticalities
+            // select hop-first routing; no synthetic timing table is needed.
+            timing_routing_costs = Some(ecp5_routing_costs(
+                architecture,
+                speed_grade,
+                BTreeMap::new(),
+            )?);
+        }
+        if let Some(costs) = timing_routing_costs.as_mut() {
+            costs.set_bounded_hop_search(true);
+        }
     }
     let mut routing = packing.global_routing_constraints_cached(
         &design,
