@@ -200,6 +200,14 @@ a complete candidate that improves the existing routed-STA objective replaces
 the incumbent. `--setup-optimization-budget-seconds` sets a soft setup-search
 budget: an in-progress candidate finishes its routing and timing checks.
 
+`--bounded-hop-routing` also tries a spatial corridor for hop-first searches,
+including the initial route with `--no-timing-optimization`. Missing local paths
+fall back to full-device searches, and stalled congestion widens the corridor.
+This opt-in policy can choose a longer local path before considering a shorter
+remote path. It uses the installed PIP delays for arrival bookkeeping and
+tie-breaking; routed STA, timing margins and the setup-before-hold-repair checks
+remain unchanged. It does not bound fallback paths that bypass routing costs.
+
 Board-level open-drain buses keep a two-state verification interface in the
 Veryl design and are fused into one physical bidirectional ECP5 pad at the
 mapping boundary. For example, this binds the scalar input `sda_i` and

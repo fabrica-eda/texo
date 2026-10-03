@@ -122,6 +122,7 @@ pub struct RoutingCosts {
     detailed_delay_quantum_ps: u64,
     alternate_source_delay_per_tile_ps: Option<u64>,
     max_iterations: u32,
+    bounded_hop_search: bool,
 }
 
 impl RoutingCosts {
@@ -139,6 +140,7 @@ impl RoutingCosts {
             detailed_delay_quantum_ps: 1,
             alternate_source_delay_per_tile_ps: None,
             max_iterations: MAX_ROUTING_ITERATIONS,
+            bounded_hop_search: false,
         }
     }
 
@@ -177,6 +179,15 @@ impl RoutingCosts {
     #[must_use]
     pub const fn max_iterations(&self) -> u32 {
         self.max_iterations
+    }
+
+    /// Try a spatial corridor before full-device hop-first searches.
+    ///
+    /// This is opt-in: a legal local path need not be the globally shortest
+    /// hop path. Missing paths fall back to the full device, and unresolved
+    /// congestion progressively widens the corridor. Timing costs are unchanged.
+    pub fn set_bounded_hop_search(&mut self, enabled: bool) {
+        self.bounded_hop_search = enabled;
     }
 
     /// Criticality weights indexed by logical net.
@@ -10370,7 +10381,7 @@ impl RouteSearch {
                 metadata,
             );
         }
-        if criticality != 0 {
+        if criticality != 0 || costs.is_some_and(|costs| costs.bounded_hop_search) {
             let goal_point = metadata.wire_points[goal.0];
             // A geometrically close branch can have reached this area through
             // a very slow detour.  Centering the timing corridor on that
@@ -10383,7 +10394,11 @@ impl RouteSearch {
                 .iter()
                 .min_by_key(|start| {
                     (
-                        tree_delays_ps[start.0],
+                        if criticality == 0 {
+                            0
+                        } else {
+                            tree_delays_ps[start.0]
+                        },
                         metadata.wire_points[start.0].manhattan(goal_point),
                         **start,
                     )
@@ -15220,71 +15235,150 @@ mod tests {
 
     #[test]
     fn negotiated_routing_escapes_a_congested_timing_corridor() {
-        let mut design = Design::new();
-        let mut device = Device::new("corridor-detour", 16, 16).unwrap();
-        let mut pins = Vec::new();
-        let mut wires = Vec::new();
-        let mut bindings = Vec::new();
-        for (name, point, direction) in [
-            ("a-driver", Point::new(6, 6), PinDirection::Output),
-            ("a-sink", Point::new(7, 6), PinDirection::Input),
-            ("b-driver", Point::new(7, 7), PinDirection::Output),
-            ("b-sink", Point::new(8, 7), PinDirection::Input),
-        ] {
-            let cell = design.add_cell(name, ResourceKind::Logic);
-            pins.push(design.add_pin(cell, "pin", direction).unwrap());
-            let wire = device.add_wire(name, point, 1).unwrap();
-            wires.push(wire);
-            let bel = device.add_bel(name, ResourceKind::Logic, point).unwrap();
-            device.add_bel_pin(bel, "pin", direction, wire).unwrap();
-            bindings.push(bel);
-        }
-        let a = design.add_net("a", pins[0], [pins[1]]).unwrap();
-        let b = design.add_net("b", pins[2], [pins[3]]).unwrap();
-        let shared = device.add_wire("shared", Point::new(6, 7), 1).unwrap();
-        // A legal alternative exists, but falls outside the initial four-tile
-        // corridor. Merely finding an over-capacity in-corridor path must not
-        // prevent the negotiator from ever considering this alternative.
-        let detour = device.add_wire("detour", Point::new(6, 12), 1).unwrap();
-        for (from, to) in [
-            (wires[0], shared),
-            (shared, wires[1]),
-            (wires[2], shared),
-            (shared, wires[3]),
-            (wires[0], detour),
-            (detour, wires[1]),
-        ] {
-            device.add_pip(from, to, false, 1).unwrap();
-        }
-        let placement = placement_from_complete_bindings(
-            &design,
-            &device,
-            &PlacementConstraints::new(),
-            bindings,
-        )
-        .unwrap();
-        let costs = RoutingCosts::new(
-            vec![50; device.pips().len()],
-            BTreeMap::from([(a, 32), (b, 64)]),
-        );
-        let routed = route_with_timing_costs_and_progress(
-            &design,
-            &device,
-            placement,
-            &RoutingConstraints::new(),
-            &costs,
-            |_| {},
-        )
-        .expect("a legal route exists outside the initial corridor");
-        assert!(routed.routes[a.0].wires().any(|wire| wire == detour));
-        assert!(!routed.routes[a.0].wires().any(|wire| wire == shared));
-        assert!(routed.routes[b.0].wires().any(|wire| wire == shared));
-        let mut occupancy = vec![0; device.wires().len()];
-        for route in &routed.routes {
-            for wire in route.wires() {
-                occupancy[wire.0] += 1;
-                assert!(occupancy[wire.0] <= device.wires()[wire.0].capacity);
+        for bounded_hops in [false, true] {
+            let mut design = Design::new();
+            let mut device = Device::new("corridor-detour", 16, 16).unwrap();
+            let mut pins = Vec::new();
+            let mut wires = Vec::new();
+            let mut bindings = Vec::new();
+            for (name, point, direction) in [
+                ("a-driver", Point::new(6, 6), PinDirection::Output),
+                ("a-sink", Point::new(7, 6), PinDirection::Input),
+                ("b-driver", Point::new(7, 7), PinDirection::Output),
+                ("b-sink", Point::new(8, 7), PinDirection::Input),
+            ] {
+                let cell = design.add_cell(name, ResourceKind::Logic);
+                pins.push(design.add_pin(cell, "pin", direction).unwrap());
+                let wire = device.add_wire(name, point, 1).unwrap();
+                wires.push(wire);
+                let bel = device.add_bel(name, ResourceKind::Logic, point).unwrap();
+                device.add_bel_pin(bel, "pin", direction, wire).unwrap();
+                bindings.push(bel);
             }
+            let a = design.add_net("a", pins[0], [pins[1]]).unwrap();
+            let b = design.add_net("b", pins[2], [pins[3]]).unwrap();
+            let shared = device.add_wire("shared", Point::new(6, 7), 1).unwrap();
+            // A legal alternative exists, but falls outside the initial four-tile
+            // corridor. Merely finding an over-capacity in-corridor path must not
+            // prevent the negotiator from ever considering this alternative.
+            let detour = device.add_wire("detour", Point::new(6, 12), 1).unwrap();
+            for (from, to) in [
+                (wires[0], shared),
+                (shared, wires[1]),
+                (wires[2], shared),
+                (shared, wires[3]),
+                (wires[0], detour),
+                (detour, wires[1]),
+            ] {
+                device.add_pip(from, to, false, 1).unwrap();
+            }
+            let placement = placement_from_complete_bindings(
+                &design,
+                &device,
+                &PlacementConstraints::new(),
+                bindings,
+            )
+            .unwrap();
+            let mut costs = RoutingCosts::new(
+                vec![50; device.pips().len()],
+                if bounded_hops {
+                    BTreeMap::new()
+                } else {
+                    BTreeMap::from([(a, 32), (b, 64)])
+                },
+            );
+            costs.set_bounded_hop_search(bounded_hops);
+            let routed = route_with_timing_costs_and_progress(
+                &design,
+                &device,
+                placement,
+                &RoutingConstraints::new(),
+                &costs,
+                |_| {},
+            )
+            .expect("a legal route exists outside the initial corridor");
+            assert!(routed.routes[a.0].wires().any(|wire| wire == detour));
+            assert!(!routed.routes[a.0].wires().any(|wire| wire == shared));
+            assert!(routed.routes[b.0].wires().any(|wire| wire == shared));
+            let mut occupancy = vec![0; device.wires().len()];
+            for route in &routed.routes {
+                for wire in route.wires() {
+                    occupancy[wire.0] += 1;
+                    assert!(occupancy[wire.0] <= device.wires()[wire.0].capacity);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hop_corridors_are_opt_in_and_fall_back_when_the_local_path_is_missing() {
+        for (bounded, local_path) in [(false, true), (true, true), (true, false)] {
+            let mut design = Design::new();
+            let mut device = Device::new("hop-corridor", 32, 32).unwrap();
+            let mut pins = Vec::new();
+            let mut ends = Vec::new();
+            let mut bindings = Vec::new();
+            for (name, point, direction) in [
+                ("driver", Point::new(10, 10), PinDirection::Output),
+                ("sink", Point::new(11, 10), PinDirection::Input),
+            ] {
+                let cell = design.add_cell(name, ResourceKind::Logic);
+                pins.push(design.add_pin(cell, "pin", direction).unwrap());
+                let wire = device.add_wire(name, point, 1).unwrap();
+                ends.push(wire);
+                let bel = device.add_bel(name, ResourceKind::Logic, point).unwrap();
+                device.add_bel_pin(bel, "pin", direction, wire).unwrap();
+                bindings.push(bel);
+            }
+            let net = design.add_net("data", pins[0], [pins[1]]).unwrap();
+            let near_a = device.add_wire("near-a", Point::new(10, 11), 1).unwrap();
+            let near_b = device.add_wire("near-b", Point::new(11, 11), 1).unwrap();
+            let far = device.add_wire("far", Point::new(0, 31), 1).unwrap();
+            if local_path {
+                device.add_pip(ends[0], near_a, false, 1).unwrap();
+                let mut previous = near_a;
+                // Make the local path long enough that the default geometric
+                // queue estimate also explores the remote two-hop alternative.
+                for index in 0..40 {
+                    let local_wire = device
+                        .add_wire(format!("local-{index}"), Point::new(11, 11), 1)
+                        .unwrap();
+                    device.add_pip(previous, local_wire, false, 1).unwrap();
+                    previous = local_wire;
+                }
+                device.add_pip(previous, near_b, false, 1).unwrap();
+                device.add_pip(near_b, ends[1], false, 1).unwrap();
+            }
+            for (from, to) in [(ends[0], far), (far, ends[1])] {
+                device.add_pip(from, to, false, 1).unwrap();
+            }
+            let placement = placement_from_complete_bindings(
+                &design,
+                &device,
+                &PlacementConstraints::new(),
+                bindings,
+            )
+            .unwrap();
+            let mut costs = RoutingCosts::new(vec![50; device.pips().len()], BTreeMap::new());
+            costs.set_bounded_hop_search(bounded);
+            assert!(costs.net_criticalities().is_empty());
+            let routed = route_with_timing_costs_and_progress(
+                &design,
+                &device,
+                placement,
+                &RoutingConstraints::new(),
+                &costs,
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(
+                routed.routes[net.0].wires().any(|wire| wire == far),
+                !bounded || !local_path
+            );
+            assert_eq!(
+                routed.routes[net.0].wires().any(|wire| wire == near_a),
+                bounded && local_path
+            );
         }
     }
 
