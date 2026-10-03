@@ -118,6 +118,14 @@ logical enables remain separate. Missing coordinates keep the previous grouping;
 coordinates guide grouping only and do not fix placement or establish timing.
 This option requires fresh synthesis and cannot accompany `--resume-checkpoint`.
 
+Complete FF replication also copies each FF's enable connection. To split that
+additional load, repeat `--post-register-enable-fanout 'physical_replicate_*=4'`
+with patterns selecting enabled replicas. These constraints run after explicit
+register branches and measured-feedback passes, using the same optional placement
+hints. The original `--register-enable-fanout` pass still runs before replication.
+Final splitting preserves register state and undergoes mapping equivalence and
+fresh PNR/STA; it cannot be combined with `--resume-checkpoint`.
+
 ## PnR search model
 
 Texo is intended to support two entry points into the same deterministic,
