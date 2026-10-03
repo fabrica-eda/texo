@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8](https://github.com/fabrica-eda/texo/compare/v0.1.7...v0.1.8) (2026-10-03)
+
+
+### Features
+
+* **cli:** group CE branches using physical register hints ([#96](https://github.com/fabrica-eda/texo/issues/96)) ([1d8c544](https://github.com/fabrica-eda/texo/commit/1d8c544adb3213a68a36a5d5238b772305b15732))
+* **pnr:** add opt-in corridors for hop-first routing ([#98](https://github.com/fabrica-eda/texo/issues/98)) ([9e03d08](https://github.com/fabrica-eda/texo/commit/9e03d08c496705cf23b9d91576e1e905931710fb))
+* write compressed binary checkpoints by default ([#85](https://github.com/fabrica-eda/texo/issues/85)) ([dd12cad](https://github.com/fabrica-eda/texo/commit/dd12cad90e7e3a586e003470810736970cfc21c7))
+
+
+### Bug Fixes
+
+* **pnr:** preserve imported trees and release placement blockers ([#75](https://github.com/fabrica-eda/texo/issues/75)) ([422b022](https://github.com/fabrica-eda/texo/commit/422b022e0f811a39552e0c65ddac2defc7e84d8c))
+* retry setup route ECOs after committed changes ([#83](https://github.com/fabrica-eda/texo/issues/83)) ([bf6b1f1](https://github.com/fabrica-eda/texo/commit/bf6b1f191408a7b755dd3c55b019230136f50e23))
+* use measured PIP costs in initial timing routing ([#84](https://github.com/fabrica-eda/texo/issues/84)) ([151060c](https://github.com/fabrica-eda/texo/commit/151060c3e1bd65f6615716835da5e549e8aae1c9))
+
 ## [0.1.7](https://github.com/fabrica-eda/texo/compare/v0.1.6...v0.1.7) (2026-09-11)
 
 
