@@ -13,6 +13,8 @@ use texo_pnr::{NetRoute, Placement, PnrError, RoutingConstraints, RoutingCosts};
 pub struct Ecp5InitialRoute {
     /// Optional endpoints of an advisory subtree. Omitted design sinks must
     /// still be connected by ordinary routing before sign-off.
+    /// An empty set requires no PIPs and nonempty advisory priorities: it
+    /// schedules every sink afresh while retaining its search priority.
     #[serde(default)]
     advisory_sink_wire_ids: Option<Vec<usize>>,
     /// Search priorities only, keyed by current physical sink wire. These do
@@ -246,7 +248,12 @@ fn select_imported_sinks(
             .iter()
             .map(|(_, wire)| wire.0)
             .collect::<BTreeSet<_>>();
-        if requested.is_empty() || requested.len() != ids.len() || !requested.is_subset(&available)
+        let priorities_only = requested.is_empty()
+            && record.pips.is_empty()
+            && !record.advisory_sink_criticalities.is_empty();
+        if (requested.is_empty() && !priorities_only)
+            || requested.len() != ids.len()
+            || !requested.is_subset(&available)
         {
             return Err(invalid(
                 "partial endpoints must name distinct current sink wires".into(),
@@ -416,6 +423,48 @@ mod tests {
         assert!(constraints.routes()[&NetId(0)].arc(CellPinId(2)).is_none());
         let result = route_seeded(&design, &device, placement, &constraints).unwrap();
         assert_eq!(result.routes[0].arc(CellPinId(1)), Some(&old));
+        assert!(result.routes[0].arc(CellPinId(2)).is_some());
+        assert_eq!(result.total_pips, 2);
+    }
+
+    #[test]
+    fn priorities_without_a_seed_still_require_every_real_sink() {
+        let (design, mut device, placement, mut record) = fixture(true);
+        record.advisory_sink_wire_ids = Some(vec![]);
+        record.advisory_sink_criticalities = BTreeMap::from([(1, 64), (2, 32)]);
+        // An empty endpoint list must not conceal supplied topology.
+        assert!(
+            import_routes(
+                &design,
+                &device,
+                &placement,
+                &[record.clone()],
+                &mut RoutingConstraints::new()
+            )
+            .is_err()
+        );
+        record.pips.clear();
+        let mut seeds = RoutingConstraints::new();
+        import_routes(&design, &device, &placement, &[record.clone()], &mut seeds).unwrap();
+        assert!(seeds.routes()[&NetId(0)].arcs.is_empty());
+        let mut costs = RoutingCosts::new(vec![23], BTreeMap::from([(NetId(0), 1)]));
+        apply_advisory_weights(&design, &device, &placement, &[record.clone()], &mut costs)
+            .unwrap();
+        assert_eq!(costs.sink_criticalities()[&(NetId(0), CellPinId(1))], 64);
+        assert_eq!(costs.sink_criticalities()[&(NetId(0), CellPinId(2))], 32);
+        assert!(route_seeded(&design, &device, placement.clone(), &seeds).is_err());
+        assert!(
+            preserve_routes(
+                &design,
+                &["data".into()],
+                &seeds,
+                &mut RoutingConstraints::new()
+            )
+            .is_err()
+        );
+        device.add_pip(WireId(0), WireId(2), false, 1).unwrap();
+        let result = route_seeded(&design, &device, placement, &seeds).unwrap();
+        assert!(result.routes[0].arc(CellPinId(1)).is_some());
         assert!(result.routes[0].arc(CellPinId(2)).is_some());
         assert_eq!(result.total_pips, 2);
     }
