@@ -109,6 +109,15 @@ enable behavior and pipeline boundaries are preserved. Both options require
 fresh synthesis, equivalence, placement, routing and STA and cannot accompany
 `--resume-checkpoint`.
 
+`--logic-branch-replication branches.txcp` similarly requests copies of ordinary
+mapped LUT4s for named LUT4/CCU2C data consumers. Its compressed payload uses
+`{"driver":"lut42","sinks":["lut71","ccu_compare0_0"]}` records. Each copy keeps
+the exact truth table and inputs, without adding registers or pipeline stages.
+Clock, reset, enable, IO and dedicated wide-mux consumers cannot be selected.
+Requests are atomic and run after explicit register branches, before measured
+feedback and final enable splitting. Fresh placement, routing and STA are
+required; the option conflicts with `--resume-checkpoint`.
+
 `--register-enable-placement ff-placement.txcp` groups equivalent enable branches
 using prior register coordinates when `--register-enable-fanout` is supplied.
 The compressed checkpoint maps mapped flip-flop names to
