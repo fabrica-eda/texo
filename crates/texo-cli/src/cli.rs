@@ -146,6 +146,7 @@ struct MappingArgs {
 }
 
 #[derive(Debug, Args)]
+#[allow(clippy::struct_excessive_bools)] // Independent command-line switches.
 struct PnrArgs {
     /// Exact register/data-consumer branches to clone, with fresh equivalence and STA.
     #[arg(long, value_name = "TXCP", conflicts_with = "resume_checkpoint")]
@@ -254,6 +255,9 @@ struct PnrArgs {
     /// Keep the initial legal placement and route without timing closure.
     #[arg(long)]
     no_timing_optimization: bool,
+    /// Try local corridors for hop-first routing; widen/fall back as needed.
+    #[arg(long)]
+    bounded_hop_routing: bool,
     /// Soft setup-search limit after initial routing; each candidate finishes STA.
     #[arg(
         long,
@@ -667,6 +671,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         lut_ff_pairs: lut_ff_pairs.as_ref(),
         placement_weight_exponent: args.placement_weight_exponent.get(),
         optimize_timing: !args.no_timing_optimization,
+        bounded_hop_routing: args.bounded_hop_routing,
         setup_optimization_budget: args
             .setup_optimization_budget_seconds
             .map(Duration::from_secs),
@@ -1338,6 +1343,14 @@ mod tests {
             panic!("expected pnr");
         };
         assert_eq!(args.setup_optimization_budget_seconds, None);
+        assert!(!args.bounded_hop_routing);
+        let mut bounded = base.to_vec();
+        bounded.extend(["--bounded-hop-routing", "--no-timing-optimization"]);
+        let Command::Pnr(args) = Cli::try_parse_from(bounded).unwrap().command else {
+            panic!("expected pnr");
+        };
+        assert!(args.bounded_hop_routing);
+        assert!(args.no_timing_optimization);
     }
 
     #[test]
