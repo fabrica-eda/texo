@@ -37,6 +37,12 @@ replaces them with current criticalities. Unspecified records retain the existin
 behavior. These optional priorities can increase routing search time and do not
 guarantee a timing improvement.
 
+To discard every branch of a net while retaining its priorities, use an empty
+`advisory_sink_wire_ids` array, an empty `pips` array, and nonempty
+`advisory_sink_criticalities`. The driver identity is still checked, and every
+real sink must be routed afresh. This record cannot replace mandatory routing
+or be listed as a preserved tree.
+
 Imported ordinary trees are advisory. To keep particular trees unchanged through
 all timing feedback, pass `--preserve-initial-routes preserved.json` containing
 exact net names, for example `["critical_data"]`. Preserved trees stay mandatory
