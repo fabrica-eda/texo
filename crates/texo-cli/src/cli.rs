@@ -232,6 +232,14 @@ struct PnrArgs {
         value_parser = parse_register_enable_fanout
     )]
     register_enable_fanout: Vec<RegisterEnableFanoutConstraint>,
+    /// Split final FF enables after explicit replicas and measured synthesis feedback.
+    #[arg(
+        long,
+        value_name = "CELL=MAX_FANOUT",
+        conflicts_with = "resume_checkpoint",
+        value_parser = parse_register_enable_fanout
+    )]
+    post_register_enable_fanout: Vec<RegisterEnableFanoutConstraint>,
     /// Advisory register positions for grouping CE branches; fresh PNR is required.
     #[arg(
         long,
@@ -541,6 +549,16 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
             "measured synthesis feedback: {} replicas, {} rewires",
             mapped.retiming().equivalent_logic_replications - before.equivalent_logic_replications,
             mapped.retiming().equivalent_physical_rewires - before.equivalent_physical_rewires
+        );
+    }
+    let post_enable_report = mapped.apply_register_enable_fanout_with_placement(
+        &args.post_register_enable_fanout,
+        &enable_placement,
+    )?;
+    if post_enable_report.matched_registers != 0 {
+        println!(
+            "post-replication register-enable constraints: {} FFs rewired onto {} branches",
+            post_enable_report.rewired_registers, post_enable_report.inserted_branches
         );
     }
     if !mapped.retiming().equivalence_signed_off {
@@ -1052,6 +1070,50 @@ mod tests {
         assert_eq!(args.input, Path::new("project"));
         assert_eq!(args.top, None);
         assert_eq!(args.placement_weight_exponent.get(), 4);
+    }
+
+    #[test]
+    fn final_enable_constraints_accept_replicas_and_reject_resume() {
+        let base = [
+            "texo",
+            "pnr",
+            "project",
+            "--package",
+            "TEST",
+            "--speed",
+            "8",
+            "--register-branch-replication",
+            "branches.txcp",
+            "--post-register-enable-fanout",
+            "physical_replicate_*=4",
+        ];
+        let cli = Cli::try_parse_from(base).unwrap();
+        let Command::Pnr(args) = cli.command else {
+            panic!("expected pnr")
+        };
+        assert_eq!(args.post_register_enable_fanout.len(), 1);
+        assert_eq!(
+            args.post_register_enable_fanout[0].cell,
+            "physical_replicate_*"
+        );
+        assert_eq!(args.post_register_enable_fanout[0].max_fanout, 4);
+        let mut resumed = base.to_vec();
+        resumed.extend(["--resume-checkpoint", "previous.txcp"]);
+        assert!(Cli::try_parse_from(resumed).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "texo",
+                "pnr",
+                "project",
+                "--package",
+                "TEST",
+                "--speed",
+                "8",
+                "--post-register-enable-fanout",
+                "physical_replicate_*=0",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
