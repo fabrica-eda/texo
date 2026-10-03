@@ -151,6 +151,9 @@ struct PnrArgs {
     /// Exact register/data-consumer branches to clone, with fresh equivalence and STA.
     #[arg(long, value_name = "TXCP", conflicts_with = "resume_checkpoint")]
     register_branch_replication: Option<PathBuf>,
+    /// Exact LUT4/data-consumer branches to clone, with fresh equivalence and STA.
+    #[arg(long, value_name = "TXCP", conflicts_with = "resume_checkpoint")]
+    logic_branch_replication: Option<PathBuf>,
     /// Ordered routed measured-STA checkpoints for cumulative equivalent branch replication.
     #[arg(long, value_name = "TXCP", conflicts_with = "resume_checkpoint")]
     measured_synthesis_feedback: Vec<PathBuf>,
@@ -541,6 +544,15 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         let report = mapped.replicate_register_branches(&branches)?;
         println!(
             "explicit register branches: {} replicas, {} rewired pins",
+            report.replicas, report.rewired_pins
+        );
+    }
+    if let Some(path) = &args.logic_branch_replication {
+        let branches: Vec<struo_target_ecp5::LogicBranchReplication> =
+            crate::read_checkpoint(path)?;
+        let report = mapped.replicate_logic_branches(&branches)?;
+        println!(
+            "explicit logic branches: {} replicas, {} rewired pins",
             report.replicas, report.rewired_pins
         );
     }
@@ -1000,6 +1012,34 @@ mod tests {
     use clap::{CommandFactory, Parser as _};
 
     use super::{Cli, Command, ensure_distinct_paths, jtagg_binding};
+
+    #[test]
+    fn explicit_logic_branches_require_a_fresh_physical_implementation() {
+        let base = [
+            "texo",
+            "pnr",
+            "project",
+            "--package",
+            "CABGA381",
+            "--speed",
+            "8_5G",
+        ];
+        let Command::Pnr(args) = Cli::try_parse_from(base).unwrap().command else {
+            panic!("expected pnr");
+        };
+        assert!(args.logic_branch_replication.is_none());
+        let mut command = base.to_vec();
+        command.extend(["--logic-branch-replication", "branches.txcp"]);
+        let Command::Pnr(args) = Cli::try_parse_from(&command).unwrap().command else {
+            panic!("expected pnr");
+        };
+        assert_eq!(
+            args.logic_branch_replication.as_deref(),
+            Some(Path::new("branches.txcp"))
+        );
+        command.extend(["--resume-checkpoint", "old.txcp"]);
+        assert!(Cli::try_parse_from(command).is_err());
+    }
 
     #[test]
     fn parses_documented_pnr_command() {
