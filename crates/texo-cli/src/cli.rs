@@ -147,6 +147,12 @@ struct MappingArgs {
 
 #[derive(Debug, Args)]
 struct PnrArgs {
+    /// Exact register/data-consumer branches to clone, with fresh equivalence and STA.
+    #[arg(long, value_name = "TXCP", conflicts_with = "resume_checkpoint")]
+    register_branch_replication: Option<PathBuf>,
+    /// Ordered routed measured-STA checkpoints for cumulative equivalent branch replication.
+    #[arg(long, value_name = "TXCP", conflicts_with = "resume_checkpoint")]
+    measured_synthesis_feedback: Vec<PathBuf>,
     /// Complete measured replacement for routing, cell and setup/hold timing.
     #[arg(long, value_name = "JSON")]
     measured_timing_library: Option<PathBuf>,
@@ -499,6 +505,26 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         println!(
             "register-enable fanout constraints: {} FFs rewired onto {} branches",
             enable_report.rewired_registers, enable_report.inserted_branches
+        );
+    }
+    if let Some(path) = &args.register_branch_replication {
+        let branches: Vec<struo_target_ecp5::RegisterBranchReplication> =
+            crate::read_checkpoint(path)?;
+        let report = mapped.replicate_register_branches(&branches)?;
+        println!(
+            "explicit register branches: {} replicas, {} rewired pins",
+            report.replicas, report.rewired_pins
+        );
+    }
+    for path in &args.measured_synthesis_feedback {
+        let feedback = crate::measured_synthesis_feedback(path)?;
+        let before = mapped.retiming();
+        mapped = mapped.apply_physical_feedback(&feedback);
+        crate::validate_feedback_replica_names(&mapped)?;
+        println!(
+            "measured synthesis feedback: {} replicas, {} rewires",
+            mapped.retiming().equivalent_logic_replications - before.equivalent_logic_replications,
+            mapped.retiming().equivalent_physical_rewires - before.equivalent_physical_rewires
         );
     }
     if !mapped.retiming().equivalence_signed_off {
@@ -1010,6 +1036,37 @@ mod tests {
         assert_eq!(args.input, Path::new("project"));
         assert_eq!(args.top, None);
         assert_eq!(args.placement_weight_exponent.get(), 4);
+    }
+
+    #[test]
+    fn measured_feedback_preserves_cumulative_checkpoint_order() {
+        let base = [
+            "texo",
+            "pnr",
+            "project",
+            "--package",
+            "TEST",
+            "--speed",
+            "8",
+            "--measured-synthesis-feedback",
+            "first.txcp",
+            "--measured-synthesis-feedback",
+            "second.txcp",
+        ];
+        let cli = Cli::try_parse_from(base).unwrap();
+        let Command::Pnr(args) = cli.command else {
+            panic!("expected pnr");
+        };
+        assert_eq!(
+            args.measured_synthesis_feedback,
+            [
+                Path::new("first.txcp").to_owned(),
+                Path::new("second.txcp").to_owned()
+            ]
+        );
+        let mut conflicting = base.to_vec();
+        conflicting.extend(["--resume-checkpoint", "saved.txcp"]);
+        assert!(Cli::try_parse_from(conflicting).is_err());
     }
 
     #[test]
