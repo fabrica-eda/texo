@@ -558,6 +558,8 @@ pub struct TimingAnalysisSession<'a> {
     model: &'a TimingModel,
     constraints: &'a TimingConstraints,
     topology: TimingTopology,
+    /// Cell arcs whose topology delay currently differs from `model`.
+    cell_arc_overrides: Vec<(CellPinId, CellPinId)>,
 }
 
 impl<'a> TimingAnalysisSession<'a> {
@@ -578,7 +580,38 @@ impl<'a> TimingAnalysisSession<'a> {
             model,
             constraints,
             topology: TimingTopology::new(design, model)?,
+            cell_arc_overrides: Vec::new(),
         })
+    }
+
+    /// Replaces combinational cell-arc delays for later analyses.
+    ///
+    /// Each pair must be an arc of the session model. Arcs absent from
+    /// `delays` return to their model delay, so the session then analyzes
+    /// exactly as a model updated with [`TimingModel::update_cell_arc_delay`].
+    /// Returns false, leaving every arc at its model delay, when a pair is not
+    /// a model arc.
+    pub fn set_cell_arc_delays(
+        &mut self,
+        delays: impl IntoIterator<Item = (CellPinId, CellPinId, DelayRange)>,
+    ) -> bool {
+        self.reset_cell_arc_delays();
+        for (from, to, delay) in delays {
+            if self.model.cell_arc(from, to).is_none() {
+                self.reset_cell_arc_delays();
+                return false;
+            }
+            self.topology.set_cell_delay(from, to, delay);
+            self.cell_arc_overrides.push((from, to));
+        }
+        true
+    }
+
+    fn reset_cell_arc_delays(&mut self) {
+        for (from, to) in std::mem::take(&mut self.cell_arc_overrides) {
+            let delay = self.model.cell_arc(from, to).expect("override is a model arc");
+            self.topology.set_cell_delay(from, to, delay);
+        }
     }
 
     /// Analyzes a complete net-delay update on the stored topology.
@@ -703,6 +736,15 @@ impl TimingTopology {
             logical_sinks,
             order,
         })
+    }
+
+    /// Sets the delay of the unique model cell arc `from -> to`.
+    fn set_cell_delay(&mut self, from: CellPinId, to: CellPinId, delay: DelayRange) {
+        let edge = self.edges[from.0]
+            .iter_mut()
+            .find(|(next, edge)| *next == to && matches!(edge, TimingEdgeDelay::Cell(_)))
+            .expect("model cell arc is in the topology");
+        edge.1 = TimingEdgeDelay::Cell(delay);
     }
 }
 
@@ -1832,6 +1874,69 @@ mod tests {
                 net: first_net,
                 sink: driver,
             })
+        );
+    }
+
+    #[test]
+    fn session_cell_arc_delays_match_an_updated_model() {
+        let (design, device, clock_net, model) = registered_path(10);
+        let implementation = place_and_route(&design, &device).unwrap();
+        let pip_delays = device
+            .pips()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| (texo_model::PipId(index), DelayRange::new(100, 100).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        let lookup = |pip| pip_delays.get(&pip).copied();
+        let mut constraints = TimingConstraints::new();
+        constraints.set_clock_period_ps(clock_net, 300);
+        let (&(from, to), _) = model.cell_arcs.iter().next().unwrap();
+        let slower = DelayRange::new(70, 90).unwrap();
+        let mut updated = model.clone();
+        assert!(updated.update_cell_arc_delay(from, to, slower));
+        let original = analyze_timing(
+            &design,
+            &device,
+            &implementation,
+            &pip_delays,
+            &model,
+            &constraints,
+        )
+        .unwrap();
+        let expected = analyze_timing(
+            &design,
+            &device,
+            &implementation,
+            &pip_delays,
+            &updated,
+            &constraints,
+        )
+        .unwrap();
+        assert_ne!(expected, original);
+
+        let mut session = TimingAnalysisSession::new(&design, &model, &constraints).unwrap();
+        assert!(session.set_cell_arc_delays([(from, to, slower)]));
+        assert_eq!(
+            session
+                .analyze_routed(&device, &implementation, lookup)
+                .unwrap(),
+            expected
+        );
+        // Omitted arcs return to their model delay.
+        assert!(session.set_cell_arc_delays([]));
+        assert_eq!(
+            session
+                .analyze_routed(&device, &implementation, lookup)
+                .unwrap(),
+            original
+        );
+        // A pair outside the model is rejected without keeping any override.
+        assert!(!session.set_cell_arc_delays([(from, to, slower), (to, from, slower)]));
+        assert_eq!(
+            session
+                .analyze_routed(&device, &implementation, lookup)
+                .unwrap(),
+            original
         );
     }
 

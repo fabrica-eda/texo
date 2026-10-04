@@ -3970,7 +3970,7 @@ fn run_setup_feedback_fallback<State, Error>(
 /// physical state, so a nonclosing search terminates after exhausting the
 /// finite set of candidate nets.
 struct Ecp5EcoTimingSession<'a> {
-    routed_model_inputs: Option<(&'a Design, &'a TimingModel, &'a TimingConstraints)>,
+    routed_model_inputs: Option<(&'a Design, &'a TimingModel)>,
     timing: TimingAnalysisSession<'a>,
     architecture: &'a Ecp5Architecture,
     speed_grade: &'a SpeedGradeRecord,
@@ -3991,11 +3991,8 @@ impl<'a> Ecp5EcoTimingSession<'a> {
         constraints: &'a TimingConstraints,
     ) -> Result<Self, Ecp5FlowError> {
         Ok(Self {
-            routed_model_inputs: routed_cell_timing::has_input_asymmetry(speed_grade).then_some((
-                design,
-                model,
-                constraints,
-            )),
+            routed_model_inputs: routed_cell_timing::has_input_asymmetry(speed_grade)
+                .then_some((design, model)),
             timing: TimingAnalysisSession::new(design, model, constraints)?,
             architecture,
             speed_grade,
@@ -4009,17 +4006,19 @@ impl<'a> Ecp5EcoTimingSession<'a> {
     }
 
     fn analyze(&mut self, implementation: &PnrResult) -> Result<TimingReport, Ecp5FlowError> {
-        if let Some((design, model, constraints)) = self.routed_model_inputs {
-            // A route ECO can change LUT permutation and therefore cell delays.
-            // The fixed-cell session cannot reuse its old graph in this case.
-            return analyze_ecp5_implementation(
+        if let Some((design, model)) = self.routed_model_inputs {
+            // A route ECO can change LUT permutation and therefore cell
+            // delays. The timing graph is unchanged; only arc delays follow
+            // the physical inputs, exactly as `routed_cell_timing::resolve`.
+            let delays = routed_cell_timing::physical_input_delays(
                 design,
                 self.architecture,
                 self.speed_grade,
                 implementation,
                 model,
-                constraints,
-            );
+            )?;
+            let applied = self.timing.set_cell_arc_delays(delays);
+            debug_assert!(applied, "physical input delays replace model arcs");
         }
 
         for pip in self.touched_pips.drain(..) {

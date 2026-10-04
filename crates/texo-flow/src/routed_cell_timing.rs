@@ -3,8 +3,8 @@
 #![allow(clippy::case_sensitive_file_extension_comparisons)]
 
 use super::{
-    BTreeMap, Design, Ecp5Architecture, Ecp5FlowError, PipId, PnrError, PnrResult, ResourceKind,
-    SpeedGradeRecord, TimingModel, find_cell_pin, timing_delay,
+    BTreeMap, CellPinId, DelayRange, Design, Ecp5Architecture, Ecp5FlowError, PipId, PnrError,
+    PnrResult, ResourceKind, SpeedGradeRecord, TimingModel, find_cell_pin, timing_delay,
 };
 use std::borrow::Cow;
 
@@ -29,15 +29,33 @@ pub(super) fn resolve<'a>(
     implementation: &PnrResult,
     model: &'a TimingModel,
 ) -> Result<Cow<'a, TimingModel>, Ecp5FlowError> {
+    let mut result = Cow::Borrowed(model);
+    for (from, to, delay) in physical_input_delays(design, architecture, grade, implementation, model)?
+    {
+        let changed = result.to_mut().update_cell_arc_delay(from, to, delay);
+        debug_assert!(changed);
+    }
+    Ok(result)
+}
+
+/// Cell arcs of `model` whose delay follows a permuted physical LUT input,
+/// with that physical input's delay. Empty without input asymmetry.
+pub(super) fn physical_input_delays(
+    design: &Design,
+    architecture: &Ecp5Architecture,
+    grade: &SpeedGradeRecord,
+    implementation: &PnrResult,
+    model: &TimingModel,
+) -> Result<Vec<(CellPinId, CellPinId, DelayRange)>, Ecp5FlowError> {
+    let mut delays = Vec::new();
     if !has_input_asymmetry(grade) {
-        return Ok(Cow::Borrowed(model));
+        return Ok(delays);
     }
     let records = grade
         .cells
         .iter()
         .map(|c| (c.cell_type.as_str(), c))
         .collect::<BTreeMap<_, _>>();
-    let mut result = Cow::Borrowed(model);
     for route in &implementation.routes {
         for arc in &route.arcs {
             let Some(sink) = arc.sink else {
@@ -122,15 +140,11 @@ pub(super) fn resolve<'a>(
                         speed_grade: grade.name.clone(),
                         cell_type: format!("{kind}:{input}->{output}"),
                     })?;
-                let changed =
-                    result
-                        .to_mut()
-                        .update_cell_arc_delay(sink, to, timing_delay(measured.delay)?);
-                debug_assert!(changed);
+                delays.push((sink, to, timing_delay(measured.delay)?));
             }
         }
     }
-    Ok(result)
+    Ok(delays)
 }
 
 /// Relative cell-input cost for route ranking, never a net-delay STA label.
