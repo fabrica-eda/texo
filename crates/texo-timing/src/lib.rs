@@ -558,6 +558,8 @@ pub struct TimingAnalysisSession<'a> {
     model: &'a TimingModel,
     constraints: &'a TimingConstraints,
     topology: TimingTopology,
+    /// Cell arcs whose topology delay currently differs from `model`.
+    cell_arc_overrides: Vec<(CellPinId, CellPinId)>,
 }
 
 impl<'a> TimingAnalysisSession<'a> {
@@ -578,7 +580,41 @@ impl<'a> TimingAnalysisSession<'a> {
             model,
             constraints,
             topology: TimingTopology::new(design, model)?,
+            cell_arc_overrides: Vec::new(),
         })
+    }
+
+    /// Replaces combinational cell-arc delays for later analyses.
+    ///
+    /// Each pair must be an arc of the session model. Arcs absent from
+    /// `delays` return to their model delay, so the session then analyzes
+    /// exactly as a model updated with [`TimingModel::update_cell_arc_delay`].
+    /// Returns false, leaving every arc at its model delay, when a pair is not
+    /// a model arc.
+    pub fn set_cell_arc_delays(
+        &mut self,
+        delays: impl IntoIterator<Item = (CellPinId, CellPinId, DelayRange)>,
+    ) -> bool {
+        self.reset_cell_arc_delays();
+        for (from, to, delay) in delays {
+            if self.model.cell_arc(from, to).is_none() {
+                self.reset_cell_arc_delays();
+                return false;
+            }
+            self.topology.set_cell_delay(from, to, delay);
+            self.cell_arc_overrides.push((from, to));
+        }
+        true
+    }
+
+    fn reset_cell_arc_delays(&mut self) {
+        for (from, to) in std::mem::take(&mut self.cell_arc_overrides) {
+            let delay = self
+                .model
+                .cell_arc(from, to)
+                .expect("override is a model arc");
+            self.topology.set_cell_delay(from, to, delay);
+        }
     }
 
     /// Analyzes a complete net-delay update on the stored topology.
@@ -703,6 +739,15 @@ impl TimingTopology {
             logical_sinks,
             order,
         })
+    }
+
+    /// Sets the delay of the unique model cell arc `from -> to`.
+    fn set_cell_delay(&mut self, from: CellPinId, to: CellPinId, delay: DelayRange) {
+        let edge = self.edges[from.0]
+            .iter_mut()
+            .find(|(next, edge)| *next == to && matches!(edge, TimingEdgeDelay::Cell(_)))
+            .expect("model cell arc is in the topology");
+        edge.1 = TimingEdgeDelay::Cell(delay);
     }
 }
 
@@ -1427,27 +1472,60 @@ fn routed_net_delays_with(
             return Err(TimingError::DuplicateRoute(route.net));
         }
     }
-    let graph = UnifiedGraph::new(design, device);
     let mut result = Vec::new();
-    for (index, net) in design.nets().iter().enumerate() {
+    for index in 0..design.nets().len() {
         let net_id = NetId(index);
         let route = routes
             .get(&net_id)
             .copied()
             .ok_or(TimingError::MissingRoute(net_id))?;
-        let driver_wire = bound_wire(&graph, &implementation.placement, net.driver, device)?;
-        for &sink in &net.sinks {
-            let sink_wire = bound_wire(&graph, &implementation.placement, sink, device)?;
-            let delay =
-                route_arc_delay(route, net_id, sink, driver_wire, sink_wire, &mut pip_delay)?;
-            result.push(NetDelay {
-                net: net_id,
-                sink,
-                delay,
-            });
-        }
+        routed_sink_delays(
+            design,
+            device,
+            &implementation.placement,
+            route,
+            &mut pip_delay,
+            &mut result,
+        )?;
     }
     Ok(result)
+}
+
+/// Appends the routed delay to every sink of `route.net`, in sink order.
+///
+/// This is the per-net step of [`TimingAnalysisSession::analyze_routed`],
+/// for callers that reuse the delays of unchanged nets. Each sink arc must
+/// run from the placed driver wire to the placed sink wire.
+///
+/// # Errors
+///
+/// Returns an error for an unknown net, missing placement or binding, an
+/// unreachable sink, a missing PIP delay, or delay overflow.
+pub fn routed_sink_delays(
+    design: &Design,
+    device: &Device,
+    placement: &Placement,
+    route: &NetRoute,
+    pip_delay: &mut impl FnMut(PipId) -> Option<DelayRange>,
+    delays: &mut Vec<NetDelay>,
+) -> Result<(), TimingError> {
+    let net_id = route.net;
+    let net = design
+        .nets()
+        .get(net_id.0)
+        .ok_or(TimingError::UnknownRoutedNet(net_id))?;
+    let graph = UnifiedGraph::new(design, device);
+    let driver_wire = bound_wire(&graph, placement, net.driver, device)?;
+    for &sink in &net.sinks {
+        let sink_wire = bound_wire(&graph, placement, sink, device)?;
+        let delay = route_arc_delay(route, net_id, sink, driver_wire, sink_wire, pip_delay)?;
+        delays.push(NetDelay {
+            net: net_id,
+            sink,
+            delay,
+        });
+    }
+    Ok(())
 }
 
 fn bound_wire(
@@ -1832,6 +1910,69 @@ mod tests {
                 net: first_net,
                 sink: driver,
             })
+        );
+    }
+
+    #[test]
+    fn session_cell_arc_delays_match_an_updated_model() {
+        let (design, device, clock_net, model) = registered_path(10);
+        let implementation = place_and_route(&design, &device).unwrap();
+        let pip_delays = device
+            .pips()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| (texo_model::PipId(index), DelayRange::new(100, 100).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        let lookup = |pip| pip_delays.get(&pip).copied();
+        let mut constraints = TimingConstraints::new();
+        constraints.set_clock_period_ps(clock_net, 300);
+        let (&(from, to), _) = model.cell_arcs.iter().next().unwrap();
+        let slower = DelayRange::new(70, 90).unwrap();
+        let mut updated = model.clone();
+        assert!(updated.update_cell_arc_delay(from, to, slower));
+        let original = analyze_timing(
+            &design,
+            &device,
+            &implementation,
+            &pip_delays,
+            &model,
+            &constraints,
+        )
+        .unwrap();
+        let expected = analyze_timing(
+            &design,
+            &device,
+            &implementation,
+            &pip_delays,
+            &updated,
+            &constraints,
+        )
+        .unwrap();
+        assert_ne!(expected, original);
+
+        let mut session = TimingAnalysisSession::new(&design, &model, &constraints).unwrap();
+        assert!(session.set_cell_arc_delays([(from, to, slower)]));
+        assert_eq!(
+            session
+                .analyze_routed(&device, &implementation, lookup)
+                .unwrap(),
+            expected
+        );
+        // Omitted arcs return to their model delay.
+        assert!(session.set_cell_arc_delays([]));
+        assert_eq!(
+            session
+                .analyze_routed(&device, &implementation, lookup)
+                .unwrap(),
+            original
+        );
+        // A pair outside the model is rejected without keeping any override.
+        assert!(!session.set_cell_arc_delays([(from, to, slower), (to, from, slower)]));
+        assert_eq!(
+            session
+                .analyze_routed(&device, &implementation, lookup)
+                .unwrap(),
+            original
         );
     }
 

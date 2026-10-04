@@ -3,10 +3,12 @@
 #![allow(clippy::case_sensitive_file_extension_comparisons)]
 
 use super::{
-    BTreeMap, Design, Ecp5Architecture, Ecp5FlowError, PipId, PnrError, PnrResult, ResourceKind,
-    SpeedGradeRecord, TimingModel, find_cell_pin, timing_delay,
+    BTreeMap, CellPinId, DelayRange, Design, Ecp5Architecture, Ecp5FlowError, NetRoute, PipId,
+    Placement, PnrError, PnrResult, ResourceKind, SpeedGradeRecord, TimingModel, find_cell_pin,
+    timing_delay,
 };
 use std::borrow::Cow;
+use texo_target_ecp5::CellTimingRecord;
 
 pub(super) fn has_input_asymmetry(grade: &SpeedGradeRecord) -> bool {
     grade.cells.iter().any(|cell| {
@@ -29,108 +31,150 @@ pub(super) fn resolve<'a>(
     implementation: &PnrResult,
     model: &'a TimingModel,
 ) -> Result<Cow<'a, TimingModel>, Ecp5FlowError> {
-    if !has_input_asymmetry(grade) {
-        return Ok(Cow::Borrowed(model));
+    let mut result = Cow::Borrowed(model);
+    for (from, to, delay) in
+        physical_input_delays(design, architecture, grade, implementation, model)?
+    {
+        let changed = result.to_mut().update_cell_arc_delay(from, to, delay);
+        debug_assert!(changed);
     }
-    let records = grade
+    Ok(result)
+}
+
+/// Cell arcs of `model` whose delay follows a permuted physical LUT input,
+/// with that physical input's delay. Empty without input asymmetry.
+pub(super) fn physical_input_delays(
+    design: &Design,
+    architecture: &Ecp5Architecture,
+    grade: &SpeedGradeRecord,
+    implementation: &PnrResult,
+    model: &TimingModel,
+) -> Result<Vec<(CellPinId, CellPinId, DelayRange)>, Ecp5FlowError> {
+    let mut delays = Vec::new();
+    if !has_input_asymmetry(grade) {
+        return Ok(delays);
+    }
+    let records = cell_records(grade);
+    for route in &implementation.routes {
+        route_physical_input_delays(
+            design,
+            architecture,
+            grade,
+            &records,
+            &implementation.placement,
+            route,
+            model,
+            &mut delays,
+        )?;
+    }
+    Ok(delays)
+}
+
+/// Speed-grade cell timing records by cell type.
+pub(super) fn cell_records(grade: &SpeedGradeRecord) -> BTreeMap<&str, &CellTimingRecord> {
+    grade
         .cells
         .iter()
         .map(|c| (c.cell_type.as_str(), c))
-        .collect::<BTreeMap<_, _>>();
-    let mut result = Cow::Borrowed(model);
-    for route in &implementation.routes {
-        for arc in &route.arcs {
-            let Some(sink) = arc.sink else {
-                continue;
-            };
-            let pin = &design.pins()[sink.0];
-            if design.cells()[pin.cell.0].kind != ResourceKind::Lut(4)
-                || !matches!(pin.name.as_str(), "A" | "B" | "C" | "D")
-            {
-                continue;
-            }
-            let bel = implementation
-                .placement
-                .bel(pin.cell)
-                .expect("routed cell is placed");
-            let bound = implementation
-                .placement
-                .pin_binding(sink)
-                .or_else(|| {
-                    architecture.device().bels()[bel.0]
-                        .pins()
-                        .iter()
-                        .copied()
-                        .find(|id| architecture.device().bel_pins()[id.0].name == pin.name)
-                })
-                .ok_or_else(|| PnrError::InvalidPlacement {
-                    reason: format!(
-                        "missing physical LUT input {}.{}",
-                        design.cells()[pin.cell.0].name,
-                        pin.name
-                    ),
-                })?;
-            let physical = &architecture.device().bel_pins()[bound.0];
-            let mut input = physical.name.as_str();
-            for &pip in &arc.pips {
-                if architecture.device().pips()[pip.0].to() != physical.wire {
-                    continue;
-                }
-                let flags = architecture.pip_metadata(pip).lutperm_flags;
-                if flags & 0x4000 != 0 {
-                    // D0 -> B0_SLICE (0x4007) routes logical B through
-                    // physical D. The bit generator permutes INIT accordingly.
-                    input = ["A", "B", "C", "D"][usize::from(flags & 3)];
-                }
-            }
-            if input == pin.name {
-                continue;
-            }
-            let carry = find_cell_pin(design, pin.cell, "FCO").is_some();
-            let ordinary = if carry {
-                if architecture.device().bels()[bel.0].name.ends_with(".K0") {
-                    "TRELLIS_CARRY0"
-                } else {
-                    "TRELLIS_CARRY1"
-                }
-            } else {
-                "TRELLIS_COMB"
-            };
-            for output in ["F", "FCO", "OFX"] {
-                let Some(to) = find_cell_pin(design, pin.cell, output) else {
-                    continue;
-                };
-                if model.cell_arc(sink, to).is_none() {
-                    continue;
-                }
-                let kind = if output == "OFX" {
-                    "TRELLIS_PFUMX"
-                } else {
-                    ordinary
-                };
-                let record = records
-                    .get(kind)
-                    .ok_or_else(|| Ecp5FlowError::MissingCellTiming {
-                        speed_grade: grade.name.clone(),
-                        cell_type: kind.into(),
-                    })?;
-                let measured = record
-                    .arcs
+        .collect()
+}
+
+/// Appends the [`physical_input_delays`] of one route's sinks. The caller
+/// checks input asymmetry; `records` comes from [`cell_records`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn route_physical_input_delays(
+    design: &Design,
+    architecture: &Ecp5Architecture,
+    grade: &SpeedGradeRecord,
+    records: &BTreeMap<&str, &CellTimingRecord>,
+    placement: &Placement,
+    route: &NetRoute,
+    model: &TimingModel,
+    delays: &mut Vec<(CellPinId, CellPinId, DelayRange)>,
+) -> Result<(), Ecp5FlowError> {
+    for arc in &route.arcs {
+        let Some(sink) = arc.sink else {
+            continue;
+        };
+        let pin = &design.pins()[sink.0];
+        if design.cells()[pin.cell.0].kind != ResourceKind::Lut(4)
+            || !matches!(pin.name.as_str(), "A" | "B" | "C" | "D")
+        {
+            continue;
+        }
+        let bel = placement.bel(pin.cell).expect("routed cell is placed");
+        let bound = placement
+            .pin_binding(sink)
+            .or_else(|| {
+                architecture.device().bels()[bel.0]
+                    .pins()
                     .iter()
-                    .find(|a| a.from_pin == input && a.to_pin == output)
-                    .ok_or_else(|| Ecp5FlowError::MissingCellTiming {
-                        speed_grade: grade.name.clone(),
-                        cell_type: format!("{kind}:{input}->{output}"),
-                    })?;
-                let changed =
-                    result
-                        .to_mut()
-                        .update_cell_arc_delay(sink, to, timing_delay(measured.delay)?);
-                debug_assert!(changed);
+                    .copied()
+                    .find(|id| architecture.device().bel_pins()[id.0].name == pin.name)
+            })
+            .ok_or_else(|| PnrError::InvalidPlacement {
+                reason: format!(
+                    "missing physical LUT input {}.{}",
+                    design.cells()[pin.cell.0].name,
+                    pin.name
+                ),
+            })?;
+        let physical = &architecture.device().bel_pins()[bound.0];
+        let mut input = physical.name.as_str();
+        for &pip in &arc.pips {
+            if architecture.device().pips()[pip.0].to() != physical.wire {
+                continue;
+            }
+            let flags = architecture.pip_metadata(pip).lutperm_flags;
+            if flags & 0x4000 != 0 {
+                // D0 -> B0_SLICE (0x4007) routes logical B through
+                // physical D. The bit generator permutes INIT accordingly.
+                input = ["A", "B", "C", "D"][usize::from(flags & 3)];
             }
         }
+        if input == pin.name {
+            continue;
+        }
+        let carry = find_cell_pin(design, pin.cell, "FCO").is_some();
+        let ordinary = if carry {
+            if architecture.device().bels()[bel.0].name.ends_with(".K0") {
+                "TRELLIS_CARRY0"
+            } else {
+                "TRELLIS_CARRY1"
+            }
+        } else {
+            "TRELLIS_COMB"
+        };
+        for output in ["F", "FCO", "OFX"] {
+            let Some(to) = find_cell_pin(design, pin.cell, output) else {
+                continue;
+            };
+            if model.cell_arc(sink, to).is_none() {
+                continue;
+            }
+            let kind = if output == "OFX" {
+                "TRELLIS_PFUMX"
+            } else {
+                ordinary
+            };
+            let record = records
+                .get(kind)
+                .ok_or_else(|| Ecp5FlowError::MissingCellTiming {
+                    speed_grade: grade.name.clone(),
+                    cell_type: kind.into(),
+                })?;
+            let measured = record
+                .arcs
+                .iter()
+                .find(|a| a.from_pin == input && a.to_pin == output)
+                .ok_or_else(|| Ecp5FlowError::MissingCellTiming {
+                    speed_grade: grade.name.clone(),
+                    cell_type: format!("{kind}:{input}->{output}"),
+                })?;
+            delays.push((sink, to, timing_delay(measured.delay)?));
+        }
     }
-    Ok(result)
+    Ok(())
 }
 
 /// Relative cell-input cost for route ranking, never a net-delay STA label.

@@ -1035,6 +1035,8 @@ pub struct RoutingWorkspace {
     /// falls back to a full sparse reset.
     resident_routes: Vec<Option<Arc<NetRoute>>>,
     resident_valid: bool,
+    /// Route trees already checked by legal net ECOs on the current inputs.
+    validated_eco_inputs: Option<ValidatedEcoInputs>,
 }
 
 impl RoutingWorkspace {
@@ -1064,6 +1066,7 @@ impl RoutingWorkspace {
             resource_owners: ResourceOwnerIndex::default(),
             resident_routes: Vec::new(),
             resident_valid: false,
+            validated_eco_inputs: None,
         }
     }
 
@@ -1586,16 +1589,45 @@ fn finish_routing_with_seeds_workspace(
     workspace: &mut RoutingWorkspace,
     progress: &mut impl FnMut(RoutingProgress),
 ) -> Result<PnrResult, PnrError> {
-    let pin_wires = PinWireCache::build(graph, &placement);
-    validate_routing_constraints(graph, &placement, &pin_wires, routing_constraints)?;
+    let mut validated = workspace.validated_eco_inputs.take();
+    let result = finish_validated_routing_with_seeds_workspace(
+        graph,
+        placement,
+        routing_constraints,
+        initial_routes,
+        routing_costs,
+        workspace,
+        &mut validated,
+        progress,
+    );
+    workspace.validated_eco_inputs = validated;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_validated_routing_with_seeds_workspace(
+    graph: &UnifiedGraph<'_>,
+    placement: Placement,
+    routing_constraints: &RoutingConstraints,
+    initial_routes: &[Arc<NetRoute>],
+    routing_costs: Option<&RoutingCosts>,
+    workspace: &mut RoutingWorkspace,
+    validated: &mut Option<ValidatedEcoInputs>,
+    progress: &mut impl FnMut(RoutingProgress),
+) -> Result<PnrResult, PnrError> {
+    let validated =
+        ValidatedEcoInputs::reuse_or_validate(validated, graph, &placement, routing_constraints)?;
     validate_routing_costs(graph, routing_costs)?;
     let seeded = if initial_routes.is_empty() {
         None
     } else {
         let seeded = seeded_routing_constraints(routing_constraints, initial_routes)?;
-        validate_routing_constraints(graph, &placement, &pin_wires, &seeded)?;
+        // Seeds share the locked restrictions, so checking every seeded tree
+        // completes the seeded constraint check.
+        validated.validate_routes(graph, seeded.routes().values())?;
         Some(seeded)
     };
+    let pin_wires = &validated.pin_wires;
     let routes = workspace.prepare_routes(
         graph.device(),
         graph.design().nets().len(),
@@ -1606,7 +1638,7 @@ fn finish_routing_with_seeds_workspace(
     let routes = route(
         graph,
         &placement,
-        &pin_wires,
+        pin_wires,
         routing_constraints,
         routing_costs,
         workspace,
@@ -7325,104 +7357,210 @@ fn validate_routing_constraints(
     pin_wires: &PinWireCache,
     constraints: &RoutingConstraints,
 ) -> Result<(), PnrError> {
+    validate_routing_restrictions(graph.device(), constraints)?;
+    for (&net_id, route) in constraints.routes() {
+        validate_constraint_route(
+            graph,
+            placement,
+            pin_wires,
+            constraints.blocked_pips(),
+            net_id,
+            route,
+        )?;
+    }
+    Ok(())
+}
+
+/// Checks one route tree stored under `net_id`. The result depends only on
+/// the tree, the placement and its pin wires, and the blocked PIPs.
+fn validate_constraint_route(
+    graph: &UnifiedGraph<'_>,
+    placement: &Placement,
+    pin_wires: &PinWireCache,
+    blocked_pips: &BTreeSet<PipId>,
+    net_id: NetId,
+    route: &NetRoute,
+) -> Result<(), PnrError> {
     let design = graph.design();
     let device = graph.device();
-    validate_routing_restrictions(device, constraints)?;
-    for (&net_id, route) in constraints.routes() {
-        let Some(net) = design.nets().get(net_id.0) else {
+    let Some(net) = design.nets().get(net_id.0) else {
+        return Err(PnrError::InvalidRoutingConstraint {
+            net: net_id,
+            reason: "net ID is outside the design".into(),
+        });
+    };
+    if route.net != net_id {
+        return Err(PnrError::InvalidRoutingConstraint {
+            net: net_id,
+            reason: "route key and route net differ".into(),
+        });
+    }
+    let driver_cell = design.pins()[net.driver.0].cell;
+    let driver_bel = placement
+        .bel(driver_cell)
+        .ok_or(PnrError::MissingPlacement { cell: driver_cell })?;
+    let driver_wire = pin_wires.resolve(graph, placement, net.driver, driver_bel)?;
+    let (wire_refs, pip_refs) = route_resource_refs(&route.arcs);
+    if wire_refs != route.wire_refs || pip_refs != route.pip_refs {
+        return Err(PnrError::InvalidRoutingConstraint {
+            net: net_id,
+            reason: "route resource reference counts are stale".into(),
+        });
+    }
+    let mut routed_sinks = BTreeSet::new();
+    for arc in &route.arcs {
+        if arc.wires.first().copied() != Some(driver_wire) {
             return Err(PnrError::InvalidRoutingConstraint {
                 net: net_id,
-                reason: "net ID is outside the design".into(),
-            });
-        };
-        if route.net != net_id {
-            return Err(PnrError::InvalidRoutingConstraint {
-                net: net_id,
-                reason: "route key and route net differ".into(),
+                reason: "route arc does not start at the placed driver wire".into(),
             });
         }
-        let driver_cell = design.pins()[net.driver.0].cell;
-        let driver_bel = placement
-            .bel(driver_cell)
-            .ok_or(PnrError::MissingPlacement { cell: driver_cell })?;
-        let driver_wire = pin_wires.resolve(graph, placement, net.driver, driver_bel)?;
-        let (wire_refs, pip_refs) = route_resource_refs(&route.arcs);
-        if wire_refs != route.wire_refs || pip_refs != route.pip_refs {
+        if arc.pips.len().saturating_add(1) != arc.wires.len() {
             return Err(PnrError::InvalidRoutingConstraint {
                 net: net_id,
-                reason: "route resource reference counts are stale".into(),
+                reason: "route arc does not have one PIP between each wire".into(),
             });
         }
-        let mut routed_sinks = BTreeSet::new();
-        for arc in &route.arcs {
-            if arc.wires.first().copied() != Some(driver_wire) {
+        if arc.wires.iter().copied().collect::<BTreeSet<_>>().len() != arc.wires.len() {
+            return Err(PnrError::InvalidRoutingConstraint {
+                net: net_id,
+                reason: "route arc contains a cycle".into(),
+            });
+        }
+        for ((&from, &to), &pip_id) in arc
+            .wires
+            .iter()
+            .zip(arc.wires.iter().skip(1))
+            .zip(&arc.pips)
+        {
+            if blocked_pips.contains(&pip_id) {
                 return Err(PnrError::InvalidRoutingConstraint {
                     net: net_id,
-                    reason: "route arc does not start at the placed driver wire".into(),
+                    reason: format!("immutable route uses blocked PIP {}", pip_id.0),
                 });
             }
-            if arc.pips.len().saturating_add(1) != arc.wires.len() {
+            let Some(pip) = device.pips().get(pip_id.0) else {
                 return Err(PnrError::InvalidRoutingConstraint {
                     net: net_id,
-                    reason: "route arc does not have one PIP between each wire".into(),
+                    reason: format!("unknown PIP {pip_id:?}"),
                 });
-            }
-            if arc.wires.iter().copied().collect::<BTreeSet<_>>().len() != arc.wires.len() {
-                return Err(PnrError::InvalidRoutingConstraint {
-                    net: net_id,
-                    reason: "route arc contains a cycle".into(),
-                });
-            }
-            for ((&from, &to), &pip_id) in arc
-                .wires
-                .iter()
-                .zip(arc.wires.iter().skip(1))
-                .zip(&arc.pips)
+            };
+            if !((pip.from() == from && pip.to() == to)
+                || (pip.bidirectional() && pip.from() == to && pip.to() == from))
             {
-                if constraints.blocked_pips().contains(&pip_id) {
-                    return Err(PnrError::InvalidRoutingConstraint {
-                        net: net_id,
-                        reason: format!("immutable route uses blocked PIP {}", pip_id.0),
-                    });
-                }
-                let Some(pip) = device.pips().get(pip_id.0) else {
-                    return Err(PnrError::InvalidRoutingConstraint {
-                        net: net_id,
-                        reason: format!("unknown PIP {pip_id:?}"),
-                    });
-                };
-                if !((pip.from() == from && pip.to() == to)
-                    || (pip.bidirectional() && pip.from() == to && pip.to() == from))
-                {
-                    return Err(PnrError::InvalidRoutingConstraint {
-                        net: net_id,
-                        reason: format!("PIP {pip_id:?} does not connect its adjacent arc wires"),
-                    });
-                }
+                return Err(PnrError::InvalidRoutingConstraint {
+                    net: net_id,
+                    reason: format!("PIP {pip_id:?} does not connect its adjacent arc wires"),
+                });
             }
-            if let Some(sink) = arc.sink {
-                if !net.sinks.contains(&sink) || !routed_sinks.insert(sink) {
-                    return Err(PnrError::InvalidRoutingConstraint {
-                        net: net_id,
-                        reason: format!("sink pin {} is unknown or has multiple arcs", sink.0),
-                    });
-                }
-                let sink_cell = design.pins()[sink.0].cell;
-                let sink_bel = placement
-                    .bel(sink_cell)
-                    .ok_or(PnrError::MissingPlacement { cell: sink_cell })?;
-                if arc.wires.last().copied()
-                    != Some(pin_wires.resolve(graph, placement, sink, sink_bel)?)
-                {
-                    return Err(PnrError::InvalidRoutingConstraint {
-                        net: net_id,
-                        reason: format!("route arc ends away from sink pin {}", sink.0),
-                    });
-                }
+        }
+        if let Some(sink) = arc.sink {
+            if !net.sinks.contains(&sink) || !routed_sinks.insert(sink) {
+                return Err(PnrError::InvalidRoutingConstraint {
+                    net: net_id,
+                    reason: format!("sink pin {} is unknown or has multiple arcs", sink.0),
+                });
+            }
+            let sink_cell = design.pins()[sink.0].cell;
+            let sink_bel = placement
+                .bel(sink_cell)
+                .ok_or(PnrError::MissingPlacement { cell: sink_cell })?;
+            if arc.wires.last().copied()
+                != Some(pin_wires.resolve(graph, placement, sink, sink_bel)?)
+            {
+                return Err(PnrError::InvalidRoutingConstraint {
+                    net: net_id,
+                    reason: format!("route arc ends away from sink pin {}", sink.0),
+                });
             }
         }
     }
     Ok(())
+}
+
+/// Legal-ECO inputs already checked against one design, placement, and
+/// routing-constraint set.
+///
+/// Successive setup ECO trials share one incumbent and differ in a few nets.
+/// Each unchanged route tree is therefore checked once instead of on every
+/// trial. Stored trees are kept alive, so pointer identity cannot be reused
+/// by a different tree while it is cached.
+#[derive(Debug)]
+struct ValidatedEcoInputs {
+    design_identity: (usize, usize, usize),
+    placement: Placement,
+    constraints: RoutingConstraints,
+    pin_wires: PinWireCache,
+    routes: Vec<Option<Arc<NetRoute>>>,
+}
+
+impl ValidatedEcoInputs {
+    /// Reuses `cached` when its design, placement, and constraints match;
+    /// otherwise validates `constraints` and starts an empty route cache.
+    fn reuse_or_validate<'c>(
+        cached: &'c mut Option<Self>,
+        graph: &UnifiedGraph<'_>,
+        placement: &Placement,
+        constraints: &RoutingConstraints,
+    ) -> Result<&'c mut Self, PnrError> {
+        let design = graph.design();
+        let design_identity = (
+            std::ptr::from_ref(design) as usize,
+            design.nets().len(),
+            design.pins().len(),
+        );
+        if cached.as_ref().is_none_or(|known| {
+            known.design_identity != design_identity
+                || known.placement != *placement
+                || known.constraints != *constraints
+        }) {
+            *cached = None;
+            let pin_wires = PinWireCache::build(graph, placement);
+            validate_routing_constraints(graph, placement, &pin_wires, constraints)?;
+            let mut routes = vec![None; design.nets().len()];
+            for (net, route) in constraints.routes() {
+                routes[net.0] = Some(route.clone());
+            }
+            *cached = Some(Self {
+                design_identity,
+                placement: placement.clone(),
+                constraints: constraints.clone(),
+                pin_wires,
+                routes,
+            });
+        }
+        Ok(cached.as_mut().expect("validated ECO inputs were stored"))
+    }
+
+    /// Checks every tree not already validated, in the given order, exactly
+    /// as [`validate_routing_constraints`] checks a constraint route stored
+    /// under the tree's own net.
+    fn validate_routes<'r>(
+        &mut self,
+        graph: &UnifiedGraph<'_>,
+        routes: impl IntoIterator<Item = &'r Arc<NetRoute>>,
+    ) -> Result<(), PnrError> {
+        for route in routes {
+            if self
+                .routes
+                .get(route.net.0)
+                .and_then(Option::as_ref)
+                .is_some_and(|known| Arc::ptr_eq(known, route))
+            {
+                continue;
+            }
+            validate_constraint_route(
+                graph,
+                &self.placement,
+                &self.pin_wires,
+                self.constraints.blocked_pips(),
+                route.net,
+                route,
+            )?;
+            self.routes[route.net.0] = Some(route.clone());
+        }
+        Ok(())
+    }
 }
 
 fn validate_routing_costs(
@@ -8631,6 +8769,7 @@ pub fn legal_nets_route_eco_candidate_with_workspace(
     workspace: &mut RoutingWorkspace,
 ) -> Result<Option<PnrResult>, PnrError> {
     let mut workspace_staged = false;
+    let mut validated = workspace.validated_eco_inputs.take();
     let result = legal_nets_route_eco_candidate(
         design,
         device,
@@ -8640,8 +8779,10 @@ pub fn legal_nets_route_eco_candidate_with_workspace(
         net_ids,
         options,
         workspace,
+        &mut validated,
         &mut workspace_staged,
     );
+    workspace.validated_eco_inputs = validated;
     if workspace_staged {
         restore_legal_eco_workspace(device, incumbent, workspace);
     }
@@ -8658,6 +8799,7 @@ fn legal_nets_route_eco_candidate(
     net_ids: &[NetId],
     options: LegalRouteEcoOptions,
     workspace: &mut RoutingWorkspace,
+    validated: &mut Option<ValidatedEcoInputs>,
     workspace_staged: &mut bool,
 ) -> Result<Option<PnrResult>, PnrError> {
     if options.estimate_delay_per_tile_ps == 0 {
@@ -8692,14 +8834,12 @@ fn legal_nets_route_eco_candidate(
     }
 
     let graph = UnifiedGraph::new(design, device);
-    let pin_wires = PinWireCache::build(&graph, &incumbent.placement);
-    validate_routing_constraints(
+    let validated = ValidatedEcoInputs::reuse_or_validate(
+        validated,
         &graph,
         &incumbent.placement,
-        &pin_wires,
         routing_constraints,
     )?;
-    let mut complete_constraints = routing_constraints.clone();
     for (index, route) in incumbent.routes.iter().enumerate() {
         if route.net != NetId(index) {
             return Err(PnrError::InvalidRoutingConstraint {
@@ -8710,15 +8850,13 @@ fn legal_nets_route_eco_candidate(
                 ),
             });
         }
-        complete_constraints.add_route(route.clone());
     }
-    validate_routing_constraints(
-        &graph,
-        &incumbent.placement,
-        &pin_wires,
-        &complete_constraints,
-    )?;
+    // The incumbent supplies one tree per net, replacing every constraint
+    // route. Checking the trees under the constraint restrictions is the
+    // complete constraint check; unchanged trees were checked earlier.
+    validated.validate_routes(&graph, &incumbent.routes)?;
     validate_routing_costs(&graph, Some(routing_costs))?;
+    let pin_wires = &validated.pin_wires;
 
     for &net_id in &selected {
         let old = &incumbent.routes[net_id.0];
@@ -8750,7 +8888,7 @@ fn legal_nets_route_eco_candidate(
         let owners = discover_route_eco_owners(
             &graph,
             &incumbent.placement,
-            &pin_wires,
+            pin_wires,
             incumbent,
             routing_constraints,
             routing_costs,
@@ -8837,7 +8975,7 @@ fn legal_nets_route_eco_candidate(
             let replacement = match route_net(
                 &graph,
                 &incumbent.placement,
-                &pin_wires,
+                pin_wires,
                 fixed.map(Arc::as_ref),
                 net_id,
                 &workspace.wire_congestion,
@@ -8874,7 +9012,7 @@ fn legal_nets_route_eco_candidate(
                 });
             }
             let reaches_all_sinks =
-                route_reaches_all_sinks(&graph, &incumbent.placement, &pin_wires, &replacement)?;
+                route_reaches_all_sinks(&graph, &incumbent.placement, pin_wires, &replacement)?;
             // A connected driver-rooted tree has exactly one fewer unique PIP
             // than unique wire. This is the same completed-route invariant
             // enforced by the full negotiated router.
@@ -8889,7 +9027,7 @@ fn legal_nets_route_eco_candidate(
             }
 
             add_route_occupancy_delta(workspace, &replacement, fixed.map(Arc::as_ref));
-            validate_legal_eco_capacity(workspace, net_id)?;
+            validate_added_eco_capacity(workspace, &replacement, net_id)?;
             if replacement != **old {
                 changed = true;
                 routes[net_id.0] = Arc::new(replacement);
@@ -8904,15 +9042,14 @@ fn legal_nets_route_eco_candidate(
         return Ok(None);
     }
 
-    let mut candidate_constraints = routing_constraints.clone();
-    for route in &routes {
-        candidate_constraints.add_route(route.clone());
-    }
-    validate_routing_constraints(
+    // Only rebuilt trees differ from the checked incumbent.
+    validated.validate_routes(
         &graph,
-        &incumbent.placement,
-        &pin_wires,
-        &candidate_constraints,
+        routes
+            .iter()
+            .zip(&incumbent.routes)
+            .filter(|(route, old)| !Arc::ptr_eq(route, old))
+            .map(|(route, _)| route),
     )?;
 
     debug_assert!(
@@ -9131,6 +9268,26 @@ fn validate_legal_eco_capacity(workspace: &RoutingWorkspace, net: NetId) -> Resu
                 reason: format!("route ECO overuses PIP {index}: {occupancy}/{capacity}"),
             });
         }
+    }
+    Ok(())
+}
+
+/// [`validate_legal_eco_capacity`] after adding `route` to occupancy that
+/// was already within capacity: only the route's own resources can overflow.
+fn validate_added_eco_capacity(
+    workspace: &RoutingWorkspace,
+    route: &NetRoute,
+    net: NetId,
+) -> Result<(), PnrError> {
+    if route
+        .wires()
+        .any(|wire| workspace.wire_occupancy[wire.0] > workspace.wire_capacities[wire.0])
+        || route
+            .pips()
+            .any(|pip| workspace.pip_occupancy[pip.0] > workspace.pip_capacities[pip.0])
+    {
+        // Report the same first overflow as the complete scan.
+        validate_legal_eco_capacity(workspace, net)?;
     }
     Ok(())
 }
@@ -13167,6 +13324,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reused, fresh);
+    }
+
+    #[test]
+    fn net_cohort_eco_rechecks_new_trees_and_changed_constraints() {
+        let fixture = net_cohort_eco_fixture();
+        let mut workspace = RoutingWorkspace::new(&fixture.device);
+        let eco = |incumbent: &PnrResult,
+                   constraints: &RoutingConstraints,
+                   workspace: &mut RoutingWorkspace| {
+            legal_nets_route_eco_candidate_with_workspace(
+                &fixture.design,
+                &fixture.device,
+                incumbent,
+                constraints,
+                &fixture.costs,
+                &[NetId(0), NetId(1)],
+                LegalRouteEcoOptions::new(52),
+                workspace,
+            )
+        };
+        let candidate = eco(
+            &fixture.incumbent,
+            &RoutingConstraints::new(),
+            &mut workspace,
+        )
+        .unwrap()
+        .expect("simultaneous release must expose the fast resource to net A");
+
+        // Equal contents in a new tree do not inherit an earlier check.
+        let mut stale = fixture.incumbent.clone();
+        let mut route = (*stale.routes[2]).clone();
+        route.wire_refs.clear();
+        stale.routes[2] = Arc::new(route);
+        let error = eco(&stale, &RoutingConstraints::new(), &mut workspace).unwrap_err();
+        assert!(error.to_string().contains("reference counts are stale"));
+
+        // Checked trees are tied to the restrictions they were checked under.
+        let mut blocked = RoutingConstraints::new();
+        blocked.block_pips(fixture.incumbent.routes[2].pips().take(1));
+        let error = eco(&fixture.incumbent, &blocked, &mut workspace).unwrap_err();
+        assert!(error.to_string().contains("uses blocked PIP"));
+
+        let reused = eco(
+            &fixture.incumbent,
+            &RoutingConstraints::new(),
+            &mut workspace,
+        )
+        .unwrap();
+        assert_eq!(reused, Some(candidate));
+        assert_workspace_matches_incumbent(&fixture.device, &fixture.incumbent, &workspace);
     }
 
     #[test]
