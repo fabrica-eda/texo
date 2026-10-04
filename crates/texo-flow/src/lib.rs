@@ -1,6 +1,7 @@
 //! Flow orchestration and explicit verification evidence.
 
 mod clock_constraints;
+mod eco_timing;
 mod ecp5_pll;
 mod initial_routing;
 mod measured_placement;
@@ -20,6 +21,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use eco_timing::Ecp5EcoTimingSession;
 use setup_budget::SetupBudget;
 
 use texo_model::{
@@ -3969,108 +3971,6 @@ fn run_setup_feedback_fallback<State, Error>(
 /// placement feedback. Each net is attempted at most once for one unchanged
 /// physical state, so a nonclosing search terminates after exhausting the
 /// finite set of candidate nets.
-struct Ecp5EcoTimingSession<'a> {
-    routed_model_inputs: Option<(&'a Design, &'a TimingModel)>,
-    timing: TimingAnalysisSession<'a>,
-    architecture: &'a Ecp5Architecture,
-    speed_grade: &'a SpeedGradeRecord,
-    pip_classes: HashMap<PipId, &'a PipClassTimingRecord>,
-    selected: Vec<bool>,
-    touched_pips: Vec<PipId>,
-    source_fanout: Vec<u64>,
-    touched_sources: Vec<WireId>,
-    pip_delays: HashMap<PipId, DelayRange>,
-}
-
-impl<'a> Ecp5EcoTimingSession<'a> {
-    fn new(
-        design: &'a Design,
-        architecture: &'a Ecp5Architecture,
-        speed_grade: &'a SpeedGradeRecord,
-        model: &'a TimingModel,
-        constraints: &'a TimingConstraints,
-    ) -> Result<Self, Ecp5FlowError> {
-        Ok(Self {
-            routed_model_inputs: routed_cell_timing::has_input_asymmetry(speed_grade)
-                .then_some((design, model)),
-            timing: TimingAnalysisSession::new(design, model, constraints)?,
-            architecture,
-            speed_grade,
-            pip_classes: HashMap::new(),
-            selected: vec![false; architecture.device().pips().len()],
-            touched_pips: Vec::new(),
-            source_fanout: vec![0; architecture.device().wires().len()],
-            touched_sources: Vec::new(),
-            pip_delays: HashMap::new(),
-        })
-    }
-
-    fn analyze(&mut self, implementation: &PnrResult) -> Result<TimingReport, Ecp5FlowError> {
-        if let Some((design, model)) = self.routed_model_inputs {
-            // A route ECO can change LUT permutation and therefore cell
-            // delays. The timing graph is unchanged; only arc delays follow
-            // the physical inputs, exactly as `routed_cell_timing::resolve`.
-            let delays = routed_cell_timing::physical_input_delays(
-                design,
-                self.architecture,
-                self.speed_grade,
-                implementation,
-                model,
-            )?;
-            let applied = self.timing.set_cell_arc_delays(delays);
-            debug_assert!(applied, "physical input delays replace model arcs");
-        }
-
-        for pip in self.touched_pips.drain(..) {
-            self.selected[pip.0] = false;
-        }
-        for wire in self.touched_sources.drain(..) {
-            self.source_fanout[wire.0] = 0;
-        }
-        for pip in implementation.routes.iter().flat_map(|route| route.pips()) {
-            if pip.0 >= self.selected.len() {
-                return Err(TimingError::UnknownRoutedPip(pip).into());
-            }
-            if !self.selected[pip.0] {
-                self.selected[pip.0] = true;
-                self.touched_pips.push(pip);
-                let source = self.architecture.device().pips()[pip.0].from();
-                if self.source_fanout[source.0] == 0 {
-                    self.touched_sources.push(source);
-                }
-                self.source_fanout[source.0] += 1;
-            }
-        }
-        for &pip in &self.touched_pips {
-            if !self.pip_classes.contains_key(&pip) {
-                let timing_class = self.architecture.pip_metadata(pip).timing_class;
-                let class = self
-                    .speed_grade
-                    .pip_classes
-                    .get(timing_class)
-                    .ok_or_else(|| Ecp5FlowError::MissingPipTimingClass {
-                        speed_grade: self.speed_grade.name.clone(),
-                        timing_class: timing_class.to_owned(),
-                    })?;
-                self.pip_classes.insert(pip, class);
-            }
-            let class = self.pip_classes[&pip];
-            self.pip_delays.insert(
-                pip,
-                pip_class_delay(
-                    class,
-                    self.source_fanout[self.architecture.device().pips()[pip.0].from().0],
-                )?,
-            );
-        }
-        Ok(self
-            .timing
-            .analyze_routed(self.architecture.device(), implementation, |pip| {
-                self.pip_delays.get(&pip).copied()
-            })?)
-    }
-}
-
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn improve_worst_setup_net_route_ecos(
     design: &Design,

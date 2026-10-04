@@ -609,7 +609,10 @@ impl<'a> TimingAnalysisSession<'a> {
 
     fn reset_cell_arc_delays(&mut self) {
         for (from, to) in std::mem::take(&mut self.cell_arc_overrides) {
-            let delay = self.model.cell_arc(from, to).expect("override is a model arc");
+            let delay = self
+                .model
+                .cell_arc(from, to)
+                .expect("override is a model arc");
             self.topology.set_cell_delay(from, to, delay);
         }
     }
@@ -1469,27 +1472,60 @@ fn routed_net_delays_with(
             return Err(TimingError::DuplicateRoute(route.net));
         }
     }
-    let graph = UnifiedGraph::new(design, device);
     let mut result = Vec::new();
-    for (index, net) in design.nets().iter().enumerate() {
+    for index in 0..design.nets().len() {
         let net_id = NetId(index);
         let route = routes
             .get(&net_id)
             .copied()
             .ok_or(TimingError::MissingRoute(net_id))?;
-        let driver_wire = bound_wire(&graph, &implementation.placement, net.driver, device)?;
-        for &sink in &net.sinks {
-            let sink_wire = bound_wire(&graph, &implementation.placement, sink, device)?;
-            let delay =
-                route_arc_delay(route, net_id, sink, driver_wire, sink_wire, &mut pip_delay)?;
-            result.push(NetDelay {
-                net: net_id,
-                sink,
-                delay,
-            });
-        }
+        routed_sink_delays(
+            design,
+            device,
+            &implementation.placement,
+            route,
+            &mut pip_delay,
+            &mut result,
+        )?;
     }
     Ok(result)
+}
+
+/// Appends the routed delay to every sink of `route.net`, in sink order.
+///
+/// This is the per-net step of [`TimingAnalysisSession::analyze_routed`],
+/// for callers that reuse the delays of unchanged nets. Each sink arc must
+/// run from the placed driver wire to the placed sink wire.
+///
+/// # Errors
+///
+/// Returns an error for an unknown net, missing placement or binding, an
+/// unreachable sink, a missing PIP delay, or delay overflow.
+pub fn routed_sink_delays(
+    design: &Design,
+    device: &Device,
+    placement: &Placement,
+    route: &NetRoute,
+    pip_delay: &mut impl FnMut(PipId) -> Option<DelayRange>,
+    delays: &mut Vec<NetDelay>,
+) -> Result<(), TimingError> {
+    let net_id = route.net;
+    let net = design
+        .nets()
+        .get(net_id.0)
+        .ok_or(TimingError::UnknownRoutedNet(net_id))?;
+    let graph = UnifiedGraph::new(design, device);
+    let driver_wire = bound_wire(&graph, placement, net.driver, device)?;
+    for &sink in &net.sinks {
+        let sink_wire = bound_wire(&graph, placement, sink, device)?;
+        let delay = route_arc_delay(route, net_id, sink, driver_wire, sink_wire, pip_delay)?;
+        delays.push(NetDelay {
+            net: net_id,
+            sink,
+            delay,
+        });
+    }
+    Ok(())
 }
 
 fn bound_wire(

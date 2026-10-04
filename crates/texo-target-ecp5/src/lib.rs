@@ -648,6 +648,12 @@ impl Ecp5Architecture {
             .map(|metadata| metadata.timing_class())
     }
 
+    /// Compact timing-class ID of one PIP, as in [`Self::pip_timing_class_ids`].
+    #[must_use]
+    pub fn pip_timing_class_id(&self, pip: PipId) -> u32 {
+        self.pip_metadata[pip.0].timing_class()
+    }
+
     /// Number of entries in the compact metadata string dictionary.
     #[must_use]
     pub const fn metadata_string_count(&self) -> usize {

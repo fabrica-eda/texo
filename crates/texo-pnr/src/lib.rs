@@ -9027,7 +9027,7 @@ fn legal_nets_route_eco_candidate(
             }
 
             add_route_occupancy_delta(workspace, &replacement, fixed.map(Arc::as_ref));
-            validate_legal_eco_capacity(workspace, net_id)?;
+            validate_added_eco_capacity(workspace, &replacement, net_id)?;
             if replacement != **old {
                 changed = true;
                 routes[net_id.0] = Arc::new(replacement);
@@ -9268,6 +9268,26 @@ fn validate_legal_eco_capacity(workspace: &RoutingWorkspace, net: NetId) -> Resu
                 reason: format!("route ECO overuses PIP {index}: {occupancy}/{capacity}"),
             });
         }
+    }
+    Ok(())
+}
+
+/// [`validate_legal_eco_capacity`] after adding `route` to occupancy that
+/// was already within capacity: only the route's own resources can overflow.
+fn validate_added_eco_capacity(
+    workspace: &RoutingWorkspace,
+    route: &NetRoute,
+    net: NetId,
+) -> Result<(), PnrError> {
+    if route
+        .wires()
+        .any(|wire| workspace.wire_occupancy[wire.0] > workspace.wire_capacities[wire.0])
+        || route
+            .pips()
+            .any(|pip| workspace.pip_occupancy[pip.0] > workspace.pip_capacities[pip.0])
+    {
+        // Report the same first overflow as the complete scan.
+        validate_legal_eco_capacity(workspace, net)?;
     }
     Ok(())
 }
@@ -13324,9 +13344,13 @@ mod tests {
                 workspace,
             )
         };
-        let candidate = eco(&fixture.incumbent, &RoutingConstraints::new(), &mut workspace)
-            .unwrap()
-            .expect("simultaneous release must expose the fast resource to net A");
+        let candidate = eco(
+            &fixture.incumbent,
+            &RoutingConstraints::new(),
+            &mut workspace,
+        )
+        .unwrap()
+        .expect("simultaneous release must expose the fast resource to net A");
 
         // Equal contents in a new tree do not inherit an earlier check.
         let mut stale = fixture.incumbent.clone();
@@ -13342,7 +13366,12 @@ mod tests {
         let error = eco(&fixture.incumbent, &blocked, &mut workspace).unwrap_err();
         assert!(error.to_string().contains("uses blocked PIP"));
 
-        let reused = eco(&fixture.incumbent, &RoutingConstraints::new(), &mut workspace).unwrap();
+        let reused = eco(
+            &fixture.incumbent,
+            &RoutingConstraints::new(),
+            &mut workspace,
+        )
+        .unwrap();
         assert_eq!(reused, Some(candidate));
         assert_workspace_matches_incumbent(&fixture.device, &fixture.incumbent, &workspace);
     }
