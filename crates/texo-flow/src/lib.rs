@@ -301,8 +301,9 @@ impl Default for Ecp5FlowOptions<'_> {
 pub enum Ecp5InitialPlacementAlgorithm {
     /// A complete caller-provided cell-to-BEL assignment was imported.
     Imported,
-    /// Connectivity-only electrostatic placement generated the assignment.
-    ConnectivityDrivenElectrostatic,
+    /// Directional RUDY area adjustment without timing weights generated it,
+    /// because no placement delay model was available or timing was off.
+    RoutabilityElectrostatic,
     /// ECP5 timing weights and directional RUDY area adjustment generated it.
     TimingDrivenRoutabilityElectrostatic,
 }
@@ -313,7 +314,7 @@ impl Ecp5InitialPlacementAlgorithm {
     pub const fn checkpoint_name(self) -> &'static str {
         match self {
             Self::Imported => "imported_v1",
-            Self::ConnectivityDrivenElectrostatic => "connectivity_electrostatic_v1",
+            Self::RoutabilityElectrostatic => "routability_electrostatic_v1",
             Self::TimingDrivenRoutabilityElectrostatic => {
                 "ecp5_timing_routability_electrostatic_v1"
             }
@@ -324,6 +325,15 @@ impl Ecp5InitialPlacementAlgorithm {
     #[must_use]
     pub const fn is_timing_driven_routability(self) -> bool {
         matches!(self, Self::TimingDrivenRoutabilityElectrostatic)
+    }
+
+    /// Whether the algorithm applies directional RUDY area tuning.
+    #[must_use]
+    pub const fn is_routability_driven(self) -> bool {
+        matches!(
+            self,
+            Self::RoutabilityElectrostatic | Self::TimingDrivenRoutabilityElectrostatic
+        )
     }
 }
 
@@ -685,12 +695,14 @@ pub fn implement_struo_ecp5_with_progress(
     .then(|| Ecp5PlacementDelayPredictor::new(architecture, &speed_grade.name))
     .transpose()?;
     let mut global_routing_cache = architecture.global_routing_cache();
+    // Measured timing replaces the placement delay predictor, so such runs
+    // place without timing weights even when timing optimization is enabled.
     let initial_placement_algorithm = if options.initial_placement.is_some() {
         Ecp5InitialPlacementAlgorithm::Imported
-    } else if options.optimize_timing {
+    } else if options.optimize_timing && placement_delay_predictor.is_some() {
         Ecp5InitialPlacementAlgorithm::TimingDrivenRoutabilityElectrostatic
     } else {
-        Ecp5InitialPlacementAlgorithm::ConnectivityDrivenElectrostatic
+        Ecp5InitialPlacementAlgorithm::RoutabilityElectrostatic
     };
     let mut placement = if let Some(bindings) = options.initial_placement {
         named_initial_placement(&design, architecture, &packing, bindings)?
@@ -3627,7 +3639,33 @@ fn initial_analytical_placement(
     )>,
 ) -> Result<Placement, Ecp5FlowError> {
     let Some((timing_model, timing_constraints, weight_exponent, delay_predictor)) = timing else {
-        let placement = placement_refiner.place_analytically(&BTreeMap::new())?;
+        // Routability does not depend on a placement delay model. Without
+        // timing weights, still derive routing capacity from a coarse solve
+        // and let eplace inflate congested cells and honor register controls;
+        // a dense design otherwise fills tiles to capacity and leaves the
+        // channel demand to negotiated routing alone.
+        let coarse = placement_refiner.place_analytically_coarse(&BTreeMap::new())?;
+        let restrictions = packing.routing_restrictions_cached(
+            design,
+            architecture,
+            &coarse,
+            global_routing_cache,
+        )?;
+        let routing_capacity = routing_capacity_map(architecture.device(), &restrictions);
+        let controls = ff_control_sets
+            .iter()
+            .map(|set| RegisterControlSet {
+                cell: set.cell,
+                clock_lsr: (set.tile_clock, set.tile_lsr),
+                ce: set.slice_ce,
+            })
+            .collect::<Vec<_>>();
+        let placement = placement_refiner
+            .place_analytically_with_routing_capacity_and_register_controls(
+                &BTreeMap::new(),
+                &routing_capacity,
+                &controls,
+            )?;
         if metrics_enabled() {
             eprintln!("[metrics] placement_global_legalizations count=1");
         }
@@ -7671,6 +7709,13 @@ mod tests {
             &mut evidence,
         )
         .unwrap();
+        // Untimed placement is still routability-driven. This tiny design
+        // meets every density target before any area adjustment, so the
+        // phase reset must not normalize zero spreading forces.
+        assert_eq!(
+            result.initial_placement_algorithm,
+            super::Ecp5InitialPlacementAlgorithm::RoutabilityElectrostatic
+        );
 
         let sda = imported
             .ports()

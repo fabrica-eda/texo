@@ -93,7 +93,9 @@ fn checkpoint_placement_model(
         "initial_algorithm": algorithm.checkpoint_name(),
         "timing_weight_model": timing_driven.then_some(ECP5_PLACEMENT_TIMING_WEIGHT_MODEL),
         "criticality_exponent": timing_driven.then_some(weight_exponent),
-        "routability_model": timing_driven.then_some(ECP5_PLACEMENT_ROUTABILITY_MODEL),
+        "routability_model": algorithm
+            .is_routability_driven()
+            .then_some(ECP5_PLACEMENT_ROUTABILITY_MODEL),
         "initial_predicted_detail": false,
     })
 }
@@ -1226,6 +1228,16 @@ mod tests {
                 "initial_algorithm": "ecp5_timing_routability_electrostatic_v1",
                 "timing_weight_model": ECP5_PLACEMENT_TIMING_WEIGHT_MODEL,
                 "criticality_exponent": 4,
+                "routability_model": ECP5_PLACEMENT_ROUTABILITY_MODEL,
+                "initial_predicted_detail": false,
+            }),
+        );
+        assert_eq!(
+            checkpoint_placement_model(Ecp5InitialPlacementAlgorithm::RoutabilityElectrostatic, 4),
+            json!({
+                "initial_algorithm": "routability_electrostatic_v1",
+                "timing_weight_model": null,
+                "criticality_exponent": null,
                 "routability_model": ECP5_PLACEMENT_ROUTABILITY_MODEL,
                 "initial_predicted_detail": false,
             }),
