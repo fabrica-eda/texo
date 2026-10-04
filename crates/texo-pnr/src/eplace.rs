@@ -464,6 +464,23 @@ fn optimize_density_once(
         <[f64]>::to_vec,
     );
     validate_fields(&initial.density.fields, &density_scales)?;
+    let mut optimizer = DynamicNesterovState::new(coordinates, bounds);
+    let mut best = PlacementCheckpoint::new(
+        rounded_targets_from_coordinates(optimizer.coordinates(), unit_count, width, height),
+        &initial.density.fields,
+    );
+    // An input that already meets this phase's stop criterion needs no
+    // multipliers. Their normalization divides by the wirelength and density
+    // forces, which are zero for a design with nothing left to spread, such
+    // as the area-reset phase of a tiny placement that needed no inflation.
+    if density_stop_reached(&initial.density.fields, stop_criterion) {
+        return Ok(DensityOptimization {
+            coordinates: optimizer.coordinates().to_vec(),
+            best_targets: best.targets,
+            completed_iterations,
+            density_scales,
+        });
+    }
     let (mut multipliers, mut multiplier_step) = if reset_after_area_adjustment {
         let multipliers = area_adjusted_density_multipliers(&initial, &density_scales)?;
         let step = area_adjusted_multiplier_step(&multipliers)?;
@@ -474,12 +491,7 @@ fn optimize_density_once(
         let step = MULTIPLIER_ALPHA_HIGH - 1.0;
         (multipliers, step)
     };
-    let mut optimizer = DynamicNesterovState::new(coordinates, bounds);
     let mut current = initial;
-    let mut best = PlacementCheckpoint::new(
-        rounded_targets_from_coordinates(optimizer.coordinates(), unit_count, width, height),
-        &current.density.fields,
-    );
     let mut previous_stationary_targets = None;
     loop {
         if density_stop_reached(&current.density.fields, stop_criterion) {
