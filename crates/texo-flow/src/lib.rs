@@ -742,7 +742,7 @@ pub fn implement_struo_ecp5_with_progress(
     };
     if !clock_bindings.is_empty() {
         let mut bindings = placement.bindings().to_vec();
-        for (cell, bel) in clock_bindings {
+        for (&cell, &bel) in &clock_bindings {
             bindings[cell.0] = bel;
         }
         placement = placement_from_complete_bindings(
@@ -890,6 +890,69 @@ pub fn implement_struo_ecp5_with_progress(
     }
     report_metric_phase("initial_route_and_timing", &mut phase_started);
     let (mut implementation, mut timing) = (initial_implementation, initial_timing);
+    // Without a placement delay predictor the first global placement has no
+    // timing weights, so its timing depends on incidental netlist details.
+    // Re-solve it once from routed STA criticalities; both candidates are
+    // fully routed and timed, and the better objective is kept.
+    if options.optimize_timing
+        && placement_delay_predictor.is_none()
+        && options.initial_placement.is_none()
+        && options.initial_routes.is_none()
+        && options.preserved_initial_routes.is_empty()
+        && let Some(costs) = timing_routing_costs.as_mut()
+    {
+        let placement_refiner = PlacementRefiner::new_with_workspace(
+            &design,
+            architecture.device(),
+            packing.constraints(),
+            &mut placement_refinement_workspace,
+        )?;
+        // Each round re-solves from the best routed result so far. A path
+        // weighted once keeps its weight, so shortening today's critical
+        // paths cannot simply push yesterday's back out.
+        let mut weight_history = [BTreeMap::new(), BTreeMap::new()];
+        for _ in 0..ROUTED_PLACEMENT_ROUNDS {
+            let Some((candidate, candidate_timing)) = routed_timing_replacement(
+                RoutedTimingReplacement {
+                    design: &design,
+                    architecture,
+                    speed_grade,
+                    packing: &packing,
+                    global_routing_cache: &mut global_routing_cache,
+                    placement_refiner: &placement_refiner,
+                    ff_control_sets: &ff_control_sets,
+                    timing_model: &timing_model,
+                    timing_constraints: &timing_constraints,
+                },
+                &implementation,
+                &timing,
+                &mut weight_history,
+                costs,
+                &mut routing_workspace,
+                &mut progress,
+            )?
+            else {
+                break;
+            };
+            // Later stages route against the global clock trees of the
+            // incumbent placement. Without imported or preserved routes those
+            // are exactly the placement's global routing constraints.
+            routing = packing.global_routing_constraints_cached(
+                &design,
+                architecture,
+                &candidate.placement,
+                &mut global_routing_cache,
+            )?;
+            immutable_routing = routing.clone();
+            implementation = candidate;
+            timing = candidate_timing;
+            costs.set_net_criticalities(timing_net_weights(&timing, &timing_constraints));
+            costs.set_sink_criticalities(timing_arc_weights(&timing, &timing_constraints));
+        }
+        costs.set_net_criticalities(timing_net_weights(&timing, &timing_constraints));
+        costs.set_sink_criticalities(timing_arc_weights(&timing, &timing_constraints));
+        report_metric_phase("routed_timing_replacement", &mut phase_started);
+    }
     let mut measured_placement = options
         .measured_placement_model
         .map(MeasuredPlacementModel::provenance);
@@ -3764,6 +3827,199 @@ fn initial_analytical_placement(
         None,
     );
     Ok(placement)
+}
+
+/// Criticality exponents for weights derived from routed STA. Routed
+/// criticalities crowd near the worst path, so these are steeper than the
+/// pre-route exponent: 8 still pulls the near-critical band, 16 only the
+/// worst paths. Each is a separately routed and timed candidate.
+const ROUTED_PLACEMENT_WEIGHT_EXPONENTS: [u32; 2] = [8, 16];
+
+/// Maximum routed-timing re-placement rounds; each stops early without gain.
+const ROUTED_PLACEMENT_ROUNDS: usize = 3;
+
+/// Worst-hold loss a routed-timing placement candidate may introduce.
+const ROUTED_PLACEMENT_HOLD_TOLERANCE_PS: i128 = 100;
+
+struct RoutedTimingReplacement<'a, 'b> {
+    design: &'a Design,
+    architecture: &'a Ecp5Architecture,
+    speed_grade: &'a SpeedGradeRecord,
+    packing: &'a Ecp5Packing,
+    global_routing_cache: &'a mut Ecp5GlobalRoutingCache<'b>,
+    placement_refiner: &'a PlacementRefiner<'a>,
+    ff_control_sets: &'a [FfControlSet],
+    timing_model: &'a TimingModel,
+    timing_constraints: &'a TimingConstraints,
+}
+
+/// Solves global placement again with sink weights from routed STA
+/// criticality, once per exponent in [`ROUTED_PLACEMENT_WEIGHT_EXPONENTS`],
+/// and routes and times each candidate.
+///
+/// Returns the best candidate only when it strictly improves the timing
+/// objective of `incumbent`. A candidate that fails to route is skipped.
+#[allow(clippy::too_many_lines)]
+fn routed_timing_replacement(
+    context: RoutedTimingReplacement<'_, '_>,
+    incumbent: &PnrResult,
+    incumbent_timing: &TimingReport,
+    weight_history: &mut [BTreeMap<(NetId, CellPinId), u64>; 2],
+    costs: &mut RoutingCosts,
+    routing_workspace: &mut RoutingWorkspace,
+    progress: &mut impl FnMut(Ecp5FlowStage),
+) -> Result<Option<(PnrResult, TimingReport)>, Ecp5FlowError> {
+    let RoutedTimingReplacement {
+        design,
+        architecture,
+        speed_grade,
+        packing,
+        global_routing_cache,
+        placement_refiner,
+        ff_control_sets,
+        timing_model,
+        timing_constraints,
+    } = context;
+    let restrictions = packing.routing_restrictions_cached(
+        design,
+        architecture,
+        &incumbent.placement,
+        global_routing_cache,
+    )?;
+    let routing_capacity = routing_capacity_map(architecture.device(), &restrictions);
+    let controls = ff_control_sets
+        .iter()
+        .map(|set| RegisterControlSet {
+            cell: set.cell,
+            clock_lsr: (set.tile_clock, set.tile_lsr),
+            ce: set.slice_ce,
+        })
+        .collect::<Vec<_>>();
+    let mut best: Option<(PnrResult, TimingReport)> = None;
+    for (exponent, history) in ROUTED_PLACEMENT_WEIGHT_EXPONENTS
+        .into_iter()
+        .zip(weight_history.iter_mut())
+    {
+        for (arc, weight) in ecp5_timing_placement_weights(incumbent_timing, exponent) {
+            let known = history.entry(arc).or_insert(weight);
+            *known = (*known).max(weight);
+        }
+        let sink_weights = history.clone();
+        // A weighted solve may stall above its density targets; its
+        // lowest-overflow checkpoint is still a legal candidate here because
+        // the routed STA below decides whether it is used.
+        let solved = placement_refiner
+            .place_analytically_best_effort_with_routing_capacity_and_register_controls(
+                &sink_weights,
+                &routing_capacity,
+                &controls,
+            )?;
+        let mut bindings = solved.bindings().to_vec();
+        restore_fixed_function_sites(design, incumbent.placement.bindings(), &mut bindings);
+        let Ok(placement) = placement_from_complete_bindings(
+            design,
+            architecture.device(),
+            packing.constraints(),
+            bindings,
+        ) else {
+            continue;
+        };
+        emit_placement_metric(
+            "routed_timing_place",
+            design,
+            architecture.device(),
+            &placement,
+            None,
+        );
+        let routing = packing.global_routing_constraints_cached(
+            design,
+            architecture,
+            &placement,
+            global_routing_cache,
+        )?;
+        let candidate = match route_with_timing_costs_workspace_and_progress(
+            design,
+            architecture.device(),
+            placement,
+            &routing,
+            costs,
+            routing_workspace,
+            |event| progress(Ecp5FlowStage::Routing(event)),
+        ) {
+            Ok(candidate) => candidate,
+            Err(PnrError::CongestionNotResolved { .. } | PnrError::Unroutable { .. }) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let candidate_timing = analyze_ecp5_implementation(
+            design,
+            architecture,
+            speed_grade,
+            &candidate,
+            timing_model,
+            timing_constraints,
+        )?;
+        progress(timing_snapshot(&candidate_timing));
+        let reference = best.as_ref().map_or(incumbent_timing, |(_, timing)| timing);
+        // The weights express setup criticality only. A structural hold loss
+        // (for example clock-crossing groups pulled apart) would still pass
+        // the setup-first objective, so reject any candidate whose worst hold
+        // slack falls more than local hold repair routinely recovers.
+        let hold_preserved = candidate_timing.worst_hold_slack_ps.unwrap_or(i128::MIN)
+            >= incumbent_timing
+                .worst_hold_slack_ps
+                .unwrap_or(i128::MIN)
+                .min(0)
+                .saturating_sub(ROUTED_PLACEMENT_HOLD_TOLERANCE_PS);
+        let improves = hold_preserved
+            && strictly_improves_timing_objective(
+                timing_objective(&candidate_timing),
+                timing_objective(reference),
+            );
+        if metrics_enabled() {
+            eprintln!(
+                "[metrics] routed_timing_replacement exponent={exponent} weighted_arcs={} incumbent_wns={:?} candidate_wns={:?} candidate_whs={:?} candidate_tns={} accepted={improves}",
+                sink_weights.values().filter(|&&weight| weight > 1).count(),
+                reference.worst_slack_ps,
+                candidate_timing.worst_slack_ps,
+                candidate_timing.worst_hold_slack_ps,
+                slack_violations(
+                    candidate_timing
+                        .setup_checks
+                        .iter()
+                        .map(|check| check.slack_ps)
+                )
+                .total_negative_slack_ps(),
+            );
+        }
+        if improves {
+            best = Some((candidate, candidate_timing));
+        }
+    }
+    Ok(best)
+}
+
+/// Returns fixed-function cells (PLL, JTAGG, global clock buffers, pads) to
+/// their `incumbent` sites, swapping out any cell a solve put there.
+///
+/// Placement weights do not see clock structure. A PLL moved away from its
+/// global buffers would put general routing ahead of the whole clock tree.
+fn restore_fixed_function_sites(design: &Design, incumbent: &[BelId], bindings: &mut [BelId]) {
+    for (index, cell) in design.cells().iter().enumerate() {
+        if matches!(
+            cell.kind,
+            ResourceKind::Lut(_)
+                | ResourceKind::Register
+                | ResourceKind::Memory
+                | ResourceKind::Dsp
+        ) {
+            continue;
+        }
+        let bel = incumbent[index];
+        if let Some(other) = bindings.iter().position(|&bound| bound == bel) {
+            bindings[other] = bindings[index];
+        }
+        bindings[index] = bel;
+    }
 }
 
 /// Runs the complete timing graph on architecture placement-delay estimates.
@@ -7019,6 +7275,27 @@ mod tests {
         ));
         assert_eq!(implementation, candidate);
         assert_eq!(timing, timing_at(-90));
+    }
+
+    #[test]
+    fn fixed_function_cells_return_to_incumbent_sites() {
+        let mut design = Design::new();
+        let pll = design.add_cell("pll", ResourceKind::Logic);
+        let buffer = design.add_cell("buffer", ResourceKind::Clock);
+        let lut = design.add_cell("lut", ResourceKind::Lut(4));
+        let other_pll = design.add_cell("other", ResourceKind::Logic);
+        let incumbent = [BelId(10), BelId(20), BelId(30), BelId(11)];
+        // The solve swapped the two PLLs, kept the buffer and moved the LUT.
+        let mut solved = vec![BelId(11), BelId(20), BelId(31), BelId(10)];
+        super::restore_fixed_function_sites(&design, &incumbent, &mut solved);
+        assert_eq!(solved[pll.0], BelId(10));
+        assert_eq!(solved[other_pll.0], BelId(11));
+        assert_eq!(solved[buffer.0], BelId(20));
+        assert_eq!(
+            solved[lut.0],
+            BelId(31),
+            "fabric cells keep the solved site"
+        );
     }
 
     #[test]

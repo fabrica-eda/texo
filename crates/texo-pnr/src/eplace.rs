@@ -249,6 +249,7 @@ pub(super) fn place(
     cell_offsets: &[(f64, f64)],
     routing_capacity: Option<&RoutingCapacityMap>,
     register_controls: &[RegisterControlSet],
+    best_effort: bool,
 ) -> Result<Vec<Point>, EplaceError> {
     let device = graph.device();
     let cell_pin_weights = hypergraph.baseline_cell_incidence_weights(graph.design().cells().len());
@@ -377,6 +378,7 @@ pub(super) fn place(
             reset_after_area_adjustment,
             stop_criterion,
             completed_iterations,
+            best_effort,
         )?;
         if density_scales.is_none() {
             density_scales = Some(optimized.density_scales.clone());
@@ -391,7 +393,7 @@ pub(super) fn place(
                 previous_area_change,
             );
         }
-        if stop_criterion == DensityStopCriterion::Final {
+        if stop_criterion == DensityStopCriterion::Final || optimized.exhausted {
             return Ok(optimized.best_targets);
         }
         let capacity = routing_capacity.expect("area adjustment requires routing capacity");
@@ -423,6 +425,8 @@ struct DensityOptimization {
     best_targets: Vec<Point>,
     completed_iterations: u128,
     density_scales: Vec<f64>,
+    /// Best-effort solve stopped before its criterion; use `best_targets`.
+    exhausted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -443,6 +447,7 @@ fn optimize_density_once(
     reset_after_area_adjustment: bool,
     stop_criterion: DensityStopCriterion,
     mut completed_iterations: u128,
+    best_effort: bool,
 ) -> Result<DensityOptimization, EplaceError> {
     // Density is independent of wirelength smoothing. Probe it once per area
     // round, then rebuild all normalization, multiplier, and Nesterov state as
@@ -479,6 +484,7 @@ fn optimize_density_once(
             best_targets: best.targets,
             completed_iterations,
             density_scales,
+            exhausted: false,
         });
     }
     let (mut multipliers, mut multiplier_step) = if reset_after_area_adjustment {
@@ -493,15 +499,15 @@ fn optimize_density_once(
     };
     let mut current = initial;
     let mut previous_stationary_targets = None;
+    let mut exhausted = false;
     loop {
         if density_stop_reached(&current.density.fields, stop_criterion) {
             break;
         }
         if eplace_iteration_limit_reached(completed_iterations) {
-            return Err(did_not_converge(
-                completed_iterations,
-                &current.density.fields,
-            ));
+            stop_without_convergence(best_effort, completed_iterations, &current.density.fields)?;
+            exhausted = true;
+            break;
         }
         let global_gamma = adaptive_wirelength_gamma(problem, &current.density.fields)?;
         completed_iterations = completed_iterations
@@ -553,10 +559,9 @@ fn optimize_density_once(
             step.status,
             &rounded_targets,
         ) {
-            return Err(did_not_converge(
-                completed_iterations,
-                &current.density.fields,
-            ));
+            stop_without_convergence(best_effort, completed_iterations, &current.density.fields)?;
+            exhausted = true;
+            break;
         }
         update_density_multipliers(
             &mut multipliers,
@@ -572,6 +577,7 @@ fn optimize_density_once(
         best_targets: best.targets,
         completed_iterations,
         density_scales,
+        exhausted,
     })
 }
 
@@ -976,6 +982,20 @@ fn stationary_target_is_fixed(
     let fixed = previous.as_deref() == Some(targets);
     *previous = Some(targets.to_vec());
     fixed
+}
+
+/// A solve that cannot reach its stop criterion: best effort keeps the
+/// lowest-overflow checkpoint, a strict solve reports non-convergence.
+fn stop_without_convergence(
+    best_effort: bool,
+    iterations: u128,
+    fields: &[DensityFieldResult],
+) -> Result<(), EplaceError> {
+    if best_effort {
+        Ok(())
+    } else {
+        Err(did_not_converge(iterations, fields))
+    }
 }
 
 fn did_not_converge(iterations: u128, fields: &[DensityFieldResult]) -> EplaceError {
@@ -1607,13 +1627,13 @@ mod tests {
 
     use super::{
         AREA_ADJUSTMENT_OVERFLOW_TARGET, AUGMENTED_DENSITY_BETA, ContinuousEvaluation,
-        DensityFieldResult, DensityResult, DynamicNesterovStatus, MULTIPLIER_ALPHA_HIGH,
-        MULTIPLIER_ALPHA_LOW, PlacementCheckpoint, WeightedAverageObjective,
+        DensityFieldResult, DensityResult, DynamicNesterovStatus, EplaceError,
+        MULTIPLIER_ALPHA_HIGH, MULTIPLIER_ALPHA_LOW, PlacementCheckpoint, WeightedAverageObjective,
         area_adjusted_density_multipliers, area_adjusted_multiplier_step, area_adjustment_is_ready,
         augmented_density_value_and_coefficient, continuous_routing_demand, density_gamma_weights,
         density_is_converged, density_kind_is_exchangeable, eplace_iteration_limit_reached,
         field_wirelength_gamma, multiplier_growth_from_logarithm, routability_adjusted_member_area,
-        stationary_target_is_fixed, weighted_gamma_mean,
+        stationary_target_is_fixed, stop_without_convergence, weighted_gamma_mean,
     };
 
     fn assert_close(actual: f64, expected: f64, tolerance: f64) {
@@ -1821,6 +1841,19 @@ mod tests {
             &target,
         ));
         assert!(previous.is_none());
+    }
+
+    #[test]
+    fn only_best_effort_solves_keep_a_nonconverged_checkpoint() {
+        let fields = [density_field(ResourceKind::Lut(4), 1, 0.30)];
+        assert!(matches!(
+            stop_without_convergence(false, 3_000, &fields),
+            Err(EplaceError::DidNotConverge {
+                iterations: 3_000,
+                ..
+            })
+        ));
+        assert!(stop_without_convergence(true, 3_000, &fields).is_ok());
     }
 
     #[test]

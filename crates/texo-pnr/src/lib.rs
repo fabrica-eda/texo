@@ -2367,6 +2367,35 @@ impl<'a> PlacementRefiner<'a> {
         )
     }
 
+    /// Like [`Self::place_analytically_with_routing_capacity_and_register_controls`],
+    /// but when the electrostatic solve exhausts its iteration budget or
+    /// stalls, the lowest-overflow checkpoint is legalized instead of
+    /// returning an error. Intended for optional candidates that the caller
+    /// routes and times before use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a movable register lacks a control identity or
+    /// the cached placement problem cannot be legalized.
+    pub fn place_analytically_best_effort_with_routing_capacity_and_register_controls(
+        &self,
+        sink_weights: &BTreeMap<(NetId, CellPinId), u64>,
+        routing_capacity: &RoutingCapacityMap,
+        register_controls: &[RegisterControlSet],
+    ) -> Result<Placement, PnrError> {
+        analytical_place(
+            &self.graph,
+            self.constraints,
+            &self.units,
+            &self.spatial_indexes,
+            sink_weights,
+            None,
+            AnalyticalGlobalPlacement::ElectrostaticBestEffort,
+            Some(routing_capacity),
+            register_controls,
+        )
+    }
+
     /// Solves only the coarse quadratic connectivity system and legalizes it.
     ///
     /// This intentionally skips electrostatic density optimization.  It is a
@@ -3947,6 +3976,9 @@ fn place_units(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AnalyticalGlobalPlacement {
     Electrostatic,
+    /// Electrostatic, but an exhausted iteration budget or a stalled solve
+    /// returns the lowest-overflow checkpoint for legalization.
+    ElectrostaticBestEffort,
     Coarse,
 }
 
@@ -4104,6 +4136,7 @@ fn analytical_place(
             &macro_offset_by_cell,
             routing_capacity,
             register_controls,
+            global_placement == AnalyticalGlobalPlacement::ElectrostaticBestEffort,
         )
         .map_err(|error| PnrError::InvalidPlacement {
             reason: format!("electrostatic global placement failed: {error:?}"),
@@ -4114,7 +4147,7 @@ fn analytical_place(
     } else {
         legalization::project(graph, constraints, units, spatial_indexes, &targets)?
     };
-    if global_placement == AnalyticalGlobalPlacement::Electrostatic
+    if global_placement != AnalyticalGlobalPlacement::Coarse
         && std::env::var_os("TEXO_PNR_METRICS").is_some()
     {
         emit_eplace_legalization_metrics(graph, units, &targets, &placed);
