@@ -3857,8 +3857,8 @@ struct RoutedTimingReplacement<'a, 'b> {
 /// criticality, once per exponent in [`ROUTED_PLACEMENT_WEIGHT_EXPONENTS`],
 /// and routes and times each candidate.
 ///
-/// Returns the best candidate only when it strictly improves the timing
-/// objective of `incumbent`. A candidate that fails to route is skipped.
+/// Returns the best candidate only when it improves on `incumbent` by
+/// [`routed_placement_score`]. A candidate that fails to route is skipped.
 #[allow(clippy::too_many_lines)]
 fn routed_timing_replacement(
     context: RoutedTimingReplacement<'_, '_>,
@@ -3971,10 +3971,7 @@ fn routed_timing_replacement(
                 .min(0)
                 .saturating_sub(ROUTED_PLACEMENT_HOLD_TOLERANCE_PS);
         let improves = hold_preserved
-            && strictly_improves_timing_objective(
-                timing_objective(&candidate_timing),
-                timing_objective(reference),
-            );
+            && routed_placement_score(&candidate_timing) > routed_placement_score(reference);
         if metrics_enabled() {
             eprintln!(
                 "[metrics] routed_timing_replacement exponent={exponent} weighted_arcs={} incumbent_wns={:?} candidate_wns={:?} candidate_whs={:?} candidate_tns={} accepted={improves}",
@@ -3996,6 +3993,19 @@ fn routed_timing_replacement(
         }
     }
     Ok(best)
+}
+
+/// Ranks routed placement candidates: closed setup first, then total and
+/// worst negative setup slack.
+///
+/// Setup ECOs repair a few worst paths well, but cannot recover a placement
+/// whose violations are spread out, so a placement is judged by its total
+/// violation before the single worst path.
+fn routed_placement_score(timing: &TimingReport) -> (bool, i128, i128) {
+    let worst = timing.worst_slack_ps.unwrap_or(i128::MIN);
+    let total = slack_violations(timing.setup_checks.iter().map(|check| check.slack_ps))
+        .total_negative_slack_ps();
+    (worst >= 0, total, worst)
 }
 
 /// Returns fixed-function cells (PLL, JTAGG, global clock buffers, pads) to
