@@ -234,10 +234,11 @@ readback to the input port.
 
 ## Releases
 
-Release-plz maintains a release PR from conventional commits on `main`.
-Merging that PR creates a `vX.Y.Z` GitHub Release. The `texo-*` crates are
-published to crates.io at the same version; `cargo install texo-cli` installs
-the `texo` binary. The release workflow builds the `texo` CLI for GNU and
+release-please maintains a release PR from conventional commits on `main`.
+Merging that PR creates a `vX.Y.Z` GitHub Release, and the `texo-*` crates are
+then published to crates.io at the same version (see
+[`.github/RELEASING.md`](.github/RELEASING.md)). `cargo install texo-cli`
+installs the `texo` binary. The release workflow builds the `texo` CLI for GNU and
 static-musl x86-64 Linux, Apple Silicon and Intel macOS, and x86-64 Windows. It
 uploads a platform archive and SHA-256 checksum for every binary.
 

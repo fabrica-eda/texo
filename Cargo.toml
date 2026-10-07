@@ -45,12 +45,12 @@ struo-ir = { git = "https://github.com/fabrica-eda/struo.git", rev = "a1f11f5ef6
 struo-rtl = { git = "https://github.com/fabrica-eda/struo.git", rev = "a1f11f5ef69829fe73cf75b7842f6da50592ae79" }
 struo-synth = { git = "https://github.com/fabrica-eda/struo.git", rev = "a1f11f5ef69829fe73cf75b7842f6da50592ae79" }
 struo-target-ecp5 = { git = "https://github.com/fabrica-eda/struo.git", rev = "a1f11f5ef69829fe73cf75b7842f6da50592ae79" }
-texo-flow = { version = "=0.2.0", path = "crates/texo-flow" }
-texo-model = { version = "=0.2.0", path = "crates/texo-model" }
-texo-pnr = { version = "=0.2.0", path = "crates/texo-pnr" }
-texo-struo = { version = "=0.2.0", path = "crates/texo-struo" }
-texo-target-ecp5 = { version = "=0.2.0", path = "crates/texo-target-ecp5" }
-texo-timing = { version = "=0.2.0", path = "crates/texo-timing" }
+texo-flow = { version = "=0.2.0", path = "crates/texo-flow" } # x-release-please-version
+texo-model = { version = "=0.2.0", path = "crates/texo-model" } # x-release-please-version
+texo-pnr = { version = "=0.2.0", path = "crates/texo-pnr" } # x-release-please-version
+texo-struo = { version = "=0.2.0", path = "crates/texo-struo" } # x-release-please-version
+texo-target-ecp5 = { version = "=0.2.0", path = "crates/texo-target-ecp5" } # x-release-please-version
+texo-timing = { version = "=0.2.0", path = "crates/texo-timing" } # x-release-please-version
 veryl-analyzer = "=0.22.0"
 veryl-metadata = "=0.22.0"
 veryl-parser = "=0.22.0"
