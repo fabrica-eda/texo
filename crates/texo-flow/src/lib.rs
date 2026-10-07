@@ -890,6 +890,7 @@ pub fn implement_struo_ecp5_with_progress(
     }
     report_metric_phase("initial_route_and_timing", &mut phase_started);
     let (mut implementation, mut timing) = (initial_implementation, initial_timing);
+    let mut candidate_pool = Vec::new();
     // Without a placement delay predictor the first global placement has no
     // timing weights, so its timing depends on incidental netlist details.
     // Re-solve it once from routed STA criticalities; both candidates are
@@ -910,7 +911,9 @@ pub fn implement_struo_ecp5_with_progress(
         // Each round re-solves from the best routed result so far. A path
         // weighted once keeps its weight, so shortening today's critical
         // paths cannot simply push yesterday's back out.
-        let mut weight_history = [BTreeMap::new(), BTreeMap::new()];
+        // The unweighted placement competes with its re-placements.
+        candidate_pool.push((implementation.clone(), timing.clone()));
+        let mut weight_history = [BTreeMap::new(), BTreeMap::new(), BTreeMap::new()];
         for _ in 0..ROUTED_PLACEMENT_ROUNDS {
             let Some((candidate, candidate_timing)) = routed_timing_replacement(
                 RoutedTimingReplacement {
@@ -927,6 +930,7 @@ pub fn implement_struo_ecp5_with_progress(
                 &implementation,
                 &timing,
                 &mut weight_history,
+                &mut candidate_pool,
                 costs,
                 &mut routing_workspace,
                 &mut progress,
@@ -949,9 +953,141 @@ pub fn implement_struo_ecp5_with_progress(
             costs.set_net_criticalities(timing_net_weights(&timing, &timing_constraints));
             costs.set_sink_criticalities(timing_arc_weights(&timing, &timing_constraints));
         }
+        if metrics_enabled() {
+            for (index, (_, pool_timing)) in candidate_pool.iter().enumerate() {
+                eprintln!(
+                    "[metrics] routed_placement_candidate index={index} wns={:?} whs={:?} tns={} violations={}",
+                    pool_timing.worst_slack_ps,
+                    pool_timing.worst_hold_slack_ps,
+                    slack_violations(pool_timing.setup_checks.iter().map(|check| check.slack_ps))
+                        .total_negative_slack_ps(),
+                    pool_timing
+                        .setup_checks
+                        .iter()
+                        .filter(|check| check.slack_ps < 0)
+                        .count(),
+                );
+            }
+        }
         costs.set_net_criticalities(timing_net_weights(&timing, &timing_constraints));
         costs.set_sink_criticalities(timing_arc_weights(&timing, &timing_constraints));
         report_metric_phase("routed_timing_replacement", &mut phase_started);
+    }
+    let mut setup_budget = SetupBudget::new(options.setup_optimization_budget);
+    let mut setup_search = SetupSearch::default();
+    if candidate_pool.len() > 1
+        && options.optimize_timing
+        && options.preserved_initial_routes.is_empty()
+        && timing.worst_slack_ps.is_some_and(|slack| slack < 0)
+        && let Some(costs) = timing_routing_costs.as_mut()
+    {
+        // Routed timing alone does not predict which placement the setup
+        // search can close: it repairs a few deep paths well but not many
+        // spread-out ones. Run the same search for a fixed number of steps
+        // from every candidate and continue from the one that got furthest.
+        // The probes count against the setup budget.
+        setup_budget.start();
+        let mut best: Option<(PnrResult, TimingReport, SetupSearch, RoutingCosts)> = None;
+        // Probe the most promising candidates by routed score first.
+        let mut shortlist = std::mem::take(&mut candidate_pool);
+        shortlist.sort_by_key(|(_, candidate_timing)| {
+            std::cmp::Reverse(routed_placement_score(candidate_timing))
+        });
+        shortlist.truncate(ROUTED_PLACEMENT_PROBE_CANDIDATES);
+        for (index, (candidate, candidate_timing)) in shortlist.into_iter().enumerate() {
+            if setup_budget.exhausted() {
+                break;
+            }
+            let (mut probe_implementation, mut probe_timing) = (candidate, candidate_timing);
+            let mut probe_costs = costs.clone();
+            probe_costs
+                .set_net_criticalities(timing_net_weights(&probe_timing, &timing_constraints));
+            probe_costs
+                .set_sink_criticalities(timing_arc_weights(&probe_timing, &timing_constraints));
+            let mut search = SetupSearch::default();
+            let probe_routing = packing.global_routing_constraints_cached(
+                &design,
+                architecture,
+                &probe_implementation.placement,
+                &mut global_routing_cache,
+            )?;
+            let start_wns = probe_timing.worst_slack_ps;
+            setup_budget.limit_steps(ROUTED_PLACEMENT_PROBE_STEPS);
+            improve_worst_setup_net_route_ecos(
+                &design,
+                architecture,
+                speed_grade,
+                &timing_model,
+                &timing_constraints,
+                &probe_routing,
+                &mut probe_costs,
+                &mut routing_workspace,
+                &mut probe_implementation,
+                &mut probe_timing,
+                &mut search.route_ecos,
+                &mut setup_budget,
+                &mut progress,
+            )?;
+            if !setup_budget.step_limit_reached() {
+                let placement_refiner = PlacementRefiner::new_with_workspace(
+                    &design,
+                    architecture.device(),
+                    packing.constraints(),
+                    &mut placement_refinement_workspace,
+                )?;
+                run_local_setup_search(
+                    &design,
+                    architecture,
+                    &packing,
+                    &placement_refiner,
+                    &mut global_routing_cache,
+                    speed_grade,
+                    &timing_model,
+                    &timing_constraints,
+                    &mut routing_workspace,
+                    &mut setup_budget,
+                    &mut search,
+                    &mut probe_implementation,
+                    &mut probe_timing,
+                    &mut probe_costs,
+                    &mut progress,
+                )?;
+            }
+            setup_budget.clear_step_limit();
+            let improves = best.as_ref().is_none_or(|(_, incumbent, _, _)| {
+                strictly_improves_timing_objective(
+                    timing_objective(&probe_timing),
+                    timing_objective(incumbent),
+                )
+            });
+            eprintln!(
+                "routed placement probe {index}: WNS {:?} -> {:?} ps, WHS {:?} ps, TNS {} ps, budget steps {}, {}",
+                start_wns,
+                probe_timing.worst_slack_ps,
+                probe_timing.worst_hold_slack_ps,
+                slack_violations(probe_timing.setup_checks.iter().map(|check| check.slack_ps))
+                    .total_negative_slack_ps(),
+                setup_budget.steps(),
+                if improves { "best so far" } else { "rejected" },
+            );
+            if improves {
+                best = Some((probe_implementation, probe_timing, search, probe_costs));
+            }
+        }
+        if let Some((best_implementation, best_timing, search, best_costs)) = best {
+            routing = packing.global_routing_constraints_cached(
+                &design,
+                architecture,
+                &best_implementation.placement,
+                &mut global_routing_cache,
+            )?;
+            immutable_routing = routing.clone();
+            implementation = best_implementation;
+            timing = best_timing;
+            setup_search = search;
+            *costs = best_costs;
+        }
+        report_metric_phase("routed_placement_probes", &mut phase_started);
     }
     let mut measured_placement = options
         .measured_placement_model
@@ -1028,6 +1164,8 @@ pub fn implement_struo_ecp5_with_progress(
             if accepted {
                 implementation = candidate;
                 timing = candidate_timing;
+                // A probed search belongs to the previous placement.
+                setup_search = SetupSearch::default();
                 break;
             }
         }
@@ -1035,8 +1173,6 @@ pub fn implement_struo_ecp5_with_progress(
             provenance["attempts"] = attempts.into();
         }
     }
-    let mut route_eco_worklist = WorstSetupRouteEcoWorklist::default();
-    let mut setup_budget = SetupBudget::new(options.setup_optimization_budget);
     if options.optimize_timing
         && timing.worst_slack_ps.is_some_and(|slack| slack < 0)
         && let Some(costs) = timing_routing_costs.as_mut()
@@ -1055,7 +1191,7 @@ pub fn implement_struo_ecp5_with_progress(
             &mut routing_workspace,
             &mut implementation,
             &mut timing,
-            &mut route_eco_worklist,
+            &mut setup_search.route_ecos,
             &mut setup_budget,
             &mut progress,
         )?;
@@ -1122,7 +1258,9 @@ pub fn implement_struo_ecp5_with_progress(
         // so a previously tried net is no longer the same route candidate.
         // Reopen every net because its route candidate now belongs to a new
         // physical state, then exhaust the refreshed exact-WNS cone.
-        route_eco_worklist.reset_attempted_after_global_change();
+        setup_search
+            .route_ecos
+            .reset_attempted_after_global_change();
         let eco_routing = packing.global_routing_constraints_cached(
             &design,
             architecture,
@@ -1140,7 +1278,7 @@ pub fn implement_struo_ecp5_with_progress(
             &mut routing_workspace,
             &mut implementation,
             &mut timing,
-            &mut route_eco_worklist,
+            &mut setup_search.route_ecos,
             &mut setup_budget,
             &mut progress,
         )?;
@@ -1156,70 +1294,23 @@ pub fn implement_struo_ecp5_with_progress(
             packing.constraints(),
             &mut placement_refinement_workspace,
         )?;
-        let mut tried_local_moves = BTreeSet::new();
-        let mut move_epoch_objective = timing_objective(&timing);
-        // A placement repair changes which routes compete for resources.
-        // Reopen route ECOs after a strict local-placement improvement, then
-        // iterate until closure or a fixed point instead of requiring another
-        // synthesis/checkpoint round trip.
-        while timing.worst_slack_ps.is_some_and(|slack| slack < 0) {
-            if setup_budget.exhausted() {
-                break;
-            }
-            let before = timing_objective(&timing);
-            TimingFeedbackContext {
-                design: &design,
-                architecture,
-                packing: &packing,
-                placement_refiner: &placement_refiner,
-                global_routing_cache: &mut global_routing_cache,
-                speed_grade,
-                timing_model: &timing_model,
-                timing_constraints: &timing_constraints,
-                routing_workspace: &mut routing_workspace,
-                setup_budget: &mut setup_budget,
-            }
-            .improve_local_setup(
-                &mut implementation,
-                &mut timing,
-                costs,
-                &mut tried_local_moves,
-                &mut progress,
-            )?;
-            if !strictly_improves_timing_objective(timing_objective(&timing), before) {
-                // Unrelated small accepted moves should not immediately retry
-                // every failed wide relocation. At a fixed point, reconsider
-                // them once in the improved physical context before stopping.
-                if strictly_improves_timing_objective(before, move_epoch_objective) {
-                    tried_local_moves.clear();
-                    move_epoch_objective = before;
-                    continue;
-                }
-                break;
-            }
-            route_eco_worklist.reset_attempted_after_global_change();
-            let eco_routing = packing.global_routing_constraints_cached(
-                &design,
-                architecture,
-                &implementation.placement,
-                &mut global_routing_cache,
-            )?;
-            improve_worst_setup_net_route_ecos(
-                &design,
-                architecture,
-                speed_grade,
-                &timing_model,
-                &timing_constraints,
-                &eco_routing,
-                costs,
-                &mut routing_workspace,
-                &mut implementation,
-                &mut timing,
-                &mut route_eco_worklist,
-                &mut setup_budget,
-                &mut progress,
-            )?;
-        }
+        run_local_setup_search(
+            &design,
+            architecture,
+            &packing,
+            &placement_refiner,
+            &mut global_routing_cache,
+            speed_grade,
+            &timing_model,
+            &timing_constraints,
+            &mut routing_workspace,
+            &mut setup_budget,
+            &mut setup_search,
+            &mut implementation,
+            &mut timing,
+            costs,
+            &mut progress,
+        )?;
     }
     // Hold repair can move cells too. Report deficits rather than replacing
     // a tree the caller explicitly preserved.
@@ -3831,15 +3922,23 @@ fn initial_analytical_placement(
 
 /// Criticality exponents for weights derived from routed STA. Routed
 /// criticalities crowd near the worst path, so these are steeper than the
-/// pre-route exponent: 8 still pulls the near-critical band, 16 only the
-/// worst paths. Each is a separately routed and timed candidate.
-const ROUTED_PLACEMENT_WEIGHT_EXPONENTS: [u32; 2] = [8, 16];
+/// pre-route exponent: 8 still pulls the near-critical band, 16 and 32 only
+/// the worst paths. Each is a separately routed and timed candidate; which
+/// one the setup search can close varies by netlist, so all are probed.
+const ROUTED_PLACEMENT_WEIGHT_EXPONENTS: [u32; 3] = [8, 16, 32];
 
 /// Maximum routed-timing re-placement rounds; each stops early without gain.
 const ROUTED_PLACEMENT_ROUNDS: usize = 3;
 
 /// Worst-hold loss a routed-timing placement candidate may introduce.
 const ROUTED_PLACEMENT_HOLD_TOLERANCE_PS: i128 = 100;
+
+/// Setup-search steps (budget checks, about one trial each) spent on each
+/// probed routed placement candidate.
+const ROUTED_PLACEMENT_PROBE_STEPS: u64 = 100;
+
+/// Routed placement candidates probed, best routed score first.
+const ROUTED_PLACEMENT_PROBE_CANDIDATES: usize = 6;
 
 struct RoutedTimingReplacement<'a, 'b> {
     design: &'a Design,
@@ -3859,12 +3958,16 @@ struct RoutedTimingReplacement<'a, 'b> {
 ///
 /// Returns the best candidate only when it improves on `incumbent` by
 /// [`routed_placement_score`]. A candidate that fails to route is skipped.
-#[allow(clippy::too_many_lines)]
+/// Every routed candidate that keeps hold is also added to
+/// `candidate_pool`, from which setup probes choose the final start.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn routed_timing_replacement(
     context: RoutedTimingReplacement<'_, '_>,
     incumbent: &PnrResult,
     incumbent_timing: &TimingReport,
-    weight_history: &mut [BTreeMap<(NetId, CellPinId), u64>; 2],
+    weight_history: &mut [BTreeMap<(NetId, CellPinId), u64>;
+             ROUTED_PLACEMENT_WEIGHT_EXPONENTS.len()],
+    candidate_pool: &mut Vec<(PnrResult, TimingReport)>,
     costs: &mut RoutingCosts,
     routing_workspace: &mut RoutingWorkspace,
     progress: &mut impl FnMut(Ecp5FlowStage),
@@ -3987,6 +4090,9 @@ fn routed_timing_replacement(
                 )
                 .total_negative_slack_ps(),
             );
+        }
+        if hold_preserved {
+            candidate_pool.push((candidate.clone(), candidate_timing.clone()));
         }
         if improves {
             best = Some((candidate, candidate_timing));
@@ -4170,6 +4276,112 @@ fn timing_snapshot(timing: &TimingReport) -> Ecp5FlowStage {
         hold_ths_ps: hold.total_negative_slack_ps(),
         hold_violations: hold.endpoints,
     }
+}
+
+/// Resumable state of the setup search used after placement: worst-net route
+/// ECOs, then local placement moves that reopen route ECOs after each strict
+/// improvement. A search stopped by a step limit continues where it stopped.
+#[derive(Default)]
+struct SetupSearch {
+    route_ecos: WorstSetupRouteEcoWorklist,
+    tried_moves: BTreeSet<PlacementMoveIdentity>,
+    epoch_objective: Option<TimingObjective>,
+    fixed_point: bool,
+}
+
+/// Runs local placement moves with route ECO reopening until setup closes,
+/// the search reaches a fixed point, or the budget stops it.
+#[allow(clippy::too_many_arguments)]
+fn run_local_setup_search<'a>(
+    design: &'a Design,
+    architecture: &'a Ecp5Architecture,
+    packing: &'a Ecp5Packing,
+    placement_refiner: &PlacementRefiner<'a>,
+    global_routing_cache: &mut Ecp5GlobalRoutingCache<'_>,
+    speed_grade: &'a SpeedGradeRecord,
+    timing_model: &'a TimingModel,
+    timing_constraints: &'a TimingConstraints,
+    routing_workspace: &mut RoutingWorkspace,
+    setup_budget: &mut SetupBudget,
+    search: &mut SetupSearch,
+    implementation: &mut PnrResult,
+    timing: &mut TimingReport,
+    costs: &mut RoutingCosts,
+    progress: &mut impl FnMut(Ecp5FlowStage),
+) -> Result<(), Ecp5FlowError> {
+    let mut move_epoch_objective = *search
+        .epoch_objective
+        .get_or_insert_with(|| timing_objective(timing));
+    // A placement repair changes which routes compete for resources.
+    // Reopen route ECOs after a strict local-placement improvement, then
+    // iterate until closure or a fixed point instead of requiring another
+    // synthesis/checkpoint round trip.
+    while !search.fixed_point && timing.worst_slack_ps.is_some_and(|slack| slack < 0) {
+        if setup_budget.exhausted() {
+            break;
+        }
+        let before = timing_objective(timing);
+        TimingFeedbackContext {
+            design,
+            architecture,
+            packing,
+            placement_refiner,
+            global_routing_cache: &mut *global_routing_cache,
+            speed_grade,
+            timing_model,
+            timing_constraints,
+            routing_workspace: &mut *routing_workspace,
+            setup_budget: &mut *setup_budget,
+        }
+        .improve_local_setup(
+            implementation,
+            timing,
+            costs,
+            &mut search.tried_moves,
+            progress,
+        )?;
+        // A step-limited search may have stopped inside the trial; that is
+        // not evidence of a fixed point, so resume it later unchanged.
+        if setup_budget.step_limit_reached() {
+            break;
+        }
+        if !strictly_improves_timing_objective(timing_objective(timing), before) {
+            // Unrelated small accepted moves should not immediately retry
+            // every failed wide relocation. At a fixed point, reconsider
+            // them once in the improved physical context before stopping.
+            if strictly_improves_timing_objective(before, move_epoch_objective) {
+                search.tried_moves.clear();
+                move_epoch_objective = before;
+                search.epoch_objective = Some(before);
+                continue;
+            }
+            search.fixed_point = true;
+            break;
+        }
+        search.route_ecos.reset_attempted_after_global_change();
+        let eco_routing = packing.global_routing_constraints_cached(
+            design,
+            architecture,
+            &implementation.placement,
+            global_routing_cache,
+        )?;
+        improve_worst_setup_net_route_ecos(
+            design,
+            architecture,
+            speed_grade,
+            timing_model,
+            timing_constraints,
+            &eco_routing,
+            costs,
+            routing_workspace,
+            implementation,
+            timing,
+            &mut search.route_ecos,
+            setup_budget,
+            progress,
+        )?;
+    }
+    Ok(())
 }
 
 fn timing_objective(timing: &TimingReport) -> TimingObjective {
