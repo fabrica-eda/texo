@@ -38,9 +38,9 @@ storage remains split into compact type-specific arenas. Adapters and target
 databases stay at the boundary so upstream API changes do not leak into the
 algorithms.
 
-`texo-struo` pins Struo to one exact Git revision because it is not published
-on crates.io. Celox is pinned to `=0.3.1` from crates.io and is never replaced
-with a Git dependency. The adapter accepts current Struo `CCU2C` output by
+Struo and Celox are consumed from crates.io: Struo at its 0.2 release and Celox
+at an exact version (`=0.10.1`, matching Struo). Neither is replaced with a Git
+dependency. The adapter accepts current Struo `CCU2C` output by
 splitting each primitive into two atomically packed ECP5 carry slices.
 
 Struo's selectable distributed-memory mapping is supported end to end. Mark a
@@ -234,9 +234,11 @@ readback to the input port.
 
 ## Releases
 
-Release-plz maintains a release PR from conventional commits on `main`.
-Merging that PR creates a `vX.Y.Z` GitHub Release without publishing the
-workspace to crates.io. The release workflow builds the `texo` CLI for GNU and
+release-please maintains a release PR from conventional commits on `main`.
+Merging that PR creates a `vX.Y.Z` GitHub Release, and the `texo-*` crates are
+then published to crates.io at the same version (see
+[`.github/RELEASING.md`](.github/RELEASING.md)). `cargo install texo-cli`
+installs the `texo` binary. The release workflow builds the `texo` CLI for GNU and
 static-musl x86-64 Linux, Apple Silicon and Intel macOS, and x86-64 Windows. It
 uploads a platform archive and SHA-256 checksum for every binary.
 
@@ -387,3 +389,7 @@ full content equality after rereading the output. Writes stream through a
 same-directory temporary file, synchronize it, and atomically replace the
 destination. Conversion does not qualify timing or reuse saved timing during
 PNR. See [the format specification](docs/checkpoint-format.md).
+
+## License
+
+Texo is licensed under the [MIT License](LICENSE).

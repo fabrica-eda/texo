@@ -11095,7 +11095,7 @@ const ROUTING_CRITICALITY_SCALE: u64 = 64;
 /// Detailed timing nets may pass a finer quantum, but measuring the AXI4
 /// self-test showed the finest setting bought nothing: the final placement
 /// and WNS were unchanged while small-trial routing slowed by ~27% from the
-/// arrival-dimension state growth in [`routing_transition_cost`] searches.
+/// arrival-dimension state growth in `routing_transition_cost` searches.
 pub const ROUTING_DELAY_QUANTUM_PS: u64 = 50;
 
 // Keep physical arrival delay at full weight for every timing-routed sink.

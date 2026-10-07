@@ -1,9 +1,12 @@
 [package]
 name = "texo-model"
 description = "Frontend-independent logical and physical models for Texo"
-version = "0.1.7"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
 
 [dependencies]
 serde.workspace = true

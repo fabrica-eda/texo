@@ -11,8 +11,9 @@ use std::time::Instant;
 
 use celox::SimulatorBuilder;
 use serde_json::{Value, json};
+use struo::rtl::Design as StruoDesign;
+use struo::{ImportError, analyze_and_lower};
 use struo_celox::ecp5_simulator;
-use struo_example_axi4_smartconnect::{AXI4_CROSSBAR_SOURCE, axi4_crossbar_self_test};
 use struo_ir::Netlist;
 use struo_synth::synthesize;
 use struo_target_ecp5::{Ecp5Cell, Ecp5Netlist, map_to_ecp5};
@@ -1000,6 +1001,14 @@ fn demo() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Two-by-two AXI4 crossbar from Struo's `SmartConnect` example.
+const AXI4_CROSSBAR_SOURCE: &str = include_str!("fixtures/axi4_crossbar_2x2.veryl");
+
+/// Analyzes and flattens the closed-system crossbar verification top.
+fn axi4_crossbar_self_test() -> Result<StruoDesign, ImportError> {
+    analyze_and_lower(AXI4_CROSSBAR_SOURCE, "struo_axi4", "Axi4CrossbarSelfTest")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -1007,11 +1016,13 @@ mod tests {
 
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
-    use struo_example_axi4_smartconnect::axi4_crossbar_self_test;
     use struo_synth::synthesize;
     use struo_target_ecp5::map_to_ecp5;
 
-    use super::{ecp5_cell_name, ecp5_demo, lossless_nextpnr_json, read_nextpnr_placement};
+    use super::{
+        axi4_crossbar_self_test, ecp5_cell_name, ecp5_demo, lossless_nextpnr_json,
+        read_nextpnr_placement,
+    };
 
     const ARCHITECTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),

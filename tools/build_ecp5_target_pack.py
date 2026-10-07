@@ -16,7 +16,7 @@ from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = REPOSITORY / "architectures" / "ecp5" / "manifest.json"
-DEFAULT_CATALOG = REPOSITORY / "architectures" / "ecp5" / "catalog.json"
+DEFAULT_CATALOG = REPOSITORY / "crates" / "texo-cli" / "ecp5-target-catalog.json"
 MAGIC = b"TEXO_TARGET_PACK\n"
 FORMAT_VERSION = 1
 

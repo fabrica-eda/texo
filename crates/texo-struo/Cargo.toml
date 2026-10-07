@@ -1,9 +1,12 @@
 [package]
 name = "texo-struo"
-description = "Revision-pinned Struo ECP5 adapter for Texo"
-version = "0.1.7"
+description = "Struo ECP5 netlist import for Texo"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
 
 [dependencies]
 celox.workspace = true

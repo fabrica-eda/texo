@@ -13,7 +13,13 @@
         "release-please-config.json",
         "release-plz.toml"
       ],
-      "package-name": "texo-cli"
+      "package-name": "texo-cli",
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "Cargo.toml"
+        }
+      ]
     }
   }
 }
