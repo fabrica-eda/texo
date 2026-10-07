@@ -7,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = ["crates-io"]
+# Measurement export tools; not part of the published crate.
+exclude = ["examples/"]
 
 [dependencies]
 postcard.workspace = true
