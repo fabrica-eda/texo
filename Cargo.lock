@@ -1367,7 +1367,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2833,7 +2833,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3118,7 +3118,8 @@ dependencies = [
 [[package]]
 name = "struo"
 version = "0.2.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad3000bd4f1bae37806110d1d61b8fc3d196ec6284f336cd297d82b26eddef6e"
 dependencies = [
  "struo-celox",
  "struo-formal",
@@ -3133,7 +3134,8 @@ dependencies = [
 [[package]]
 name = "struo-celox"
 version = "0.2.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41ae823b5b4a98d4ececc5083407ee8d56f1160ebb6cd636a33a25db72904e8f"
 dependencies = [
  "celox",
  "struo-ir",
@@ -3143,7 +3145,8 @@ dependencies = [
 [[package]]
 name = "struo-formal"
 version = "0.2.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "113044b603e693e98de8768f0d4699495c1f81afd0776df6eb18caf32ebb4ad2"
 dependencies = [
  "struo-ir",
 ]
@@ -3151,7 +3154,8 @@ dependencies = [
 [[package]]
 name = "struo-frontend-veryl"
 version = "0.2.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d51b21e4d98056431aeb3ed36f43f1484f34f5ab6f049f867d29acb4e00ecda0"
 dependencies = [
  "struo-rtl",
  "veryl-analyzer",
@@ -3162,22 +3166,26 @@ dependencies = [
 [[package]]
 name = "struo-ir"
 version = "0.2.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e2f4750ab8c5f0900ee4079001af4c2a146b02c19b11983d1e9a95fb3b81097"
 
 [[package]]
 name = "struo-rtl"
 version = "0.2.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5021efe0273a74b7db10676921363ae2e6ccbd8dc7fc2b407323345eda54768d"
 
 [[package]]
 name = "struo-sim"
 version = "0.2.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "094c0ebb933bb701306c5e4af9a1308a36d4b5182f21102b2519a8a0e081b7ed"
 
 [[package]]
 name = "struo-synth"
 version = "0.2.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f9d5c59e8b401cbbc618ba54cb0f820e984f96504d07eb6f50e1a2e22dd1f9e"
 dependencies = [
  "struo-ir",
  "struo-rtl",
@@ -3186,7 +3194,8 @@ dependencies = [
 [[package]]
 name = "struo-target-ecp5"
 version = "0.2.0"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e471d515bb971b956667d67d88a6fc55ce34c2f8e8c5b08796094b039a274656"
 dependencies = [
  "ciborium",
  "serde",
@@ -3292,7 +3301,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4313,7 +4322,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
