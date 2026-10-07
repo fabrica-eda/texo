@@ -1070,8 +1070,14 @@ pub fn implement_struo_ecp5_with_progress(
                 setup_budget.steps(),
                 if improves { "best so far" } else { "rejected" },
             );
+            let closed = probe_timing.worst_slack_ps.is_some_and(|slack| slack >= 0);
             if improves {
                 best = Some((probe_implementation, probe_timing, search, probe_costs));
+            }
+            // A probe that closed setup cannot be beaten on setup; hold
+            // repair follows as for any closed placement.
+            if improves && closed {
+                break;
             }
         }
         if let Some((best_implementation, best_timing, search, best_costs)) = best {
