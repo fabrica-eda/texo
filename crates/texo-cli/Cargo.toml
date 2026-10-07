@@ -1,9 +1,11 @@
 [package]
 name = "texo-cli"
 description = "Command-line interface for Texo"
-version = "0.1.7"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "texo"
@@ -34,7 +36,7 @@ zstd.workspace = true
 texo-timing.workspace = true
 celox.workspace = true
 struo-celox.workspace = true
-struo-example-axi4-smartconnect.workspace = true
+struo.workspace = true
 struo-ir.workspace = true
 
 [lints]

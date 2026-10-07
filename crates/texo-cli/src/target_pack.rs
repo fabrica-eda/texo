@@ -16,7 +16,7 @@ const FORMAT_VERSION: u32 = 1;
 const VERIFIED_MARKER: &str = ".texo-verified";
 const CATALOG: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../architectures/ecp5/catalog.json"
+    "/ecp5-target-catalog.json"
 ));
 
 /// Paths supplied by one installed ECP5 target pack.

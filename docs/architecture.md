@@ -19,14 +19,13 @@ The inspected upstream versions are:
 
 | Project | Dependency policy | Relevant contract |
 |---|---|---|
-| `fabrica-eda/struo` | `7917f1149dfab9d1227d53c2721df6454238b7d4` | `Ecp5Netlist`, `Ecp5Cell`, distributed/block memory selection, `PFUMX`/`L6MUX21`, `CCU2C`, `PllBinding`, mapped ports, nextpnr-compatible JSON, verification policy |
-| `celox` | crates.io exact version `=0.3.1` | `FrontendArtifact` and native post-map simulation |
+| `fabrica-eda/struo` | crates.io `0.2` | `Ecp5Netlist`, `Ecp5Cell`, distributed/block memory selection, `PFUMX`/`L6MUX21`, `CCU2C`, `PllBinding`, mapped ports, nextpnr-compatible JSON, verification policy |
+| `celox` | crates.io exact version `=0.10.1` | `FrontendArtifact` and native post-map simulation |
 | `YosysHQ/prjtrellis` | exporter inspected at `3afe7b52b30f4b4417ee98f03016767a502006e3` | deduplicated chip database, relative resource references, package IO database |
 | `prjtrellis-db` | snapshot records the exact revision; fixture uses `015e0330630d7c238c0e4f2cdd9c8157eb78c54a` | ECP5 routing, package, cell timing, and interconnect timing data |
 
-Struo is not currently published on crates.io, so its first adapter will pin an
-exact Git revision. Celox must be consumed from crates.io and pinned to an exact
-release version; it must not be added as a Git dependency or overridden with a
+Struo is consumed from its crates.io releases. Celox must be consumed from
+crates.io and pinned to an exact release version; it must not be added as a Git dependency or overridden with a
 Git `[patch.crates-io]` entry. Both adapters require fixture tests before an
 upgrade.
 

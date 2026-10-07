@@ -1,9 +1,11 @@
 [package]
 name = "texo-flow"
 description = "EDA flow orchestration and verification gates for Texo"
-version = "0.1.7"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 serde_json.workspace = true

@@ -345,9 +345,9 @@ dependencies = [
 
 [[package]]
 name = "celox"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c10b42f02c2f901cffdcca1bf77909d3b0c11a6495a1304d9738334fdf5ced44"
+checksum = "35abccc22b0af76fbc3b1cd8fc7fb6c51b47361e64eb3a5596db6f243858e7ce"
 dependencies = [
  "bit-set",
  "celox-analysis",
@@ -382,28 +382,28 @@ dependencies = [
  "thiserror 2.0.20",
  "toml",
  "tracing",
- "veryl-analyzer 0.21.0",
+ "veryl-analyzer",
  "veryl-component-sys",
- "veryl-metadata 0.21.0",
- "veryl-parser 0.21.0",
- "veryl-path 0.21.0",
+ "veryl-metadata",
+ "veryl-parser",
+ "veryl-path",
  "wasmtime",
 ]
 
 [[package]]
 name = "celox-analysis"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "825b53317b9ce9bcb26d4eeb64e36833fb34b98d0e002c7bb7ae0ec1c9298e5c"
+checksum = "f716226684c94c9f72792a53c0424a2e7dc0a68db19d0443fadfa0bad3884dd1"
 dependencies = [
  "fxhash",
 ]
 
 [[package]]
 name = "celox-backend-arm64"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3163766e447eb128a1b31051881b67394fffd54995e654d5b19db87dd9888b1"
+checksum = "70800d0ce332f01e525a9b4614e99f24ba77ce5c781ff9dd9a45f7a5024b9945"
 dependencies = [
  "celox-analysis",
  "celox-backend-common",
@@ -419,18 +419,18 @@ dependencies = [
 
 [[package]]
 name = "celox-backend-common"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2738199b0d496e0d883b152e0dce5cdf5a52adc27b90fdcb92cc689220c5850"
+checksum = "a122baf8ea8251a5a5a70c11c5732b1795f737c2b4a136e4382f0be960b24390"
 dependencies = [
  "fxhash",
 ]
 
 [[package]]
 name = "celox-backend-cranelift"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2818c47525cb904f8db4a39b80e69941f23616df5a35a969e3a39b5df84eec49"
+checksum = "9cb82b26e780442e7f193f5ac5fe0711c66c34ef55201f22c9bca2c040f91eca"
 dependencies = [
  "celox-design",
  "celox-sir",
@@ -447,22 +447,22 @@ dependencies = [
 
 [[package]]
 name = "celox-backend-wasm"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "676cc137325f1f93d08964e607b42387f8467689282acbb926747feb54813403"
+checksum = "03b5b737ea973f6e7fb59619cbf8277bc3c691f7175f801c200418e7bdd27f2c"
 dependencies = [
  "celox-design",
  "celox-sir",
  "celox-state-layout",
  "fxhash",
- "wasm-encoder 0.259.0",
+ "wasm-encoder 0.260.0",
 ]
 
 [[package]]
 name = "celox-backend-x86"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c94a0cee994d7d8eef9ad7167c3b748e05ea0b97670e332cf08ae290e3ad7759"
+checksum = "c1a77e65db8e23576c2de018de37cd1708ced129df6e366a5cc1b46361f2c0e4"
 dependencies = [
  "celox-analysis",
  "celox-backend-common",
@@ -479,9 +479,9 @@ dependencies = [
 
 [[package]]
 name = "celox-design"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f0c514e8733ea7a3b972efb655f572c91086ca2ba7c01bc1ab4f547ecc0ec83"
+checksum = "48f2c971574af0ab8804b808e4f6980cd3343ff002fd8cadf6203d3b907cb0bb"
 dependencies = [
  "fxhash",
  "num-bigint",
@@ -490,9 +490,9 @@ dependencies = [
 
 [[package]]
 name = "celox-frontend-core"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "633cfc27557133bcb42e5a775713010e045ee606ae3e97246d45f710b5d43cd3"
+checksum = "8bd82e1570b39709cef4a0e473501f2fe4cbdd5df202d9a13d668dc40cabdeb1"
 dependencies = [
  "celox-design",
  "celox-frontend-sdk",
@@ -508,9 +508,9 @@ dependencies = [
 
 [[package]]
 name = "celox-frontend-sdk"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ce8fad7b7be2eb6ec72537836125c94d611369391639c5ca10a48982fb89cbc"
+checksum = "90b2d5397f697745f92c77463b322001f7a3d04ff6c83b4934d40883e0635c62"
 dependencies = [
  "fxhash",
  "num-bigint",
@@ -521,9 +521,9 @@ dependencies = [
 
 [[package]]
 name = "celox-frontend-veryl"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23e25f59698181e3d9efefcb96d9972dcae3146756bdd7ce0664cc9b16ea2c77"
+checksum = "2dbc4bb36f9b5a8836c0fafbc36fb7e9f1c3092ae584721c549f0413bf950cc1"
 dependencies = [
  "bit-set",
  "celox-design",
@@ -537,32 +537,32 @@ dependencies = [
  "num-traits",
  "thiserror 2.0.20",
  "tracing",
- "veryl-analyzer 0.21.0",
- "veryl-metadata 0.21.0",
- "veryl-parser 0.21.0",
+ "veryl-analyzer",
+ "veryl-metadata",
+ "veryl-parser",
 ]
 
 [[package]]
 name = "celox-macros"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96e5bea0c45da8b12e425886f543f59c4f776b4dd52b2be07fa2b31bdd380b65"
+checksum = "6cd1e2528127edfba76602c945012762b13293ed79930a5f2ebd749e7b505f87"
 dependencies = [
  "fxhash",
  "num-bigint",
  "proc-macro2",
  "quote",
  "syn 3.0.3",
- "veryl-analyzer 0.21.0",
- "veryl-metadata 0.21.0",
- "veryl-parser 0.21.0",
+ "veryl-analyzer",
+ "veryl-metadata",
+ "veryl-parser",
 ]
 
 [[package]]
 name = "celox-runtime"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9435219b37c5987d281aa5f81ae71ca6f67aac405c93607e003ded4d209485da"
+checksum = "9bcc3c29f2b3d328261366a4a394ee7b3104875b293d69c4d69b0d376e616291"
 dependencies = [
  "bit-set",
  "celox-design",
@@ -576,9 +576,9 @@ dependencies = [
 
 [[package]]
 name = "celox-sir"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9db29fc74ea3e2be72be2f7c73eeb7e41aac67befe9076a817f3d9b5f7cbd2a1"
+checksum = "510cabbfd4d879da7fc0f2b364832a4c8101edb2289c989f91c50f988b4b4274"
 dependencies = [
  "celox-analysis",
  "celox-design",
@@ -590,9 +590,9 @@ dependencies = [
 
 [[package]]
 name = "celox-sir-opt"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98f9572298b480724b43c3e418f847d9d9a20997794cead1f5772146ea7178d6"
+checksum = "fbc3447e01a006c89b4f46aaafa79b36b852cafe179e08ba306969ad470b2fa1"
 dependencies = [
  "bit-set",
  "celox-analysis",
@@ -609,9 +609,9 @@ dependencies = [
 
 [[package]]
 name = "celox-slt"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16ef6e7ce72848fe629fb23dbc901e2406361f2630cc53ac54eb4ae5c790b614"
+checksum = "3b1429c6c4a907b7ec743b4a868649fdbf3a7c10a4dcdb6bb46f14d66e8ceead"
 dependencies = [
  "celox-analysis",
  "celox-design",
@@ -626,9 +626,9 @@ dependencies = [
 
 [[package]]
 name = "celox-state-layout"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "728eec69375a03b3a08b51370d8a45cdd164d3d9a9edb9cbe122d6069c214b4d"
+checksum = "93ba08bd8a11ee0dfc9512f7d023e63a5f591425362c1d0d51db97c9b3d79f3e"
 dependencies = [
  "celox-design",
  "fxhash",
@@ -637,10 +637,11 @@ dependencies = [
 
 [[package]]
 name = "celox-testbench"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f811f1bc098ec58b74bc0666e42289a3f7b802cdce5680d86ceaace21db68fd"
+checksum = "77949b234db9596ce5dfa29da2c96dc580b9c5945b930d1a202e87105b1b1bf9"
 dependencies = [
+ "celox-design",
  "num-bigint",
  "num-traits",
  "serde",
@@ -3116,8 +3117,8 @@ dependencies = [
 
 [[package]]
 name = "struo"
-version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=bee70eb6d6f473e6e56877f38025cd62e3a79b50#bee70eb6d6f473e6e56877f38025cd62e3a79b50"
+version = "0.2.0"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
 dependencies = [
  "struo-celox",
  "struo-formal",
@@ -3131,8 +3132,8 @@ dependencies = [
 
 [[package]]
 name = "struo-celox"
-version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=bee70eb6d6f473e6e56877f38025cd62e3a79b50#bee70eb6d6f473e6e56877f38025cd62e3a79b50"
+version = "0.2.0"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
 dependencies = [
  "celox",
  "struo-ir",
@@ -3140,51 +3141,43 @@ dependencies = [
 ]
 
 [[package]]
-name = "struo-example-axi4-smartconnect"
-version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=bee70eb6d6f473e6e56877f38025cd62e3a79b50#bee70eb6d6f473e6e56877f38025cd62e3a79b50"
-dependencies = [
- "struo",
-]
-
-[[package]]
 name = "struo-formal"
-version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=bee70eb6d6f473e6e56877f38025cd62e3a79b50#bee70eb6d6f473e6e56877f38025cd62e3a79b50"
+version = "0.2.0"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
 dependencies = [
  "struo-ir",
 ]
 
 [[package]]
 name = "struo-frontend-veryl"
-version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=bee70eb6d6f473e6e56877f38025cd62e3a79b50#bee70eb6d6f473e6e56877f38025cd62e3a79b50"
+version = "0.2.0"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
 dependencies = [
  "struo-rtl",
- "veryl-analyzer 0.22.0",
- "veryl-metadata 0.22.0",
- "veryl-parser 0.22.0",
+ "veryl-analyzer",
+ "veryl-metadata",
+ "veryl-parser",
 ]
 
 [[package]]
 name = "struo-ir"
-version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=bee70eb6d6f473e6e56877f38025cd62e3a79b50#bee70eb6d6f473e6e56877f38025cd62e3a79b50"
+version = "0.2.0"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
 
 [[package]]
 name = "struo-rtl"
-version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=bee70eb6d6f473e6e56877f38025cd62e3a79b50#bee70eb6d6f473e6e56877f38025cd62e3a79b50"
+version = "0.2.0"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
 
 [[package]]
 name = "struo-sim"
-version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=bee70eb6d6f473e6e56877f38025cd62e3a79b50#bee70eb6d6f473e6e56877f38025cd62e3a79b50"
+version = "0.2.0"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
 
 [[package]]
 name = "struo-synth"
-version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=bee70eb6d6f473e6e56877f38025cd62e3a79b50#bee70eb6d6f473e6e56877f38025cd62e3a79b50"
+version = "0.2.0"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
 dependencies = [
  "struo-ir",
  "struo-rtl",
@@ -3192,8 +3185,8 @@ dependencies = [
 
 [[package]]
 name = "struo-target-ecp5"
-version = "0.1.1"
-source = "git+https://github.com/fabrica-eda/struo.git?rev=bee70eb6d6f473e6e56877f38025cd62e3a79b50#bee70eb6d6f473e6e56877f38025cd62e3a79b50"
+version = "0.2.0"
+source = "git+https://github.com/fabrica-eda/struo.git?rev=a1f11f5ef69829fe73cf75b7842f6da50592ae79#a1f11f5ef69829fe73cf75b7842f6da50592ae79"
 dependencies = [
  "ciborium",
  "serde",
@@ -3329,7 +3322,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "texo-cli"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "celox",
  "ciborium",
@@ -3337,8 +3330,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "struo",
  "struo-celox",
- "struo-example-axi4-smartconnect",
  "struo-frontend-veryl",
  "struo-ir",
  "struo-rtl",
@@ -3351,15 +3344,15 @@ dependencies = [
  "texo-target-ecp5",
  "texo-timing",
  "ureq",
- "veryl-analyzer 0.22.0",
- "veryl-metadata 0.22.0",
- "veryl-parser 0.22.0",
+ "veryl-analyzer",
+ "veryl-metadata",
+ "veryl-parser",
  "zstd",
 ]
 
 [[package]]
 name = "texo-flow"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3377,14 +3370,14 @@ dependencies = [
 
 [[package]]
 name = "texo-model"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "texo-pnr"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "libm",
  "rayon",
@@ -3394,11 +3387,11 @@ dependencies = [
 
 [[package]]
 name = "texo-release-metadata"
-version = "0.1.7"
+version = "0.2.0"
 
 [[package]]
 name = "texo-struo"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "celox",
  "struo-celox",
@@ -3409,7 +3402,7 @@ dependencies = [
 
 [[package]]
 name = "texo-target-ecp5"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "postcard",
  "serde",
@@ -3423,7 +3416,7 @@ dependencies = [
 
 [[package]]
 name = "texo-timing"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "texo-model",
  "texo-pnr",
@@ -3736,38 +3729,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "veryl-analyzer"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27642985fd83ff90aeea356cbc70f63d2ac83988e1e1bae9e7b0bd63fe61fcf8"
-dependencies = [
- "bimap",
- "daggy",
- "fxhash",
- "indent",
- "itertools 0.15.0",
- "log",
- "miette",
- "num-bigint",
- "num-traits",
- "paste",
- "postcard",
- "serde",
- "serde_json",
- "similar",
- "smallvec",
- "strnum_bitwidth",
- "strum",
- "strum_macros",
- "thiserror 2.0.20",
- "toml",
- "vcd",
- "veryl-component-sys",
- "veryl-metadata 0.21.0",
- "veryl-parser 0.21.0",
-]
-
-[[package]]
-name = "veryl-analyzer"
 version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c706e71bd1b264ef400acac505335f341721f83cc62fd29018e435914313f8cf"
@@ -3794,8 +3755,8 @@ dependencies = [
  "toml",
  "vcd",
  "veryl-component-sys",
- "veryl-metadata 0.22.0",
- "veryl-parser 0.22.0",
+ "veryl-metadata",
+ "veryl-parser",
 ]
 
 [[package]]
@@ -3803,34 +3764,6 @@ name = "veryl-component-sys"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51fd96eba08b4bad6f83eca30c213e6fc29f83d02be4d67d8604fd95be757ff8"
-
-[[package]]
-name = "veryl-metadata"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1feef2d04be41a3b8f35b5fc1a1573e161054561d42f76d80dd89284048a9a83"
-dependencies = [
- "log",
- "miette",
- "once_cell",
- "pathdiff",
- "regex",
- "semver",
- "serde",
- "serde_json",
- "serde_regex",
- "spdx",
- "thiserror 2.0.20",
- "toml",
- "url",
- "uuid",
- "veryl-component-sys",
- "veryl-parser 0.21.0",
- "veryl-path 0.21.0",
- "veryl-std 0.21.0",
- "walkdir",
- "which",
-]
 
 [[package]]
 name = "veryl-metadata"
@@ -3853,30 +3786,11 @@ dependencies = [
  "url",
  "uuid",
  "veryl-component-sys",
- "veryl-parser 0.22.0",
- "veryl-path 0.22.0",
- "veryl-std 0.22.0",
+ "veryl-parser",
+ "veryl-path",
+ "veryl-std",
  "walkdir",
  "which",
-]
-
-[[package]]
-name = "veryl-parser"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d8b2b967783ca8fbb19915e9dd7fb9d69bc6b51dcda8a7c578d31d724c8f7fa"
-dependencies = [
- "anyhow",
- "bimap",
- "miette",
- "once_cell",
- "parol",
- "parol_runtime",
- "paste",
- "regex",
- "scnr2",
- "serde",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3900,21 +3814,6 @@ dependencies = [
 
 [[package]]
 name = "veryl-path"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f03fd8c2c572a28be2ea6ba2a97ded7308fddc9d7c8d71732392228d7d95962"
-dependencies = [
- "directories",
- "fs4",
- "log",
- "miette",
- "tempfile",
- "thiserror 2.0.20",
- "walkdir",
-]
-
-[[package]]
-name = "veryl-path"
 version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b634d0a91253af293d815892af214c799e9ce356dd3b74c230d83e7d7b67d152"
@@ -3930,19 +3829,6 @@ dependencies = [
 
 [[package]]
 name = "veryl-std"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3a03c4f7d6bf43edd7dbd5d7a4c68d52f36a0624e6242a99b03caaa72d9ccc4"
-dependencies = [
- "merkle_hash",
- "miette",
- "rust-embed",
- "thiserror 2.0.20",
- "veryl-path 0.21.0",
-]
-
-[[package]]
-name = "veryl-std"
 version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30bf95dea1084d78b50f2b0a7e1bd2a9c5135ab56f4bbe7b2911042b24a5b457"
@@ -3951,7 +3837,7 @@ dependencies = [
  "miette",
  "rust-embed",
  "thiserror 2.0.20",
- "veryl-path 0.22.0",
+ "veryl-path",
 ]
 
 [[package]]
@@ -4062,6 +3948,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-encoder"
+version = "0.260.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1e9692da9ef627c5ee12b45378f68ac2689ce306f88078f5cf849b7c3444ed8"
+dependencies = [
+ "leb128fmt",
+ "wasmparser 0.260.0",
+]
+
+[[package]]
 name = "wasm-metadata"
 version = "0.258.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4091,6 +3987,17 @@ name = "wasmparser"
 version = "0.259.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0f7c12eac7bb587801590f6a67ff0bc84d0748513864b71108e4b311cc3df694"
+dependencies = [
+ "bitflags 2.13.1",
+ "indexmap",
+ "semver",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.260.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c94519d78304dc4a4bb5925eda6ff153bf06167467cff9233dc9593bae28fdd"
 dependencies = [
  "bitflags 2.13.1",
  "indexmap",
