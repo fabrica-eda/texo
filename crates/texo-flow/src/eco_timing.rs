@@ -342,10 +342,8 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn reused_net_delays_match_complete_sta_across_route_changes() {
-        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../texo-target-ecp5/fixtures/minimal-ecp5.json"
-        ))
-        .unwrap();
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(texo_target_ecp5::MINIMAL_ECP5_FIXTURE_JSON).unwrap();
         // PADDI -> D0_SLICE, and D0_SLICE -> B0_SLICE through the LUT
         // permutation, so logical B can use physical D.
         let pips = fixture["location_types"][0]["pips"].as_array_mut().unwrap();

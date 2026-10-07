@@ -13,6 +13,10 @@ pub use lpf::{
 };
 pub use placement_delay::{Ecp5DelayPredictorError, Ecp5PlacementDelayPredictor};
 
+/// A minimal ECP5 architecture snapshot for tests in the Texo crates.
+#[doc(hidden)]
+pub const MINIMAL_ECP5_FIXTURE_JSON: &str = include_str!("../fixtures/minimal-ecp5.json");
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;

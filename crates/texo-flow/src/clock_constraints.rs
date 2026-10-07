@@ -121,10 +121,8 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let architecture = read_architecture(
-                include_bytes!("../../texo-target-ecp5/fixtures/minimal-ecp5.json").as_slice(),
-            )
-            .unwrap();
+            let architecture =
+                read_architecture(texo_target_ecp5::MINIMAL_ECP5_FIXTURE_JSON.as_bytes()).unwrap();
             let mut design = Design::new();
             let jtagg = design.add_cell("tap", ResourceKind::Logic);
             let jtck = design.add_pin(jtagg, "JTCK", PinDirection::Output).unwrap();

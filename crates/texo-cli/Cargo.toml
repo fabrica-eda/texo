@@ -7,8 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = ["crates-io"]
-# Development benchmarks and measurements; not part of the published crate.
-exclude = ["examples/"]
+# Development benchmarks and measurements, and integration tests that read the
+# repository's example projects; not part of the published crate.
+exclude = ["examples/", "tests/binary_checkpoint_cli.rs", "tests/core250_qor.rs"]
 
 [[bin]]
 name = "texo"

@@ -1872,10 +1872,7 @@ mod tests {
         write_distributed_ram_write_port, write_ff, write_jtagg, write_multiplier, write_pll,
     };
 
-    const ARCHITECTURE: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../texo-target-ecp5/fixtures/minimal-ecp5.json"
-    ));
+    const ARCHITECTURE: &str = texo_target_ecp5::MINIMAL_ECP5_FIXTURE_JSON;
 
     #[test]
     fn parses_and_canonically_serializes_an_empty_device_config() {

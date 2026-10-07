@@ -74,15 +74,38 @@ wait_for_crate() {
   return 1
 }
 
+if [[ "$mode" == "package" ]]; then
+  # crates.io may not have this version of the sibling crates yet, so package
+  # them all together, then type-check every target of each archive with the
+  # siblings patched to their own archives. This catches files a crate reads
+  # from outside its package before anything is uploaded.
+  package_args=()
+  for crate in "${crates[@]}"; do
+    package_args+=(-p "$crate")
+  done
+  cargo package --locked --allow-dirty --no-verify "${package_args[@]}"
+  # Outside the repository, so Cargo does not treat the archives as members of
+  # this workspace.
+  sources="$(mktemp -d)"
+  trap 'rm -rf "$sources"' EXIT
+  patches=()
+  for crate in "${crates[@]}"; do
+    tar -xzf "$repo_root/target/package/$crate-$version.crate" -C "$sources"
+    patches+=(--config "patch.crates-io.$crate.path=\"$sources/$crate-$version\"")
+  done
+  for crate in "${crates[@]}"; do
+    echo "checking all targets of the $crate@$version archive"
+    cargo check \
+      --quiet \
+      --all-targets \
+      --manifest-path "$sources/$crate-$version/Cargo.toml" \
+      --target-dir "$repo_root/target/package-checks" \
+      "${patches[@]}"
+  done
+  exit 0
+fi
+
 for crate in "${crates[@]}"; do
-  if [[ "$mode" == "package" ]]; then
-    # Before the first release, crates.io cannot resolve unpublished internal
-    # dependencies. File-list validation still catches manifest packaging
-    # errors; the ordered publish pass verifies each normalized archive.
-    echo "checking package file list for $crate@$version"
-    cargo package --locked --allow-dirty --no-verify --list -p "$crate" >/dev/null
-    continue
-  fi
 
   if crate_exists "$crate"; then
     echo "$crate@$version is already published; skipping"

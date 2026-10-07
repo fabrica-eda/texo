@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn changed_measurement_and_incomplete_surface_never_install() {
         let mut architecture = texo_target_ecp5::read_architecture(
-            include_str!("../../texo-target-ecp5/fixtures/minimal-ecp5.json").as_bytes(),
+            texo_target_ecp5::MINIMAL_ECP5_FIXTURE_JSON.as_bytes(),
         )
         .unwrap();
         let original = architecture.speed_grades()["6"].clone();
