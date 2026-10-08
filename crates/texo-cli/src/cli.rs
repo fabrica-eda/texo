@@ -109,6 +109,9 @@ struct BitgenArgs {
     /// ECP5 bitstream destination.
     #[arg(short, long)]
     bit: PathBuf,
+    /// Measured STA library used by the checkpoint, matched by its recorded SHA-256.
+    #[arg(long, value_name = "JSON")]
+    measured_timing_library: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -163,6 +166,10 @@ struct PnrArgs {
     /// Verified board-measured LUT-hop model; replaces guessed placement prediction.
     #[arg(long, value_name = "JSON")]
     measured_placement_model: Option<PathBuf>,
+    /// Read and hash-check the evidence files recorded in the measured model and
+    /// STA library (paths relative to each file). Otherwise only their form is checked.
+    #[arg(long)]
+    verify_measured_evidence: bool,
     /// Project directory or `Veryl.toml`.
     input: PathBuf,
     /// Top module; overrides `[synth].top`.
@@ -436,6 +443,7 @@ fn run_bitgen(args: &BitgenArgs) -> Result<(), Box<dyn Error>> {
         bitstream: args.bit.clone(),
         configuration: args.config.clone(),
         runtime,
+        measured_timing_library: args.measured_timing_library.clone(),
     })?;
     println!(
         "Texo native bitgen: {} programmable PIPs, {} fixed edges",
@@ -604,10 +612,23 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
         .or_else(|| pack.as_ref().map(|pack| pack.architecture.as_path()))
         .expect("an explicit architecture or target pack was resolved");
     let mut architecture = load_architecture(architecture_path)?;
+    let measured_evidence = if args.verify_measured_evidence {
+        texo_flow::MeasuredEvidence::Verify
+    } else {
+        texo_flow::MeasuredEvidence::Skip
+    };
     let measured_timing = args
         .measured_timing_library
         .as_deref()
-        .map(|path| crate::measured_timing::install(path, &mut architecture, &args.package, None))
+        .map(|path| {
+            crate::measured_timing::install_with(
+                path,
+                &mut architecture,
+                &args.package,
+                None,
+                measured_evidence,
+            )
+        })
         .transpose()?;
     if let Some(record) = measured_timing.as_ref() {
         let guard = record["required_setup_hold_guard_ps"]
@@ -648,7 +669,7 @@ fn pnr(args: &PnrArgs) -> Result<(), Box<dyn Error>> {
     let measured_model = args
         .measured_placement_model
         .as_deref()
-        .map(texo_flow::MeasuredPlacementModel::load)
+        .map(|path| texo_flow::MeasuredPlacementModel::load_with(path, measured_evidence))
         .transpose()?;
     let mut options = Ecp5FlowOptions {
         measured_placement_model: measured_model.as_ref(),

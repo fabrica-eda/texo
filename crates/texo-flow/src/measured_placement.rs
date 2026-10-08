@@ -22,6 +22,7 @@ pub struct MeasuredPlacementModel {
     holdout_error: f64,
     sha256: String,
     source: String,
+    evidence_verified: bool,
 }
 
 #[derive(Deserialize)]
@@ -61,6 +62,55 @@ fn open_input(path: &Path) -> Result<(Box<dyn Read>, PathBuf), Box<dyn std::erro
     Ok((reader, source))
 }
 
+/// Whether a measured model's recorded evidence files are read and hash-checked.
+///
+/// Evidence paths are always relative to the model or library file. With
+/// [`MeasuredEvidence::Skip`], the caller is responsible for pinning the model
+/// or library file itself (its SHA-256 is recorded in checkpoint provenance).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MeasuredEvidence {
+    /// Read every evidence file next to the model and compare its SHA-256.
+    Verify,
+    /// Check that evidence paths are well formed, without reading them.
+    #[default]
+    Skip,
+}
+
+/// Validate the evidence paths recorded in a measured model or STA library and,
+/// with [`MeasuredEvidence::Verify`], their SHA-256 against the files resolved
+/// relative to the directory that contains `source`.
+///
+/// # Errors
+/// Rejects absolute or parent-relative paths, unreadable evidence and hash
+/// mismatches.
+pub fn check_measured_evidence(
+    source: &Path,
+    input_sha256: &BTreeMap<String, String>,
+    evidence: MeasuredEvidence,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = source.parent().unwrap_or_else(|| Path::new(""));
+    for (name, expected) in input_sha256 {
+        let relative = Path::new(name);
+        if !relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(format!(
+                "measured evidence path must be relative to the model without `..`: {name}"
+            )
+            .into());
+        }
+        if evidence == MeasuredEvidence::Verify {
+            let actual = input_digest(&base.join(relative))
+                .map_err(|error| format!("cannot read measured evidence {name}: {error}"))?;
+            if actual != *expected {
+                return Err(format!("measured evidence hash mismatch: {name}").into());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn input_digest(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let (mut reader, _) = open_input(path)?;
     let mut digest = Sha256::new();
@@ -75,12 +125,25 @@ fn input_digest(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 impl MeasuredPlacementModel {
-    /// Load and verify every measured input hash, including archived `.zst`
-    /// models and evidence. No guessed-model fallback.
+    /// Load a measured model and verify every evidence file it records,
+    /// including archived `.zst` models and evidence. No guessed-model fallback.
     ///
     /// # Errors
     /// Rejects missing/tampered inputs, incompatible target or invalid fit.
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::load_with(path, MeasuredEvidence::Verify)
+    }
+
+    /// Load a measured model, reading its evidence files only with
+    /// [`MeasuredEvidence::Verify`].
+    ///
+    /// # Errors
+    /// Rejects malformed evidence paths, missing/tampered evidence when
+    /// verified, an incompatible target or an invalid fit.
+    pub fn load_with(
+        path: &Path,
+        evidence: MeasuredEvidence,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let (mut reader, source) = open_input(path)?;
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes)?;
@@ -114,24 +177,23 @@ impl MeasuredPlacementModel {
         {
             return Err("invalid measured placement model or failed independent holdout".into());
         }
-        for (file, expected) in &r.input_sha256 {
-            let actual = input_digest(Path::new(file))
-                .map_err(|error| format!("cannot read measured input {file}: {error}"))?;
-            if actual != *expected {
-                return Err(format!("measured input hash mismatch: {file}").into());
-            }
-        }
+        check_measured_evidence(&source, &r.input_sha256, evidence)?;
         Ok(Self {
             coefficients: r.coefficients_by_input_pin_ps,
             holdout_error: r.holdout_max_abs_relative_error,
             sha256: format!("{:x}", Sha256::digest(&bytes)),
-            source: source.canonicalize()?.display().to_string(),
+            // Only the file name: checkpoints must not carry local directories.
+            source: source
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            evidence_verified: evidence == MeasuredEvidence::Verify,
         })
     }
 
     pub(super) fn provenance(&self) -> Value {
-        json!({"kind":"measured_lut_hop_ranking_v1", "model_path":self.source,
-            "model_sha256":self.sha256, "holdout_max_abs_relative_error":self.holdout_error,
+        json!({"kind":"measured_lut_hop_ranking_v1", "model_file":self.source,
+            "model_sha256":self.sha256, "evidence_verified":self.evidence_verified, "holdout_max_abs_relative_error":self.holdout_error,
             "guessed_placement_predictor_enabled":false, "sta_model_replaced":false,
             "scope":"K0 F to K0 A/B/C/D, one logical sink, nonzero displacement, major axis <=12 tiles and minor axis <=2",
             "acceptance":"fresh whole-design routed STA, no worse setup or hold slack",
@@ -405,6 +467,7 @@ mod tests {
             holdout_error: 0.04,
             sha256: String::new(),
             source: String::new(),
+            evidence_verified: false,
         }
     }
     #[test]
@@ -458,7 +521,7 @@ mod tests {
             "device":"LFE5UM5G-85F","package":"CABGA381","sta_qualified":false,
             "features":["lut_hops","x_near_tiles","x_far_tiles","y_near_tiles","y_far_tiles","loop_offset"],
             "coefficients_by_input_pin_ps":model().coefficients,"holdout_max_abs_relative_error":0.04,
-            "input_sha256":{sample.display().to_string():format!("{:x}",Sha256::digest(b"measured counts"))}});
+            "input_sha256":{"sample.json":format!("{:x}",Sha256::digest(b"measured counts"))}});
         std::fs::write(&model_path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(MeasuredPlacementModel::load(&model_path).is_ok());
         let plain = MeasuredPlacementModel::load(&model_path).unwrap();
@@ -494,6 +557,32 @@ mod tests {
         assert!(MeasuredPlacementModel::load(&model_path).is_err());
         std::fs::write(&archive, b"broken zstd frame").unwrap();
         assert!(MeasuredPlacementModel::load(&model_path).is_err());
+        // Unverified loading does not read evidence, but records that it did not.
+        let skipped =
+            MeasuredPlacementModel::load_with(&model_path, MeasuredEvidence::Skip).unwrap();
+        assert_eq!(skipped.provenance()["evidence_verified"], false);
+        // Only the opened file's name is recorded (here the archived model).
+        assert_eq!(skipped.provenance()["model_file"], "model.json.zst");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn evidence_paths_must_stay_beside_the_model() {
+        let dir = std::env::temp_dir().join(format!("texo-measured-paths-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model_path = dir.join("model.json");
+        let absolute = dir.join("sample.json").display().to_string();
+        for name in [absolute.as_str(), "../sample.json"] {
+            let value = json!({"schema":1,"kind":"measured_loop_average_lut_plus_route_cost",
+                "device":"LFE5UM5G-85F","package":"CABGA381","sta_qualified":false,
+                "features":["lut_hops","x_near_tiles","x_far_tiles","y_near_tiles","y_far_tiles","loop_offset"],
+                "coefficients_by_input_pin_ps":model().coefficients,"holdout_max_abs_relative_error":0.04,
+                "input_sha256":{name:"0".repeat(64)}});
+            std::fs::write(&model_path, serde_json::to_vec(&value).unwrap()).unwrap();
+            for evidence in [MeasuredEvidence::Verify, MeasuredEvidence::Skip] {
+                assert!(MeasuredPlacementModel::load_with(&model_path, evidence).is_err());
+            }
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
