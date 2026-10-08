@@ -242,7 +242,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn routed_d_to_b_uses_physical_delay_and_does_not_mutate_the_logical_model() {
         let mut fixture: serde_json::Value =
-            serde_json::from_str(texo_target_ecp5::MINIMAL_ECP5_FIXTURE_JSON).unwrap();
+            serde_json::from_str(include_str!("../fixtures/minimal-ecp5.json")).unwrap();
         fixture["location_types"][0]["pips"]
             .as_array_mut()
             .unwrap()

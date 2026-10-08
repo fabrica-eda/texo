@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn rejects_foreign_device_package_and_architecture_revisions() {
         let architecture =
-            read_architecture(texo_target_ecp5::MINIMAL_ECP5_FIXTURE_JSON.as_bytes()).unwrap();
+            read_architecture(include_str!("../fixtures/minimal-ecp5.json").as_bytes()).unwrap();
         saved().validate_target(&architecture, "TEST").unwrap();
         assert!(saved().validate_target(&architecture, "OTHER").is_err());
         let mut checkpoint = saved();

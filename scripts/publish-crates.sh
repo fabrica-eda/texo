@@ -77,8 +77,10 @@ wait_for_crate() {
 if [[ "$mode" == "package" ]]; then
   # crates.io may not have this version of the sibling crates yet, so package
   # them all together, then type-check every target of each archive with the
-  # siblings patched to their own archives. This catches files a crate reads
-  # from outside its package before anything is uploaded.
+  # unpublished siblings patched to their own archives. Siblings already on
+  # crates.io at this version come from there, as they will when publishing.
+  # This catches files a crate reads from outside its package, or API it needs
+  # from a sibling that was published without it, before anything is uploaded.
   package_args=()
   for crate in "${crates[@]}"; do
     package_args+=(-p "$crate")
@@ -89,11 +91,19 @@ if [[ "$mode" == "package" ]]; then
   sources="$(mktemp -d)"
   trap 'rm -rf "$sources"' EXIT
   patches=()
+  unpublished=()
   for crate in "${crates[@]}"; do
+    if crate_exists "$crate"; then
+      echo "$crate@$version is already published; checking dependents against it"
+      continue
+    fi
     tar -xzf "$repo_root/target/package/$crate-$version.crate" -C "$sources"
+    # The packaged lockfile records checksums from Cargo's temporary registry.
+    rm -f "$sources/$crate-$version/Cargo.lock"
     patches+=(--config "patch.crates-io.$crate.path=\"$sources/$crate-$version\"")
+    unpublished+=("$crate")
   done
-  for crate in "${crates[@]}"; do
+  for crate in "${unpublished[@]}"; do
     echo "checking all targets of the $crate@$version archive"
     cargo check \
       --quiet \
