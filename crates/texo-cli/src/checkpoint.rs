@@ -1189,10 +1189,7 @@ mod tests {
 
     use super::{checkpoint_placement_model, cib_ties_for_bels, primitive_metadata_json};
 
-    const ARCHITECTURE: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../texo-target-ecp5/fixtures/minimal-ecp5.json"
-    ));
+    const ARCHITECTURE: &str = texo_target_ecp5::MINIMAL_ECP5_FIXTURE_JSON;
 
     #[test]
     fn checkpoints_distributed_ram_cell_roles() {
