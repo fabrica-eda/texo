@@ -49,6 +49,9 @@ pub struct Ecp5BitgenOptions {
     pub configuration: Option<PathBuf>,
     /// Runtime files used to encode the bitstream.
     pub runtime: Ecp5BitgenRuntime,
+    /// Measured STA library of a checkpoint implemented with one; it must match
+    /// the SHA-256 recorded in the checkpoint.
+    pub measured_timing_library: Option<PathBuf>,
 }
 
 impl Ecp5BitgenOptions {
@@ -59,6 +62,7 @@ impl Ecp5BitgenOptions {
             bitstream: bitstream.into(),
             configuration: None,
             runtime: Ecp5BitgenRuntime::Auto,
+            measured_timing_library: None,
         }
     }
 }
@@ -162,9 +166,12 @@ fn bitgen_inner(options: &Ecp5BitgenOptions) -> Result<Ecp5BitgenOutput, Box<dyn
         .pointer("/target/measured_timing")
         .filter(|v| !v.is_null())
     {
-        let path = measured["path"]
-            .as_str()
-            .ok_or("measured library path missing")?;
+        // Checkpoints from Texo 0.2.0 recorded the library's absolute path.
+        let path = options
+            .measured_timing_library
+            .clone()
+            .or_else(|| measured["path"].as_str().map(PathBuf::from))
+            .ok_or("the checkpoint uses a measured STA library; pass --measured-timing-library")?;
         let digest = measured["sha256"]
             .as_str()
             .ok_or("measured library digest missing")?;
@@ -172,11 +179,12 @@ fn bitgen_inner(options: &Ecp5BitgenOptions) -> Result<Ecp5BitgenOutput, Box<dyn
             .pointer("/target/package")
             .and_then(Value::as_str)
             .ok_or("package missing")?;
-        let loaded = crate::measured_timing::install(
-            Path::new(path),
+        let loaded = crate::measured_timing::install_with(
+            &path,
             &mut architecture,
             package,
             Some(digest),
+            texo_flow::MeasuredEvidence::Skip,
         )?;
         if checkpoint.pointer("/target/speed_grade") != Some(&loaded["timing_grade"]) {
             return Err("bitgen measured timing grade mismatch".into());

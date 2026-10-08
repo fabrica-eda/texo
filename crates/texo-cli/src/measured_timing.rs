@@ -7,6 +7,7 @@ use std::error::Error;
 use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use texo_flow::{MeasuredEvidence, check_measured_evidence};
 use texo_target_ecp5::{Ecp5Architecture, SpeedGradeRecord};
 
 // Evidence hashes bind the original bytes, regardless of their storage encoding.
@@ -31,19 +32,6 @@ fn open_input(path: &Path) -> Result<(Box<dyn Read>, PathBuf), Box<dyn Error>> {
         Box::new(file)
     };
     Ok((reader, source))
-}
-
-fn input_digest(path: &Path) -> Result<String, Box<dyn Error>> {
-    let (mut reader, _) = open_input(path)?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0; 8_192];
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            return Ok(format!("{:x}", digest.finalize()));
-        }
-        digest.update(&buffer[..count]);
-    }
 }
 
 #[derive(Deserialize)]
@@ -78,6 +66,28 @@ pub fn install(
     package: &str,
     expected_sha256: Option<&str>,
 ) -> Result<Value, Box<dyn Error>> {
+    install_with(
+        path,
+        architecture,
+        package,
+        expected_sha256,
+        MeasuredEvidence::Verify,
+    )
+}
+
+/// [`install`], reading the library's evidence files only with
+/// [`MeasuredEvidence::Verify`]. Evidence paths are relative to the library.
+///
+/// # Errors
+/// Rejects hash mismatches, malformed evidence paths, failed holdouts,
+/// unsupported targets and missing entries.
+pub fn install_with(
+    path: &Path,
+    architecture: &mut Ecp5Architecture,
+    package: &str,
+    expected_sha256: Option<&str>,
+    evidence: MeasuredEvidence,
+) -> Result<Value, Box<dyn Error>> {
     let (mut reader, source) = open_input(path)?;
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;
@@ -100,11 +110,7 @@ pub fn install(
     {
         return Err("unqualified or incompatible measured STA library".into());
     }
-    for (name, expected) in &library.input_sha256 {
-        if input_digest(Path::new(name))? != *expected {
-            return Err(format!("measurement input changed: {name}").into());
-        }
-    }
+    check_measured_evidence(&source, &library.input_sha256, evidence)?;
     for path in library.qualification.validated_samples.values() {
         if !library.input_sha256.contains_key(path) {
             return Err("sample evidence is not hash-bound".into());
@@ -144,7 +150,14 @@ pub fn install(
             return Err(format!("missing measurement support for {key}").into());
         }
     }
-    let result = json!({"path":source.canonicalize()?.display().to_string(),"sha256":digest,
+    // Only the file name: checkpoints must not carry local directories. Bitgen
+    // is given the library again and matches it by this SHA-256.
+    let file = source
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let result = json!({"file":file,"sha256":digest,
+        "evidence_verified":evidence == MeasuredEvidence::Verify,
         "kind":library.kind,"timing_grade":library.timing.name,"entries":keys.len(),
         "legacy_table_fallback":false,"lut_input_timing":"routed_physical_pin","temperature_fraction":library.qualification.temperature_fraction,
         "voltage_sweep_measured":library.qualification.independent_voltage_sweep,
@@ -173,15 +186,13 @@ mod tests {
         compressed
     }
 
-    #[test]
-    fn changed_measurement_and_incomplete_surface_never_install() {
-        let mut architecture = texo_target_ecp5::read_architecture(
-            include_str!("../fixtures/minimal-ecp5.json").as_bytes(),
-        )
-        .unwrap();
+    /// A complete synthetic library whose only evidence file is written to
+    /// `directory`. Returns the library and the evidence path and digest.
+    fn synthetic_library(
+        architecture: &Ecp5Architecture,
+        directory: &Path,
+    ) -> (Value, PathBuf, String) {
         let original = architecture.speed_grades()["6"].clone();
-        let temporary = tempfile::tempdir().unwrap();
-        let directory = temporary.path();
         let evidence = directory.join("explicit-synthetic-unit-test.txt");
         std::fs::write(
             &evidence,
@@ -210,13 +221,26 @@ mod tests {
                 );
             }
         }
-        let mut library = json!({"schema":1,"kind":"measured_joint_cell_route_sta_library",
+        let library = json!({"schema":1,"kind":"measured_joint_cell_route_sta_library",
             "device":architecture.device().name(),"package":"test-package",
-            "input_sha256":{evidence.display().to_string():digest},
+            "input_sha256":{"explicit-synthetic-unit-test.txt":digest},
             "qualification":{"heldout_passed":true,"no_legacy_delay_labels":true,"independent_voltage_sweep":false,
                 "temperature_fraction":0.2,"required_setup_hold_guard_ps":201,
-                "validated_samples":{"test":evidence.display().to_string()}},
+                "validated_samples":{"test":"explicit-synthetic-unit-test.txt"}},
             "timing":original,"entry_evidence":refs});
+        (library, evidence, digest)
+    }
+
+    #[test]
+    fn changed_measurement_and_incomplete_surface_never_install() {
+        let mut architecture = texo_target_ecp5::read_architecture(
+            include_str!("../fixtures/minimal-ecp5.json").as_bytes(),
+        )
+        .unwrap();
+        let original = architecture.speed_grades()["6"].clone();
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path();
+        let (mut library, evidence, _) = synthetic_library(&architecture, directory);
         let file = directory.join("library.json");
         std::fs::write(&file, serde_json::to_vec(&library).unwrap()).unwrap();
         assert!(
@@ -252,6 +276,8 @@ mod tests {
         let provenance = install(&file, &mut architecture, "test-package", None).unwrap();
         assert_eq!(provenance["legacy_table_fallback"], false);
         assert_eq!(provenance["required_setup_hold_guard_ps"], 201);
+        assert_eq!(provenance["file"], "library.json");
+        assert_eq!(provenance["evidence_verified"], true);
 
         // Compress both artifacts without changing any hash-bound input paths.
         // Both the legacy path and the explicit archive must remain usable.
@@ -278,5 +304,50 @@ mod tests {
         std::fs::write(&compressed_evidence, damaged).unwrap();
         assert!(install(&file, &mut architecture, "test-package", None).is_err());
         assert_eq!(architecture.speed_grades()["6"], original);
+    }
+
+    #[test]
+    fn unverified_evidence_is_still_bound_by_the_library_digest() {
+        let mut architecture = texo_target_ecp5::read_architecture(
+            include_str!("../fixtures/minimal-ecp5.json").as_bytes(),
+        )
+        .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path();
+        let (library, evidence, digest) = synthetic_library(&architecture, directory);
+        let file = directory.join("library.json");
+        std::fs::write(&file, serde_json::to_vec(&library).unwrap()).unwrap();
+        let provenance = install(&file, &mut architecture, "test-package", None).unwrap();
+        std::fs::remove_file(&evidence).unwrap();
+        assert!(install(&file, &mut architecture, "test-package", None).is_err());
+        let complete = library;
+        // Without evidence verification the missing evidence is not read, the
+        // library digest still binds the result, and an absolute path is refused.
+        let trusted = install_with(
+            &file,
+            &mut architecture,
+            "test-package",
+            provenance["sha256"].as_str(),
+            MeasuredEvidence::Skip,
+        )
+        .unwrap();
+        assert_eq!(trusted["evidence_verified"], false);
+        let absolute = directory.join("explicit-synthetic-unit-test.txt");
+        let mut leaked = complete.clone();
+        leaked["input_sha256"] = json!({absolute.display().to_string():digest});
+        leaked["qualification"]["validated_samples"] =
+            json!({"test":absolute.display().to_string()});
+        let leaked_file = directory.join("leaked.json");
+        std::fs::write(&leaked_file, serde_json::to_vec(&leaked).unwrap()).unwrap();
+        assert!(
+            install_with(
+                &leaked_file,
+                &mut architecture,
+                "test-package",
+                None,
+                MeasuredEvidence::Skip,
+            )
+            .is_err()
+        );
     }
 }

@@ -27,18 +27,20 @@ fn delay(v: DelayRangeRecord) -> DelayRange {
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    assert_eq!(args.len(), 3, "ARCH CHECKPOINT OUTPUT");
+    assert_eq!(args.len(), 4, "ARCH CHECKPOINT LIBRARY OUTPUT");
     let mut arch = read_architecture_cache(BufReader::new(File::open(&args[0])?))?;
     let cp: Value = serde_json::from_reader(BufReader::new(File::open(&args[1])?))?;
     let measured = cp
         .pointer("/target/measured_timing")
         .filter(|v| !v.is_null())
         .ok_or("measured checkpoint required")?;
-    texo_cli::measured_timing::install(
-        std::path::Path::new(s(&measured["path"])),
+    // The checkpoint records only the library's SHA-256, which must match.
+    texo_cli::measured_timing::install_with(
+        std::path::Path::new(&args[2]),
         &mut arch,
         s(&cp["target"]["package"]),
         Some(s(&measured["sha256"])),
+        texo_flow::MeasuredEvidence::Skip,
     )?;
 
     let metadata: BTreeMap<_, _> = cp["primitive_metadata"]
@@ -314,7 +316,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "rising_edge_registers":rising,"other_tap_clock_registers":other_tap_clocks,
         "worst_setup_slack_ps":report.worst_slack_ps,"worst_hold_slack_ps":report.worst_hold_slack_ps,
         "unchecked_endpoints":unchecked,"setup_checks":setup,"hold_checks":hold,"structural_and_internal_timing_gate":pass});
-    serde_json::to_writer_pretty(File::create(&args[2])?, &result)?;
+    serde_json::to_writer_pretty(File::create(&args[3])?, &result)?;
     println!(
         "JTCK FFs={} setup={} hold={} unchecked={} WNS={:?} WHS={:?} gate={pass}",
         selected.len(),

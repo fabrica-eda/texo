@@ -6,7 +6,7 @@ mod ecp5_pll;
 mod initial_routing;
 mod measured_placement;
 mod routed_cell_timing;
-pub use measured_placement::MeasuredPlacementModel;
+pub use measured_placement::{MeasuredEvidence, MeasuredPlacementModel, check_measured_evidence};
 mod setup_budget;
 mod timing_coverage;
 

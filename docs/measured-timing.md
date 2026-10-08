@@ -26,8 +26,17 @@ is independent of placement model selection. The JSON schema is version 1,
 kind `measured_joint_cell_route_sta_library`; `timing` is a complete
 `SpeedGradeRecord`. The loader checks device/package, successful heldout
 validation, a declared temperature margin of at least 20%, required setup/hold
-uncertainty, hashes of all measurement inputs, and evidence references for every
-entry. It never copies missing numeric entries from the architecture cache.
+uncertainty, and evidence references for every entry. It never copies missing
+numeric entries from the architecture cache.
+
+Both files list their measurement evidence in `input_sha256`. Evidence paths
+must be relative to the model or library file and may not contain `..`;
+absolute paths are rejected, so a published model never carries local
+directories. `--verify-measured-evidence` reads every evidence file next to the
+model and library and compares its SHA-256. Without it, only the paths' form is
+checked and the caller is responsible for pinning the model and library files
+themselves; their SHA-256 is recorded in the checkpoint either way, together
+with `evidence_verified`.
 
 LUT timing follows the physical input selected by the routed input-permutation
 PIP, rather than the logical input name before routing. Full STA and ECO STA
@@ -37,9 +46,11 @@ remain unchanged, and STA counts the selected cell arc exactly once. Equal-input
 legacy libraries retain their previous routing costs.
 
 Both CLI uncertainties must be at least the library's
-`qualification.required_setup_hold_guard_ps`. The checkpoint stores the exact
-library path and SHA-256. Checked bitgen reloads that exact library and rejects
-changed or missing evidence. Resuming a measured checkpoint requires an explicit
+`qualification.required_setup_hold_guard_ps`. The checkpoint stores the
+library's file name and SHA-256, never its directory. `texo bitgen` takes the
+library again with `--measured-timing-library` and rejects a file whose SHA-256
+differs (checkpoints from Texo 0.2.0 still record a path, which bitgen uses when
+the option is omitted). Resuming a measured checkpoint requires an explicit
 library selection and fresh STA. These checks enforce provenance and declared
 coverage; they do not independently establish that the physical experiment or
 fitting assumptions are correct.
@@ -61,7 +72,7 @@ must never be used as board timing libraries.
 `measurement_identities` exports physical PIP classes and BEL/pin identities
 without numeric delay labels. `measured_surface` exports table structure for
 coverage auditing. `measured_jtag_sta` reconstructs the internal JTCK graph using
-the exact checkpoint library, allowing comparison against integrated STA; it
+the library given on its command line, matched by the checkpoint's SHA-256, allowing comparison against integrated STA; it
 does not characterize the external JTAGG boundary.
 
 Hold repair first tries collective routing, then isolates each currently violating net while retaining all of its sink floors. If frozen neighbors block a detour, bounded owner discovery releases the conflicting routes and preserves their existing hold requirements. When routing alone stalls, at most 128 legal trials move violating cells to nearby vacant sites (radii 2, 4 and 8). Complete placement validation preserves fixed bindings, atomic groups, pin compatibility and shared resources. Every trial must keep setup closed and strictly improve the whole-design timing objective before it commits.
