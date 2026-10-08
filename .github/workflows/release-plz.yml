@@ -38,7 +38,8 @@ jobs:
           client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           permission-contents: write
-          permission-pull-requests: read
+          permission-issues: write
+          permission-pull-requests: write
 
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
@@ -61,6 +62,22 @@ jobs:
           test -n "${release_tag}"
           echo "tag=${release_tag}" >> "${GITHUB_OUTPUT}"
 
+      # release-please opens no new release PR while a merged one is still
+      # labelled "autorelease: pending". release-plz creates the tag here, so
+      # mark the merged release PR as tagged.
+      - name: Mark the release PR as tagged
+        if: steps.release-metadata.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh label create "autorelease: tagged" --repo "${GITHUB_REPOSITORY}" --color ededed --force
+          gh pr list --repo "${GITHUB_REPOSITORY}" --state merged --label "autorelease: pending" \
+            --json number --jq '.[].number' |
+            while read -r number; do
+              gh pr edit "${number}" --repo "${GITHUB_REPOSITORY}" \
+                --remove-label "autorelease: pending" --add-label "autorelease: tagged"
+            done
+
   release-pr:
     name: Release Please PR
     needs: release
@@ -80,6 +97,7 @@ jobs:
           client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           permission-contents: write
+          permission-issues: write
           permission-pull-requests: write
 
       - name: Create or update release PR
@@ -87,7 +105,6 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
           skip-github-release: true
-          skip-labeling: true
 
   upload-cli:
     name: CLI (${{ matrix.target }})
