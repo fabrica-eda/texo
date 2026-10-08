@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1](https://github.com/fabrica-eda/texo/compare/v0.2.0...v0.2.1) (2026-10-08)
+
+
+### Bug Fixes
+
+* **release:** make the published Texo crates check without the repository ([#108](https://github.com/fabrica-eda/texo/issues/108)) ([9755628](https://github.com/fabrica-eda/texo/commit/97556282b3a40e855cc8027f6dab770f2a505356))
+
 ## [0.1.7](https://github.com/fabrica-eda/texo/compare/v0.1.6...v0.1.7) (2026-09-11)
 
 
