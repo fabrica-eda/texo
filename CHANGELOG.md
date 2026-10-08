@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0](https://github.com/fabrica-eda/texo/compare/v0.2.0...v0.3.0) (2026-10-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* **measured:** `Ecp5BitgenOptions` has a new public field, `measured_timing_library`. Struct literals must set it or use `Ecp5BitgenOptions::new`. The `measured_jtag_sta` example takes the library as its third argument.
+
+### Bug Fixes
+
+* **measured:** keep local paths out of measured models and checkpoints ([#111](https://github.com/fabrica-eda/texo/issues/111)) ([37bdd46](https://github.com/fabrica-eda/texo/commit/37bdd4698ce0f6ed7a7563ae90fd7e0d602ce345))
+
 ## [0.1.7](https://github.com/fabrica-eda/texo/compare/v0.1.6...v0.1.7) (2026-09-11)
 
 
