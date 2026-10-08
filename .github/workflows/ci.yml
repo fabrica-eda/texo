@@ -46,6 +46,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check copied test fixtures
+        # Published crates cannot read a sibling crate's files, so texo-flow
+        # and texo-cli carry their own copy of the minimal ECP5 fixture.
+        run: |
+          for crate in texo-flow texo-cli; do
+            cmp crates/texo-target-ecp5/fixtures/minimal-ecp5.json "crates/$crate/fixtures/minimal-ecp5.json"
+          done
+
       - name: Check Python tools
         run: python3 -m compileall -q tools
 

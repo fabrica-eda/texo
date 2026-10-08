@@ -1,0 +1,548 @@
+{
+  "schema_version": 7,
+  "provenance": {
+    "project_trellis_revision": "3afe7b52b30f4b4417ee98f03016767a502006e3",
+    "database_revision": "015e0330630d7c238c0e4f2cdd9c8157eb78c54a",
+    "include_lutperm_pips": true,
+    "split_slice_mode": true
+  },
+  "family": "ECP5",
+  "device": "LFE5UM5G-85F-test",
+  "width": 2,
+  "height": 1,
+  "location_types": [
+    {
+      "wires": [
+        { "name": "A0_SLICE" },
+        { "name": "B0_SLICE" },
+        { "name": "C0_SLICE" },
+        { "name": "D0_SLICE" },
+        { "name": "F0_SLICE" },
+        { "name": "H01E0001" },
+        { "name": "PADDI_A" },
+        { "name": "PADDO_A" },
+        { "name": "PADDT_A" },
+        { "name": "DI0_SLICE" },
+        { "name": "M0_SLICE" },
+        { "name": "CLK0_SLICE" },
+        { "name": "LSR0_SLICE" },
+        { "name": "CE0_SLICE" },
+        { "name": "Q0_SLICE" },
+        { "name": "CLKA_EBR" },
+        { "name": "ADA1_EBR" },
+        { "name": "ADA2_EBR" },
+        { "name": "DIA0_EBR" },
+        { "name": "DIA1_EBR" },
+        { "name": "WEA_EBR" },
+        { "name": "ADB1_EBR" },
+        { "name": "ADB2_EBR" },
+        { "name": "CLKB_EBR" },
+        { "name": "DOB0_EBR" },
+        { "name": "DOB1_EBR" },
+        { "name": "CLKI_DCCA" },
+        { "name": "CLKO_DCCA" },
+        { "name": "FCI_SLICE" },
+        { "name": "FCIA1_SLICE" },
+        { "name": "FCO1_SLICE" },
+        { "name": "A1_SLICE" },
+        { "name": "B1_SLICE" },
+        { "name": "C1_SLICE" },
+        { "name": "D1_SLICE" },
+        { "name": "F1_SLICE" }
+      ],
+      "bels": [
+        {
+          "name": "SLICEA.K0",
+          "bel_type": "TRELLIS_COMB",
+          "z": 0,
+          "pins": [
+            { "name": "A", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 0 } },
+            { "name": "B", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 1 } },
+            { "name": "C", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 2 } },
+            { "name": "D", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 3 } },
+            { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 4 } },
+            { "name": "F1", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 35 } },
+            { "name": "M", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 10 } },
+            { "name": "OFX", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 5 } },
+            { "name": "FCI", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 28 } },
+            { "name": "FCO", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 29 } }
+          ]
+        },
+        {
+          "name": "SLICEA.K1",
+          "bel_type": "TRELLIS_COMB",
+          "z": 4,
+          "pins": [
+            { "name": "A", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 31 } },
+            { "name": "B", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 32 } },
+            { "name": "C", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 33 } },
+            { "name": "D", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 34 } },
+            { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 35 } },
+            { "name": "M", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 10 } },
+            { "name": "OFX", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 30 } },
+            { "name": "FXA", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 27 } },
+            { "name": "FXB", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 5 } },
+            { "name": "FCI", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 29 } },
+            { "name": "FCO", "direction": "output", "wire": { "dx": 1, "dy": 0, "index": 19 } }
+          ]
+        },
+        {
+          "name": "SLICEB.K0",
+          "bel_type": "TRELLIS_COMB",
+          "z": 8,
+          "pins": [
+            { "name": "A", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 0 } },
+            { "name": "B", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 1 } },
+            { "name": "C", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 2 } },
+            { "name": "D", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 3 } },
+            { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 4 } },
+            { "name": "F1", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 30 } },
+            { "name": "M", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 10 } },
+            { "name": "OFX", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 27 } }
+          ]
+        },
+        {
+          "name": "SLICEB.K1",
+          "bel_type": "TRELLIS_COMB",
+          "z": 12,
+          "pins": [
+            { "name": "A", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 31 } },
+            { "name": "B", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 32 } },
+            { "name": "C", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 33 } },
+            { "name": "D", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 34 } },
+            { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 30 } }
+          ]
+        },
+        {
+          "name": "PIOA",
+          "bel_type": "PIO",
+          "z": 8,
+          "pins": [
+            { "name": "I", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 7 } },
+            { "name": "T", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 8 } },
+            { "name": "O", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 6 } }
+          ]
+        },
+        {
+          "name": "SLICEA.FF0",
+          "bel_type": "TRELLIS_FF",
+          "z": 1,
+          "pins": [
+            { "name": "DI", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 9 } },
+            { "name": "M", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 10 } },
+            { "name": "CLK", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 11 } },
+            { "name": "LSR", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 12 } },
+            { "name": "CE", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 13 } },
+            { "name": "Q", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 14 } }
+          ]
+        },
+        {
+          "name": "EBR0",
+          "bel_type": "DP16KD",
+          "z": 16,
+          "pins": [
+            { "name": "CLKA", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 15 } },
+            { "name": "ADA1", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 16 } },
+            { "name": "ADA2", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 17 } },
+            { "name": "DIA0", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 18 } },
+            { "name": "DIA1", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 19 } },
+            { "name": "WEA", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 20 } },
+            { "name": "ADB1", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 21 } },
+            { "name": "ADB2", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 22 } },
+            { "name": "CLKB", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 23 } },
+            { "name": "DOB0", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 24 } },
+            { "name": "DOB1", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 25 } }
+          ]
+        },
+        {
+          "name": "DCCA0",
+          "bel_type": "DCCA",
+          "z": 24,
+          "pins": [
+            { "name": "CLKI", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 26 } },
+            { "name": "CLKO", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 27 } }
+          ]
+        }
+      ],
+      "pips": [
+        {
+          "from": { "dx": 0, "dy": 0, "index": 5 },
+          "to": { "dx": 1, "dy": 0, "index": 5 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "timing_class": "default",
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 6 },
+          "to": { "dx": 0, "dy": 0, "index": 26 },
+          "fixed": false,
+          "tile_type": "EFB1_PICB1",
+          "timing_class": "default",
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 27 },
+          "to": { "dx": 0, "dy": 0, "index": 11 },
+          "fixed": false,
+          "tile_type": "EFB1_PICB1",
+          "timing_class": "default",
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 6 },
+          "to": { "dx": 0, "dy": 0, "index": 5 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "timing_class": "default",
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 6 },
+          "to": { "dx": 0, "dy": 0, "index": 0 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "timing_class": "default",
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 6 },
+          "to": { "dx": 0, "dy": 0, "index": 1 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "timing_class": "default",
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 4 },
+          "to": { "dx": 1, "dy": 0, "index": 17 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "timing_class": "default",
+          "lutperm_flags": 0
+        }
+      ]
+    },
+    {
+      "wires": [
+        { "name": "A0_SLICE" },
+        { "name": "B0_SLICE" },
+        { "name": "C0_SLICE" },
+        { "name": "D0_SLICE" },
+        { "name": "F0_SLICE" },
+        { "name": "H01E0001" },
+        { "name": "DI0_SLICE" },
+        { "name": "M0_SLICE" },
+        { "name": "CLK0_SLICE" },
+        { "name": "LSR0_SLICE" },
+        { "name": "CE0_SLICE" },
+        { "name": "Q0_SLICE" },
+        { "name": "CLKA_EBR" },
+        { "name": "PADDI_B" },
+        { "name": "PADDO_B" },
+        { "name": "PADDT_B" },
+        { "name": "PADDI_C" },
+        { "name": "PADDO_C" },
+        { "name": "PADDT_C" },
+        { "name": "FCI_SLICE" },
+        { "name": "FCIA1_SLICE" },
+        { "name": "FCO1_SLICE" },
+        { "name": "A1_SLICE" },
+        { "name": "B1_SLICE" },
+        { "name": "C1_SLICE" },
+        { "name": "D1_SLICE" },
+        { "name": "F1_SLICE" }
+      ],
+      "bels": [
+        {
+          "name": "SLICEA.K0",
+          "bel_type": "TRELLIS_COMB",
+          "z": 0,
+          "pins": [
+            { "name": "A", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 0 } },
+            { "name": "B", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 1 } },
+            { "name": "C", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 2 } },
+            { "name": "D", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 3 } },
+            { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 4 } },
+            { "name": "F1", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 26 } },
+            { "name": "M", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 7 } },
+            { "name": "OFX", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 5 } },
+            { "name": "FCI", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 19 } },
+            { "name": "FCO", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 20 } }
+          ]
+        },
+        {
+          "name": "SLICEA.K1",
+          "bel_type": "TRELLIS_COMB",
+          "z": 4,
+          "pins": [
+            { "name": "A", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 22 } },
+            { "name": "B", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 23 } },
+            { "name": "C", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 24 } },
+            { "name": "D", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 25 } },
+            { "name": "F", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 26 } },
+            { "name": "FCI", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 20 } },
+            { "name": "FCO", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 21 } }
+          ]
+        },
+        {
+          "name": "SLICEA.FF0",
+          "bel_type": "TRELLIS_FF",
+          "z": 1,
+          "pins": [
+            { "name": "DI", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 6 } },
+            { "name": "M", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 7 } },
+            { "name": "CLK", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 8 } },
+            { "name": "LSR", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 9 } },
+            { "name": "CE", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 10 } },
+            { "name": "Q", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 11 } }
+          ]
+        },
+        {
+          "name": "EBR0",
+          "bel_type": "DP16KD",
+          "z": 16,
+          "pins": [
+            { "name": "CLKA", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 12 } }
+          ]
+        },
+        {
+          "name": "PIOB",
+          "bel_type": "PIO",
+          "z": 9,
+          "pins": [
+            { "name": "I", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 14 } },
+            { "name": "T", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 15 } },
+            { "name": "O", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 13 } }
+          ]
+        },
+        {
+          "name": "PIOC",
+          "bel_type": "PIO",
+          "z": 10,
+          "pins": [
+            { "name": "I", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 17 } },
+            { "name": "T", "direction": "input", "wire": { "dx": 0, "dy": 0, "index": 18 } },
+            { "name": "O", "direction": "output", "wire": { "dx": 0, "dy": 0, "index": 16 } }
+          ]
+        }
+      ],
+      "pips": [
+        {
+          "from": { "dx": 0, "dy": 0, "index": 5 },
+          "to": { "dx": 0, "dy": 0, "index": 0 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "timing_class": "default",
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 5 },
+          "to": { "dx": 0, "dy": 0, "index": 1 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "timing_class": "default",
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 13 },
+          "to": { "dx": 0, "dy": 0, "index": 0 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "timing_class": "default",
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 13 },
+          "to": { "dx": 0, "dy": 0, "index": 1 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "timing_class": "default",
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 4 },
+          "to": { "dx": 0, "dy": 0, "index": 17 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "timing_class": "default",
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 13 },
+          "to": { "dx": -1, "dy": 0, "index": 0 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "timing_class": "default",
+          "lutperm_flags": 0
+        },
+        {
+          "from": { "dx": 0, "dy": 0, "index": 13 },
+          "to": { "dx": -1, "dy": 0, "index": 1 },
+          "fixed": false,
+          "tile_type": "PLC2",
+          "timing_class": "default",
+          "lutperm_flags": 0
+        }
+      ]
+    }
+  ],
+  "locations": [
+    { "x": 0, "y": 0, "location_type": 0, "global": { "quadrant": "ul", "tap_direction": "left", "tap_column": 0, "spine": { "x": 0, "y": 0 } } },
+    { "x": 1, "y": 0, "location_type": 1, "global": { "quadrant": "ur", "tap_direction": "right", "tap_column": 1, "spine": { "x": 1, "y": 0 } } }
+  ],
+  "packages": [
+    {
+      "name": "CABGA381",
+      "pins": [
+        { "name": "A10", "x": 0, "y": 0, "bel": 4 },
+        { "name": "B10", "x": 1, "y": 0, "bel": 4 },
+        { "name": "C10", "x": 1, "y": 0, "bel": 5 }
+      ]
+    }
+  ],
+  "speed_grades": [
+    {
+      "name": "6",
+      "pip_classes": {
+        "default": {
+          "base": { "min_ps": 1, "typ_ps": 1, "max_ps": 1 },
+          "fanout_adder": { "min_ps": 0, "typ_ps": 0, "max_ps": 0 }
+        },
+        "zero": {
+          "base": { "min_ps": 0, "typ_ps": 0, "max_ps": 0 },
+          "fanout_adder": { "min_ps": 0, "typ_ps": 0, "max_ps": 0 }
+        }
+      },
+      "cells": [
+        {
+          "cell_type": "DCCA",
+          "arcs": [
+            {
+              "from_pin": "CLKI",
+              "to_pin": "CLKO",
+              "delay": { "min_ps": 0, "max_ps": 0 }
+            }
+          ],
+          "setup_holds": []
+        },
+        {
+          "cell_type": "DP16KD",
+          "arcs": [
+            { "from_pin": "CLKA", "to_pin": "DOA0", "delay": { "min_ps": 5784, "max_ps": 5820 } },
+            { "from_pin": "CLKB", "to_pin": "DOB0", "delay": { "min_ps": 5795, "max_ps": 5830 } }
+          ],
+          "setup_holds": [
+            {
+              "signal_pin": "DIA0",
+              "clock_pin": "CLKA",
+              "setup": { "min_ps": 220, "max_ps": 220 },
+              "hold": { "min_ps": 43, "max_ps": 43 }
+            },
+            {
+              "signal_pin": "ADB0",
+              "clock_pin": "CLKB",
+              "setup": { "min_ps": 251, "max_ps": 251 },
+              "hold": { "min_ps": 123, "max_ps": 123 }
+            }
+          ]
+        },
+        {
+          "cell_type": "TRELLIS_COMB",
+          "arcs": [
+            { "from_pin": "A", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "B", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "C", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "D", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } }
+          ],
+          "setup_holds": []
+        },
+        {
+          "cell_type": "TRELLIS_PFUMX",
+          "arcs": [
+            { "from_pin": "A", "to_pin": "OFX", "delay": { "min_ps": 268, "max_ps": 401 } },
+            { "from_pin": "B", "to_pin": "OFX", "delay": { "min_ps": 268, "max_ps": 401 } },
+            { "from_pin": "C", "to_pin": "OFX", "delay": { "min_ps": 268, "max_ps": 401 } },
+            { "from_pin": "D", "to_pin": "OFX", "delay": { "min_ps": 268, "max_ps": 401 } },
+            { "from_pin": "F1", "to_pin": "OFX", "delay": { "min_ps": 68, "max_ps": 165 } },
+            { "from_pin": "M", "to_pin": "OFX", "delay": { "min_ps": 187, "max_ps": 256 } }
+          ],
+          "setup_holds": []
+        },
+        {
+          "cell_type": "TRELLIS_L6MUX21",
+          "arcs": [
+            { "from_pin": "FXA", "to_pin": "OFX", "delay": { "min_ps": 189, "max_ps": 239 } },
+            { "from_pin": "FXB", "to_pin": "OFX", "delay": { "min_ps": 189, "max_ps": 242 } },
+            { "from_pin": "M", "to_pin": "OFX", "delay": { "min_ps": 186, "max_ps": 252 } }
+          ],
+          "setup_holds": []
+        },
+        {
+          "cell_type": "TRELLIS_CARRY0",
+          "arcs": [
+            { "from_pin": "A", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "B", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "C", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "D", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "A", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "B", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "C", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "D", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "FCI", "to_pin": "F", "delay": { "min_ps": 244, "max_ps": 443 } },
+            { "from_pin": "FCI", "to_pin": "FCO", "delay": { "min_ps": 62, "max_ps": 71 } }
+          ],
+          "setup_holds": []
+        },
+        {
+          "cell_type": "TRELLIS_CARRY1",
+          "arcs": [
+            { "from_pin": "A", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "B", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "C", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "D", "to_pin": "F", "delay": { "min_ps": 200, "max_ps": 236 } },
+            { "from_pin": "A", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "B", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "C", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "D", "to_pin": "FCO", "delay": { "min_ps": 175, "max_ps": 447 } },
+            { "from_pin": "FCI", "to_pin": "F", "delay": { "min_ps": 295, "max_ps": 403 } },
+            { "from_pin": "FCI", "to_pin": "FCO", "delay": { "min_ps": 0, "max_ps": 0 } }
+          ],
+          "setup_holds": []
+        },
+        {
+          "cell_type": "TRELLIS_FF",
+          "arcs": [
+            { "from_pin": "CLK", "to_pin": "Q", "delay": { "min_ps": 430, "max_ps": 525 } }
+          ],
+          "setup_holds": [
+            {
+              "signal_pin": "DI",
+              "clock_pin": "CLK",
+              "setup": { "min_ps": 0, "max_ps": 0 },
+              "hold": { "min_ps": 267, "max_ps": 303 }
+            },
+            {
+              "signal_pin": "M",
+              "clock_pin": "CLK",
+              "setup": { "min_ps": 0, "max_ps": 0 },
+              "hold": { "min_ps": 233, "max_ps": 303 }
+            },
+            {
+              "signal_pin": "CE",
+              "clock_pin": "CLK",
+              "setup": { "min_ps": 0, "max_ps": 0 },
+              "hold": { "min_ps": 144, "max_ps": 152 }
+            },
+            {
+              "signal_pin": "LSR",
+              "clock_pin": "CLK",
+              "setup": { "min_ps": 271, "max_ps": 424 },
+              "hold": { "min_ps": 0, "max_ps": 0 }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

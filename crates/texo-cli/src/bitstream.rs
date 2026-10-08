@@ -1872,7 +1872,7 @@ mod tests {
         write_distributed_ram_write_port, write_ff, write_jtagg, write_multiplier, write_pll,
     };
 
-    const ARCHITECTURE: &str = texo_target_ecp5::MINIMAL_ECP5_FIXTURE_JSON;
+    const ARCHITECTURE: &str = include_str!("../fixtures/minimal-ecp5.json");
 
     #[test]
     fn parses_and_canonically_serializes_an_empty_device_config() {

@@ -5606,7 +5606,7 @@ mod tests {
         worst_setup_net_route_eco_candidates, worst_setup_route_eco_cohort,
     };
 
-    const ECP5_FIXTURE: &str = texo_target_ecp5::MINIMAL_ECP5_FIXTURE_JSON;
+    const ECP5_FIXTURE: &str = include_str!("../fixtures/minimal-ecp5.json");
 
     #[test]
     fn timing_gate_rejects_an_unconstrained_domain_even_when_checked_paths_pass() {
